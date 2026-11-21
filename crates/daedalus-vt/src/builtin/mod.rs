@@ -98,7 +98,7 @@ impl Perform for PerformerState {
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         let mut flat: Vec<u16> = params.iter().map(|p| p[0]).collect();
-        let is_private = intermediates == [b'?'];
+        let is_private = intermediates == b"?";
 
         match (is_private, action) {
             (false, 'm') => self.apply_sgr(&flat),
