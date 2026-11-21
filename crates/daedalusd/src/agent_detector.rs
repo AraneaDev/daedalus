@@ -17,6 +17,9 @@ const APPROVAL_PATTERNS: &[&str] = &[
     "confirm?",
     "press enter to continue",
     "allow once",
+    "permission?",
+    "permission required",
+    "grant permission",
 ];
 
 const SPINNER_GLYPHS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -242,6 +245,9 @@ impl AgentStateDetector {
     ) -> Option<AgentState> {
         let expires_at = now.checked_add(ttl).unwrap_or(now);
         self.override_state = Some((state, expires_at));
+        if state != AgentState::WaitingForApproval {
+            self.tail.clear();
+        }
         self.transition(state)
     }
 }

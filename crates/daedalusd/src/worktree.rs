@@ -524,6 +524,7 @@ pub fn remove_worktree(path: &Path, force: bool) -> Result<(), WorktreeError> {
     if force {
         args.push(OsStr::new("--force"));
     }
+    args.push(OsStr::new("--"));
     args.push(target.as_os_str());
 
     let out = run_git_with_timeout(&primary_repo, &args).map_err(WorktreeError::GitFailed)?;
