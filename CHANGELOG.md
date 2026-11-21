@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.2](https://github.com/AraneaDev/daedalus/compare/v0.0.1...v0.0.2) (2026-11-21)
+
+
+### Features
+
+* daily-driver workbench (v0.0.2) ([#16](https://github.com/AraneaDev/daedalus/issues/16)) ([8595c2b](https://github.com/AraneaDev/daedalus/commit/8595c2bc1bbb3df66a9a0dbfef6f96f3699159e4))
+
 ## 0.0.1 (2026-11-21)
 
 
