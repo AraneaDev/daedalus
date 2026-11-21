@@ -1,0 +1,204 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use daedalus_proto::{GridSnapshot, PaneId, PaneRole, ServerEvent};
+use daedalus_ui::bridge::{BridgeConfig, DaemonBridge, UiCommand, UiEvent, UiEventSink};
+use daedalus_ui::state::AgentPreset;
+use daedalusd::server::DaemonServer;
+use daedalusd::supervisor::{IsolationMode, Supervisor};
+use tempfile::TempDir;
+use tokio::sync::{mpsc, oneshot};
+
+struct ChannelSink {
+    tx: mpsc::UnboundedSender<UiEvent>,
+}
+
+impl UiEventSink for ChannelSink {
+    fn emit(&self, event: UiEvent) {
+        let _ = self.tx.send(event);
+    }
+}
+
+fn snapshot_text(snapshot: &GridSnapshot) -> String {
+    snapshot
+        .rows_data
+        .iter()
+        .map(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn daemon_bridge_bootstraps_three_panes_and_forwards_runner_failure_to_agent() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daedalusd.sock");
+    let runtime = dir.path().join("runtime");
+
+    let server = DaemonServer::bind_with_supervisor(
+        sock.clone(),
+        runtime,
+        Supervisor::with_mode(IsolationMode::PgidFallback),
+    )
+    .await
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
+    let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink { tx: evt_tx });
+    let bridge = DaemonBridge::start(
+        BridgeConfig {
+            socket_path: sock,
+            initial_dir: dir.path().to_path_buf(),
+            default_agent: AgentPreset::Shell,
+            auto_spawn_daemon: false,
+        },
+        sink,
+    );
+
+    // 1. Wait for Connected, WorkspaceCreated, and 3 PaneSpawned events (Agent, Service, Runner).
+    let mut connected = false;
+    let mut created_workspace_id = None;
+    let mut panes_by_role: HashMap<PaneRole, PaneId> = HashMap::new();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !connected || created_workspace_id.is_none() || panes_by_role.len() < 3 {
+            let evt = evt_rx.recv().await.expect("event channel closed");
+            match evt {
+                UiEvent::Connected => connected = true,
+                UiEvent::WorkspaceCreated(ws) => {
+                    assert!(
+                        created_workspace_id.is_none(),
+                        "expected exactly 1 auto-bootstrapped workspace"
+                    );
+                    created_workspace_id = Some(ws.id);
+                }
+                UiEvent::PaneSpawned {
+                    summary,
+                    agent_preset,
+                } => {
+                    if summary.role == PaneRole::Agent {
+                        assert_eq!(agent_preset, Some(AgentPreset::Shell));
+                    } else {
+                        assert_eq!(agent_preset, None);
+                    }
+                    panes_by_role.insert(summary.role, summary.id);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for 3-pane auto-bootstrap");
+
+    let agent_pane_id = *panes_by_role.get(&PaneRole::Agent).expect("Agent pane");
+    let _service_pane_id = *panes_by_role.get(&PaneRole::Service).expect("Service pane");
+    let runner_pane_id = *panes_by_role.get(&PaneRole::Runner).expect("Runner pane");
+
+    // Allow interactive shells to finish emitting their initial prompt / OSC 133 hooks.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // 2. Run a failing command in the Runner pane and wait for CommandFinished with exit 19.
+    bridge.send(UiCommand::SendInput {
+        pane_id: runner_pane_id,
+        data: b"sh -c 'echo UI_BRIDGE_FAIL; exit 19'\n".to_vec(),
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let evt = evt_rx.recv().await.expect("event channel closed");
+            if let UiEvent::ServerEvent(ServerEvent::CommandFinished {
+                pane_id,
+                exit_code,
+                has_failure_trace,
+                ..
+            }) = evt
+                && pane_id == runner_pane_id
+                && exit_code == 19
+            {
+                assert!(
+                    has_failure_trace,
+                    "expected Runner failure trace to be captured for exit 19"
+                );
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for Runner CommandFinished(exit_code=19)");
+
+    // 3. Forward the Runner failure trace to the Agent pane and verify confirmation toast + output.
+    bridge.send(UiCommand::ForwardRunnerFailureToAgent {
+        runner_pane_id,
+        agent_pane_id,
+    });
+
+    let mut saw_toast = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !saw_toast {
+            let evt = evt_rx.recv().await.expect("event channel closed");
+            if let UiEvent::Toast { message, is_error } = evt
+                && message.contains("exit 19")
+            {
+                assert!(!is_error, "expected non-error confirmation toast");
+                saw_toast = true;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for failure-forward confirmation toast");
+
+    // Poll Agent pane snapshot until the pasted failure trace text is visible on screen.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut found_in_agent = false;
+    while tokio::time::Instant::now() < deadline && !found_in_agent {
+        bridge.send(UiCommand::RequestSnapshot {
+            pane_id: agent_pane_id,
+        });
+        let wait_until = tokio::time::Instant::now() + Duration::from_millis(250);
+        while tokio::time::Instant::now() < wait_until {
+            let remaining = wait_until.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, evt_rx.recv()).await {
+                Ok(Some(UiEvent::Snapshot(snap))) if snap.pane_id == agent_pane_id => {
+                    if snapshot_text(&snap).contains("UI_BRIDGE_FAIL") {
+                        found_in_agent = true;
+                        break;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("event channel closed unexpectedly"),
+                Err(_) => break,
+            }
+        }
+    }
+    assert!(
+        found_in_agent,
+        "expected Agent pane snapshot to contain forwarded 'UI_BRIDGE_FAIL' trace"
+    );
+
+    // 4. Cleanly shut down bridge and daemon server.
+    tokio::task::spawn_blocking(move || bridge.shutdown())
+        .await
+        .expect("bridge shutdown task panicked");
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), srv_handle)
+        .await
+        .expect("timed out waiting for DaemonServer shutdown")
+        .expect("DaemonServer task panicked");
+}
