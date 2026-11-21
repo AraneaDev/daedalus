@@ -5,9 +5,10 @@ use daedalus_proto::{
 use daedalus_vt::{CommandTracker, VtConfig, create_vt_engine};
 use portable_pty::PtySize;
 use std::io::{Read, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+#[derive(Debug)]
 enum PaneCmd {
     SendInput {
         data: Vec<u8>,
@@ -37,7 +38,12 @@ enum PtyOutput {
     Closed,
 }
 
-#[derive(Clone)]
+struct WriteRequest {
+    data: Vec<u8>,
+    reply: oneshot::Sender<Result<(), ProtoError>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct PaneHandle {
     id: PaneId,
     workspace_id: WorkspaceId,
@@ -57,11 +63,12 @@ impl PaneHandle {
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (pty_tx, pty_rx) = mpsc::channel(256);
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteRequest>(128);
 
         let SpawnedPty {
             master,
             mut reader,
-            writer,
+            mut writer,
             handle: proc_handle,
         } = spawned;
 
@@ -88,6 +95,20 @@ impl PaneHandle {
             })
             .expect("failed to spawn PTY reader thread");
 
+        let writer_handle = std::thread::Builder::new()
+            .name(format!("pty-writer-{}", pane_id.short()))
+            .spawn(move || {
+                while let Some(WriteRequest { data, reply }) = write_rx.blocking_recv() {
+                    let res = writer
+                        .write_all(&data)
+                        .and_then(|_| writer.flush())
+                        .map_err(|e| ProtoError::IoError(e.to_string()));
+                    let _ = reply.send(res);
+                }
+                drop(writer);
+            })
+            .expect("failed to spawn PTY writer thread");
+
         tokio::spawn(run_pane_actor(
             workspace_id,
             pane_id,
@@ -95,7 +116,8 @@ impl PaneHandle {
             cols,
             rows,
             master,
-            writer,
+            write_tx,
+            writer_handle,
             proc_handle,
             pty_rx,
             cmd_rx,
@@ -184,15 +206,18 @@ async fn run_pane_actor(
     workspace_id: WorkspaceId,
     pane_id: PaneId,
     role: PaneRole,
-    mut cols: u16,
-    mut rows: u16,
+    cols: u16,
+    rows: u16,
     master: Box<dyn portable_pty::MasterPty + Send>,
-    mut writer: Box<dyn Write + Send>,
+    write_tx: mpsc::Sender<WriteRequest>,
+    writer_handle: std::thread::JoinHandle<()>,
     mut proc_handle: crate::supervisor::ProcessHandle,
     mut pty_rx: mpsc::Receiver<PtyOutput>,
     mut cmd_rx: mpsc::Receiver<PaneCmd>,
     event_tx: broadcast::Sender<ServerEvent>,
 ) {
+    let mut cols = cols.max(1);
+    let mut rows = rows.max(1);
     let engine = create_vt_engine(VtConfig {
         cols,
         rows,
@@ -203,6 +228,7 @@ async fn run_pane_actor(
     let mut has_pending_delta = false;
     let mut pty_open = true;
     let mut delta_tick = tokio::time::interval(Duration::from_millis(16));
+    delta_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -236,29 +262,42 @@ async fn run_pane_actor(
                                 let _ = event_tx.send(ServerEvent::GridDelta(delta));
                             }
                         }
-                        let exit_code = proc_handle.try_wait_exit();
+                        let mut exit_code = proc_handle.try_wait_exit();
+                        if exit_code.is_none() {
+                            for _ in 0..20 {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                exit_code = proc_handle.try_wait_exit();
+                                if exit_code.is_some() {
+                                    break;
+                                }
+                            }
+                        }
                         tracker.mark_exited(exit_code);
                         let _ = event_tx.send(ServerEvent::PaneExited { pane_id, exit_code });
                     }
                 }
             }
-            _ = delta_tick.tick() => {
-                if has_pending_delta {
-                    has_pending_delta = false;
-                    seq += 1;
-                    if let Some(delta) = tracker.engine_mut().take_dirty_delta(pane_id, seq) {
-                        let _ = event_tx.send(ServerEvent::GridDelta(delta));
-                    }
+            _ = delta_tick.tick(), if has_pending_delta => {
+                has_pending_delta = false;
+                seq += 1;
+                if let Some(delta) = tracker.engine_mut().take_dirty_delta(pane_id, seq) {
+                    let _ = event_tx.send(ServerEvent::GridDelta(delta));
                 }
             }
             maybe_cmd = cmd_rx.recv() => {
                 match maybe_cmd {
                     Some(PaneCmd::SendInput { data, reply }) => {
-                        let res = writer
-                            .write_all(&data)
-                            .and_then(|_| writer.flush())
-                            .map_err(|e| ProtoError::IoError(e.to_string()));
-                        let _ = reply.send(res);
+                        if let Err(err) = write_tx.try_send(WriteRequest { data, reply }) {
+                            let (msg, reply) = match err {
+                                mpsc::error::TrySendError::Full(req) => {
+                                    ("PTY input queue full".to_string(), req.reply)
+                                }
+                                mpsc::error::TrySendError::Closed(req) => {
+                                    ("PTY writer closed".to_string(), req.reply)
+                                }
+                            };
+                            let _ = reply.send(Err(ProtoError::IoError(msg)));
+                        }
                     }
                     Some(PaneCmd::Resize { cols: new_cols, rows: new_rows, reply }) => {
                         cols = new_cols.max(1);
@@ -296,24 +335,37 @@ async fn run_pane_actor(
                         let _ = reply.send(summary);
                     }
                     Some(PaneCmd::Close { reply }) => {
-                        drop(writer);
-                        drop(master);
-                        let _ = tokio::task::spawn_blocking(move || {
-                            proc_handle.teardown();
-                        }).await;
+                        teardown_pane(write_tx, master, writer_handle, proc_handle).await;
                         let _ = reply.send(());
                         break;
                     }
                     None => {
-                        drop(writer);
-                        drop(master);
-                        let _ = tokio::task::spawn_blocking(move || {
-                            proc_handle.teardown();
-                        }).await;
+                        teardown_pane(write_tx, master, writer_handle, proc_handle).await;
                         break;
                     }
                 }
             }
         }
     }
+}
+
+async fn teardown_pane(
+    write_tx: mpsc::Sender<WriteRequest>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    writer_handle: std::thread::JoinHandle<()>,
+    mut proc_handle: crate::supervisor::ProcessHandle,
+) {
+    drop(write_tx);
+    drop(master);
+    let _ = tokio::task::spawn_blocking(move || {
+        // Give the writer thread a brief window to observe channel closure and drop the writer fd
+        // before process teardown; if it is blocked on a full PTY, teardown kills the child to unblock it.
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while !writer_handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        proc_handle.teardown();
+        let _ = writer_handle.join();
+    })
+    .await;
 }
