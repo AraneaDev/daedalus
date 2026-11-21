@@ -1,6 +1,7 @@
 use crate::types::{
-    FailureTrace, GridDelta, GridRow, GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary,
-    WorkspaceId, WorkspaceInfo,
+    ContainerHealth, ExternalStatus, FailureTrace, GitWorktreeInfo, GridDelta, GridRow,
+    GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary, PortMapping, StatusLevel, WorkspaceId,
+    WorkspaceInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -21,9 +22,28 @@ pub enum ClientMessage {
         root_dir: PathBuf,
         env: HashMap<String, String>,
     },
+    DiscoverWorktrees {
+        repo_dir: PathBuf,
+    },
+    CreateWorktreeWorkspace {
+        repo_dir: PathBuf,
+        branch: String,
+        create_branch: bool,
+        env: HashMap<String, String>,
+    },
     ListWorkspaces,
     CloseWorkspace {
         id: WorkspaceId,
+        #[serde(default)]
+        compose_down: bool,
+    },
+    PublishExternalStatus {
+        workspace_id: Option<WorkspaceId>,
+        root_dir: Option<PathBuf>,
+        source: String,
+        level: StatusLevel,
+        label: String,
+        detail: Option<String>,
     },
     SpawnPane {
         workspace_id: WorkspaceId,
@@ -81,6 +101,7 @@ pub enum ResponsePayload {
     },
     WorkspaceCreated(WorkspaceInfo),
     Workspaces(Vec<WorkspaceInfo>),
+    Worktrees(Vec<GitWorktreeInfo>),
     PaneSpawned(PaneSummary),
     Snapshot(GridSnapshot),
     ScrollbackRows {
@@ -112,6 +133,15 @@ pub enum ServerEvent {
     },
     ResyncRequired {
         pane_id: PaneId,
+    },
+    WorkspaceRuntimeUpdated {
+        workspace_id: WorkspaceId,
+        bound_ports: Vec<PortMapping>,
+        containers: Vec<ContainerHealth>,
+    },
+    ExternalStatusUpdated {
+        workspace_id: WorkspaceId,
+        status: ExternalStatus,
     },
 }
 

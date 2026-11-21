@@ -758,6 +758,12 @@ mod tests {
                 last_exit_code: None,
                 has_failure_trace: false,
             }],
+            port_offset: 0,
+            compose_project_name: None,
+            git_branch: None,
+            bound_ports: Vec::new(),
+            containers: Vec::new(),
+            external_statuses: Vec::new(),
         };
 
         let mut state = AppState::new();

@@ -520,7 +520,12 @@ async fn handle_command(
             .await?;
         }
         UiCommand::CloseWorkspace { id } => {
-            let _ = conn.call(ClientMessage::CloseWorkspace { id }).await?;
+            let _ = conn
+                .call(ClientMessage::CloseWorkspace {
+                    id,
+                    compose_down: false,
+                })
+                .await?;
             if let ResponsePayload::Workspaces(ws) =
                 conn.call(ClientMessage::ListWorkspaces).await?
             {

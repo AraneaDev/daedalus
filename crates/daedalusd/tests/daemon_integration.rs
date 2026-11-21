@@ -168,7 +168,15 @@ async fn bash_osc133_captures_failure_trace_and_survives_client_reconnect() {
     assert!(!trace.output.contains("\x1b[31m"));
 
     // Clean close
-    send_rpc(&mut c2, 11, ClientMessage::CloseWorkspace { id: ws.id }).await;
+    send_rpc(
+        &mut c2,
+        11,
+        ClientMessage::CloseWorkspace {
+            id: ws.id,
+            compose_down: false,
+        },
+    )
+    .await;
     let _ = shutdown_tx.send(());
     srv_handle.await.unwrap();
 }
@@ -272,7 +280,15 @@ async fn zsh_osc133_captures_failure_trace_when_zsh_installed() {
     assert_eq!(trace.exit_code, 17);
     assert!(trace.output.contains("ZSH_FAIL_MARKER"));
 
-    send_rpc(&mut client, 6, ClientMessage::CloseWorkspace { id: ws.id }).await;
+    send_rpc(
+        &mut client,
+        6,
+        ClientMessage::CloseWorkspace {
+            id: ws.id,
+            compose_down: false,
+        },
+    )
+    .await;
     let _ = shutdown_tx.send(());
     srv_handle.await.unwrap();
 }
@@ -431,7 +447,15 @@ async fn get_scrollback_returns_lines_scrolled_above_viewport() {
     let top_text = rows_to_text(&top_rows);
     assert_eq!(top_text, vec!["LINE_1", "LINE_2", "LINE_3", "LINE_4"]);
 
-    send_rpc(&mut client, 6, ClientMessage::CloseWorkspace { id: ws.id }).await;
+    send_rpc(
+        &mut client,
+        6,
+        ClientMessage::CloseWorkspace {
+            id: ws.id,
+            compose_down: false,
+        },
+    )
+    .await;
     let _ = shutdown_tx.send(());
     srv_handle.await.unwrap();
 }

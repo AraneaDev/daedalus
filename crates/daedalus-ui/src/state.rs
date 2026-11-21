@@ -481,6 +481,8 @@ impl AppState {
                 None
             }
             ServerEvent::ResyncRequired { pane_id } => Some(pane_id),
+            ServerEvent::WorkspaceRuntimeUpdated { .. }
+            | ServerEvent::ExternalStatusUpdated { .. } => None,
         }
     }
 
@@ -561,6 +563,12 @@ mod tests {
             slot_index: 0,
             injected_env: HashMap::new(),
             panes: vec![agent, service, runner],
+            port_offset: 0,
+            compose_project_name: None,
+            git_branch: None,
+            bound_ports: Vec::new(),
+            containers: Vec::new(),
+            external_statuses: Vec::new(),
         };
         (ws, ids.0, ids.1, ids.2)
     }

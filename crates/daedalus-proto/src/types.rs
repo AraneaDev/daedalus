@@ -96,6 +96,57 @@ pub struct PaneSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitWorktreeInfo {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub head: String,
+    pub is_primary: bool,
+    pub is_detached: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortSource {
+    Docker,
+    LocalProcess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortMapping {
+    pub host_port: u16,
+    pub container_port: Option<u16>,
+    pub service: Option<String>,
+    pub source: PortSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerHealth {
+    pub name: String,
+    pub service: Option<String>,
+    pub state: String,
+    pub health: Option<String>,
+    pub ports: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusLevel {
+    Info,
+    Ok,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalStatus {
+    pub source: String,
+    pub level: StatusLevel,
+    pub label: String,
+    pub detail: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceInfo {
     pub id: WorkspaceId,
     pub name: String,
@@ -103,6 +154,18 @@ pub struct WorkspaceInfo {
     pub slot_index: u16,
     pub injected_env: HashMap<String, String>,
     pub panes: Vec<PaneSummary>,
+    #[serde(default)]
+    pub port_offset: u16,
+    #[serde(default)]
+    pub compose_project_name: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub bound_ports: Vec<PortMapping>,
+    #[serde(default)]
+    pub containers: Vec<ContainerHealth>,
+    #[serde(default)]
+    pub external_statuses: Vec<ExternalStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

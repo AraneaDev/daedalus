@@ -77,6 +77,12 @@ impl Registry {
             slot_index: 0,
             injected_env: env,
             panes: Vec::new(),
+            port_offset: 0,
+            compose_project_name: None,
+            git_branch: None,
+            bound_ports: Vec::new(),
+            containers: Vec::new(),
+            external_statuses: Vec::new(),
         })
     }
 
@@ -127,6 +133,12 @@ impl Registry {
                 slot_index,
                 injected_env,
                 panes,
+                port_offset: 0,
+                compose_project_name: None,
+                git_branch: None,
+                bound_ports: Vec::new(),
+                containers: Vec::new(),
+                external_statuses: Vec::new(),
             });
         }
         out

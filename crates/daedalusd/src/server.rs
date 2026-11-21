@@ -112,14 +112,15 @@ impl SubscriptionFilter {
         let Some(allowed) = &self.pane_ids else {
             return true;
         };
-        let pid = match event {
-            ServerEvent::GridDelta(d) => d.pane_id,
+        match event {
+            ServerEvent::GridDelta(d) => allowed.contains(&d.pane_id),
             ServerEvent::PaneStatusChanged { pane_id, .. }
             | ServerEvent::CommandFinished { pane_id, .. }
             | ServerEvent::PaneExited { pane_id, .. }
-            | ServerEvent::ResyncRequired { pane_id } => *pane_id,
-        };
-        allowed.contains(&pid)
+            | ServerEvent::ResyncRequired { pane_id } => allowed.contains(pane_id),
+            ServerEvent::WorkspaceRuntimeUpdated { .. }
+            | ServerEvent::ExternalStatusUpdated { .. } => false,
+        }
     }
 }
 
@@ -190,9 +191,17 @@ async fn dispatch_request(
         ClientMessage::ListWorkspaces => Ok(ResponsePayload::Workspaces(
             registry.list_workspaces().await,
         )),
-        ClientMessage::CloseWorkspace { id } => {
+        ClientMessage::CloseWorkspace {
+            id,
+            compose_down: _,
+        } => {
             registry.close_workspace(id).await?;
             Ok(ResponsePayload::Ok)
+        }
+        ClientMessage::DiscoverWorktrees { .. }
+        | ClientMessage::CreateWorktreeWorkspace { .. }
+        | ClientMessage::PublishExternalStatus { .. } => {
+            Err(ProtoError::InvalidRequest("not yet implemented".to_string()))
         }
         ClientMessage::SpawnPane {
             workspace_id,
