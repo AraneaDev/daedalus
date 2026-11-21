@@ -1,7 +1,4 @@
-use serde_yml::{
-    Mapping, Sequence, Value,
-    value::{Tag, TaggedValue},
-};
+use serde_yml::{Mapping, Sequence, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, ErrorKind, Read};
 use std::net::TcpListener;
@@ -268,7 +265,7 @@ fn sanitize_compose_project(name: &str, slot_index: u16) -> String {
 
 fn untag_value(mut value: &Value) -> &Value {
     while let Value::Tagged(tagged) = value {
-        value = &tagged.value;
+        value = tagged.value();
     }
     value
 }
@@ -293,7 +290,7 @@ fn parse_compose_ports(
     let Some(root_map) = untag_value(&doc).as_mapping() else {
         return Ok(BTreeMap::new());
     };
-    let Some(services_val) = root_map.get(Value::String("services".to_string())) else {
+    let Some(services_val) = root_map.get("services") else {
         return Ok(BTreeMap::new());
     };
     let Some(services_map) = untag_value(services_val).as_mapping() else {
@@ -301,14 +298,11 @@ fn parse_compose_ports(
     };
 
     let mut result = BTreeMap::new();
-    for (svc_key, svc_val) in services_map {
-        let Some(svc_name) = untag_value(svc_key).as_str() else {
-            continue;
-        };
+    for (svc_name, svc_val) in services_map {
         let Some(svc_map) = untag_value(svc_val).as_mapping() else {
             continue;
         };
-        let Some(ports_val) = svc_map.get(Value::String("ports".to_string())) else {
+        let Some(ports_val) = svc_map.get("ports") else {
             continue;
         };
         let Some(ports_seq) = untag_value(ports_val).as_sequence() else {
@@ -384,18 +378,18 @@ fn parse_long_port_spec(
     map: &Mapping,
     env_lookup: &HashMap<String, String>,
 ) -> Option<ParsedPortEntry> {
-    let published_val = map.get(Value::String("published".to_string()))?;
-    let target_val = map.get(Value::String("target".to_string()))?;
+    let published_val = map.get("published")?;
+    let target_val = map.get("target")?;
 
     let host_port = value_to_port(untag_value(published_val), env_lookup)?;
     let container_port = value_to_scalar_string(untag_value(target_val))?;
     let protocol = map
-        .get(Value::String("protocol".to_string()))
+        .get("protocol")
         .and_then(|v| untag_value(v).as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let host_ip = map
-        .get(Value::String("host_ip".to_string()))
+        .get("host_ip")
         .and_then(|v| untag_value(v).as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
@@ -502,7 +496,7 @@ fn write_compose_override(
     std::fs::create_dir_all(&daedalus_dir)?;
     let override_path = daedalus_dir.join("compose.override.yml");
 
-    let mut services_map = Mapping::new();
+    let mut remappable_services = Vec::new();
     for (svc_name, entries) in compose_services {
         let has_remappable = entries
             .iter()
@@ -540,25 +534,36 @@ fn write_compose_override(
             }
         }
 
-        let mut svc_map = Mapping::new();
-        svc_map.insert(
-            Value::String("ports".to_string()),
-            Value::Tagged(Box::new(TaggedValue {
-                tag: Tag::new("!override"),
-                value: Value::Sequence(port_seq),
-            })),
-        );
-        services_map.insert(Value::String(svc_name.clone()), Value::Mapping(svc_map));
+        remappable_services.push((svc_name, port_seq));
     }
 
-    let mut root_map = Mapping::new();
-    root_map.insert(
-        Value::String("services".to_string()),
-        Value::Mapping(services_map),
-    );
+    // Emit `!override` YAML tags directly because `serde_yml 0.0.13`'s generic
+    // `to_string` routes `Value::Tagged` through `serialize_map` instead of
+    // writing YAML tag syntax.
+    let mut yaml = String::from("services:");
+    if remappable_services.is_empty() {
+        yaml.push_str(" {}\n");
+    } else {
+        yaml.push('\n');
+        for (svc_name, port_seq) in remappable_services {
+            let key_yaml = serde_yml::to_string(svc_name)
+                .map_err(|e| io::Error::other(format!("failed to serialize service name: {e}")))?;
+            let seq_yaml = serde_yml::to_string(&Value::Sequence(port_seq)).map_err(|e| {
+                io::Error::other(format!("failed to serialize compose.override.yml: {e}"))
+            })?;
+            yaml.push_str("  ");
+            yaml.push_str(key_yaml.trim());
+            yaml.push_str(":\n    ports: !override\n");
+            for line in seq_yaml.lines() {
+                if !line.is_empty() {
+                    yaml.push_str("      ");
+                    yaml.push_str(line);
+                    yaml.push('\n');
+                }
+            }
+        }
+    }
 
-    let yaml = serde_yml::to_string(&Value::Mapping(root_map))
-        .map_err(|e| io::Error::other(format!("failed to serialize compose.override.yml: {e}")))?;
     std::fs::write(&override_path, yaml)?;
     Ok(override_path)
 }
@@ -1033,7 +1038,7 @@ services:
         let web_ports = &parsed["services"]["web"]["ports"];
         assert!(matches!(
             web_ports,
-            Value::Tagged(tagged) if tagged.tag == "override"
+            Value::Tagged(tagged) if tagged.tag().nobang() == "override"
         ));
     }
 

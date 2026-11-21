@@ -1,7 +1,7 @@
 use crate::registry::Registry;
 use bollard::Docker;
-use bollard::container::ListContainersOptions;
 use bollard::models::ContainerSummary;
+use bollard::query_parameters::ListContainersOptions;
 use daedalus_proto::{ContainerHealth, PortMapping, PortSource, WorkspaceId};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -235,7 +235,11 @@ fn map_container_summaries(
             .and_then(|labels| labels.get("com.docker.compose.service"))
             .cloned();
 
-        let state = summary.state.unwrap_or_else(|| "unknown".to_string());
+        let state = summary
+            .state
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
         let health = extract_container_health(summary.status.as_deref());
 
         let mut container_ports = BTreeSet::new();
@@ -294,7 +298,7 @@ pub async fn poll_workspace_docker(
     );
     let options = ListContainersOptions {
         all: true,
-        filters,
+        filters: Some(filters),
         ..Default::default()
     };
     let summaries = docker.list_containers(Some(options)).await?;
@@ -439,7 +443,7 @@ pub fn spawn_runtime_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bollard::models::{Port, PortTypeEnum};
+    use bollard::models::{ContainerSummaryStateEnum, PortSummary, PortSummaryTypeEnum};
     use std::net::TcpListener;
     use std::process::{Command, Stdio};
 
@@ -523,26 +527,26 @@ mod tests {
                     "com.docker.compose.service".to_string(),
                     "web".to_string(),
                 )])),
-                state: Some("running".to_string()),
+                state: Some(ContainerSummaryStateEnum::RUNNING),
                 status: Some("Up 2 minutes (healthy)".to_string()),
                 ports: Some(vec![
-                    Port {
+                    PortSummary {
                         ip: Some("0.0.0.0".to_string()),
                         private_port: 3000,
                         public_port: Some(3100),
-                        typ: Some(PortTypeEnum::TCP),
+                        typ: Some(PortSummaryTypeEnum::TCP),
                     },
-                    Port {
+                    PortSummary {
                         ip: Some("::".to_string()),
                         private_port: 3000,
                         public_port: Some(3100),
-                        typ: Some(PortTypeEnum::TCP),
+                        typ: Some(PortSummaryTypeEnum::TCP),
                     },
-                    Port {
+                    PortSummary {
                         ip: None,
                         private_port: 9229,
                         public_port: None,
-                        typ: Some(PortTypeEnum::TCP),
+                        typ: Some(PortSummaryTypeEnum::TCP),
                     },
                 ]),
                 ..Default::default()
@@ -554,7 +558,7 @@ mod tests {
                     "com.docker.compose.service".to_string(),
                     "db".to_string(),
                 )])),
-                state: Some("exited".to_string()),
+                state: Some(ContainerSummaryStateEnum::EXITED),
                 status: Some("Exited (0) 5 seconds ago".to_string()),
                 ports: Some(vec![]),
                 ..Default::default()
@@ -566,7 +570,7 @@ mod tests {
                     "com.docker.compose.service".to_string(),
                     "worker".to_string(),
                 )])),
-                state: Some("running".to_string()),
+                state: Some(ContainerSummaryStateEnum::RUNNING),
                 status: Some("Up 3 seconds (health: starting)".to_string()),
                 ports: None,
                 ..Default::default()

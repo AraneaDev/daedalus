@@ -8,7 +8,7 @@ use daedalus_ui::bridge::{BridgeConfig, DaemonBridge, UiCommand, UiEvent, UiEven
 use daedalus_ui::input::{UiAction, translate_key};
 use daedalus_ui::layout::{HitTarget, LayoutInput, WorkspaceLayout, compute_layout, hit_test};
 use daedalus_ui::renderer::{
-    GpuRenderer, picker_item_rect, picker_modal_rect, worktree_modal_rect,
+    GpuRenderer, RenderError, picker_item_rect, picker_modal_rect, worktree_modal_rect,
 };
 use daedalus_ui::selection::{CellPos, Selection, extract_selected_text, select_word_at};
 use daedalus_ui::state::{AgentPreset, AppState};
@@ -896,7 +896,7 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
 
                 match renderer.render(&mut self.state, &layout) {
                     Ok(()) => {}
-                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                    Err(RenderError::Reconfigure) => {
                         if let Some(window) = self.window.as_ref() {
                             let size = window.inner_size();
                             if size.width > 0 && size.height > 0 {
@@ -909,18 +909,11 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
                             }
                         }
                     }
-                    Err(wgpu::SurfaceError::Timeout) => {
+                    Err(RenderError::Timeout) => {
                         warn!("wgpu surface frame timed out");
                     }
-                    Err(wgpu::SurfaceError::OutOfMemory) => {
-                        error!("wgpu surface out of memory; exiting");
-                        if let Some(bridge) = self.bridge.take() {
-                            bridge.shutdown();
-                        }
-                        event_loop.exit();
-                    }
-                    Err(wgpu::SurfaceError::Other) => {
-                        warn!("wgpu surface error: other");
+                    Err(RenderError::Validation) => {
+                        warn!("wgpu surface validation error");
                     }
                 }
             }
