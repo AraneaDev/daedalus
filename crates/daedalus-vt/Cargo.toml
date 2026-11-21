@@ -1,0 +1,17 @@
+[package]
+name = "daedalus-vt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+ghostty-vt = ["dep:bindgen", "dep:pkg-config"]
+
+[dependencies]
+daedalus-proto = { path = "../daedalus-proto" }
+vte.workspace = true
+
+[build-dependencies]
+bindgen = { version = "0.71", optional = true }
+pkg-config = { version = "0.3", optional = true }

@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/daedalus-proto",
+    "crates/daedalus-vt",
 ]
 
 [workspace.package]
