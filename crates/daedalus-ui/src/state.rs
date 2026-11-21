@@ -1,0 +1,750 @@
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+use clap::ValueEnum;
+use daedalus_proto::{
+    CursorState, FailureTrace, GridDelta, GridRow, GridSnapshot, PaneId, PaneRole, PaneStatus,
+    PaneSummary, ServerEvent, WorkspaceId, WorkspaceInfo,
+};
+
+use crate::selection::Selection;
+
+/// Directional focus navigation across the fixed 3-pane semantic layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FocusDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// First-class Agent pane CLI presets selectable via `--agent` or the in-app picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, ValueEnum)]
+pub enum AgentPreset {
+    #[default]
+    Agy,
+    Claude,
+    Codex,
+    Shell,
+}
+
+impl AgentPreset {
+    pub const ALL: [Self; 4] = [Self::Agy, Self::Claude, Self::Codex, Self::Shell];
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Agy => "agy — Antigravity CLI",
+            Self::Claude => "claude — Claude Code",
+            Self::Codex => "codex — OpenAI Codex CLI",
+            Self::Shell => "shell — Interactive Shell",
+        }
+    }
+
+    pub const fn short_name(&self) -> &'static str {
+        match self {
+            Self::Agy => "agy",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Shell => "shell",
+        }
+    }
+
+    pub fn command(&self) -> Option<Vec<String>> {
+        match self {
+            Self::Agy => Some(vec!["agy".to_string()]),
+            Self::Claude => Some(vec!["claude".to_string()]),
+            Self::Codex => Some(vec!["codex".to_string()]),
+            Self::Shell => None,
+        }
+    }
+
+    pub fn from_cli_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "agy" => Some(Self::Agy),
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "shell" => Some(Self::Shell),
+            _ => None,
+        }
+    }
+}
+
+/// State of the interactive Agent preset picker modal (`Ctrl+Shift+P`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PickerState {
+    pub open: bool,
+    pub selected_index: usize,
+}
+
+impl PickerState {
+    pub fn toggle(&mut self) {
+        self.open = !self.open;
+        if self.selected_index >= AgentPreset::ALL.len() {
+            self.selected_index = 0;
+        }
+    }
+
+    pub fn open_with(&mut self, preset: AgentPreset) {
+        self.open = true;
+        self.selected_index = AgentPreset::ALL
+            .iter()
+            .position(|&p| p == preset)
+            .unwrap_or(0);
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+    }
+
+    pub fn move_up(&mut self) {
+        let len = AgentPreset::ALL.len();
+        self.selected_index = if self.selected_index == 0 {
+            len - 1
+        } else {
+            self.selected_index - 1
+        };
+    }
+
+    pub fn move_down(&mut self) {
+        self.selected_index = (self.selected_index + 1) % AgentPreset::ALL.len();
+    }
+
+    pub fn selected_preset(&self) -> AgentPreset {
+        AgentPreset::ALL[self.selected_index % AgentPreset::ALL.len()]
+    }
+}
+
+/// Client-side cached terminal state for a single daemon pane.
+#[derive(Debug, Clone)]
+pub struct PaneViewState {
+    pub summary: PaneSummary,
+    pub cols: u16,
+    pub rows: u16,
+    pub cursor: CursorState,
+    pub viewport_rows: Vec<GridRow>,
+    pub scrollback_len: usize,
+    pub scroll_offset: usize,
+    pub scrolled_rows: Option<Vec<GridRow>>,
+    pub dirty_row_indices: Vec<usize>,
+    pub selection: Option<Selection>,
+    pub agent_preset: Option<AgentPreset>,
+    pub last_failure_trace: Option<FailureTrace>,
+    pub last_seq: u64,
+}
+
+impl PaneViewState {
+    pub fn from_summary(summary: PaneSummary) -> Self {
+        let cols = summary.cols;
+        let rows = summary.rows;
+        Self {
+            summary,
+            cols,
+            rows,
+            cursor: CursorState::default(),
+            viewport_rows: Vec::new(),
+            scrollback_len: 0,
+            scroll_offset: 0,
+            scrolled_rows: None,
+            dirty_row_indices: Vec::new(),
+            selection: None,
+            agent_preset: None,
+            last_failure_trace: None,
+            last_seq: 0,
+        }
+    }
+
+    /// Replaces the cached viewport with a full `GridSnapshot` and marks all rows dirty.
+    pub fn apply_snapshot(&mut self, snapshot: GridSnapshot) {
+        self.cols = snapshot.cols;
+        self.rows = snapshot.rows;
+        self.summary.cols = snapshot.cols;
+        self.summary.rows = snapshot.rows;
+        self.cursor = snapshot.cursor;
+        self.last_seq = snapshot.seq;
+        self.scrollback_len = snapshot.scrollback_len;
+        self.viewport_rows = snapshot.rows_data;
+        self.scroll_offset = self.scroll_offset.min(self.scrollback_len);
+        if self.scroll_offset == 0 {
+            self.scrolled_rows = None;
+        }
+        self.mark_all_visible_dirty();
+    }
+
+    /// Patches only the rows present in `delta` and records their indices for incremental shaping.
+    pub fn apply_delta(&mut self, delta: GridDelta) {
+        let resized = self.cols != delta.cols || self.rows != delta.rows;
+        self.cols = delta.cols;
+        self.rows = delta.rows;
+        self.summary.cols = delta.cols;
+        self.summary.rows = delta.rows;
+        self.cursor = delta.cursor;
+        self.last_seq = delta.seq;
+
+        let target_rows = delta.rows as usize;
+        if self.viewport_rows.len() > target_rows {
+            self.viewport_rows.truncate(target_rows);
+        }
+
+        for row in delta.dirty_rows {
+            let idx = row.row_index as usize;
+            if idx >= self.viewport_rows.len() {
+                for fill_idx in self.viewport_rows.len()..=idx {
+                    self.viewport_rows.push(GridRow {
+                        row_index: fill_idx as u16,
+                        abs_row: 0,
+                        cells: Vec::new(),
+                    });
+                }
+            }
+            self.viewport_rows[idx] = row;
+            if !self.dirty_row_indices.contains(&idx) {
+                self.dirty_row_indices.push(idx);
+            }
+        }
+
+        if resized {
+            self.mark_all_visible_dirty();
+        }
+    }
+
+    /// Applies a `GetScrollback` response from `daedalusd`.
+    pub fn apply_scrollback(&mut self, total_scrollback: usize, rows: Vec<GridRow>) {
+        self.scrollback_len = total_scrollback;
+        self.scroll_offset = self.scroll_offset.min(total_scrollback);
+        if self.scroll_offset == 0 {
+            self.scrolled_rows = None;
+        } else {
+            self.scrolled_rows = Some(rows);
+        }
+        self.mark_all_visible_dirty();
+    }
+
+    /// Returns the rows currently visible in the pane viewport (scrolled history or live viewport).
+    pub fn visible_rows(&self) -> &[GridRow] {
+        if self.scroll_offset > 0
+            && let Some(ref scrolled) = self.scrolled_rows
+        {
+            return scrolled.as_slice();
+        }
+        &self.viewport_rows
+    }
+
+    /// Adjusts `scroll_offset` by `delta` (positive = scroll up into history,
+    /// negative = scroll down toward live output), clamped to `0..=scrollback_len`.
+    pub fn adjust_scroll_offset(&mut self, delta: isize) -> usize {
+        let candidate = if delta >= 0 {
+            self.scroll_offset.saturating_add(delta as usize)
+        } else {
+            self.scroll_offset.saturating_sub(delta.unsigned_abs())
+        };
+        let clamped = candidate.min(self.scrollback_len);
+        if clamped != self.scroll_offset {
+            self.scroll_offset = clamped;
+            if self.scroll_offset == 0 {
+                self.scrolled_rows = None;
+                self.mark_all_visible_dirty();
+            }
+        }
+        self.scroll_offset
+    }
+
+    /// Returns the pane to the live bottom viewport (`scroll_offset = 0`).
+    pub fn reset_scroll(&mut self) {
+        if self.scroll_offset != 0 || self.scrolled_rows.is_some() {
+            self.scroll_offset = 0;
+            self.scrolled_rows = None;
+            self.mark_all_visible_dirty();
+        }
+    }
+
+    /// Drains and returns dirty row indices that need `glyphon` re-shaping.
+    pub fn take_dirty_rows(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.dirty_row_indices)
+    }
+
+    fn mark_all_visible_dirty(&mut self) {
+        let len = self.visible_rows().len();
+        self.dirty_row_indices = (0..len).collect();
+    }
+}
+
+/// Top-level UI application state shared between input handling, daemon bridge events, and rendering.
+#[derive(Debug)]
+pub struct AppState {
+    pub connected: bool,
+    pub workspaces: Vec<WorkspaceInfo>,
+    pub active_workspace_id: Option<WorkspaceId>,
+    pub panes: HashMap<PaneId, PaneViewState>,
+    pub focused_role: PaneRole,
+    pub sidebar_visible: bool,
+    pub zoomed: bool,
+    pub picker: PickerState,
+    pub toast: Option<(String, bool, Instant)>,
+    pub last_sent_sizes: HashMap<PaneId, (u16, u16)>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        Self {
+            connected: false,
+            workspaces: Vec::new(),
+            active_workspace_id: None,
+            panes: HashMap::new(),
+            focused_role: PaneRole::Agent,
+            sidebar_visible: true,
+            zoomed: false,
+            picker: PickerState::default(),
+            toast: None,
+            last_sent_sizes: HashMap::new(),
+        }
+    }
+
+    pub fn active_workspace(&self) -> Option<&WorkspaceInfo> {
+        let id = self.active_workspace_id?;
+        self.workspaces.iter().find(|ws| ws.id == id)
+    }
+
+    pub fn active_workspace_mut(&mut self) -> Option<&mut WorkspaceInfo> {
+        let id = self.active_workspace_id?;
+        self.workspaces.iter_mut().find(|ws| ws.id == id)
+    }
+
+    pub fn pane_id_for_role(&self, role: PaneRole) -> Option<PaneId> {
+        let ws = self.active_workspace()?;
+        ws.panes
+            .iter()
+            .rev()
+            .find(|pane| pane.role == role)
+            .map(|pane| pane.id)
+    }
+
+    pub fn pane_for_role(&self, role: PaneRole) -> Option<&PaneViewState> {
+        let id = self.pane_id_for_role(role)?;
+        self.panes.get(&id)
+    }
+
+    pub fn pane_for_role_mut(&mut self, role: PaneRole) -> Option<&mut PaneViewState> {
+        let id = self.pane_id_for_role(role)?;
+        self.panes.get_mut(&id)
+    }
+
+    pub fn focused_pane_id(&self) -> Option<PaneId> {
+        self.pane_id_for_role(self.focused_role)
+    }
+
+    pub fn runner_has_failure(&self) -> bool {
+        self.pane_for_role(PaneRole::Runner)
+            .is_some_and(|pane| pane.summary.has_failure_trace)
+    }
+
+    pub fn show_toast(&mut self, message: impl Into<String>, is_error: bool) {
+        self.toast = Some((message.into(), is_error, Instant::now()));
+    }
+
+    /// Replaces the workspace list while preserving cached `PaneViewState` for still-existing panes.
+    pub fn set_workspaces(&mut self, workspaces: Vec<WorkspaceInfo>) {
+        let mut live_panes = HashSet::new();
+        for ws in &workspaces {
+            for summary in &ws.panes {
+                live_panes.insert(summary.id);
+                self.panes
+                    .entry(summary.id)
+                    .and_modify(|view| view.summary = summary.clone())
+                    .or_insert_with(|| PaneViewState::from_summary(summary.clone()));
+            }
+        }
+        self.panes.retain(|id, _| live_panes.contains(id));
+        self.last_sent_sizes.retain(|id, _| live_panes.contains(id));
+
+        self.workspaces = workspaces;
+        let active_still_exists = self
+            .active_workspace_id
+            .is_some_and(|id| self.workspaces.iter().any(|ws| ws.id == id));
+        if !active_still_exists {
+            self.active_workspace_id = self.workspaces.first().map(|ws| ws.id);
+        }
+    }
+
+    /// Inserts or updates a single workspace and synchronizes its pane summaries.
+    pub fn upsert_workspace(&mut self, ws: WorkspaceInfo) {
+        for summary in &ws.panes {
+            self.panes
+                .entry(summary.id)
+                .and_modify(|view| view.summary = summary.clone())
+                .or_insert_with(|| PaneViewState::from_summary(summary.clone()));
+        }
+        let ws_id = ws.id;
+        if let Some(existing) = self.workspaces.iter_mut().find(|item| item.id == ws_id) {
+            *existing = ws;
+        } else {
+            self.workspaces.push(ws);
+        }
+        if self.active_workspace_id.is_none() {
+            self.active_workspace_id = Some(ws_id);
+        }
+    }
+
+    /// Registers a newly spawned pane into both its workspace summary list and `self.panes`.
+    pub fn register_pane(&mut self, summary: PaneSummary, agent_preset: Option<AgentPreset>) {
+        if let Some(ws) = self
+            .workspaces
+            .iter_mut()
+            .find(|ws| ws.id == summary.workspace_id)
+        {
+            if let Some(existing) = ws.panes.iter_mut().find(|p| p.id == summary.id) {
+                *existing = summary.clone();
+            } else {
+                ws.panes.push(summary.clone());
+            }
+        }
+        let entry = self
+            .panes
+            .entry(summary.id)
+            .and_modify(|view| view.summary = summary.clone())
+            .or_insert_with(|| PaneViewState::from_summary(summary));
+        if let Some(preset) = agent_preset {
+            entry.agent_preset = Some(preset);
+        }
+    }
+
+    /// Applies a `ServerEvent` from `daedalusd`.
+    /// Returns `Some(pane_id)` when `ServerEvent::ResyncRequired` requires a fresh `GetSnapshot`.
+    pub fn apply_server_event(&mut self, event: ServerEvent) -> Option<PaneId> {
+        match event {
+            ServerEvent::GridDelta(delta) => {
+                if let Some(pane) = self.panes.get_mut(&delta.pane_id) {
+                    pane.apply_delta(delta);
+                }
+                None
+            }
+            ServerEvent::PaneStatusChanged {
+                pane_id,
+                status,
+                cwd,
+            } => {
+                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    pane.summary.status = status;
+                    if cwd.is_some() {
+                        pane.summary.cwd = cwd.clone();
+                    }
+                }
+                if let Some(summary) = self.workspace_pane_summary_mut(pane_id) {
+                    summary.status = status;
+                    if cwd.is_some() {
+                        summary.cwd = cwd;
+                    }
+                }
+                None
+            }
+            ServerEvent::CommandFinished {
+                pane_id,
+                command: _,
+                exit_code,
+                has_failure_trace,
+            } => {
+                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    pane.summary.last_exit_code = Some(exit_code);
+                    pane.summary.has_failure_trace = has_failure_trace;
+                    if !has_failure_trace {
+                        pane.last_failure_trace = None;
+                    }
+                }
+                if let Some(summary) = self.workspace_pane_summary_mut(pane_id) {
+                    summary.last_exit_code = Some(exit_code);
+                    summary.has_failure_trace = has_failure_trace;
+                }
+                None
+            }
+            ServerEvent::PaneExited { pane_id, exit_code } => {
+                let status = PaneStatus::Exited { code: exit_code };
+                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    pane.summary.status = status;
+                    if exit_code.is_some() {
+                        pane.summary.last_exit_code = exit_code;
+                    }
+                }
+                if let Some(summary) = self.workspace_pane_summary_mut(pane_id) {
+                    summary.status = status;
+                    if exit_code.is_some() {
+                        summary.last_exit_code = exit_code;
+                    }
+                }
+                None
+            }
+            ServerEvent::ResyncRequired { pane_id } => Some(pane_id),
+        }
+    }
+
+    /// Moves focus directionally across the fixed 3-pane semantic layout:
+    /// `Agent` (left) <-> `Service` (right-top) / `Runner` (right-bottom).
+    pub fn focus_direction(&mut self, dir: FocusDirection) -> PaneRole {
+        let next = match (self.focused_role, dir) {
+            (PaneRole::Agent, FocusDirection::Right) => PaneRole::Service,
+            (PaneRole::Service, FocusDirection::Left)
+            | (PaneRole::Runner, FocusDirection::Left) => PaneRole::Agent,
+            (PaneRole::Service, FocusDirection::Down) => PaneRole::Runner,
+            (PaneRole::Runner, FocusDirection::Up) => PaneRole::Service,
+            (role, _) => role,
+        };
+        self.focused_role = next;
+        next
+    }
+
+    fn workspace_pane_summary_mut(&mut self, pane_id: PaneId) -> Option<&mut PaneSummary> {
+        self.workspaces
+            .iter_mut()
+            .flat_map(|ws| ws.panes.iter_mut())
+            .find(|pane| pane.id == pane_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daedalus_proto::{Cell, CellFlags, Color};
+    use std::path::PathBuf;
+
+    fn make_row(row_index: u16, abs_row: u64, text: &str) -> GridRow {
+        GridRow {
+            row_index,
+            abs_row,
+            cells: text
+                .chars()
+                .map(|ch| Cell {
+                    text: ch.to_string(),
+                    fg: Color::Default,
+                    bg: Color::Default,
+                    flags: CellFlags::empty(),
+                    width: 1,
+                })
+                .collect(),
+        }
+    }
+
+    fn row_text(row: &GridRow) -> String {
+        row.cells.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    fn make_pane_summary(ws_id: WorkspaceId, role: PaneRole) -> PaneSummary {
+        PaneSummary {
+            id: PaneId::new(),
+            workspace_id: ws_id,
+            role,
+            status: PaneStatus::Idle,
+            cols: 80,
+            rows: 24,
+            cwd: Some(PathBuf::from("/tmp/repo")),
+            last_exit_code: None,
+            has_failure_trace: false,
+        }
+    }
+
+    fn make_workspace_with_three_panes() -> (WorkspaceInfo, PaneId, PaneId, PaneId) {
+        let ws_id = WorkspaceId::new();
+        let agent = make_pane_summary(ws_id, PaneRole::Agent);
+        let service = make_pane_summary(ws_id, PaneRole::Service);
+        let runner = make_pane_summary(ws_id, PaneRole::Runner);
+        let ids = (agent.id, service.id, runner.id);
+        let ws = WorkspaceInfo {
+            id: ws_id,
+            name: "demo".to_string(),
+            root_dir: PathBuf::from("/tmp/repo"),
+            slot_index: 0,
+            injected_env: HashMap::new(),
+            panes: vec![agent, service, runner],
+        };
+        (ws, ids.0, ids.1, ids.2)
+    }
+
+    #[test]
+    fn snapshot_and_delta_patching_tracks_dirty_rows() {
+        let mut state = AppState::new();
+        let (ws, agent_id, _, _) = make_workspace_with_three_panes();
+        state.set_workspaces(vec![ws]);
+
+        let snapshot = GridSnapshot {
+            pane_id: agent_id,
+            seq: 1,
+            cols: 10,
+            rows: 3,
+            cursor: CursorState {
+                col: 2,
+                row: 1,
+                visible: true,
+            },
+            rows_data: vec![
+                make_row(0, 10, "line zero"),
+                make_row(1, 11, "line one"),
+                make_row(2, 12, "line two"),
+            ],
+            scrollback_len: 10,
+        };
+
+        let pane = state.panes.get_mut(&agent_id).unwrap();
+        pane.apply_snapshot(snapshot);
+        assert_eq!(pane.dirty_row_indices, vec![0, 1, 2]);
+        assert_eq!(pane.scrollback_len, 10);
+        assert_eq!(pane.take_dirty_rows(), vec![0, 1, 2]);
+        assert!(pane.dirty_row_indices.is_empty());
+
+        let delta = GridDelta {
+            pane_id: agent_id,
+            seq: 2,
+            cols: 10,
+            rows: 3,
+            cursor: CursorState {
+                col: 5,
+                row: 1,
+                visible: true,
+            },
+            dirty_rows: vec![make_row(1, 11, "PATCHED!")],
+        };
+        assert_eq!(state.apply_server_event(ServerEvent::GridDelta(delta)), None);
+
+        let pane = state.panes.get(&agent_id).unwrap();
+        assert_eq!(pane.dirty_row_indices, vec![1]);
+        assert_eq!(row_text(&pane.visible_rows()[0]), "line zero");
+        assert_eq!(row_text(&pane.visible_rows()[1]), "PATCHED!");
+        assert_eq!(row_text(&pane.visible_rows()[2]), "line two");
+        assert_eq!(pane.cursor.col, 5);
+    }
+
+    #[test]
+    fn resync_required_signals_pane_id() {
+        let mut state = AppState::new();
+        let pane_id = PaneId::new();
+        let resync = state.apply_server_event(ServerEvent::ResyncRequired { pane_id });
+        assert_eq!(resync, Some(pane_id));
+    }
+
+    #[test]
+    fn scrollback_offset_clamps_and_switches_visible_rows() {
+        let ws_id = WorkspaceId::new();
+        let summary = make_pane_summary(ws_id, PaneRole::Runner);
+        let mut pane = PaneViewState::from_summary(summary);
+        pane.apply_snapshot(GridSnapshot {
+            pane_id: pane.summary.id,
+            seq: 1,
+            cols: 20,
+            rows: 2,
+            cursor: CursorState::default(),
+            rows_data: vec![make_row(0, 5, "live-0"), make_row(1, 6, "live-1")],
+            scrollback_len: 5,
+        });
+
+        // Clamps above scrollback_len
+        assert_eq!(pane.adjust_scroll_offset(100), 5);
+        // Clamps below 0
+        assert_eq!(pane.adjust_scroll_offset(-100), 0);
+
+        // Scroll up 3 lines and load scrollback rows
+        assert_eq!(pane.adjust_scroll_offset(3), 3);
+        pane.apply_scrollback(
+            5,
+            vec![make_row(0, 2, "hist-2"), make_row(1, 3, "hist-3")],
+        );
+        assert_eq!(row_text(&pane.visible_rows()[0]), "hist-2");
+        assert_eq!(row_text(&pane.visible_rows()[1]), "hist-3");
+
+        // Reset scroll returns to live viewport
+        pane.reset_scroll();
+        assert_eq!(pane.scroll_offset, 0);
+        assert!(pane.scrolled_rows.is_none());
+        assert_eq!(row_text(&pane.visible_rows()[0]), "live-0");
+    }
+
+    #[test]
+    fn command_finished_updates_runner_failure_badge_and_workspace_summary() {
+        let mut state = AppState::new();
+        let (ws, _, _, runner_id) = make_workspace_with_three_panes();
+        state.set_workspaces(vec![ws]);
+        assert!(!state.runner_has_failure());
+
+        state.apply_server_event(ServerEvent::CommandFinished {
+            pane_id: runner_id,
+            command: Some("cargo test".to_string()),
+            exit_code: 101,
+            has_failure_trace: true,
+        });
+
+        assert!(state.runner_has_failure());
+        let runner = state.panes.get(&runner_id).unwrap();
+        assert_eq!(runner.summary.last_exit_code, Some(101));
+        assert!(runner.summary.has_failure_trace);
+
+        let ws_runner = state
+            .active_workspace()
+            .unwrap()
+            .panes
+            .iter()
+            .find(|p| p.id == runner_id)
+            .unwrap();
+        assert_eq!(ws_runner.last_exit_code, Some(101));
+        assert!(ws_runner.has_failure_trace);
+
+        // Subsequent passing command clears failure badge
+        state.apply_server_event(ServerEvent::CommandFinished {
+            pane_id: runner_id,
+            command: Some("cargo test".to_string()),
+            exit_code: 0,
+            has_failure_trace: false,
+        });
+        assert!(!state.runner_has_failure());
+        assert_eq!(
+            state.panes.get(&runner_id).unwrap().summary.last_exit_code,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn picker_state_wraps_around_and_presets_match_spec() {
+        let mut picker = PickerState::default();
+        assert!(!picker.open);
+        assert_eq!(picker.selected_preset(), AgentPreset::Agy);
+
+        picker.toggle();
+        assert!(picker.open);
+
+        // Wrap up from 0 -> Shell (index 3)
+        picker.move_up();
+        assert_eq!(picker.selected_index, 3);
+        assert_eq!(picker.selected_preset(), AgentPreset::Shell);
+        assert_eq!(picker.selected_preset().command(), None);
+
+        // Wrap down from 3 -> Agy (index 0)
+        picker.move_down();
+        assert_eq!(picker.selected_index, 0);
+        assert_eq!(picker.selected_preset(), AgentPreset::Agy);
+        assert_eq!(
+            picker.selected_preset().command(),
+            Some(vec!["agy".to_string()])
+        );
+
+        picker.move_down();
+        assert_eq!(picker.selected_preset(), AgentPreset::Claude);
+        assert_eq!(picker.selected_preset().short_name(), "claude");
+        assert_eq!(picker.selected_preset().label(), "claude — Claude Code");
+
+        assert_eq!(AgentPreset::from_cli_name("CODEX"), Some(AgentPreset::Codex));
+        assert_eq!(AgentPreset::from_cli_name("unknown"), None);
+    }
+
+    #[test]
+    fn directional_focus_navigates_three_pane_layout() {
+        let mut state = AppState::new();
+        assert_eq!(state.focused_role, PaneRole::Agent);
+
+        assert_eq!(state.focus_direction(FocusDirection::Right), PaneRole::Service);
+        assert_eq!(state.focus_direction(FocusDirection::Down), PaneRole::Runner);
+        assert_eq!(state.focus_direction(FocusDirection::Up), PaneRole::Service);
+        assert_eq!(state.focus_direction(FocusDirection::Left), PaneRole::Agent);
+        // Moving left from Agent is a no-op
+        assert_eq!(state.focus_direction(FocusDirection::Left), PaneRole::Agent);
+    }
+}
