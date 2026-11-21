@@ -163,6 +163,10 @@ impl Supervisor {
 }
 
 impl ProcessHandle {
+    pub fn root_pid(&self) -> Option<u32> {
+        self.pid
+    }
+
     pub fn try_wait_exit(&mut self) -> Option<i32> {
         match self.child.try_wait() {
             Ok(Some(status)) => Some(status.exit_code() as i32),

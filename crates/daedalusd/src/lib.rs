@@ -1,6 +1,7 @@
 pub mod isolation;
 pub mod pane_actor;
 pub mod registry;
+pub mod runtime_monitor;
 pub mod server;
 pub mod shell_integration;
 pub mod supervisor;

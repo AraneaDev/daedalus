@@ -54,6 +54,7 @@ pub struct PaneHandle {
     id: PaneId,
     workspace_id: WorkspaceId,
     role: PaneRole,
+    root_pid: Option<u32>,
     cmd_tx: mpsc::Sender<PaneCmd>,
 }
 
@@ -77,6 +78,7 @@ impl PaneHandle {
             mut writer,
             handle: proc_handle,
         } = spawned;
+        let root_pid = proc_handle.root_pid();
 
         std::thread::Builder::new()
             .name(format!("pty-reader-{}", pane_id.short()))
@@ -134,6 +136,7 @@ impl PaneHandle {
             id: pane_id,
             workspace_id,
             role,
+            root_pid,
             cmd_tx,
         }
     }
@@ -148,6 +151,10 @@ impl PaneHandle {
 
     pub fn role(&self) -> PaneRole {
         self.role
+    }
+
+    pub fn root_pid(&self) -> Option<u32> {
+        self.root_pid
     }
 
     pub async fn summary(&self) -> Result<PaneSummary, ProtoError> {
