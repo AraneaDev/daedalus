@@ -719,6 +719,17 @@ fn emit_cell_run_quad(
     }
 }
 
+/// Outcome when surface acquisition or presentation requires caller action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderError {
+    /// Surface is lost, outdated, or suboptimal and should be reconfigured.
+    Reconfigure,
+    /// Acquiring the next surface texture timed out.
+    Timeout,
+    /// A wgpu surface validation error occurred.
+    Validation,
+}
+
 /// Two-pass `wgpu` + `glyphon` GPU renderer for `daedalus-ui`.
 pub struct GpuRenderer {
     surface: wgpu::Surface<'static>,
@@ -738,9 +749,9 @@ impl GpuRenderer {
         let height = size.height.max(1);
         let scale_factor = sanitize_scale(window.scale_factor() as f32);
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         let surface = instance
@@ -757,20 +768,20 @@ impl GpuRenderer {
                     power_preference: wgpu::PowerPreference::HighPerformance,
                     compatible_surface: Some(&surface),
                     force_fallback_adapter: false,
+                    apply_limit_buckets: false,
                 })
                 .await
-                .ok_or_else(|| "no compatible GPU adapter found".to_string())?;
+                .map_err(|err| format!("no compatible GPU adapter found: {err}"))?;
 
             let (device, queue) = adapter
-                .request_device(
-                    &wgpu::DeviceDescriptor {
-                        label: Some("daedalus-ui-device"),
-                        required_features: wgpu::Features::empty(),
-                        required_limits: wgpu::Limits::default(),
-                        memory_hints: wgpu::MemoryHints::Performance,
-                    },
-                    None,
-                )
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("daedalus-ui-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                    memory_hints: wgpu::MemoryHints::Performance,
+                    trace: wgpu::Trace::Off,
+                })
                 .await
                 .map_err(|err| format!("failed to request GPU device: {err}"))?;
 
@@ -795,6 +806,7 @@ impl GpuRenderer {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width,
             height,
             present_mode: wgpu::PresentMode::Fifo,
@@ -839,7 +851,7 @@ impl GpuRenderer {
         &mut self,
         state: &mut AppState,
         layout: &WorkspaceLayout,
-    ) -> Result<(), wgpu::SurfaceError> {
+    ) -> Result<(), RenderError> {
         let screen_w = self.config.width as f32;
         let screen_h = self.config.height as f32;
         let cell_size = self.text_renderer.cell_size();
@@ -867,7 +879,16 @@ impl GpuRenderer {
             screen_h,
         );
 
-        let frame = self.surface.get_current_texture()?;
+        let (frame, suboptimal) = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
+            wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Timeout => return Err(RenderError::Timeout),
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                return Err(RenderError::Reconfigure);
+            }
+            wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::Validation),
+        };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -886,6 +907,7 @@ impl GpuRenderer {
                 label: Some("daedalus-main-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear_color),
@@ -895,6 +917,7 @@ impl GpuRenderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             // Pass 1: base colored quads (sidebar, panes, merged cell backgrounds, selection, cursor, borders)
@@ -913,8 +936,11 @@ impl GpuRenderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        frame.present();
+        self.queue.present(frame);
         self.text_renderer.trim_atlas();
+        if suboptimal {
+            return Err(RenderError::Reconfigure);
+        }
         Ok(())
     }
 }

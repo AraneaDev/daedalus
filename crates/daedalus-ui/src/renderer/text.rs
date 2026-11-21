@@ -79,13 +79,13 @@ pub fn measure_cell_size(
 
     let family = mono_family_name.map_or(Family::Monospace, Family::Name);
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    buffer.set_wrap(font_system, Wrap::None);
-    buffer.set_size(font_system, Some(font_size * 20.0), Some(line_height * 2.0));
+    buffer.set_wrap(Wrap::None);
+    buffer.set_size(Some(font_size * 20.0), Some(line_height * 2.0));
     buffer.set_text(
-        font_system,
         "MMMMMMMMMM",
-        Attrs::new().family(family),
+        &Attrs::new().family(family),
         Shaping::Advanced,
+        None,
     );
     buffer.shape_until_scroll(font_system, false);
 
@@ -461,13 +461,12 @@ impl TextRenderer {
         }
 
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        buffer.set_wrap(&mut self.font_system, Wrap::None);
+        buffer.set_wrap(Wrap::None);
         buffer.set_size(
-            &mut self.font_system,
             Some(spec.max_w.max(1.0)),
             Some((spec.line_height_logical * s) * 1.5),
         );
-        buffer.set_text(&mut self.font_system, spec.text, attrs, Shaping::Advanced);
+        buffer.set_text(spec.text, &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         Some(ChromeTextItem {
@@ -1011,10 +1010,9 @@ fn shape_terminal_row(
     viewport_width: f32,
     family: Family<'_>,
 ) {
-    buffer.set_metrics(font_system, metrics);
-    buffer.set_wrap(font_system, Wrap::None);
+    buffer.set_metrics(metrics);
+    buffer.set_wrap(Wrap::None);
     buffer.set_size(
-        font_system,
         Some(viewport_width.max(1.0)),
         Some(metrics.line_height * 2.0),
     );
@@ -1025,10 +1023,9 @@ fn shape_terminal_row(
         .color(theme::TEXT_PRIMARY.to_glyphon_color());
 
     if spans.is_empty() {
-        buffer.set_text(font_system, "", default_attrs, Shaping::Advanced);
+        buffer.set_text("", &default_attrs, Shaping::Advanced, None);
     } else {
         buffer.set_rich_text(
-            font_system,
             spans.iter().map(|span| {
                 let mut attrs = Attrs::new().family(family).color(span.color);
                 if span.bold {
@@ -1039,8 +1036,9 @@ fn shape_terminal_row(
                 }
                 (span.text.as_str(), attrs)
             }),
-            default_attrs,
+            &default_attrs,
             Shaping::Advanced,
+            None,
         );
     }
     buffer.shape_until_scroll(font_system, false);
