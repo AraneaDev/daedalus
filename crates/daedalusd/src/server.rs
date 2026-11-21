@@ -1,9 +1,11 @@
+use crate::external_hook::ExternalHookServer;
 use crate::registry::Registry;
+use crate::runtime_monitor;
 use crate::shell_integration::ShellIntegration;
 use crate::supervisor::Supervisor;
 use daedalus_proto::{
     ClientMessage, PaneId, ProtoError, Request, ResponsePayload, ServerEvent, ServerMessage,
-    read_frame, write_frame,
+    default_events_socket_path, read_frame, write_frame,
 };
 use daedalus_vt::{VtConfig, create_vt_engine};
 use std::collections::HashSet;
@@ -12,7 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 const CLIENT_OUTBOUND_CAPACITY: usize = 256;
@@ -21,17 +23,33 @@ pub struct DaemonServer {
     socket_path: PathBuf,
     listener: UnixListener,
     registry: Arc<Registry>,
+    external_hook: Option<ExternalHookServer>,
 }
 
 impl DaemonServer {
     pub async fn bind(socket_path: PathBuf, runtime_dir: PathBuf) -> std::io::Result<Self> {
         let supervisor = Supervisor::detect();
-        Self::bind_with_supervisor(socket_path, runtime_dir, supervisor).await
+        Self::bind_with_events_socket(
+            socket_path,
+            runtime_dir,
+            Some(default_events_socket_path()),
+            supervisor,
+        )
+        .await
     }
 
     pub async fn bind_with_supervisor(
         socket_path: PathBuf,
         runtime_dir: PathBuf,
+        supervisor: Supervisor,
+    ) -> std::io::Result<Self> {
+        Self::bind_with_events_socket(socket_path, runtime_dir, None, supervisor).await
+    }
+
+    pub async fn bind_with_events_socket(
+        socket_path: PathBuf,
+        runtime_dir: PathBuf,
+        events_socket_path: Option<PathBuf>,
         supervisor: Supervisor,
     ) -> std::io::Result<Self> {
         if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -61,16 +79,54 @@ impl DaemonServer {
         let (event_tx, _) = broadcast::channel(1024);
         let registry = Arc::new(Registry::new(supervisor, shell_integration, event_tx));
         let listener = UnixListener::bind(&socket_path)?;
+        let external_hook = match events_socket_path {
+            Some(events_path) => {
+                match ExternalHookServer::bind(events_path, Arc::clone(&registry)).await {
+                    Ok(hook) => Some(hook),
+                    Err(err) => {
+                        let _ = std::fs::remove_file(&socket_path);
+                        return Err(err);
+                    }
+                }
+            }
+            None => None,
+        };
         info!(socket = %socket_path.display(), "daedalusd listening");
 
         Ok(Self {
             socket_path,
             listener,
             registry,
+            external_hook,
         })
     }
 
+    pub fn set_worktrees_dir(&self, dir: PathBuf) {
+        self.registry.set_worktrees_dir(dir);
+    }
+
     pub async fn serve(self, shutdown: impl Future<Output = ()>) -> std::io::Result<()> {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let monitor_handle =
+            runtime_monitor::spawn_runtime_monitor(Arc::clone(&self.registry), shutdown_rx.clone());
+        let hook_handle = self.external_hook.map(|hook| {
+            let mut hook_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = hook
+                    .serve(async move {
+                        while !*hook_shutdown.borrow() {
+                            if hook_shutdown.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .await
+                {
+                    error!(error = %e, "external hook server failed");
+                }
+            })
+        });
+
         tokio::pin!(shutdown);
         loop {
             tokio::select! {
@@ -92,6 +148,11 @@ impl DaemonServer {
             }
         }
 
+        let _ = shutdown_tx.send(true);
+        let _ = monitor_handle.await;
+        if let Some(handle) = hook_handle {
+            let _ = handle.await;
+        }
         self.registry.close_all().await;
         let _ = std::fs::remove_file(&self.socket_path);
         Ok(())
@@ -191,17 +252,35 @@ async fn dispatch_request(
         ClientMessage::ListWorkspaces => Ok(ResponsePayload::Workspaces(
             registry.list_workspaces().await,
         )),
-        ClientMessage::CloseWorkspace {
-            id,
-            compose_down: _,
-        } => {
-            registry.close_workspace(id).await?;
+        ClientMessage::CloseWorkspace { id, compose_down } => {
+            registry.close_workspace(id, compose_down).await?;
             Ok(ResponsePayload::Ok)
         }
-        ClientMessage::DiscoverWorktrees { .. }
-        | ClientMessage::CreateWorktreeWorkspace { .. }
-        | ClientMessage::PublishExternalStatus { .. } => {
-            Err(ProtoError::InvalidRequest("not yet implemented".to_string()))
+        ClientMessage::DiscoverWorktrees { repo_dir } => Ok(ResponsePayload::Worktrees(
+            registry.discover_worktrees(repo_dir).await?,
+        )),
+        ClientMessage::CreateWorktreeWorkspace {
+            repo_dir,
+            branch,
+            create_branch,
+            env,
+        } => Ok(ResponsePayload::WorkspaceCreated(
+            registry
+                .create_worktree_workspace(repo_dir, branch, create_branch, env)
+                .await?,
+        )),
+        ClientMessage::PublishExternalStatus {
+            workspace_id,
+            root_dir,
+            source,
+            level,
+            label,
+            detail,
+        } => {
+            registry
+                .publish_external_status(workspace_id, root_dir, source, level, label, detail)
+                .await?;
+            Ok(ResponsePayload::Ok)
         }
         ClientMessage::SpawnPane {
             workspace_id,

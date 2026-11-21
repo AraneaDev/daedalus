@@ -1,8 +1,17 @@
+use crate::registry::Registry;
 use bollard::Docker;
 use bollard::container::ListContainersOptions;
 use bollard::models::ContainerSummary;
 use daedalus_proto::{ContainerHealth, PortMapping, PortSource, WorkspaceId};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tracing::debug;
+
+const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const DOCKER_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Snapshot of a workspace's runtime monitoring inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,6 +299,140 @@ pub async fn poll_workspace_docker(
     };
     let summaries = docker.list_containers(Some(options)).await?;
     Ok(map_container_summaries(summaries))
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Spawns the 3-second background runtime monitor that discovers local bound ports
+/// (via `spawn_blocking`) and Docker Compose container health, broadcasting changes
+/// through [`Registry::update_workspace_runtime`].
+pub fn spawn_runtime_monitor(
+    registry: Arc<Registry>,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(RUNTIME_POLL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut docker_client: Option<Docker> = None;
+        let mut docker_unavailable_logged = false;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => break,
+                _ = interval.tick() => {}
+            }
+
+            if *shutdown.borrow() {
+                break;
+            }
+
+            let targets = registry.monitor_targets().await;
+            if targets.is_empty() {
+                continue;
+            }
+
+            let local_targets: Vec<(WorkspaceId, Vec<u32>)> = targets
+                .iter()
+                .map(|t| (t.workspace_id, t.root_pids.clone()))
+                .collect();
+
+            let local_ports_fut = tokio::task::spawn_blocking(move || {
+                local_targets
+                    .into_iter()
+                    .map(|(ws_id, roots)| (ws_id, discover_local_ports_for_roots(&roots)))
+                    .collect::<HashMap<WorkspaceId, Vec<PortMapping>>>()
+            });
+
+            let mut local_by_ws = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => break,
+                res = local_ports_fut => match res {
+                    Ok(map) => map,
+                    Err(e) => {
+                        debug!(error = %e, "local port discovery task failed");
+                        HashMap::new()
+                    }
+                }
+            };
+
+            if targets.iter().any(|t| t.compose_project_name.is_some()) && docker_client.is_none() {
+                match Docker::connect_with_local_defaults() {
+                    Ok(client) => docker_client = Some(client),
+                    Err(e) => {
+                        if !docker_unavailable_logged {
+                            debug!(error = %e, "docker unavailable; skipping container health polling");
+                            docker_unavailable_logged = true;
+                        }
+                    }
+                }
+            }
+
+            for target in targets {
+                if *shutdown.borrow() {
+                    break;
+                }
+
+                let mut bound_ports = Vec::new();
+                let mut containers = Vec::new();
+
+                if let (Some(docker), Some(project)) =
+                    (docker_client.as_ref(), target.compose_project_name.as_deref())
+                {
+                    let docker_res = tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown) => break,
+                        res = tokio::time::timeout(
+                            DOCKER_POLL_TIMEOUT,
+                            poll_workspace_docker(docker, project),
+                        ) => res,
+                    };
+
+                    match docker_res {
+                        Ok(Ok((ws_containers, ws_docker_ports))) => {
+                            docker_unavailable_logged = false;
+                            containers = ws_containers;
+                            bound_ports.extend(ws_docker_ports);
+                        }
+                        Ok(Err(e)) => {
+                            if !docker_unavailable_logged {
+                                debug!(
+                                    error = %e,
+                                    project = %project,
+                                    "docker unavailable; skipping container health polling"
+                                );
+                                docker_unavailable_logged = true;
+                            }
+                        }
+                        Err(_) => {
+                            if !docker_unavailable_logged {
+                                debug!(
+                                    project = %project,
+                                    "docker poll timed out; skipping container health polling"
+                                );
+                                docker_unavailable_logged = true;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(local_ports) = local_by_ws.remove(&target.workspace_id) {
+                    bound_ports.extend(local_ports);
+                }
+
+                registry
+                    .update_workspace_runtime(target.workspace_id, bound_ports, containers)
+                    .await;
+            }
+        }
+    })
 }
 
 #[cfg(test)]

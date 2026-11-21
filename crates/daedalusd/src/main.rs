@@ -1,6 +1,7 @@
 use clap::Parser;
-use daedalus_proto::{default_runtime_dir, default_socket_path};
+use daedalus_proto::{default_events_socket_path, default_runtime_dir, default_socket_path};
 use daedalusd::server::DaemonServer;
+use daedalusd::supervisor::Supervisor;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -14,6 +15,8 @@ struct Args {
     socket: Option<PathBuf>,
     #[arg(long, env = "DAEDALUS_RUNTIME_DIR")]
     runtime_dir: Option<PathBuf>,
+    #[arg(long, env = "DAEDALUS_EVENTS_SOCKET")]
+    events_socket: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -27,8 +30,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let socket = args.socket.unwrap_or_else(default_socket_path);
     let runtime_dir = args.runtime_dir.unwrap_or_else(default_runtime_dir);
+    let events_socket = args
+        .events_socket
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(default_events_socket_path);
 
-    let server = DaemonServer::bind(socket, runtime_dir).await?;
+    let server = DaemonServer::bind_with_events_socket(
+        socket,
+        runtime_dir,
+        Some(events_socket),
+        Supervisor::detect(),
+    )
+    .await?;
     server
         .serve(async {
             let ctrl_c = tokio::signal::ctrl_c();

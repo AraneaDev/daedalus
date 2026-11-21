@@ -1,3 +1,4 @@
+pub mod external_hook;
 pub mod isolation;
 pub mod pane_actor;
 pub mod registry;

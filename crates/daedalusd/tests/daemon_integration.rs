@@ -1,12 +1,15 @@
 use daedalus_proto::{
-    ClientMessage, PaneRole, Request, ResponsePayload, ServerEvent, ServerMessage, read_frame,
-    write_frame,
+    ClientMessage, PaneRole, Request, ResponsePayload, ServerEvent, ServerMessage, StatusLevel,
+    read_frame, write_frame,
 };
 use daedalusd::server::DaemonServer;
 use daedalusd::supervisor::{IsolationMode, Supervisor};
 use std::collections::HashMap;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 
@@ -458,4 +461,371 @@ async fn get_scrollback_returns_lines_scrolled_above_viewport() {
     .await;
     let _ = shutdown_tx.send(());
     srv_handle.await.unwrap();
+}
+
+fn run_git(repo: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("git command should execute");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: stdout={}, stderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn create_worktree_workspace_isolates_ports_and_injects_env() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daedalusd.sock");
+    let runtime = dir.path().join("runtime");
+    let worktrees_dir = dir.path().join("worktrees");
+    let repo_dir = dir.path().join("app");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    run_git(&repo_dir, &["init", "-b", "main"]);
+    std::fs::write(
+        repo_dir.join("docker-compose.yml"),
+        "services:\n  web:\n    image: node:20\n    ports:\n      - \"3000:3000\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join(".env"),
+        "PORT=3000\nDATABASE_URL=postgres://localhost:5432/app\n",
+    )
+    .unwrap();
+    run_git(&repo_dir, &["add", "docker-compose.yml", ".env"]);
+    run_git(
+        &repo_dir,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "initial commit",
+        ],
+    );
+
+    let server = DaemonServer::bind_with_supervisor(
+        sock.clone(),
+        runtime,
+        Supervisor::with_mode(IsolationMode::PgidFallback),
+    )
+    .await
+    .unwrap();
+    server.set_worktrees_dir(worktrees_dir);
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let mut client = UnixStream::connect(&sock).await.unwrap();
+
+    // Open primary workspace (slot 0, port_offset 0)
+    let primary_ws = match send_rpc(
+        &mut client,
+        1,
+        ClientMessage::CreateWorkspace {
+            name: "app".to_string(),
+            root_dir: repo_dir.clone(),
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::WorkspaceCreated(ws) => ws,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(primary_ws.slot_index, 0);
+    assert_eq!(primary_ws.port_offset, 0);
+    assert_eq!(primary_ws.git_branch.as_deref(), Some("main"));
+
+    // Create worktree workspace for branch feat/billing (slot 1, offset >= 100)
+    let wt_ws = match send_rpc(
+        &mut client,
+        2,
+        ClientMessage::CreateWorktreeWorkspace {
+            repo_dir: repo_dir.clone(),
+            branch: "feat/billing".to_string(),
+            create_branch: true,
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::WorkspaceCreated(ws) => ws,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(wt_ws.slot_index, 1);
+    assert!(
+        wt_ws.port_offset >= 100,
+        "expected port_offset >= 100, got {}",
+        wt_ws.port_offset
+    );
+    assert_eq!(wt_ws.git_branch.as_deref(), Some("feat/billing"));
+    let expected_compose_project = wt_ws
+        .compose_project_name
+        .clone()
+        .expect("compose_project_name should be set");
+    let expected_port = 3000 + wt_ws.port_offset;
+    let expected_db_port = 5432 + wt_ws.port_offset;
+
+    let worktrees = match send_rpc(
+        &mut client,
+        3,
+        ClientMessage::DiscoverWorktrees {
+            repo_dir: repo_dir.clone(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::Worktrees(wts) => wts,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(worktrees.len(), 2);
+
+    let override_path = wt_ws
+        .root_dir
+        .join(".daedalus")
+        .join("compose.override.yml");
+    assert!(
+        override_path.is_file(),
+        "expected compose.override.yml at {}",
+        override_path.display()
+    );
+    let override_contents = std::fs::read_to_string(&override_path).unwrap();
+    assert!(
+        override_contents.contains("!override"),
+        "expected !override in compose.override.yml:\n{override_contents}"
+    );
+    assert!(
+        override_contents.contains(&format!("{expected_port}:3000")),
+        "expected remapped port {expected_port}:3000 in compose.override.yml:\n{override_contents}"
+    );
+
+    // Spawn a pane inside the worktree and verify it observes remapped PORT and COMPOSE_PROJECT_NAME
+    let pane = match send_rpc(
+        &mut client,
+        4,
+        ClientMessage::SpawnPane {
+            workspace_id: wt_ws.id,
+            role: PaneRole::Service,
+            command: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo PORT=$PORT PROJ=$COMPOSE_PROJECT_NAME DB=$DATABASE_URL; sleep 2".to_string(),
+            ]),
+            shell: None,
+            cols: 160,
+            rows: 12,
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::PaneSpawned(p) => p,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    let expected_line = format!(
+        "PORT={expected_port} PROJ={expected_compose_project} DB=postgres://localhost:{expected_db_port}/app"
+    );
+    let snap_text = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snap = match send_rpc(
+                &mut client,
+                5,
+                ClientMessage::GetSnapshot { pane_id: pane.id },
+            )
+            .await
+            {
+                ResponsePayload::Snapshot(s) => s,
+                other => panic!("unexpected response: {other:?}"),
+            };
+            let text: String = snap
+                .rows_data
+                .iter()
+                .map(|r| {
+                    r.cells
+                        .iter()
+                        .map(|c| c.text.as_str())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.contains(&expected_line) {
+                return text;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for remapped env in worktree pane");
+    assert!(snap_text.contains(&expected_line));
+
+    send_rpc(
+        &mut client,
+        6,
+        ClientMessage::CloseWorkspace {
+            id: wt_ws.id,
+            compose_down: false,
+        },
+    )
+    .await;
+    send_rpc(
+        &mut client,
+        7,
+        ClientMessage::CloseWorkspace {
+            id: primary_ws.id,
+            compose_down: false,
+        },
+    )
+    .await;
+
+    let _ = shutdown_tx.send(());
+    srv_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn external_status_ingests_via_ndjson_socket_and_rpc() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daedalusd.sock");
+    let events_sock = dir.path().join("events.sock");
+    let runtime = dir.path().join("runtime");
+    let ws_dir = dir.path().join("project");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let server = DaemonServer::bind_with_events_socket(
+        sock.clone(),
+        runtime,
+        Some(events_sock.clone()),
+        Supervisor::with_mode(IsolationMode::PgidFallback),
+    )
+    .await
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let mut client = UnixStream::connect(&sock).await.unwrap();
+    let ws = match send_rpc(
+        &mut client,
+        1,
+        ClientMessage::CreateWorkspace {
+            name: "project".to_string(),
+            root_dir: ws_dir.clone(),
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::WorkspaceCreated(ws) => ws,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    send_rpc(&mut client, 2, ClientMessage::Subscribe { pane_ids: None }).await;
+
+    // 1. Write 1-line JSON status for phrourion to events.sock
+    let mut hook_stream = UnixStream::connect(&events_sock).await.unwrap();
+    let ndjson = format!(
+        "{{\"source\":\"phrourion\",\"root_dir\":\"{}\",\"level\":\"warn\",\"label\":\"3 dirty\",\"detail\":\"2 modified, 1 untracked\"}}\n",
+        ws_dir.display()
+    );
+    hook_stream.write_all(ndjson.as_bytes()).await.unwrap();
+    hook_stream.shutdown().await.unwrap();
+    drop(hook_stream);
+
+    // 2. Send PublishExternalStatus RPC for cassandra
+    send_rpc(
+        &mut client,
+        3,
+        ClientMessage::PublishExternalStatus {
+            workspace_id: Some(ws.id),
+            root_dir: None,
+            source: "cassandra".to_string(),
+            level: StatusLevel::Error,
+            label: "retry 3/5".to_string(),
+            detail: Some("rate limited".to_string()),
+        },
+    )
+    .await;
+
+    // Assert both ExternalStatusUpdated events arrive on the subscribed client
+    let mut seen_sources = HashMap::new();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while seen_sources.len() < 2 {
+            match read_frame::<_, ServerMessage>(&mut client).await.unwrap() {
+                Some(ServerMessage::Event(ServerEvent::ExternalStatusUpdated {
+                    workspace_id,
+                    status,
+                })) if workspace_id == ws.id => {
+                    seen_sources.insert(status.source.clone(), status);
+                }
+                Some(ServerMessage::Event(_)) => continue,
+                other => panic!("unexpected message while waiting for status events: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for ExternalStatusUpdated events");
+
+    let phrourion = seen_sources.get("phrourion").unwrap();
+    assert_eq!(phrourion.level, StatusLevel::Warn);
+    assert_eq!(phrourion.label, "3 dirty");
+    assert_eq!(
+        phrourion.detail.as_deref(),
+        Some("2 modified, 1 untracked")
+    );
+
+    let cassandra = seen_sources.get("cassandra").unwrap();
+    assert_eq!(cassandra.level, StatusLevel::Error);
+    assert_eq!(cassandra.label, "retry 3/5");
+    assert_eq!(cassandra.detail.as_deref(), Some("rate limited"));
+
+    // Assert both appear in ListWorkspaces
+    let workspaces = match send_rpc(&mut client, 4, ClientMessage::ListWorkspaces).await {
+        ResponsePayload::Workspaces(list) => list,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(workspaces.len(), 1);
+    assert_eq!(workspaces[0].external_statuses.len(), 2);
+    assert!(
+        workspaces[0]
+            .external_statuses
+            .iter()
+            .any(|s| s.source == "phrourion" && s.label == "3 dirty")
+    );
+    assert!(
+        workspaces[0]
+            .external_statuses
+            .iter()
+            .any(|s| s.source == "cassandra" && s.label == "retry 3/5")
+    );
+
+    let _ = shutdown_tx.send(());
+    srv_handle.await.unwrap();
+    assert!(
+        !events_sock.exists(),
+        "events.sock should be removed on daemon shutdown"
+    );
 }
