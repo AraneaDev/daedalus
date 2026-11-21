@@ -1,0 +1,49 @@
+# Changelog
+
+## 0.0.1 (2026-11-21)
+
+
+### Features
+
+* add GetScrollback RPC and VtEngine scrollback window support ([eccfcbd](https://github.com/AraneaDev/daedalus/commit/eccfcbd9b1ae41ccc01e62ea7d3db3bd06b34d04))
+* **ctl:** add daedalus-ctl CLI smoke client and end-to-end smoke tests ([caeead4](https://github.com/AraneaDev/daedalus/commit/caeead448388f609e66a107ed91a17b3951c8dd1))
+* **ctl:** add worktree list/create, compose-down, and external status publish commands ([c5ae926](https://github.com/AraneaDev/daedalus/commit/c5ae926f8d475f63c5e7a421a12954f9868155a3))
+* **daedalusd:** add bollard Docker health and /proc/net/tcp local bound-port monitor ([5f8965d](https://github.com/AraneaDev/daedalus/commit/5f8965dddbb7284dd462f3137fb679abe23c4361))
+* **daedalusd:** add git worktree discovery and isolated worktree creation ([37ac96b](https://github.com/AraneaDev/daedalus/commit/37ac96be69c14cc621ea69c1f18a04e88643ac2a))
+* **daedalusd:** add non-destructive bash/zsh OSC 7 and OSC 133 shell integration ([1e7699b](https://github.com/AraneaDev/daedalus/commit/1e7699b19a617bbd77ea1b706a97c2be9a714877))
+* **daedalusd:** add PaneActor with 60Hz delta coalescing and in-memory Registry ([cd00972](https://github.com/AraneaDev/daedalus/commit/cd0097203cc9b6004526ff1d892f53a0a19d417f))
+* **daedalusd:** add port-offset allocator, env remapper, and Compose override generator ([d6b4323](https://github.com/AraneaDev/daedalus/commit/d6b432390ce9686acde0b8477297994ed3bd46a1))
+* **daedalusd:** add process isolation supervisor with systemd-scope and pgid teardown ([7de3dd8](https://github.com/AraneaDev/daedalus/commit/7de3dd8f363577994d7949d73d2415154bfdac62))
+* **daedalusd:** add Unix socket server, main binary, and OSC 133 integration tests ([d8b7c49](https://github.com/AraneaDev/daedalus/commit/d8b7c49c7625b3c68fb339a0bc765befabe094da))
+* **daedalusd:** wire worktrees, port/Compose isolation, runtime monitor, and NDJSON status hook ([845286f](https://github.com/AraneaDev/daedalus/commit/845286ff75754ba7f519a1911cfe7c81dd7a20e0))
+* **proto:** add Phase 3 worktree, runtime port/container, and external status protocol types ([a7fa32c](https://github.com/AraneaDev/daedalus/commit/a7fa32ce2b18b79cb2b4151a334ffc9c4eded73a))
+* **proto:** add workspace, domain types, RPC schema, and MessagePack codec ([624ac35](https://github.com/AraneaDev/daedalus/commit/624ac350edd0bf1d3c4a7e1ec4e5d9b2fd8f76dd))
+* **ui:** add AppState grid cache, AgentPreset picker, and text selection ([0e1c04c](https://github.com/AraneaDev/daedalus/commit/0e1c04cd1bc34ce3f3baff10b33508a04328c718))
+* **ui:** add async DaemonBridge with auto-spawn, 3-pane bootstrap, and failure forwarding ([a4bffd4](https://github.com/AraneaDev/daedalus/commit/a4bffd40e120127cb62d607c87630bc525985a74))
+* **ui:** add keyboard chord dispatcher, VT encoder, and failure-trace formatter ([06bbe44](https://github.com/AraneaDev/daedalus/commit/06bbe441b266577eee606eae88a2ed0f42776a07))
+* **ui:** add two-pass wgpu instanced quad and glyphon text renderer ([fc83cb8](https://github.com/AraneaDev/daedalus/commit/fc83cb8ee3c80840296335271f3a64cf944f55c2))
+* **ui:** scaffold daedalus-ui with theme palette and 3-pane semantic layout ([a6df75b](https://github.com/AraneaDev/daedalus/commit/a6df75b13f8d7afc4f2e4a886b911a28eccd315c))
+* **ui:** surface git branch, ports, Docker health, external badges, and Ctrl+Shift+W worktree modal ([bd4b7d7](https://github.com/AraneaDev/daedalus/commit/bd4b7d77dce6fe06f1f3e6fff50f0e412c3326cf))
+* **ui:** wire winit ApplicationHandler event loop, clipboard, and daedalus-ui binary ([65d0712](https://github.com/AraneaDev/daedalus/commit/65d071205b088cc9a5b61d3fac152a83027c6b65))
+* **vt:** add CommandTracker failure slicing and feature-gated libghostty-vt FFI ([d79ffde](https://github.com/AraneaDev/daedalus/commit/d79ffde42bdaea029a0e49e11d91b2f9a4806db2))
+* **vt:** add VtEngine trait, scrollback grid, and BuiltinVt backend ([620bef6](https://github.com/AraneaDev/daedalus/commit/620bef6d9b5d0eb54ae824fe353d427c99a4144e))
+
+
+### Bug Fixes
+
+* address phase 1 final code review findings ([bf5ce07](https://github.com/AraneaDev/daedalus/commit/bf5ce0731f0594a4dfcfc202e26d7dcef451a03c))
+* address phase 3 final code review findings ([e2e6c2e](https://github.com/AraneaDev/daedalus/commit/e2e6c2ed279c2773473ad2a8f6a31bdfddcdcc72))
+* **ci:** satisfy rust 1.100 clippy, update actions/deps, and group gpu dependabot ([#7](https://github.com/AraneaDev/daedalus/issues/7)) ([9ae06c9](https://github.com/AraneaDev/daedalus/commit/9ae06c9002228a6cbb2a72a512192380306ee3ec))
+* **ci:** use simple release-please strategy with Cargo workspace version ([8fc5d16](https://github.com/AraneaDev/daedalus/commit/8fc5d16ed448247a005ae2e72c1f0a39cb5d459e))
+* **daedalusd:** check systemd unit liveness during teardown and silence probes ([3b0889f](https://github.com/AraneaDev/daedalus/commit/3b0889f219ae9cd889f42138bc55411f650dc21f))
+* **daedalusd:** offload PTY writes, handle close/exit races, and add registry tests ([e958ea5](https://github.com/AraneaDev/daedalus/commit/e958ea55966ff6da6ae15c52f97eaacad31121de))
+* **daedalusd:** preserve ResyncRequired under backpressure and guard socket parent chmod ([ab2edee](https://github.com/AraneaDev/daedalus/commit/ab2edee22aeec701fd19213459399941a0576176))
+* **ui:** address phase 2 final code review findings ([15f8202](https://github.com/AraneaDev/daedalus/commit/15f82025d7324b0454bf213b3472b8b286c78058))
+* **ui:** prevent RpcConnection disconnect deadlock and retry failed session init ([a6784ea](https://github.com/AraneaDev/daedalus/commit/a6784eac59bb756193bcc1f0539cf99f8a5c0624))
+* **vt:** conform restored main screen dimensions after alt-screen resize ([2b85912](https://github.com/AraneaDev/daedalus/commit/2b85912d14655c4da8e18588fb497e4d075cc0c6))
+* **vt:** pass bindgen include paths and clarify GhosttyVt doc comment ([84e97a3](https://github.com/AraneaDev/daedalus/commit/84e97a3db981f1263af9f532a13bd21e1191d148))
+
+
+### Chores
+
+* **release:** prepare initial 0.0.1 release ([bf5fcbb](https://github.com/AraneaDev/daedalus/commit/bf5fcbb4c25c8ee03302ff04b4e9a25449916ae7))
