@@ -7,9 +7,10 @@ pub mod ffi {
     include!(concat!(env!("OUT_DIR"), "/ghostty_vt_bindings.rs"));
 }
 
-/// Safe RAII wrapper around libghostty-vt 1.0 C ABI.
-/// Feeds incoming bytes into the linked libghostty-vt terminal instance while
-/// maintaining a synchronized semantic OSC 7/133 shadow for cross-pane slicing.
+/// Feature-gated `libghostty-vt` backend wrapper.
+/// Currently generates and links the `libghostty-vt` C ABI bindings via [`ffi`]
+/// while delegating `VtEngine` state to `shadow: BuiltinVt` until `libghostty-vt`
+/// C ABI calls are wired against an installed 1.0 header.
 pub struct GhosttyVt {
     shadow: BuiltinVt,
 }
