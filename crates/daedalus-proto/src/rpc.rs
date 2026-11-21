@@ -1,7 +1,7 @@
 use crate::types::{
     ContainerHealth, ExternalStatus, FailureTrace, GitWorktreeInfo, GridDelta, GridRow,
-    GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary, PortMapping, StatusLevel, WorkspaceId,
-    WorkspaceInfo,
+    GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary, PortMapping, SearchMatch, StatusLevel,
+    WorkspaceId, WorkspaceInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -74,6 +74,11 @@ pub enum ClientMessage {
         offset_from_bottom: usize,
         count: usize,
     },
+    SearchPane {
+        pane_id: PaneId,
+        query: String,
+        case_sensitive: bool,
+    },
     GetFailureTrace {
         pane_id: PaneId,
     },
@@ -84,6 +89,7 @@ pub enum ClientMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum ServerMessage {
     Response {
         id: u64,
@@ -93,6 +99,7 @@ pub enum ServerMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum ResponsePayload {
     Pong {
         version: String,
@@ -108,6 +115,11 @@ pub enum ResponsePayload {
         pane_id: PaneId,
         total_scrollback: usize,
         rows: Vec<GridRow>,
+    },
+    SearchMatches {
+        pane_id: PaneId,
+        total_scrollback: usize,
+        matches: Vec<SearchMatch>,
     },
     FailureTrace(Option<FailureTrace>),
     Ok,

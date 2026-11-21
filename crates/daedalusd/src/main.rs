@@ -1,5 +1,7 @@
 use clap::Parser;
-use daedalus_proto::{default_events_socket_path, default_runtime_dir, default_socket_path};
+use daedalus_proto::{
+    default_events_socket_path, default_runtime_dir, default_socket_path, default_state_file_path,
+};
 use daedalusd::server::DaemonServer;
 use daedalusd::supervisor::Supervisor;
 use std::path::PathBuf;
@@ -17,6 +19,8 @@ struct Args {
     runtime_dir: Option<PathBuf>,
     #[arg(long, env = "DAEDALUS_EVENTS_SOCKET")]
     events_socket: Option<PathBuf>,
+    #[arg(long, env = "DAEDALUS_STATE_FILE")]
+    state_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -34,11 +38,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .events_socket
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(default_events_socket_path);
+    let state_file = args
+        .state_file
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(default_state_file_path);
 
-    let server = DaemonServer::bind_with_events_socket(
+    let server = DaemonServer::bind_with_options(
         socket,
         runtime_dir,
         Some(events_socket),
+        Some(state_file),
         Supervisor::detect(),
     )
     .await?;

@@ -99,8 +99,54 @@ add-zsh-hook precmd __daedalus_precmd
 add-zsh-hook preexec __daedalus_preexec
 "#;
 
+const FISH_INIT_SCRIPT: &str = r#"# Daedalus non-destructive fish shell integration (OSC 7 + OSC 133)
+status is-interactive; or return
+
+if not set -q __daedalus_fish_initialized
+    set -g __daedalus_fish_initialized 1
+
+    function __daedalus_preexec --on-event fish_preexec
+        printf '\033]133;C\007'
+    end
+
+    function __daedalus_postexec --on-event fish_postexec
+        set -l exit_code $status
+        printf '\033]133;D;%d\007' $exit_code
+    end
+
+    function __daedalus_prompt --on-event fish_prompt
+        set -l encoded_pwd (string replace -a -- '%' '%25' $PWD | string replace -a -- ' ' '%20')
+        set -l host $hostname
+        if test -z "$host"
+            set host localhost
+        end
+        printf '\033]7;file://%s%s\007' "$host" "$encoded_pwd"
+        printf '\033]133;A\007'
+
+        if functions -q fish_prompt; and not functions -q __daedalus_orig_fish_prompt
+            functions -c fish_prompt __daedalus_orig_fish_prompt
+            function fish_prompt
+                __daedalus_orig_fish_prompt
+                printf '\033]133;B\007'
+            end
+        end
+    end
+end
+"#;
+
+const DEFAULT_XDG_DATA_DIRS: &str = "/usr/local/share:/usr/share";
+
+fn build_fish_xdg_data_dirs(shell_dir: &Path, existing: Option<&str>) -> String {
+    let prefix = shell_dir.to_string_lossy();
+    let tail = existing
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_XDG_DATA_DIRS);
+    format!("{prefix}:{tail}")
+}
+
 #[derive(Debug, Clone)]
 pub struct ShellIntegration {
+    shell_dir: PathBuf,
     bash_rc: PathBuf,
     zsh_dir: PathBuf,
 }
@@ -116,15 +162,25 @@ impl ShellIntegration {
     pub fn prepare(runtime_dir: &Path) -> std::io::Result<Self> {
         let shell_dir = runtime_dir.join("shell");
         let zsh_dir = shell_dir.join("zsh");
+        let fish_dir = shell_dir.join("fish");
+        let fish_vendor_dir = fish_dir.join("vendor_conf.d");
         fs::create_dir_all(&zsh_dir)?;
+        fs::create_dir_all(&fish_vendor_dir)?;
         fs::set_permissions(&shell_dir, fs::Permissions::from_mode(0o700))?;
         fs::set_permissions(&zsh_dir, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&fish_dir, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&fish_vendor_dir, fs::Permissions::from_mode(0o700))?;
 
         let bash_rc = shell_dir.join("bash-init.sh");
         fs::write(&bash_rc, BASH_INIT_SCRIPT)?;
         fs::write(zsh_dir.join(".zshrc"), ZSH_INIT_SCRIPT)?;
+        fs::write(fish_vendor_dir.join("daedalus.fish"), FISH_INIT_SCRIPT)?;
 
-        Ok(Self { bash_rc, zsh_dir })
+        Ok(Self {
+            shell_dir,
+            bash_rc,
+            zsh_dir,
+        })
     }
 
     pub fn build_launch_spec(
@@ -177,6 +233,21 @@ impl ShellIntegration {
                     extra_env,
                 }
             }
+            "fish" => {
+                let mut extra_env = HashMap::new();
+                extra_env.insert(
+                    "XDG_DATA_DIRS".to_string(),
+                    build_fish_xdg_data_dirs(
+                        &self.shell_dir,
+                        std::env::var("XDG_DATA_DIRS").ok().as_deref(),
+                    ),
+                );
+                ShellLaunchSpec {
+                    program: shell_path,
+                    args: vec!["-i".to_string()],
+                    extra_env,
+                }
+            }
             _ => ShellLaunchSpec {
                 program: shell_path,
                 args: Vec::new(),
@@ -210,11 +281,52 @@ mod tests {
                 .exists()
         );
 
+        let fish = integration.build_launch_spec(None, Some("/usr/bin/fish"));
+        assert_eq!(fish.program, "/usr/bin/fish");
+        assert_eq!(fish.args, vec!["-i"]);
+        let xdg_data_dirs = fish.extra_env.get("XDG_DATA_DIRS").unwrap();
+        let expected_shell_dir = dir.path().join("shell");
+        assert!(
+            xdg_data_dirs.starts_with(&format!("{}:", expected_shell_dir.display())),
+            "unexpected XDG_DATA_DIRS: {xdg_data_dirs}"
+        );
+        let fish_script_path = expected_shell_dir
+            .join("fish")
+            .join("vendor_conf.d")
+            .join("daedalus.fish");
+        assert!(fish_script_path.is_file());
+        let fish_script = fs::read_to_string(&fish_script_path).unwrap();
+        assert!(fish_script.contains("133;A"));
+        assert!(fish_script.contains("133;B"));
+        assert!(fish_script.contains("133;C"));
+        assert!(fish_script.contains("133;D;%d"));
+        assert!(fish_script.contains("7;file://"));
+        assert!(fish_script.contains("fish_preexec"));
+        assert!(fish_script.contains("fish_postexec"));
+        assert!(fish_script.contains("fish_prompt"));
+
         let agy = integration
             .build_launch_spec(Some(&["agy".to_string(), "--version".to_string()]), None);
         assert_eq!(agy.program, "agy");
         assert_eq!(agy.args, vec!["--version"]);
         assert!(agy.extra_env.is_empty());
+    }
+
+    #[test]
+    fn fish_xdg_data_dirs_prepends_or_uses_standard_fallback() {
+        let shell_dir = Path::new("/run/user/1000/daedalus/shell");
+        assert_eq!(
+            build_fish_xdg_data_dirs(shell_dir, Some("/custom/share:/usr/share")),
+            "/run/user/1000/daedalus/shell:/custom/share:/usr/share"
+        );
+        assert_eq!(
+            build_fish_xdg_data_dirs(shell_dir, Some("")),
+            "/run/user/1000/daedalus/shell:/usr/local/share:/usr/share"
+        );
+        assert_eq!(
+            build_fish_xdg_data_dirs(shell_dir, None),
+            "/run/user/1000/daedalus/shell:/usr/local/share:/usr/share"
+        );
     }
 
     fn run_bash_with_bashrc(bashrc_contents: &str) -> Vec<daedalus_vt::SemanticEvent> {

@@ -327,3 +327,197 @@ async fn daemon_bridge_handles_mid_session_disconnect_and_reconnects_cleanly() {
         .expect("timed out waiting for server2 shutdown")
         .expect("server2 panicked");
 }
+
+#[tokio::test]
+async fn daemon_bridge_activates_dormant_workspace_with_manifest_and_searches_scrollback() {
+    let dir = TempDir::new().unwrap();
+    let ws_dir = dir.path().join("project");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    std::fs::write(
+        ws_dir.join(".daedalus.toml"),
+        r#"
+[runner]
+command = ["sh", "-c", "echo MANIFEST_RUNNER_NEEDLE; sleep 5"]
+"#,
+    )
+    .unwrap();
+
+    let sock = dir.path().join("daedalusd.sock");
+    let runtime = dir.path().join("runtime");
+    let state_file = dir.path().join("state.json");
+
+    // Seed state.json via DaemonServer 1 creating a workspace and closing cleanly.
+    {
+        let srv1 = DaemonServer::bind_with_options(
+            sock.clone(),
+            runtime.clone(),
+            None,
+            Some(state_file.clone()),
+            Supervisor::with_mode(IsolationMode::PgidFallback),
+        )
+        .await
+        .unwrap();
+        let (tx1, rx1) = oneshot::channel::<()>();
+        let handle1 = tokio::spawn(async move {
+            let _ = srv1
+                .serve(async {
+                    let _ = rx1.await;
+                })
+                .await;
+        });
+
+        let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink { tx: evt_tx });
+        let bridge1 = DaemonBridge::start(
+            BridgeConfig {
+                socket_path: sock.clone(),
+                initial_dir: ws_dir.clone(),
+                default_agent: AgentPreset::Shell,
+                auto_spawn_daemon: false,
+            },
+            sink,
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut spawned = 0usize;
+            while spawned < 3 {
+                if matches!(
+                    evt_rx.recv().await.expect("event channel closed"),
+                    UiEvent::PaneSpawned { .. }
+                ) {
+                    spawned += 1;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for initial workspace creation");
+
+        tokio::task::spawn_blocking(move || bridge1.shutdown())
+            .await
+            .unwrap();
+        let _ = tx1.send(());
+        handle1.await.unwrap();
+    }
+
+    // Start DaemonServer 2 which restores the workspace as dormant (`panes: []`).
+    let srv2 = DaemonServer::bind_with_options(
+        sock.clone(),
+        runtime,
+        None,
+        Some(state_file),
+        Supervisor::with_mode(IsolationMode::PgidFallback),
+    )
+    .await
+    .unwrap();
+    let (tx2, rx2) = oneshot::channel::<()>();
+    let handle2 = tokio::spawn(async move {
+        let _ = srv2
+            .serve(async {
+                let _ = rx2.await;
+            })
+            .await;
+    });
+
+    let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
+    let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink { tx: evt_tx });
+    let bridge2 = DaemonBridge::start(
+        BridgeConfig {
+            socket_path: sock,
+            initial_dir: ws_dir,
+            default_agent: AgentPreset::Shell,
+            auto_spawn_daemon: false,
+        },
+        sink,
+    );
+
+    let dormant_ws = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let UiEvent::WorkspacesLoaded(mut wss) =
+                evt_rx.recv().await.expect("event channel closed")
+            {
+                assert_eq!(wss.len(), 1);
+                let ws = wss.pop().unwrap();
+                assert!(ws.panes.is_empty(), "restored workspace must be dormant");
+                assert!(
+                    ws.manifest.is_some(),
+                    "restored workspace must load manifest"
+                );
+                break ws;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for dormant WorkspacesLoaded");
+
+    bridge2.send(UiCommand::EnsureWorkspacePanes {
+        workspace_id: dormant_ws.id,
+        default_agent: AgentPreset::Shell,
+        manifest: dormant_ws.manifest.clone(),
+    });
+
+    let mut ensured = false;
+    let mut runner_pane_id = None;
+    let mut spawned_count = 0usize;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !ensured || spawned_count < 3 {
+            match evt_rx.recv().await.expect("event channel closed") {
+                UiEvent::PaneSpawned { summary, .. } => {
+                    spawned_count += 1;
+                    if summary.role == PaneRole::Runner {
+                        runner_pane_id = Some(summary.id);
+                    }
+                }
+                UiEvent::WorkspacePanesEnsured { workspace_id }
+                    if workspace_id == dormant_ws.id =>
+                {
+                    ensured = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for EnsureWorkspacePanes");
+
+    let runner_id = runner_pane_id.expect("runner pane must be spawned");
+
+    // Poll SearchPane until the manifest runner command output appears in the VT grid.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut found = false;
+    while tokio::time::Instant::now() < deadline && !found {
+        bridge2.send(UiCommand::SearchPane {
+            pane_id: runner_id,
+            query: "manifest_runner_needle".to_string(),
+            case_sensitive: false,
+            generation: 1,
+        });
+        let wait_until = tokio::time::Instant::now() + Duration::from_millis(250);
+        while tokio::time::Instant::now() < wait_until {
+            let remaining = wait_until.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, evt_rx.recv()).await {
+                Ok(Some(UiEvent::SearchResults {
+                    pane_id, matches, ..
+                })) if pane_id == runner_id && !matches.is_empty() => {
+                    found = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("event channel closed"),
+                Err(_) => break,
+            }
+        }
+    }
+    assert!(
+        found,
+        "expected SearchPane to locate manifest runner output in restored pane"
+    );
+
+    tokio::task::spawn_blocking(move || bridge2.shutdown())
+        .await
+        .unwrap();
+    let _ = tx2.send(());
+    handle2.await.unwrap();
+}

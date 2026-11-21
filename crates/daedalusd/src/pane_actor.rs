@@ -1,7 +1,7 @@
 use crate::supervisor::SpawnedPty;
 use daedalus_proto::{
-    FailureTrace, GridRow, GridSnapshot, PaneId, PaneRole, PaneSummary, ProtoError, ServerEvent,
-    WorkspaceId,
+    FailureTrace, GridRow, GridSnapshot, PaneId, PaneRole, PaneSummary, ProtoError, SearchMatch,
+    ServerEvent, WorkspaceId,
 };
 use daedalus_vt::{CommandTracker, VtConfig, create_vt_engine};
 use portable_pty::PtySize;
@@ -27,6 +27,11 @@ enum PaneCmd {
         offset_from_bottom: usize,
         count: usize,
         reply: oneshot::Sender<(usize, Vec<GridRow>)>,
+    },
+    Search {
+        query: String,
+        case_sensitive: bool,
+        reply: oneshot::Sender<(usize, Vec<SearchMatch>)>,
     },
     GetFailureTrace {
         reply: oneshot::Sender<Option<FailureTrace>>,
@@ -214,6 +219,23 @@ impl PaneHandle {
         rx.await.map_err(|_| ProtoError::PaneNotFound(self.id))
     }
 
+    pub async fn search(
+        &self,
+        query: String,
+        case_sensitive: bool,
+    ) -> Result<(usize, Vec<SearchMatch>), ProtoError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(PaneCmd::Search {
+                query,
+                case_sensitive,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| ProtoError::PaneNotFound(self.id))?;
+        rx.await.map_err(|_| ProtoError::PaneNotFound(self.id))
+    }
+
     pub async fn failure_trace(&self) -> Result<Option<FailureTrace>, ProtoError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -356,6 +378,17 @@ async fn run_pane_actor(
                         let _ = reply.send((
                             engine.scrollback_len(),
                             engine.scrollback_window(offset_from_bottom, count),
+                        ));
+                    }
+                    Some(PaneCmd::Search {
+                        query,
+                        case_sensitive,
+                        reply,
+                    }) => {
+                        let engine = tracker.engine();
+                        let _ = reply.send((
+                            engine.scrollback_len(),
+                            engine.search(&query, case_sensitive),
                         ));
                     }
                     Some(PaneCmd::GetFailureTrace { reply }) => {

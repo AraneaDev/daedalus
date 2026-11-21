@@ -14,10 +14,14 @@ pub enum UiAction {
     ToggleSidebar,
     ToggleAgentPicker,
     ToggleWorktreeModal,
+    ToggleSearch,
     NewWorkspace,
     CopySelection,
     PasteClipboard,
     ForwardFailureToAgent,
+    FontZoomIn,
+    FontZoomOut,
+    FontZoomReset,
     ScrollPageUp,
     ScrollPageDown,
     ScrollToBottom,
@@ -26,11 +30,26 @@ pub enum UiAction {
     PickerDown,
     PickerConfirm,
     PickerCancel,
-    WorktreeModalChar(char),
+    WorktreeModalText(String),
     WorktreeModalBackspace,
     WorktreeModalConfirm,
     WorktreeModalCancel,
+    SearchText(String),
+    SearchBackspace,
+    SearchNext,
+    SearchPrev,
+    SearchCancel,
     Ignore,
+}
+
+/// Filters a composed text / IME slice for modal inputs, stripping control characters
+/// and optionally stripping whitespace (e.g. for Git branch names).
+pub fn filter_modal_text(raw: &str, allow_whitespace: bool) -> Option<String> {
+    let filtered: String = raw
+        .chars()
+        .filter(|ch| !ch.is_control() && (allow_whitespace || !ch.is_whitespace()))
+        .collect();
+    (!filtered.is_empty()).then_some(filtered)
 }
 
 /// Translates a `winit` key press into either a workbench UI action, a modal
@@ -41,12 +60,16 @@ pub fn translate_key(
     mods: ModifiersState,
     picker_open: bool,
     worktree_modal_open: bool,
+    search_open: bool,
 ) -> UiAction {
     if picker_open {
         return translate_picker_key(key, mods);
     }
     if worktree_modal_open {
         return translate_worktree_modal_key(key, text, mods);
+    }
+    if search_open {
+        return translate_search_key(key, text, mods);
     }
 
     // Never leak OS / window-manager Super shortcuts into the terminal.
@@ -83,10 +106,12 @@ pub fn translate_key(
                 "b" => UiAction::ToggleSidebar,
                 "p" => UiAction::ToggleAgentPicker,
                 "w" => UiAction::ToggleWorktreeModal,
+                "f" => UiAction::ToggleSearch,
                 "n" => UiAction::NewWorkspace,
                 "c" => UiAction::CopySelection,
                 "v" => UiAction::PasteClipboard,
                 "e" => UiAction::ForwardFailureToAgent,
+                "=" | "+" => UiAction::FontZoomIn,
                 _ => UiAction::Ignore,
             };
         }
@@ -106,13 +131,18 @@ pub fn translate_key(
         }
     }
 
-    // Ctrl+<key> (without Shift/Alt) -> single ASCII control byte
+    // Ctrl+<key> (without Shift/Alt) -> font zoom chords or single ASCII control byte
     if ctrl && !shift && !alt {
         return match key {
             Key::Named(NamedKey::Space) => UiAction::SendBytes(vec![0x00]),
-            Key::Character(ch) => match encode_ctrl_char(ch.as_str()) {
-                Some(byte) => UiAction::SendBytes(vec![byte]),
-                None => UiAction::Ignore,
+            Key::Character(ch) => match ch.as_str() {
+                "=" | "+" => UiAction::FontZoomIn,
+                "-" => UiAction::FontZoomOut,
+                "0" => UiAction::FontZoomReset,
+                other => match encode_ctrl_char(other) {
+                    Some(byte) => UiAction::SendBytes(vec![byte]),
+                    None => UiAction::Ignore,
+                },
             },
             _ => UiAction::Ignore,
         };
@@ -231,18 +261,56 @@ fn translate_worktree_modal_key(key: &Key, text: Option<&str>, mods: ModifiersSt
         Key::Named(NamedKey::Escape) => UiAction::WorktreeModalCancel,
         Key::Named(NamedKey::Backspace) => UiAction::WorktreeModalBackspace,
         Key::Named(_) => UiAction::Ignore,
-        Key::Character(ch) => {
-            let candidate = text
-                .filter(|t| !t.is_empty())
-                .unwrap_or(ch.as_str())
-                .chars()
-                .next();
-            match candidate {
-                Some(c) if !c.is_control() && !c.is_whitespace() => UiAction::WorktreeModalChar(c),
-                _ => UiAction::Ignore,
+        _ => {
+            let candidate = text.filter(|t| !t.is_empty()).or(match key {
+                Key::Character(ch) => Some(ch.as_str()),
+                _ => None,
+            });
+            match candidate.and_then(|raw| filter_modal_text(raw, false)) {
+                Some(cleaned) => UiAction::WorktreeModalText(cleaned),
+                None => UiAction::Ignore,
             }
         }
-        _ => UiAction::Ignore,
+    }
+}
+
+fn translate_search_key(key: &Key, text: Option<&str>, mods: ModifiersState) -> UiAction {
+    if mods.control_key()
+        && mods.shift_key()
+        && !mods.alt_key()
+        && !mods.super_key()
+        && let Key::Character(ch) = key
+        && ch.eq_ignore_ascii_case("f")
+    {
+        return UiAction::ToggleSearch;
+    }
+
+    if mods.control_key() || mods.alt_key() || mods.super_key() {
+        return UiAction::Ignore;
+    }
+
+    match key {
+        Key::Named(NamedKey::Escape) => UiAction::SearchCancel,
+        Key::Named(NamedKey::Enter) => {
+            if mods.shift_key() {
+                UiAction::SearchPrev
+            } else {
+                UiAction::SearchNext
+            }
+        }
+        Key::Named(NamedKey::Backspace) => UiAction::SearchBackspace,
+        Key::Named(NamedKey::Space) => UiAction::SearchText(" ".to_string()),
+        Key::Named(_) => UiAction::Ignore,
+        _ => {
+            let candidate = text.filter(|t| !t.is_empty()).or(match key {
+                Key::Character(ch) => Some(ch.as_str()),
+                _ => None,
+            });
+            match candidate.and_then(|raw| filter_modal_text(raw, true)) {
+                Some(cleaned) => UiAction::SearchText(cleaned),
+                None => UiAction::Ignore,
+            }
+        }
     }
 }
 
@@ -317,15 +385,15 @@ mod tests {
     fn alt_number_chords_focus_semantic_roles() {
         let alt = ModifiersState::ALT;
         assert_eq!(
-            translate_key(&char_key("1"), None, alt, false, false),
+            translate_key(&char_key("1"), None, alt, false, false, false),
             UiAction::FocusRole(PaneRole::Agent)
         );
         assert_eq!(
-            translate_key(&char_key("2"), None, alt, false, false),
+            translate_key(&char_key("2"), None, alt, false, false, false),
             UiAction::FocusRole(PaneRole::Service)
         );
         assert_eq!(
-            translate_key(&char_key("3"), None, alt, false, false),
+            translate_key(&char_key("3"), None, alt, false, false, false),
             UiAction::FocusRole(PaneRole::Runner)
         );
     }
@@ -345,6 +413,8 @@ mod tests {
             ("P", UiAction::ToggleAgentPicker),
             ("W", UiAction::ToggleWorktreeModal),
             ("w", UiAction::ToggleWorktreeModal),
+            ("F", UiAction::ToggleSearch),
+            ("f", UiAction::ToggleSearch),
             ("N", UiAction::NewWorkspace),
             ("C", UiAction::CopySelection),
             ("V", UiAction::PasteClipboard),
@@ -353,7 +423,7 @@ mod tests {
 
         for (ch, expected) in cases {
             assert_eq!(
-                translate_key(&char_key(ch), Some(ch), cs, false, false),
+                translate_key(&char_key(ch), Some(ch), cs, false, false, false),
                 expected,
                 "Ctrl+Shift+{ch}"
             );
@@ -361,8 +431,39 @@ mod tests {
 
         // Unbound Ctrl+Shift letter should be ignored, not leaked as text
         assert_eq!(
-            translate_key(&char_key("Q"), Some("Q"), cs, false, false),
+            translate_key(&char_key("Q"), Some("Q"), cs, false, false, false),
             UiAction::Ignore
+        );
+    }
+
+    #[test]
+    fn font_zoom_chords_dispatch_in_out_and_reset() {
+        let ctrl = ModifiersState::CONTROL;
+        let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
+
+        assert_eq!(
+            translate_key(&char_key("="), None, ctrl, false, false, false),
+            UiAction::FontZoomIn
+        );
+        assert_eq!(
+            translate_key(&char_key("+"), None, ctrl, false, false, false),
+            UiAction::FontZoomIn
+        );
+        assert_eq!(
+            translate_key(&char_key("+"), Some("+"), cs, false, false, false),
+            UiAction::FontZoomIn
+        );
+        assert_eq!(
+            translate_key(&char_key("="), None, cs, false, false, false),
+            UiAction::FontZoomIn
+        );
+        assert_eq!(
+            translate_key(&char_key("-"), None, ctrl, false, false, false),
+            UiAction::FontZoomOut
+        );
+        assert_eq!(
+            translate_key(&char_key("0"), None, ctrl, false, false, false),
+            UiAction::FontZoomReset
         );
     }
 
@@ -370,15 +471,29 @@ mod tests {
     fn shift_scroll_chords_dispatch_scroll_actions() {
         let shift = ModifiersState::SHIFT;
         assert_eq!(
-            translate_key(&named_key(NamedKey::PageUp), None, shift, false, false),
+            translate_key(
+                &named_key(NamedKey::PageUp),
+                None,
+                shift,
+                false,
+                false,
+                false
+            ),
             UiAction::ScrollPageUp
         );
         assert_eq!(
-            translate_key(&named_key(NamedKey::PageDown), None, shift, false, false),
+            translate_key(
+                &named_key(NamedKey::PageDown),
+                None,
+                shift,
+                false,
+                false,
+                false
+            ),
             UiAction::ScrollPageDown
         );
         assert_eq!(
-            translate_key(&named_key(NamedKey::End), None, shift, false, false),
+            translate_key(&named_key(NamedKey::End), None, shift, false, false, false),
             UiAction::ScrollToBottom
         );
     }
@@ -387,19 +502,19 @@ mod tests {
     fn vt_encodes_ctrl_letters_and_ctrl_c() {
         let ctrl = ModifiersState::CONTROL;
         assert_eq!(
-            translate_key(&char_key("a"), Some("\x01"), ctrl, false, false),
+            translate_key(&char_key("a"), Some("\x01"), ctrl, false, false, false),
             UiAction::SendBytes(vec![0x01])
         );
         assert_eq!(
-            translate_key(&char_key("c"), Some("\x03"), ctrl, false, false),
+            translate_key(&char_key("c"), Some("\x03"), ctrl, false, false, false),
             UiAction::SendBytes(vec![0x03])
         );
         assert_eq!(
-            translate_key(&char_key("d"), None, ctrl, false, false),
+            translate_key(&char_key("d"), None, ctrl, false, false, false),
             UiAction::SendBytes(vec![0x04])
         );
         assert_eq!(
-            translate_key(&char_key("z"), None, ctrl, false, false),
+            translate_key(&char_key("z"), None, ctrl, false, false, false),
             UiAction::SendBytes(vec![0x1a])
         );
     }
@@ -426,7 +541,7 @@ mod tests {
 
         for (named, expected) in cases {
             assert_eq!(
-                translate_key(&named_key(named), None, none, false, false),
+                translate_key(&named_key(named), None, none, false, false, false),
                 UiAction::SendBytes(expected.to_vec()),
                 "NamedKey::{named:?}"
             );
@@ -438,6 +553,7 @@ mod tests {
                 &named_key(NamedKey::Tab),
                 None,
                 ModifiersState::SHIFT,
+                false,
                 false,
                 false
             ),
@@ -451,6 +567,7 @@ mod tests {
                 None,
                 ModifiersState::SHIFT,
                 false,
+                false,
                 false
             ),
             UiAction::Ignore
@@ -461,25 +578,25 @@ mod tests {
     fn vt_encodes_alt_chords_and_utf8_text() {
         let alt = ModifiersState::ALT;
         assert_eq!(
-            translate_key(&char_key("b"), None, alt, false, false),
+            translate_key(&char_key("b"), None, alt, false, false, false),
             UiAction::SendBytes(b"\x1bb".to_vec())
         );
         assert_eq!(
-            translate_key(&char_key("é"), None, alt, false, false),
+            translate_key(&char_key("é"), None, alt, false, false, false),
             UiAction::SendBytes("\x1bé".as_bytes().to_vec())
         );
 
         let none = ModifiersState::empty();
         assert_eq!(
-            translate_key(&char_key("x"), Some("x"), none, false, false),
+            translate_key(&char_key("x"), Some("x"), none, false, false, false),
             UiAction::SendBytes(b"x".to_vec())
         );
         assert_eq!(
-            translate_key(&char_key("λ"), Some("λ"), none, false, false),
+            translate_key(&char_key("λ"), Some("λ"), none, false, false, false),
             UiAction::SendBytes("λ".as_bytes().to_vec())
         );
         assert_eq!(
-            translate_key(&char_key("🚀"), None, none, false, false),
+            translate_key(&char_key("🚀"), None, none, false, false, false),
             UiAction::SendBytes("🚀".as_bytes().to_vec())
         );
         // Super-modified keys are never leaked to the PTY
@@ -488,6 +605,7 @@ mod tests {
                 &char_key("l"),
                 Some("l"),
                 ModifiersState::SUPER,
+                false,
                 false,
                 false
             ),
@@ -499,11 +617,18 @@ mod tests {
     fn picker_modal_captures_navigation_and_swallows_other_keys() {
         let none = ModifiersState::empty();
         assert_eq!(
-            translate_key(&named_key(NamedKey::ArrowUp), None, none, true, false),
+            translate_key(
+                &named_key(NamedKey::ArrowUp),
+                None,
+                none,
+                true,
+                false,
+                false
+            ),
             UiAction::PickerUp
         );
         assert_eq!(
-            translate_key(&char_key("k"), Some("k"), none, true, false),
+            translate_key(&char_key("k"), Some("k"), none, true, false, false),
             UiAction::PickerUp
         );
         assert_eq!(
@@ -512,16 +637,24 @@ mod tests {
                 Some("K"),
                 ModifiersState::SHIFT,
                 true,
+                false,
                 false
             ),
             UiAction::PickerUp
         );
         assert_eq!(
-            translate_key(&named_key(NamedKey::ArrowDown), None, none, true, false),
+            translate_key(
+                &named_key(NamedKey::ArrowDown),
+                None,
+                none,
+                true,
+                false,
+                false
+            ),
             UiAction::PickerDown
         );
         assert_eq!(
-            translate_key(&char_key("j"), Some("j"), none, true, false),
+            translate_key(&char_key("j"), Some("j"), none, true, false, false),
             UiAction::PickerDown
         );
         assert_eq!(
@@ -530,12 +663,20 @@ mod tests {
                 Some("J"),
                 ModifiersState::SHIFT,
                 true,
+                false,
                 false
             ),
             UiAction::PickerDown
         );
         assert_eq!(
-            translate_key(&named_key(NamedKey::Enter), Some("\r"), none, true, false),
+            translate_key(
+                &named_key(NamedKey::Enter),
+                Some("\r"),
+                none,
+                true,
+                false,
+                false
+            ),
             UiAction::PickerConfirm
         );
         assert_eq!(
@@ -544,6 +685,7 @@ mod tests {
                 Some("\x1b"),
                 none,
                 true,
+                false,
                 false
             ),
             UiAction::PickerCancel
@@ -551,11 +693,18 @@ mod tests {
 
         // Normal text and workbench chords are swallowed while picker is open
         assert_eq!(
-            translate_key(&char_key("a"), Some("a"), none, true, false),
+            translate_key(&char_key("a"), Some("a"), none, true, false, false),
             UiAction::Ignore
         );
         assert_eq!(
-            translate_key(&char_key("1"), None, ModifiersState::ALT, true, false),
+            translate_key(
+                &char_key("1"),
+                None,
+                ModifiersState::ALT,
+                true,
+                false,
+                false
+            ),
             UiAction::Ignore
         );
         assert_eq!(
@@ -564,12 +713,20 @@ mod tests {
                 Some("Z"),
                 ModifiersState::CONTROL | ModifiersState::SHIFT,
                 true,
+                false,
                 false
             ),
             UiAction::Ignore
         );
         assert_eq!(
-            translate_key(&char_key("k"), None, ModifiersState::CONTROL, true, false),
+            translate_key(
+                &char_key("k"),
+                None,
+                ModifiersState::CONTROL,
+                true,
+                false,
+                false
+            ),
             UiAction::Ignore
         );
     }
@@ -578,35 +735,49 @@ mod tests {
     fn ctrl_shift_p_toggles_picker_closed_when_already_open() {
         let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
         assert_eq!(
-            translate_key(&char_key("P"), Some("P"), cs, true, false),
+            translate_key(&char_key("P"), Some("P"), cs, true, false, false),
             UiAction::ToggleAgentPicker
         );
         assert_eq!(
-            translate_key(&char_key("p"), Some("p"), cs, true, false),
+            translate_key(&char_key("p"), Some("p"), cs, true, false, false),
             UiAction::ToggleAgentPicker
         );
         assert_eq!(
-            translate_key(&char_key("P"), None, cs | ModifiersState::ALT, true, false),
+            translate_key(
+                &char_key("P"),
+                None,
+                cs | ModifiersState::ALT,
+                true,
+                false,
+                false
+            ),
             UiAction::Ignore
         );
         assert_eq!(
-            translate_key(&char_key("p"), None, ModifiersState::CONTROL, true, false),
+            translate_key(
+                &char_key("p"),
+                None,
+                ModifiersState::CONTROL,
+                true,
+                false,
+                false
+            ),
             UiAction::Ignore
         );
     }
 
     #[test]
-    fn worktree_modal_captures_branch_typing_submit_cancel_and_toggle() {
+    fn worktree_modal_captures_branch_typing_ime_submit_cancel_and_toggle() {
         let none = ModifiersState::empty();
         let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
 
         assert_eq!(
-            translate_key(&char_key("f"), Some("f"), none, false, true),
-            UiAction::WorktreeModalChar('f')
+            translate_key(&char_key("f"), Some("f"), none, false, true, false),
+            UiAction::WorktreeModalText("f".to_string())
         );
         assert_eq!(
-            translate_key(&char_key("/"), Some("/"), none, false, true),
-            UiAction::WorktreeModalChar('/')
+            translate_key(&char_key("/"), Some("/"), none, false, true, false),
+            UiAction::WorktreeModalText("/".to_string())
         );
         assert_eq!(
             translate_key(
@@ -614,16 +785,43 @@ mod tests {
                 Some("A"),
                 ModifiersState::SHIFT,
                 false,
-                true
+                true,
+                false
             ),
-            UiAction::WorktreeModalChar('A')
+            UiAction::WorktreeModalText("A".to_string())
+        );
+        // Full multi-char IME / dead-key composition string, stripping whitespace & control chars
+        assert_eq!(
+            translate_key(
+                &char_key("é"),
+                Some("feat/日本語\n "),
+                none,
+                false,
+                true,
+                false
+            ),
+            UiAction::WorktreeModalText("feat/日本語".to_string())
         );
         assert_eq!(
-            translate_key(&named_key(NamedKey::Backspace), None, none, false, true),
+            translate_key(
+                &named_key(NamedKey::Backspace),
+                None,
+                none,
+                false,
+                true,
+                false
+            ),
             UiAction::WorktreeModalBackspace
         );
         assert_eq!(
-            translate_key(&named_key(NamedKey::Enter), Some("\r"), none, false, true),
+            translate_key(
+                &named_key(NamedKey::Enter),
+                Some("\r"),
+                none,
+                false,
+                true,
+                false
+            ),
             UiAction::WorktreeModalConfirm
         );
         assert_eq!(
@@ -632,26 +830,143 @@ mod tests {
                 Some("\x1b"),
                 none,
                 false,
-                true
+                true,
+                false
             ),
             UiAction::WorktreeModalCancel
         );
         assert_eq!(
-            translate_key(&char_key("W"), Some("W"), cs, false, true),
+            translate_key(&char_key("W"), Some("W"), cs, false, true, false),
             UiAction::ToggleWorktreeModal
         );
 
         // Space, control, and alt chords are swallowed while worktree modal is open
         assert_eq!(
-            translate_key(&named_key(NamedKey::Space), Some(" "), none, false, true),
+            translate_key(
+                &named_key(NamedKey::Space),
+                Some(" "),
+                none,
+                false,
+                true,
+                false
+            ),
             UiAction::Ignore
         );
         assert_eq!(
-            translate_key(&char_key("c"), None, ModifiersState::CONTROL, false, true),
+            translate_key(
+                &char_key("c"),
+                None,
+                ModifiersState::CONTROL,
+                false,
+                true,
+                false
+            ),
             UiAction::Ignore
         );
         assert_eq!(
-            translate_key(&char_key("1"), None, ModifiersState::ALT, false, true),
+            translate_key(
+                &char_key("1"),
+                None,
+                ModifiersState::ALT,
+                false,
+                true,
+                false
+            ),
+            UiAction::Ignore
+        );
+    }
+
+    #[test]
+    fn search_mode_captures_query_ime_navigation_and_cancel() {
+        let none = ModifiersState::empty();
+        let shift = ModifiersState::SHIFT;
+        let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
+
+        assert_eq!(
+            translate_key(&char_key("e"), Some("e"), none, false, false, true),
+            UiAction::SearchText("e".to_string())
+        );
+        assert_eq!(
+            translate_key(
+                &named_key(NamedKey::Space),
+                Some(" "),
+                none,
+                false,
+                false,
+                true
+            ),
+            UiAction::SearchText(" ".to_string())
+        );
+        // Multi-char IME composition preserves spaces and filters control chars
+        assert_eq!(
+            translate_key(
+                &char_key("x"),
+                Some("foo bar\x07"),
+                none,
+                false,
+                false,
+                true
+            ),
+            UiAction::SearchText("foo bar".to_string())
+        );
+        assert_eq!(
+            translate_key(
+                &named_key(NamedKey::Backspace),
+                None,
+                none,
+                false,
+                false,
+                true
+            ),
+            UiAction::SearchBackspace
+        );
+        assert_eq!(
+            translate_key(
+                &named_key(NamedKey::Enter),
+                Some("\r"),
+                none,
+                false,
+                false,
+                true
+            ),
+            UiAction::SearchNext
+        );
+        assert_eq!(
+            translate_key(
+                &named_key(NamedKey::Enter),
+                Some("\r"),
+                shift,
+                false,
+                false,
+                true
+            ),
+            UiAction::SearchPrev
+        );
+        assert_eq!(
+            translate_key(
+                &named_key(NamedKey::Escape),
+                Some("\x1b"),
+                none,
+                false,
+                false,
+                true
+            ),
+            UiAction::SearchCancel
+        );
+        assert_eq!(
+            translate_key(&char_key("F"), Some("F"), cs, false, false, true),
+            UiAction::ToggleSearch
+        );
+        // Ctrl+other is swallowed rather than typed
+        assert_eq!(
+            translate_key(
+                &char_key("c"),
+                None,
+                ModifiersState::CONTROL,
+                false,
+                false,
+                true
+            ),
             UiAction::Ignore
         );
     }

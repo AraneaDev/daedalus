@@ -7,16 +7,17 @@ use glyphon::{
     Viewport, Weight, Wrap,
 };
 
+use crate::config::clamp_font_size;
 use crate::layout::{
     LayoutMetrics, PaneRect, Rect, WorkspaceLayout, sidebar_new_workspace_rect,
     sidebar_new_worktree_rect, sidebar_workspace_rect,
 };
-use crate::state::{AgentPreset, AppState};
+use crate::state::{AgentPreset, AppState, SearchState};
 use crate::theme::{self, Theme};
 
 use super::{
     external_status_color, format_docker_health, format_ports_summary, picker_item_rect,
-    picker_modal_rect, sidebar_branch_badge_rect, sidebar_docker_pill_rect,
+    picker_modal_rect, search_bar_rect, sidebar_branch_badge_rect, sidebar_docker_pill_rect,
     sidebar_external_badge_rect, visible_external_statuses, workspace_branch_badge,
     worktree_input_rect, worktree_modal_rect,
 };
@@ -67,15 +68,70 @@ fn select_mono_family(font_system: &FontSystem) -> Option<String> {
     None
 }
 
-/// Measures the physical `(cell_w, cell_h)` of the chosen monospace font at `scale_factor`.
-pub fn measure_cell_size(
+fn resolve_mono_family(font_system: &FontSystem, requested: Option<&str>) -> Option<String> {
+    if let Some(name) = requested.map(str::trim).filter(|s| !s.is_empty()) {
+        let matched = font_system.db().faces().find_map(|face| {
+            face.families
+                .iter()
+                .find(|(fam, _)| fam.eq_ignore_ascii_case(name))
+                .map(|(fam, _)| fam.clone())
+        });
+        if matched.is_some() {
+            return matched;
+        }
+        tracing::warn!(
+            font_family = %name,
+            "requested font_family not found; falling back to default monospace font"
+        );
+    }
+    select_mono_family(font_system)
+}
+
+/// Computes the proportional logical line height for a clamped logical `font_size`.
+pub fn line_height_for_font_size(font_size_logical: f32) -> f32 {
+    let clamped = clamp_font_size(font_size_logical);
+    (clamped * (LINE_HEIGHT_LOGICAL / FONT_SIZE_LOGICAL))
+        .round()
+        .max(clamped + 2.0)
+}
+
+/// Left-truncates `input` to at most `max_chars` Unicode scalar values, prefixing `'…'`
+/// when truncated so the trailing characters and caret stay visible inside fixed-width inputs.
+pub fn truncate_left_with_ellipsis(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let char_count = input.chars().count();
+    if char_count <= max_chars {
+        return input.to_string();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let keep = max_chars - 1;
+    let skip = char_count - keep;
+    let byte_start = input
+        .char_indices()
+        .nth(skip)
+        .map_or(input.len(), |(idx, _)| idx);
+    let mut out = String::with_capacity('…'.len_utf8() + (input.len() - byte_start));
+    out.push('…');
+    out.push_str(&input[byte_start..]);
+    out
+}
+
+/// Measures the physical `(cell_w, cell_h)` of the chosen monospace font at
+/// `font_size_logical` and `scale_factor`.
+pub fn measure_cell_size_for_font(
     font_system: &mut FontSystem,
     mono_family_name: Option<&str>,
+    font_size_logical: f32,
     scale_factor: f32,
 ) -> (f32, f32) {
     let s = sanitize_scale(scale_factor);
-    let font_size = FONT_SIZE_LOGICAL * s;
-    let line_height = LINE_HEIGHT_LOGICAL * s;
+    let clamped_logical = clamp_font_size(font_size_logical);
+    let font_size = clamped_logical * s;
+    let line_height = line_height_for_font_size(clamped_logical) * s;
 
     let family = mono_family_name.map_or(Family::Monospace, Family::Name);
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
@@ -105,10 +161,26 @@ pub fn measure_cell_size(
     (measured_w.max(1.0), line_height.round().max(1.0))
 }
 
+/// Measures the physical `(cell_w, cell_h)` of the chosen monospace font at the default
+/// `FONT_SIZE_LOGICAL` and `scale_factor`.
+pub fn measure_cell_size(
+    font_system: &mut FontSystem,
+    mono_family_name: Option<&str>,
+    scale_factor: f32,
+) -> (f32, f32) {
+    measure_cell_size_for_font(
+        font_system,
+        mono_family_name,
+        FONT_SIZE_LOGICAL,
+        scale_factor,
+    )
+}
+
 struct CachedPaneRows {
     rows: Vec<Buffer>,
     scale_factor: f32,
     viewport_width: f32,
+    theme: Theme,
 }
 
 struct ChromeTextItem {
@@ -148,8 +220,9 @@ pub struct TextRenderer {
     modal_renderer: GlyphonTextRenderer,
     mono_family_name: Option<String>,
     scale_factor: f32,
-    font_size: f32,
-    line_height: f32,
+    font_size_logical: f32,
+    font_size_px: f32,
+    line_height_px: f32,
     cell_w: f32,
     cell_h: f32,
     pane_buffers: HashMap<PaneId, CachedPaneRows>,
@@ -159,6 +232,7 @@ pub struct TextRenderer {
 }
 
 impl TextRenderer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -166,6 +240,8 @@ impl TextRenderer {
         width: u32,
         height: u32,
         scale_factor: f32,
+        font_size_logical: f32,
+        font_family: Option<&str>,
     ) -> Self {
         let mut font_system = FontSystem::new();
         let swash_cache = SwashCache::new();
@@ -184,9 +260,16 @@ impl TextRenderer {
         let modal_renderer =
             GlyphonTextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
 
-        let mono_family_name = select_mono_family(&font_system);
+        let mono_family_name = resolve_mono_family(&font_system, font_family);
         let s = sanitize_scale(scale_factor);
-        let (cell_w, cell_h) = measure_cell_size(&mut font_system, mono_family_name.as_deref(), s);
+        let clamped_logical = clamp_font_size(font_size_logical);
+        let line_height_logical = line_height_for_font_size(clamped_logical);
+        let (cell_w, cell_h) = measure_cell_size_for_font(
+            &mut font_system,
+            mono_family_name.as_deref(),
+            clamped_logical,
+            s,
+        );
 
         Self {
             font_system,
@@ -198,8 +281,9 @@ impl TextRenderer {
             modal_renderer,
             mono_family_name,
             scale_factor: s,
-            font_size: FONT_SIZE_LOGICAL * s,
-            line_height: LINE_HEIGHT_LOGICAL * s,
+            font_size_logical: clamped_logical,
+            font_size_px: clamped_logical * s,
+            line_height_px: line_height_logical * s,
             cell_w,
             cell_h,
             pane_buffers: HashMap::new(),
@@ -213,6 +297,33 @@ impl TextRenderer {
         (self.cell_w, self.cell_h)
     }
 
+    pub fn font_size(&self) -> f32 {
+        self.font_size_logical
+    }
+
+    /// Updates the logical terminal font size (clamped to `[8.0, 32.0]`), recalculates cell
+    /// metrics, invalidates cached row buffers, and returns whether `(cell_w, cell_h)` changed.
+    pub fn set_font_size(&mut self, font_size_logical: f32) -> bool {
+        let clamped = clamp_font_size(font_size_logical);
+        if (clamped - self.font_size_logical).abs() <= 1e-4 {
+            return false;
+        }
+        self.font_size_logical = clamped;
+        self.font_size_px = clamped * self.scale_factor;
+        self.line_height_px = line_height_for_font_size(clamped) * self.scale_factor;
+        let (cw, ch) = measure_cell_size_for_font(
+            &mut self.font_system,
+            self.mono_family_name.as_deref(),
+            clamped,
+            self.scale_factor,
+        );
+        let metrics_changed = (cw - self.cell_w).abs() > 1e-4 || (ch - self.cell_h).abs() > 1e-4;
+        self.cell_w = cw;
+        self.cell_h = ch;
+        self.pane_buffers.clear();
+        metrics_changed
+    }
+
     pub fn resize(&mut self, queue: &wgpu::Queue, width: u32, height: u32, scale_factor: f32) {
         self.viewport.update(
             queue,
@@ -224,10 +335,14 @@ impl TextRenderer {
         let s = sanitize_scale(scale_factor);
         if (s - self.scale_factor).abs() > 1e-4 {
             self.scale_factor = s;
-            self.font_size = FONT_SIZE_LOGICAL * s;
-            self.line_height = LINE_HEIGHT_LOGICAL * s;
-            let (cw, ch) =
-                measure_cell_size(&mut self.font_system, self.mono_family_name.as_deref(), s);
+            self.font_size_px = self.font_size_logical * s;
+            self.line_height_px = line_height_for_font_size(self.font_size_logical) * s;
+            let (cw, ch) = measure_cell_size_for_font(
+                &mut self.font_system,
+                self.mono_family_name.as_deref(),
+                self.font_size_logical,
+                s,
+            );
             self.cell_w = cw;
             self.cell_h = ch;
             self.pane_buffers.clear();
@@ -265,7 +380,7 @@ impl TextRenderer {
             let visible_rows = pane_state.visible_rows();
             let row_count = visible_rows.len().min(pane_rect.rows as usize);
 
-            let metrics = Metrics::new(self.font_size, self.line_height);
+            let metrics = Metrics::new(self.font_size_px, self.line_height_px);
             let viewport_width = pane_rect.viewport.width.max(1.0);
 
             let entry = self
@@ -275,11 +390,13 @@ impl TextRenderer {
                     rows: Vec::new(),
                     scale_factor: 0.0,
                     viewport_width: 0.0,
+                    theme: *theme,
                 });
 
             let needs_full_rebuild = entry.rows.len() != row_count
                 || (entry.scale_factor - self.scale_factor).abs() > 1e-4
-                || (entry.viewport_width - viewport_width).abs() > 1.0;
+                || (entry.viewport_width - viewport_width).abs() > 1.0
+                || entry.theme != *theme;
 
             if entry.rows.len() < row_count {
                 while entry.rows.len() < row_count {
@@ -290,6 +407,7 @@ impl TextRenderer {
             }
             entry.scale_factor = self.scale_factor;
             entry.viewport_width = viewport_width;
+            entry.theme = *theme;
 
             let family = self
                 .mono_family_name
@@ -305,6 +423,7 @@ impl TextRenderer {
                         metrics,
                         viewport_width,
                         family,
+                        theme,
                     );
                 }
             } else if !dirty_indices.is_empty() {
@@ -318,6 +437,7 @@ impl TextRenderer {
                             metrics,
                             viewport_width,
                             family,
+                            theme,
                         );
                     }
                 }
@@ -380,15 +500,17 @@ impl TextRenderer {
             tracing::warn!(%err, "glyphon base text prepare failed");
         }
 
-        // 4. Rebuild & prepare modal text pass if a centered modal is open.
+        // 4. Rebuild & prepare overlay text pass if a modal or search bar is open.
         self.modal_items.clear();
-        let modal_open = state.picker.open || state.worktree_modal.open;
+        let modal_open = state.picker.open || state.worktree_modal.open || state.search.is_some();
         self.has_modal_text = modal_open;
         if modal_open {
             if state.picker.open {
                 self.build_picker_items(state, theme, screen_w, screen_h);
             } else if state.worktree_modal.open {
                 self.build_worktree_modal_items(state, theme, screen_w, screen_h);
+            } else if let Some(ref search) = state.search {
+                self.build_search_bar_items(search, state, layout, theme);
             }
             let modal_areas: Vec<TextArea<'_>> = self
                 .modal_items
@@ -931,7 +1053,14 @@ impl TextRenderer {
                 bold: false,
             });
         } else {
-            let typed = format!("{}|", state.worktree_modal.branch_input);
+            let usable_w = (input_rect.width - 24.0 * s).max(16.0);
+            let approx_char_w = (CHROME_FONT_SIZE_LOGICAL * s * 0.62).max(1.0);
+            let max_chars = ((usable_w / approx_char_w).floor() as usize)
+                .saturating_sub(1)
+                .max(4);
+            let truncated =
+                truncate_left_with_ellipsis(&state.worktree_modal.branch_input, max_chars);
+            let typed = format!("{truncated}|");
             self.push_modal_line(ChromeLineSpec {
                 text: &typed,
                 left: input_rect.x + 10.0 * s,
@@ -957,6 +1086,76 @@ impl TextRenderer {
             bold: false,
         });
     }
+
+    fn build_search_bar_items(
+        &mut self,
+        search: &SearchState,
+        state: &AppState,
+        layout: &WorkspaceLayout,
+        theme: &Theme,
+    ) {
+        let Some(pane_rect) = layout
+            .panes
+            .iter()
+            .find(|p| state.pane_id_for_role(p.role) == Some(search.pane_id))
+            .or_else(|| layout.pane(state.focused_role))
+        else {
+            return;
+        };
+        let s = self.scale_factor;
+        let bar = search_bar_rect(pane_rect, s);
+        let (cur, total) = search.display_counter();
+        let counter = format!("({cur}/{total})");
+        let counter_w = ((counter.chars().count() as f32)
+            * (CHROME_SUB_FONT_SIZE_LOGICAL * s * 0.65)
+            + 12.0 * s)
+            .min(bar.width * 0.45);
+        let query_max_w = (bar.width - 16.0 * s - counter_w).max(24.0);
+        let approx_char_w = (CHROME_FONT_SIZE_LOGICAL * s * 0.62).max(1.0);
+        let prefix = "Search: ";
+        let max_query_chars = ((query_max_w / approx_char_w).floor() as usize)
+            .saturating_sub(prefix.chars().count() + 1)
+            .max(3);
+        let display_query = truncate_left_with_ellipsis(&search.query, max_query_chars);
+        let query_line = format!("{prefix}{display_query}|");
+
+        let query_bounds = Rect::new(bar.x + 8.0 * s, bar.y, query_max_w, bar.height);
+        self.push_modal_line(ChromeLineSpec {
+            text: &query_line,
+            left: bar.x + 8.0 * s,
+            top: bar.y + (bar.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+            max_w: query_max_w,
+            bounds: query_bounds,
+            font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+            line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+            color: theme.text_primary,
+            bold: false,
+        });
+
+        let counter_color = if !search.query.is_empty() && total == 0 {
+            theme.status_err
+        } else {
+            theme.text_muted
+        };
+        let counter_left = (bar.right() - counter_w + 4.0 * s).max(query_bounds.right() + 4.0 * s);
+        let counter_bounds = Rect::new(
+            counter_left,
+            bar.y,
+            (bar.right() - counter_left - 6.0 * s).max(1.0),
+            bar.height,
+        );
+        self.push_modal_line(ChromeLineSpec {
+            text: &counter,
+            left: counter_left,
+            top: bar.y + (bar.height - CHROME_SUB_LINE_HEIGHT_LOGICAL * s) * 0.5,
+            max_w: counter_bounds.width,
+            bounds: counter_bounds,
+            font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+            line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
+            color: counter_color,
+            bold: false,
+        });
+    }
 }
 
 /// Coalesced styled text run within a single terminal row.
@@ -968,13 +1167,13 @@ struct RowSpan {
     italic: bool,
 }
 
-fn build_row_spans(row: &GridRow) -> Vec<RowSpan> {
+fn build_row_spans(row: &GridRow, theme: &Theme) -> Vec<RowSpan> {
     let mut spans: Vec<RowSpan> = Vec::new();
     for cell in &row.cells {
         if cell.width == 0 {
             continue;
         }
-        let (fg_rgba, _bg) = theme::resolve_cell_colors(cell.fg, cell.bg, cell.flags);
+        let (fg_rgba, _bg) = theme.resolve_cell_colors(cell.fg, cell.bg, cell.flags);
         let color = fg_rgba.to_glyphon_color();
         let bold = cell.flags.contains(CellFlags::BOLD);
         let italic = cell.flags.contains(CellFlags::ITALIC);
@@ -1009,6 +1208,7 @@ fn shape_terminal_row(
     metrics: Metrics,
     viewport_width: f32,
     family: Family<'_>,
+    theme: &Theme,
 ) {
     buffer.set_metrics(metrics);
     buffer.set_wrap(Wrap::None);
@@ -1017,10 +1217,10 @@ fn shape_terminal_row(
         Some(metrics.line_height * 2.0),
     );
 
-    let spans = build_row_spans(row);
+    let spans = build_row_spans(row, theme);
     let default_attrs = Attrs::new()
         .family(family)
-        .color(theme::TEXT_PRIMARY.to_glyphon_color());
+        .color(theme.text_primary.to_glyphon_color());
 
     if spans.is_empty() {
         buffer.set_text("", &default_attrs, Shaping::Advanced, None);
@@ -1093,7 +1293,7 @@ mod tests {
             ],
         };
 
-        let spans = build_row_spans(&row);
+        let spans = build_row_spans(&row, &Theme::dark());
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].text, "Hi");
         assert!(spans[0].bold);
@@ -1103,15 +1303,47 @@ mod tests {
         assert_eq!(spans[1].text, "!界");
         assert!(!spans[1].bold);
         assert!(spans[1].italic);
+
+        // Light theme uses SolarizedLight default foreground for Color::Default
+        let light = Theme::from_preset(crate::theme::ThemeName::SolarizedLight);
+        let light_spans = build_row_spans(&row, &light);
+        assert_eq!(light_spans[1].color, light.text_primary.to_glyphon_color());
     }
 
     #[test]
-    fn measure_cell_size_scales_with_dpi() {
+    fn measure_cell_size_scales_with_dpi_and_font_size_clamp() {
         let mut font_system = FontSystem::new();
         let family = select_mono_family(&font_system);
         let (w1, h1) = measure_cell_size(&mut font_system, family.as_deref(), 1.0);
         let (w2, h2) = measure_cell_size(&mut font_system, family.as_deref(), 2.0);
         assert!(w1 > 0.0 && h1 > 0.0);
         assert!(w2 > w1 && h2 > h1);
+
+        // Clamped min (<= 8.0) and max (>= 32.0) match exact 8.0 and 32.0 measurements
+        let min_clamped = measure_cell_size_for_font(&mut font_system, family.as_deref(), 2.0, 1.0);
+        let min_exact = measure_cell_size_for_font(&mut font_system, family.as_deref(), 8.0, 1.0);
+        assert_eq!(min_clamped, min_exact);
+
+        let max_clamped =
+            measure_cell_size_for_font(&mut font_system, family.as_deref(), 72.0, 1.0);
+        let max_exact = measure_cell_size_for_font(&mut font_system, family.as_deref(), 32.0, 1.0);
+        assert_eq!(max_clamped, max_exact);
+        assert!(max_exact.0 > min_exact.0 && max_exact.1 > min_exact.1);
+    }
+
+    #[test]
+    fn truncate_left_with_ellipsis_handles_long_ascii_and_multibyte_utf8() {
+        assert_eq!(truncate_left_with_ellipsis("feat/auth", 20), "feat/auth");
+        assert_eq!(truncate_left_with_ellipsis("feat/auth", 9), "feat/auth");
+        assert_eq!(
+            truncate_left_with_ellipsis("feat/very-long-branch", 12),
+            "…long-branch"
+        );
+        assert_eq!(
+            truncate_left_with_ellipsis("feat/日本語テスト🚀", 6),
+            "…語テスト🚀"
+        );
+        assert_eq!(truncate_left_with_ellipsis("abcdef", 1), "…");
+        assert_eq!(truncate_left_with_ellipsis("abcdef", 0), "");
     }
 }

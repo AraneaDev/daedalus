@@ -1,9 +1,10 @@
 use daedalus_proto::{
-    Cell, CellFlags, Color, CursorState, GridDelta, GridRow, GridSnapshot, PaneId,
+    Cell, CellFlags, Color, CursorState, GridDelta, GridRow, GridSnapshot, PaneId, SearchMatch,
 };
 use std::collections::VecDeque;
 
 pub const MAX_TRACE_BYTES: usize = 64 * 1024;
+pub const MAX_SEARCH_MATCHES: usize = 2_000;
 
 #[derive(Debug, Clone)]
 struct StoredRow {
@@ -467,6 +468,70 @@ impl Grid {
             }
         }
         String::new()
+    }
+
+    /// Searches scrollback and viewport rows top-to-bottom, returning up to `MAX_SEARCH_MATCHES` matches.
+    pub fn search(&self, query: &str, case_sensitive: bool) -> Vec<SearchMatch> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let needle_owned;
+        let needle = if case_sensitive {
+            query
+        } else {
+            needle_owned = query.to_lowercase();
+            &needle_owned
+        };
+        if needle.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matches = Vec::new();
+        let mut haystack = String::new();
+        let mut byte_to_col: Vec<u16> = Vec::new();
+
+        for row in self.scrollback.iter().chain(self.viewport.iter()) {
+            haystack.clear();
+            byte_to_col.clear();
+
+            for (col, cell) in row.cells.iter().enumerate() {
+                let col_u16 = col as u16;
+                let start = haystack.len();
+                if case_sensitive {
+                    haystack.push_str(&cell.text);
+                } else {
+                    for ch in cell.text.chars() {
+                        for lc in ch.to_lowercase() {
+                            haystack.push(lc);
+                        }
+                    }
+                }
+                let added = haystack.len() - start;
+                byte_to_col.resize(byte_to_col.len() + added, col_u16);
+            }
+
+            for (start_byte, matched) in haystack.match_indices(needle) {
+                let end_byte = start_byte + matched.len();
+                let start_col = byte_to_col[start_byte];
+                let last_col = byte_to_col[end_byte - 1];
+                let end_col = row
+                    .cells
+                    .get(last_col as usize)
+                    .map(|c| last_col.saturating_add(c.width.max(1) as u16))
+                    .unwrap_or_else(|| last_col.saturating_add(1));
+                matches.push(SearchMatch {
+                    abs_row: row.abs_row,
+                    start_col,
+                    end_col,
+                });
+                if matches.len() >= MAX_SEARCH_MATCHES {
+                    return matches;
+                }
+            }
+        }
+
+        matches
     }
 }
 
