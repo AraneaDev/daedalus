@@ -1,0 +1,24 @@
+[package]
+name = "daedalusd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+ghostty-vt = ["daedalus-vt/ghostty-vt"]
+
+[dependencies]
+clap.workspace = true
+daedalus-proto = { path = "../daedalus-proto" }
+daedalus-vt = { path = "../daedalus-vt" }
+nix.workspace = true
+portable-pty.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
