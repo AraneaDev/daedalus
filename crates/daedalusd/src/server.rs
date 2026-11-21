@@ -34,9 +34,12 @@ impl DaemonServer {
         runtime_dir: PathBuf,
         supervisor: Supervisor,
     ) -> std::io::Result<Self> {
-        if let Some(parent) = socket_path.parent() {
+        if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let created = !parent.exists();
             std::fs::create_dir_all(parent)?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            if created {
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            }
         }
         std::fs::create_dir_all(&runtime_dir)?;
 
@@ -134,39 +137,10 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) {
         }
     });
 
-    let mut event_rx = registry.subscribe_events();
+    let event_rx = registry.subscribe_events();
     let sub_out_tx = out_tx.clone();
     let sub_filter = Arc::clone(&filter);
-    let event_task = tokio::spawn(async move {
-        loop {
-            match event_rx.recv().await {
-                Ok(evt) => {
-                    if !sub_filter.read().await.matches(&evt) {
-                        continue;
-                    }
-                    match &evt {
-                        ServerEvent::GridDelta(delta) => {
-                            let pane_id = delta.pane_id;
-                            if sub_out_tx.try_send(ServerMessage::Event(evt)).is_err() {
-                                let _ = sub_out_tx.try_send(ServerMessage::Event(
-                                    ServerEvent::ResyncRequired { pane_id },
-                                ));
-                            }
-                        }
-                        _ => {
-                            if sub_out_tx.send(ServerMessage::Event(evt)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(skipped, "event subscriber lagged");
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
+    let event_task = tokio::spawn(forward_subscriber_events(event_rx, sub_out_tx, sub_filter));
 
     loop {
         match read_frame::<_, Request>(&mut reader).await {
@@ -267,5 +241,246 @@ async fn dispatch_request(
             f.pane_ids = None;
             Ok(ResponsePayload::Ok)
         }
+    }
+}
+
+enum DrainResult {
+    Drained,
+    StillFull,
+    Closed,
+}
+
+fn drain_pending_resync(
+    pending_resync: &mut HashSet<PaneId>,
+    out_tx: &mpsc::Sender<ServerMessage>,
+) -> DrainResult {
+    let pane_ids: Vec<PaneId> = pending_resync.drain().collect();
+    for (idx, pane_id) in pane_ids.iter().enumerate() {
+        let msg = ServerMessage::Event(ServerEvent::ResyncRequired { pane_id: *pane_id });
+        match out_tx.try_send(msg) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                pending_resync.extend(pane_ids[idx..].iter().copied());
+                return DrainResult::StillFull;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return DrainResult::Closed;
+            }
+        }
+    }
+    DrainResult::Drained
+}
+
+async fn forward_subscriber_events(
+    mut event_rx: broadcast::Receiver<ServerEvent>,
+    sub_out_tx: mpsc::Sender<ServerMessage>,
+    sub_filter: Arc<RwLock<SubscriptionFilter>>,
+) {
+    let mut pending_resync: HashSet<PaneId> = HashSet::new();
+
+    loop {
+        let recv_res = if pending_resync.is_empty() {
+            event_rx.recv().await
+        } else {
+            tokio::select! {
+                permit = sub_out_tx.reserve() => {
+                    match permit {
+                        Ok(permit) => {
+                            if let Some(&pane_id) = pending_resync.iter().next() {
+                                pending_resync.remove(&pane_id);
+                                permit.send(ServerMessage::Event(ServerEvent::ResyncRequired {
+                                    pane_id,
+                                }));
+                            }
+                            if let DrainResult::Closed =
+                                drain_pending_resync(&mut pending_resync, &sub_out_tx)
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                res = event_rx.recv() => res,
+            }
+        };
+
+        match recv_res {
+            Ok(evt) => {
+                if !sub_filter.read().await.matches(&evt) {
+                    continue;
+                }
+                match drain_pending_resync(&mut pending_resync, &sub_out_tx) {
+                    DrainResult::Drained => {}
+                    DrainResult::StillFull => {
+                        if let ServerEvent::GridDelta(delta) = &evt {
+                            pending_resync.insert(delta.pane_id);
+                            continue;
+                        }
+                    }
+                    DrainResult::Closed => break,
+                }
+                match &evt {
+                    ServerEvent::GridDelta(delta) => {
+                        let pane_id = delta.pane_id;
+                        match sub_out_tx.try_send(ServerMessage::Event(evt)) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                pending_resync.insert(pane_id);
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                    _ => {
+                        if sub_out_tx.send(ServerMessage::Event(evt)).await.is_err() {
+                            break;
+                        }
+                        if let DrainResult::Closed =
+                            drain_pending_resync(&mut pending_resync, &sub_out_tx)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(skipped, "event subscriber lagged");
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::supervisor::IsolationMode;
+    use daedalus_proto::{CursorState, GridDelta};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    fn dummy_delta(pane_id: PaneId, seq: u64) -> ServerEvent {
+        ServerEvent::GridDelta(GridDelta {
+            pane_id,
+            seq,
+            cols: 80,
+            rows: 24,
+            cursor: CursorState::default(),
+            dirty_rows: Vec::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn resync_required_is_delivered_after_backpressure_drains() {
+        let (event_tx, _) = broadcast::channel(16);
+        let event_rx = event_tx.subscribe();
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        let filter = Arc::new(RwLock::new(SubscriptionFilter {
+            active: true,
+            pane_ids: None,
+        }));
+
+        let handle = tokio::spawn(forward_subscriber_events(event_rx, out_tx, filter));
+
+        let pane_id = PaneId::new();
+        for seq in 1..=4 {
+            event_tx.send(dummy_delta(pane_id, seq)).unwrap();
+        }
+
+        // Yield so forwarder fills the 2-slot mpsc and queues pending_resync
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let m1 = out_rx.recv().await.unwrap();
+        let m2 = out_rx.recv().await.unwrap();
+        assert!(matches!(
+            m1,
+            ServerMessage::Event(ServerEvent::GridDelta(_))
+        ));
+        assert!(matches!(
+            m2,
+            ServerMessage::Event(ServerEvent::GridDelta(_))
+        ));
+
+        // Even with no further events on event_tx, ResyncRequired must arrive
+        let m3 = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("timed out waiting for ResyncRequired")
+            .unwrap();
+        assert_eq!(
+            m3,
+            ServerMessage::Event(ServerEvent::ResyncRequired { pane_id })
+        );
+
+        drop(event_tx);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("forwarder did not exit on broadcast close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn event_forwarder_exits_when_outbound_receiver_closes() {
+        let (event_tx, _) = broadcast::channel(16);
+        let event_rx = event_tx.subscribe();
+        let (out_tx, out_rx) = mpsc::channel(1);
+        let filter = Arc::new(RwLock::new(SubscriptionFilter {
+            active: true,
+            pane_ids: None,
+        }));
+
+        let handle = tokio::spawn(forward_subscriber_events(event_rx, out_tx, filter));
+        drop(out_rx);
+
+        event_tx.send(dummy_delta(PaneId::new(), 1)).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("forwarder did not exit when outbound channel closed")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bind_preserves_existing_parent_permissions_and_sets_0700_on_created_parent() {
+        let dir = TempDir::new().unwrap();
+        let existing_parent = dir.path().join("existing");
+        std::fs::create_dir(&existing_parent).unwrap();
+        std::fs::set_permissions(&existing_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let runtime = dir.path().join("runtime");
+        let sock1 = existing_parent.join("daedalusd.sock");
+        let srv1 = DaemonServer::bind_with_supervisor(
+            sock1,
+            runtime.clone(),
+            Supervisor::with_mode(IsolationMode::PgidFallback),
+        )
+        .await
+        .unwrap();
+
+        let mode1 = std::fs::metadata(&existing_parent)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode1, 0o755);
+        drop(srv1);
+
+        let created_parent = dir.path().join("newly_created");
+        let sock2 = created_parent.join("daedalusd.sock");
+        let srv2 = DaemonServer::bind_with_supervisor(
+            sock2,
+            runtime,
+            Supervisor::with_mode(IsolationMode::PgidFallback),
+        )
+        .await
+        .unwrap();
+
+        let mode2 = std::fs::metadata(&created_parent)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode2, 0o700);
+        drop(srv2);
     }
 }
