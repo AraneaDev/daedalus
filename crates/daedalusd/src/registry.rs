@@ -5,10 +5,11 @@ use crate::persistence::{PersistedState, PersistedWorkspace, STATE_VERSION, Stat
 use crate::runtime_monitor::WorkspaceMonitorTarget;
 use crate::shell_integration::ShellIntegration;
 use crate::supervisor::{IsolationMode, Supervisor};
-use crate::worktree;
+use crate::worktree::{self, WorktreeError};
 use daedalus_proto::{
-    ContainerHealth, ExternalStatus, GitWorktreeInfo, PaneId, PaneRole, PaneSummary, PortMapping,
-    ProtoError, ServerEvent, StatusLevel, WorkspaceId, WorkspaceInfo, WorkspaceManifest,
+    AgentState, ContainerHealth, ExternalStatus, FailureTrace, GitWorkspaceStatus, GitWorktreeInfo,
+    PaneId, PaneRole, PaneSummary, PortMapping, ProtoError, ServerEvent, StatusLevel, WorkspaceId,
+    WorkspaceInfo, WorkspaceManifest,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,7 @@ struct WorkspaceRecord {
     port_offset: u16,
     compose_project_name: Option<String>,
     git_branch: Option<String>,
+    git_status: Option<GitWorkspaceStatus>,
     injected_env: HashMap<String, String>,
     reserved_ports: HashSet<u16>,
     pane_ids: Vec<PaneId>,
@@ -48,7 +50,7 @@ impl WorkspaceRecord {
             port_offset: self.port_offset,
             compose_project_name: self.compose_project_name.clone(),
             git_branch: self.git_branch.clone(),
-            git_status: None,
+            git_status: self.git_status,
             bound_ports: self.bound_ports.clone(),
             containers: self.containers.clone(),
             external_statuses: self.external_statuses.clone(),
@@ -70,6 +72,7 @@ impl WorkspaceRecord {
 struct PreparedWorkspaceComponents {
     plan: isolation::IsolationPlan,
     git_branch: Option<String>,
+    git_status: Option<GitWorkspaceStatus>,
     canonical_root_dir: PathBuf,
     manifest: Option<WorkspaceManifest>,
 }
@@ -100,12 +103,16 @@ fn prepare_workspace_components(
         reserved_ports,
         extra_ports,
     )?;
-    let git_branch = worktree::current_branch(root_dir);
+    let (git_status, git_branch) = match worktree::git_workspace_status_and_branch(root_dir) {
+        Some((status, branch)) => (Some(status), branch),
+        None => (None, worktree::current_branch(root_dir)),
+    };
     let canonical_root_dir =
         std::fs::canonicalize(root_dir).unwrap_or_else(|_| root_dir.to_path_buf());
     Ok(PreparedWorkspaceComponents {
         plan,
         git_branch,
+        git_status,
         canonical_root_dir,
         manifest: loaded_manifest.map(|m| m.workspace_manifest),
     })
@@ -127,6 +134,7 @@ fn build_workspace_record(
         port_offset: prepared.plan.port_offset,
         compose_project_name: prepared.plan.compose_project_name,
         git_branch: prepared.git_branch,
+        git_status: prepared.git_status,
         injected_env: prepared.plan.injected_env,
         reserved_ports,
         pane_ids: Vec::new(),
@@ -593,17 +601,47 @@ impl Registry {
         &self,
         workspace_id: WorkspaceId,
         compose_down: bool,
+        remove_worktree: bool,
+        force_remove_worktree: bool,
     ) -> Result<(), ProtoError> {
-        self.close_workspace_internal(workspace_id, compose_down, true)
-            .await
+        self.close_workspace_internal(
+            workspace_id,
+            compose_down,
+            remove_worktree,
+            force_remove_worktree,
+            true,
+        )
+        .await
     }
 
     async fn close_workspace_internal(
         &self,
         workspace_id: WorkspaceId,
         compose_down: bool,
+        remove_worktree: bool,
+        force_remove_worktree: bool,
         persist: bool,
     ) -> Result<(), ProtoError> {
+        if remove_worktree {
+            let root_dir = self
+                .workspaces
+                .read()
+                .await
+                .get(&workspace_id)
+                .map(|ws| ws.root_dir.clone())
+                .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
+
+            let validation = tokio::task::spawn_blocking(move || {
+                worktree::validate_worktree_removal(&root_dir, force_remove_worktree)
+            })
+            .await
+            .map_err(|e| ProtoError::Internal(format!("worktree validation task failed: {e}")))?;
+
+            if let Err(err) = validation {
+                return Err(map_worktree_error(err));
+            }
+        }
+
         let ws = self
             .workspaces
             .write()
@@ -628,7 +666,7 @@ impl Registry {
         }
 
         if compose_down && let Some(project) = ws.compose_project_name {
-            let root_dir = ws.root_dir;
+            let root_dir = ws.root_dir.clone();
             let project_for_task = project.clone();
             let res = tokio::task::spawn_blocking(move || {
                 isolation::run_compose_down(&root_dir, &project_for_task)
@@ -655,6 +693,19 @@ impl Registry {
             }
         }
 
+        if remove_worktree {
+            let root_dir = ws.root_dir;
+            let removal = tokio::task::spawn_blocking(move || {
+                worktree::remove_worktree(&root_dir, force_remove_worktree)
+            })
+            .await
+            .map_err(|e| ProtoError::Internal(format!("worktree removal task failed: {e}")))?;
+
+            if let Err(err) = removal {
+                return Err(map_worktree_error(err));
+            }
+        }
+
         Ok(())
     }
 
@@ -663,8 +714,125 @@ impl Registry {
     pub async fn close_all(&self) {
         let ws_ids: Vec<WorkspaceId> = self.workspaces.read().await.keys().copied().collect();
         for id in ws_ids {
-            let _ = self.close_workspace_internal(id, false, false).await;
+            let _ = self
+                .close_workspace_internal(id, false, false, false, false)
+                .await;
         }
+    }
+
+    async fn canonicalize_target(
+        workspace_id: Option<WorkspaceId>,
+        root_dir: Option<&Path>,
+    ) -> Option<PathBuf> {
+        match (workspace_id, root_dir) {
+            (None, Some(dir)) => {
+                let dir_clone = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || std::fs::canonicalize(&dir_clone).ok())
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_workspace_in_map(
+        ws_map: &HashMap<WorkspaceId, WorkspaceRecord>,
+        workspace_id: Option<WorkspaceId>,
+        root_dir: Option<&Path>,
+        canonical_target: Option<&Path>,
+    ) -> Result<WorkspaceId, ProtoError> {
+        if let Some(id) = workspace_id {
+            if !ws_map.contains_key(&id) {
+                return Err(ProtoError::WorkspaceNotFound(id));
+            }
+            Ok(id)
+        } else if let Some(target_dir) = root_dir {
+            find_longest_prefix_workspace(ws_map, target_dir, canonical_target).ok_or_else(|| {
+                ProtoError::InvalidRequest(format!(
+                    "no workspace matches root_dir: {}",
+                    target_dir.display()
+                ))
+            })
+        } else {
+            Err(ProtoError::InvalidRequest(
+                "either workspace_id or root_dir must be provided".to_string(),
+            ))
+        }
+    }
+
+    pub async fn set_agent_state(
+        &self,
+        pane_id: Option<PaneId>,
+        workspace_id: Option<WorkspaceId>,
+        root_dir: Option<PathBuf>,
+        state: AgentState,
+    ) -> Result<(), ProtoError> {
+        let handle = if let Some(pid) = pane_id {
+            self.get_pane(pid).await?
+        } else {
+            if workspace_id.is_none() && root_dir.is_none() {
+                return Err(ProtoError::InvalidRequest(
+                    "one of pane_id, workspace_id, or root_dir must be provided".to_string(),
+                ));
+            }
+            let canonical_target =
+                Self::canonicalize_target(workspace_id, root_dir.as_deref()).await;
+
+            let ws_id;
+            let agent_handle = {
+                let ws_map = self.workspaces.read().await;
+                let pane_map = self.panes.read().await;
+                ws_id = Self::resolve_workspace_in_map(
+                    &ws_map,
+                    workspace_id,
+                    root_dir.as_deref(),
+                    canonical_target.as_deref(),
+                )?;
+                let ws = ws_map
+                    .get(&ws_id)
+                    .ok_or(ProtoError::WorkspaceNotFound(ws_id))?;
+                ws.pane_ids
+                    .iter()
+                    .filter_map(|pid| pane_map.get(pid))
+                    .find(|h| h.role() == PaneRole::Agent)
+                    .cloned()
+            };
+
+            agent_handle.ok_or_else(|| {
+                ProtoError::InvalidRequest(format!("workspace {ws_id} has no agent pane"))
+            })?
+        };
+
+        handle.set_agent_state(state).await
+    }
+
+    pub async fn get_failure_trace(
+        &self,
+        pane_id: PaneId,
+    ) -> Result<Option<FailureTrace>, ProtoError> {
+        let handle = self.get_pane(pane_id).await?;
+        let Some(mut trace) = handle.failure_trace().await? else {
+            return Ok(None);
+        };
+
+        let ws_root = self
+            .workspaces
+            .read()
+            .await
+            .get(&handle.workspace_id())
+            .map(|ws| ws.root_dir.clone());
+        let context_dir = ws_root.or_else(|| trace.cwd.clone());
+
+        if let Some(dir) = context_dir
+            && let Ok((git_branch, git_diff_stat)) =
+                tokio::task::spawn_blocking(move || worktree::git_failure_context(&dir)).await
+        {
+            trace.git_branch = git_branch;
+            trace.git_diff_stat = git_diff_stat;
+        }
+
+        Ok(Some(trace))
     }
 
     pub async fn publish_external_status(
@@ -692,16 +860,7 @@ impl Registry {
             ));
         }
 
-        let canonical_target = match (&workspace_id, &root_dir) {
-            (None, Some(dir)) => {
-                let dir_clone = dir.clone();
-                tokio::task::spawn_blocking(move || std::fs::canonicalize(&dir_clone).ok())
-                    .await
-                    .ok()
-                    .flatten()
-            }
-            _ => None,
-        };
+        let canonical_target = Self::canonicalize_target(workspace_id, root_dir.as_deref()).await;
 
         let updated_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -718,23 +877,12 @@ impl Registry {
 
         let target_id = {
             let mut ws_map = self.workspaces.write().await;
-            let resolved_id = if let Some(id) = workspace_id {
-                if !ws_map.contains_key(&id) {
-                    return Err(ProtoError::WorkspaceNotFound(id));
-                }
-                id
-            } else {
-                let target_dir = root_dir
-                    .as_deref()
-                    .expect("checked workspace_id.is_none() && root_dir.is_none() above");
-                find_longest_prefix_workspace(&ws_map, target_dir, canonical_target.as_deref())
-                    .ok_or_else(|| {
-                        ProtoError::InvalidRequest(format!(
-                            "no workspace matches root_dir: {}",
-                            target_dir.display()
-                        ))
-                    })?
-            };
+            let resolved_id = Self::resolve_workspace_in_map(
+                &ws_map,
+                workspace_id,
+                root_dir.as_deref(),
+                canonical_target.as_deref(),
+            )?;
 
             let ws = ws_map
                 .get_mut(&resolved_id)
@@ -761,6 +909,63 @@ impl Registry {
         Ok(status)
     }
 
+    pub async fn clear_external_status(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        root_dir: Option<PathBuf>,
+        source: String,
+    ) -> Result<(), ProtoError> {
+        if source.trim().is_empty() {
+            return Err(ProtoError::InvalidRequest(
+                "external status source cannot be empty".to_string(),
+            ));
+        }
+        if workspace_id.is_none() && root_dir.is_none() {
+            return Err(ProtoError::InvalidRequest(
+                "either workspace_id or root_dir must be provided".to_string(),
+            ));
+        }
+
+        let canonical_target = Self::canonicalize_target(workspace_id, root_dir.as_deref()).await;
+        let updated_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+
+        let cleared_ws_id = {
+            let mut ws_map = self.workspaces.write().await;
+            let resolved_id = Self::resolve_workspace_in_map(
+                &ws_map,
+                workspace_id,
+                root_dir.as_deref(),
+                canonical_target.as_deref(),
+            )?;
+            let ws = ws_map
+                .get_mut(&resolved_id)
+                .ok_or(ProtoError::WorkspaceNotFound(resolved_id))?;
+
+            let before = ws.external_statuses.len();
+            ws.external_statuses
+                .retain(|existing| existing.source != source);
+            (ws.external_statuses.len() != before).then_some(resolved_id)
+        };
+
+        if let Some(target_id) = cleared_ws_id {
+            let _ = self.event_tx.send(ServerEvent::ExternalStatusUpdated {
+                workspace_id: target_id,
+                status: ExternalStatus {
+                    source,
+                    level: StatusLevel::Info,
+                    label: String::new(),
+                    detail: None,
+                    updated_at_ms,
+                },
+            });
+        }
+
+        Ok(())
+    }
+
     pub async fn monitor_targets(&self) -> Vec<WorkspaceMonitorTarget> {
         let ws_map = self.workspaces.read().await;
         let pane_map = self.panes.read().await;
@@ -775,6 +980,7 @@ impl Registry {
                     .collect();
                 WorkspaceMonitorTarget {
                     workspace_id: ws.id,
+                    root_dir: ws.root_dir.clone(),
                     compose_project_name: ws.compose_project_name.clone(),
                     root_pids,
                 }
@@ -787,17 +993,25 @@ impl Registry {
         workspace_id: WorkspaceId,
         bound_ports: Vec<PortMapping>,
         containers: Vec<ContainerHealth>,
+        git_status: Option<GitWorkspaceStatus>,
+        git_branch: Option<String>,
     ) -> bool {
         let changed = {
             let mut ws_map = self.workspaces.write().await;
             let Some(ws) = ws_map.get_mut(&workspace_id) else {
                 return false;
             };
-            if ws.bound_ports == bound_ports && ws.containers == containers {
+            if ws.bound_ports == bound_ports
+                && ws.containers == containers
+                && ws.git_status == git_status
+                && ws.git_branch == git_branch
+            {
                 return false;
             }
             ws.bound_ports = bound_ports.clone();
             ws.containers = containers.clone();
+            ws.git_status = git_status;
+            ws.git_branch = git_branch.clone();
             true
         };
 
@@ -806,11 +1020,20 @@ impl Registry {
                 workspace_id,
                 bound_ports,
                 containers,
-                git_status: None,
-                git_branch: None,
+                git_status,
+                git_branch,
             });
         }
         changed
+    }
+}
+
+fn map_worktree_error(err: WorktreeError) -> ProtoError {
+    match err {
+        WorktreeError::PrimaryCheckout(_)
+        | WorktreeError::NotAWorktree(_)
+        | WorktreeError::DirtyWorktree(_) => ProtoError::InvalidRequest(err.to_string()),
+        WorktreeError::GitFailed(_) => ProtoError::Internal(err.to_string()),
     }
 }
 
@@ -888,10 +1111,16 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, ws.id);
 
-        registry.close_workspace(ws.id, false).await.unwrap();
+        registry
+            .close_workspace(ws.id, false, false, false)
+            .await
+            .unwrap();
         assert!(registry.list_workspaces().await.is_empty());
 
-        let err = registry.close_workspace(ws.id, false).await.unwrap_err();
+        let err = registry
+            .close_workspace(ws.id, false, false, false)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ProtoError::WorkspaceNotFound(_)));
     }
 
@@ -917,7 +1146,10 @@ mod tests {
         assert_eq!(ws1.slot_index, 1);
         assert_eq!(ws2.slot_index, 2);
 
-        registry.close_workspace(ws1.id, false).await.unwrap();
+        registry
+            .close_workspace(ws1.id, false, false, false)
+            .await
+            .unwrap();
         let ws_reused = registry
             .create_workspace(
                 "reused".to_string(),
@@ -1082,21 +1314,46 @@ mod tests {
         }];
         let containers = vec![];
 
+        let git_status = Some(GitWorkspaceStatus {
+            is_worktree: false,
+            dirty: true,
+            ahead: 1,
+            behind: 0,
+        });
+        let git_branch = Some("main".to_string());
+
         assert!(
             registry
-                .update_workspace_runtime(ws.id, ports.clone(), containers.clone())
+                .update_workspace_runtime(
+                    ws.id,
+                    ports.clone(),
+                    containers.clone(),
+                    git_status,
+                    git_branch.clone(),
+                )
                 .await
         );
         assert!(
             !registry
-                .update_workspace_runtime(ws.id, ports.clone(), containers.clone())
+                .update_workspace_runtime(
+                    ws.id,
+                    ports.clone(),
+                    containers.clone(),
+                    git_status,
+                    git_branch.clone(),
+                )
                 .await
         );
 
         let evt = events.recv().await.unwrap();
         assert!(matches!(
             evt,
-            ServerEvent::WorkspaceRuntimeUpdated { workspace_id, .. } if workspace_id == ws.id
+            ServerEvent::WorkspaceRuntimeUpdated {
+                workspace_id,
+                git_status: gs,
+                git_branch: gb,
+                ..
+            } if workspace_id == ws.id && gs == git_status && gb == git_branch
         ));
         assert!(events.try_recv().is_err());
     }
@@ -1159,7 +1416,10 @@ mod tests {
         assert_eq!(resized.rows, 30);
         assert_eq!(handle.summary().await.unwrap().cols, 100);
 
-        registry.close_workspace(ws.id, false).await.unwrap();
+        registry
+            .close_workspace(ws.id, false, false, false)
+            .await
+            .unwrap();
         let err = registry.get_pane(summary.id).await.unwrap_err();
         assert!(matches!(err, ProtoError::PaneNotFound(_)));
     }
@@ -1235,7 +1495,7 @@ mod tests {
                 24,
                 HashMap::new(),
             );
-            let close_fut = reg_close.close_workspace(ws.id, false);
+            let close_fut = reg_close.close_workspace(ws.id, false, false, false);
 
             let (spawn_res, close_res) = tokio::join!(spawn_fut, close_fut);
             assert!(close_res.is_ok());
@@ -1411,7 +1671,9 @@ SHARED_KEY = "from_manifest"
         assert_ne!(reloaded.workspaces[0].id, ws_drop.id);
 
         // Closing workspace removes it from state.json.
-        reg2.close_workspace(ws_keep.id, false).await.unwrap();
+        reg2.close_workspace(ws_keep.id, false, false, false)
+            .await
+            .unwrap();
         let after_close = StateStore::new(state_path).load().unwrap();
         assert!(after_close.workspaces.is_empty());
     }

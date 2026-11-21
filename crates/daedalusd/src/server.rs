@@ -281,15 +281,35 @@ async fn dispatch_request(
         ClientMessage::CloseWorkspace {
             id,
             compose_down,
-            remove_worktree: _,
-            force_remove_worktree: _,
+            remove_worktree,
+            force_remove_worktree,
         } => {
-            registry.close_workspace(id, compose_down).await?;
+            registry
+                .close_workspace(id, compose_down, remove_worktree, force_remove_worktree)
+                .await?;
             Ok(ResponsePayload::Ok)
         }
-        ClientMessage::SetAgentState { .. } | ClientMessage::ClearExternalStatus { .. } => Err(
-            ProtoError::InvalidRequest("not yet implemented".to_string()),
-        ),
+        ClientMessage::SetAgentState {
+            pane_id,
+            workspace_id,
+            root_dir,
+            state,
+        } => {
+            registry
+                .set_agent_state(pane_id, workspace_id, root_dir, state)
+                .await?;
+            Ok(ResponsePayload::Ok)
+        }
+        ClientMessage::ClearExternalStatus {
+            workspace_id,
+            root_dir,
+            source,
+        } => {
+            registry
+                .clear_external_status(workspace_id, root_dir, source)
+                .await?;
+            Ok(ResponsePayload::Ok)
+        }
         ClientMessage::DiscoverWorktrees { repo_dir } => Ok(ResponsePayload::Worktrees(
             registry.discover_worktrees(repo_dir).await?,
         )),
@@ -381,7 +401,7 @@ async fn dispatch_request(
             })
         }
         ClientMessage::GetFailureTrace { pane_id } => Ok(ResponsePayload::FailureTrace(
-            registry.get_pane(pane_id).await?.failure_trace().await?,
+            registry.get_failure_trace(pane_id).await?,
         )),
         ClientMessage::Subscribe { pane_ids } => {
             let mut f = filter.write().await;

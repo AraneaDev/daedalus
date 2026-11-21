@@ -1,11 +1,26 @@
-use daedalus_proto::GitWorktreeInfo;
+use daedalus_proto::{GitWorkspaceStatus, GitWorktreeInfo};
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+use thiserror::Error;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_FAILURE_CONTEXT_BYTES: usize = 4096;
+
+#[derive(Debug, Error)]
+pub enum WorktreeError {
+    #[error("refusing to remove primary repository checkout: {0}")]
+    PrimaryCheckout(PathBuf),
+    #[error("path is not a linked git worktree: {0}")]
+    NotAWorktree(PathBuf),
+    #[error("worktree has uncommitted changes (use force to remove): {0}")]
+    DirtyWorktree(PathBuf),
+    #[error("git command failed: {0}")]
+    GitFailed(String),
+}
 
 struct GitOutput {
     status: ExitStatus,
@@ -91,6 +106,14 @@ fn spawn_reader<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHan
 }
 
 fn run_git_with_timeout(repo_dir: &Path, args: &[&OsStr]) -> Result<GitOutput, String> {
+    run_git_with_timeout_for(repo_dir, args, GIT_TIMEOUT)
+}
+
+fn run_git_with_timeout_for(
+    repo_dir: &Path,
+    args: &[&OsStr],
+    timeout: Duration,
+) -> Result<GitOutput, String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo_dir);
     for arg in args {
@@ -109,7 +132,7 @@ fn run_git_with_timeout(repo_dir: &Path, args: &[&OsStr]) -> Result<GitOutput, S
     let stdout_handle = child.stdout.take().map(spawn_reader);
     let stderr_handle = child.stderr.take().map(spawn_reader);
 
-    let deadline = Instant::now() + GIT_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let mut poll_interval = Duration::from_millis(1);
 
     let status = loop {
@@ -126,7 +149,10 @@ fn run_git_with_timeout(repo_dir: &Path, args: &[&OsStr]) -> Result<GitOutput, S
                     if let Some(h) = stderr_handle {
                         let _ = h.join();
                     }
-                    return Err("git command timed out after 5s".to_string());
+                    return Err(format!(
+                        "git command timed out after {}s",
+                        timeout.as_secs()
+                    ));
                 }
                 let remaining = deadline.saturating_duration_since(now);
                 std::thread::sleep(poll_interval.min(remaining));
@@ -375,6 +401,219 @@ pub fn create_worktree(
         })
 }
 
+fn parse_git_status_v2(output: &str, is_worktree: bool) -> (GitWorkspaceStatus, Option<String>) {
+    let mut dirty = false;
+    let mut ahead = 0u32;
+    let mut behind = 0u32;
+    let mut branch = None;
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# ") {
+            if let Some(head) = rest.strip_prefix("branch.head ") {
+                if head != "(detached)" && !head.is_empty() {
+                    branch = Some(head.to_string());
+                }
+            } else if let Some(ab) = rest.strip_prefix("branch.ab ") {
+                for token in ab.split_whitespace() {
+                    if let Some(a) = token.strip_prefix('+') {
+                        ahead = a.parse::<u32>().unwrap_or(0);
+                    } else if let Some(b) = token.strip_prefix('-') {
+                        behind = b.parse::<u32>().unwrap_or(0);
+                    }
+                }
+            }
+        } else {
+            dirty = true;
+        }
+    }
+
+    (
+        GitWorkspaceStatus {
+            is_worktree,
+            dirty,
+            ahead,
+            behind,
+        },
+        branch,
+    )
+}
+
+/// Queries `git status --porcelain=v2 --branch` (with a 2s timeout) and returns
+/// `(GitWorkspaceStatus, Option<branch_name>)`, or `None` if `path` is not a git repository.
+pub fn git_workspace_status_and_branch(
+    path: &Path,
+) -> Option<(GitWorkspaceStatus, Option<String>)> {
+    if !path.is_dir() {
+        return None;
+    }
+
+    let is_worktree = path.join(".git").is_file();
+    let args = [
+        OsStr::new("status"),
+        OsStr::new("--porcelain=v2"),
+        OsStr::new("--branch"),
+    ];
+    let out = run_git_with_timeout_for(path, &args, GIT_PROBE_TIMEOUT).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(parse_git_status_v2(&out.stdout, is_worktree))
+}
+
+/// Queries [`GitWorkspaceStatus`] for `path` with a 2s timeout, returning `None` if not a git repo.
+pub fn git_workspace_status(path: &Path) -> Option<GitWorkspaceStatus> {
+    git_workspace_status_and_branch(path).map(|(status, _)| status)
+}
+
+/// Validates that `path` is a linked secondary worktree (never the primary checkout) and returns
+/// the primary repository directory path so removal can run from it.
+pub fn validate_worktree_removal(path: &Path, force: bool) -> Result<PathBuf, WorktreeError> {
+    if !path.is_dir() {
+        return Err(WorktreeError::NotAWorktree(path.to_path_buf()));
+    }
+
+    let dot_git = path.join(".git");
+    if dot_git.is_dir() {
+        return Err(WorktreeError::PrimaryCheckout(path.to_path_buf()));
+    }
+    if !dot_git.is_file() {
+        return Err(WorktreeError::NotAWorktree(path.to_path_buf()));
+    }
+
+    let worktrees = discover_worktrees(path).map_err(WorktreeError::GitFailed)?;
+    let canon_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let matched = worktrees.iter().find(|wt| {
+        std::fs::canonicalize(&wt.path).unwrap_or_else(|_| wt.path.clone()) == canon_path
+    });
+    match matched {
+        Some(wt) if wt.is_primary => {
+            return Err(WorktreeError::PrimaryCheckout(path.to_path_buf()));
+        }
+        Some(_) => {}
+        None => {
+            return Err(WorktreeError::NotAWorktree(path.to_path_buf()));
+        }
+    }
+
+    let primary_repo = worktrees
+        .iter()
+        .find(|wt| wt.is_primary)
+        .map(|wt| wt.path.clone())
+        .ok_or_else(|| WorktreeError::NotAWorktree(path.to_path_buf()))?;
+
+    if !force
+        && let Some(status) = git_workspace_status(path)
+        && status.dirty
+    {
+        return Err(WorktreeError::DirtyWorktree(path.to_path_buf()));
+    }
+
+    Ok(primary_repo)
+}
+
+/// Removes a linked secondary git worktree at `path`, refusing to remove a primary repo checkout.
+pub fn remove_worktree(path: &Path, force: bool) -> Result<(), WorktreeError> {
+    let primary_repo = validate_worktree_removal(path, force)?;
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    let mut args = vec![OsStr::new("worktree"), OsStr::new("remove")];
+    if force {
+        args.push(OsStr::new("--force"));
+    }
+    args.push(target.as_os_str());
+
+    let out = run_git_with_timeout(&primary_repo, &args).map_err(WorktreeError::GitFailed)?;
+    if !out.status.success() {
+        let stderr_lower = out.stderr.to_ascii_lowercase();
+        if !force && stderr_lower.contains("modified or untracked files") {
+            return Err(WorktreeError::DirtyWorktree(path.to_path_buf()));
+        }
+        return Err(WorktreeError::GitFailed(format!(
+            "git worktree remove failed: {}",
+            out.stderr.trim()
+        )));
+    }
+
+    Ok(())
+}
+
+fn truncate_utf8_with_suffix(mut text: String, max_bytes: usize, suffix: &str) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let target = max_bytes.saturating_sub(suffix.len());
+    let mut cut = target.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    text.push_str(suffix);
+    text
+}
+
+/// Captures `(branch, bounded_diff_stat)` (`git status --short` + `git diff --stat`, capped at
+/// 4 KiB with a 2s timeout) for enriching [`daedalus_proto::FailureTrace`].
+pub fn git_failure_context(path: &Path) -> (Option<String>, Option<String>) {
+    if !path.is_dir() {
+        return (None, None);
+    }
+
+    let branch = {
+        let args = [
+            OsStr::new("symbolic-ref"),
+            OsStr::new("--short"),
+            OsStr::new("HEAD"),
+        ];
+        run_git_with_timeout_for(path, &args, GIT_PROBE_TIMEOUT)
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| out.stdout.trim().to_string())
+            .filter(|b| !b.is_empty())
+    };
+
+    let status_args = [OsStr::new("status"), OsStr::new("--short")];
+    let Ok(status_out) = run_git_with_timeout_for(path, &status_args, GIT_PROBE_TIMEOUT) else {
+        return (branch, None);
+    };
+    if !status_out.status.success() {
+        return (branch, None);
+    }
+
+    let diff_args = [OsStr::new("diff"), OsStr::new("--stat")];
+    let diff_out = run_git_with_timeout_for(path, &diff_args, GIT_PROBE_TIMEOUT)
+        .ok()
+        .filter(|out| out.status.success());
+
+    let status_trimmed = status_out.stdout.trim_end();
+    let diff_trimmed = diff_out
+        .as_ref()
+        .map(|out| out.stdout.trim_end())
+        .unwrap_or("");
+
+    let mut combined = String::new();
+    if !status_trimmed.is_empty() {
+        combined.push_str(status_trimmed);
+    }
+    if !diff_trimmed.is_empty() {
+        if !combined.is_empty() {
+            combined.push_str("\n\n");
+        }
+        combined.push_str(diff_trimmed);
+    }
+
+    if combined.is_empty() {
+        return (branch, None);
+    }
+
+    let bounded =
+        truncate_utf8_with_suffix(combined, MAX_FAILURE_CONTEXT_BYTES, "\n...[truncated]");
+    (branch, Some(bounded))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,5 +846,124 @@ detached\r\n";
             std::fs::canonicalize(base_dir.path().join("primary-repo").join("feat-two")).unwrap()
         );
         assert!(!base_dir.path().join("feat-one").join("feat-two").exists());
+    }
+
+    #[test]
+    fn parses_git_status_v2_ahead_behind_and_dirty_lines() {
+        let clean = "\
+# branch.oid 1111111111111111111111111111111111111111\n\
+# branch.head feat/v0.0.3\n\
+# branch.upstream origin/feat/v0.0.3\n\
+# branch.ab +3 -2\n";
+        assert_eq!(
+            parse_git_status_v2(clean, true),
+            (
+                GitWorkspaceStatus {
+                    is_worktree: true,
+                    dirty: false,
+                    ahead: 3,
+                    behind: 2,
+                },
+                Some("feat/v0.0.3".to_string()),
+            )
+        );
+
+        let dirty = "\
+# branch.oid 1111111111111111111111111111111111111111\n\
+# branch.head (detached)\n\
+1 .M N... 100644 100644 100644 abc def src/lib.rs\n\
+? untracked.txt\n";
+        assert_eq!(
+            parse_git_status_v2(dirty, false),
+            (
+                GitWorkspaceStatus {
+                    is_worktree: false,
+                    dirty: true,
+                    ahead: 0,
+                    behind: 0,
+                },
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn git_workspace_status_and_remove_worktree_lifecycle() {
+        let root = TempDir::new().unwrap();
+        let base_dir = TempDir::new().unwrap();
+        let non_git = TempDir::new().unwrap();
+
+        assert_eq!(git_workspace_status(non_git.path()), None);
+        assert!(matches!(
+            remove_worktree(non_git.path(), false),
+            Err(WorktreeError::NotAWorktree(_))
+        ));
+
+        let repo = init_temp_repo(root.path(), "app");
+        let primary_status = git_workspace_status(&repo).unwrap();
+        assert!(!primary_status.is_worktree);
+        assert!(!primary_status.dirty);
+
+        // Must refuse to remove primary repo checkout even with force = true
+        assert!(matches!(
+            remove_worktree(&repo, false),
+            Err(WorktreeError::PrimaryCheckout(_))
+        ));
+        assert!(matches!(
+            remove_worktree(&repo, true),
+            Err(WorktreeError::PrimaryCheckout(_))
+        ));
+
+        let wt_clean = create_worktree(&repo, "feat/clean", true, base_dir.path()).unwrap();
+        let clean_status = git_workspace_status(&wt_clean.path).unwrap();
+        assert!(clean_status.is_worktree);
+        assert!(!clean_status.dirty);
+
+        // Clean worktree removes cleanly without force
+        remove_worktree(&wt_clean.path, false).unwrap();
+        assert!(!wt_clean.path.exists());
+
+        // Dirty worktree fails without force, succeeds with force
+        let wt_dirty = create_worktree(&repo, "feat/dirty", true, base_dir.path()).unwrap();
+        std::fs::write(wt_dirty.path.join("README.md"), "# modified\n").unwrap();
+        std::fs::write(wt_dirty.path.join("untracked.txt"), "hi\n").unwrap();
+        let dirty_status = git_workspace_status(&wt_dirty.path).unwrap();
+        assert!(dirty_status.is_worktree);
+        assert!(dirty_status.dirty);
+
+        assert!(matches!(
+            remove_worktree(&wt_dirty.path, false),
+            Err(WorktreeError::DirtyWorktree(_))
+        ));
+        assert!(wt_dirty.path.exists());
+
+        remove_worktree(&wt_dirty.path, true).unwrap();
+        assert!(!wt_dirty.path.exists());
+    }
+
+    #[test]
+    fn git_failure_context_captures_branch_and_bounded_diff_stat() {
+        let non_git = TempDir::new().unwrap();
+        assert_eq!(git_failure_context(non_git.path()), (None, None));
+
+        let root = TempDir::new().unwrap();
+        let repo = init_temp_repo(root.path(), "ctx-app");
+        assert_eq!(git_failure_context(&repo), (Some("main".to_string()), None));
+
+        std::fs::write(repo.join("README.md"), "# modified\nsecond line\n").unwrap();
+        std::fs::write(repo.join("extra.txt"), "new file\n").unwrap();
+        let (branch, diff_stat) = git_failure_context(&repo);
+        assert_eq!(branch.as_deref(), Some("main"));
+        let stat = diff_stat.expect("dirty repo should have failure context");
+        assert!(stat.contains("README.md"));
+        assert!(stat.contains("extra.txt"));
+        assert!(stat.len() <= MAX_FAILURE_CONTEXT_BYTES);
+
+        // Verify truncation helper respects byte limit and UTF-8 boundaries
+        let long = "é".repeat(3000); // 6000 bytes
+        let truncated =
+            truncate_utf8_with_suffix(long, MAX_FAILURE_CONTEXT_BYTES, "\n...[truncated]");
+        assert!(truncated.len() <= MAX_FAILURE_CONTEXT_BYTES);
+        assert!(truncated.ends_with("\n...[truncated]"));
     }
 }

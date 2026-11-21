@@ -1,9 +1,11 @@
 use crate::registry::Registry;
+use crate::worktree;
 use bollard::Docker;
 use bollard::models::ContainerSummary;
 use bollard::query_parameters::ListContainersOptions;
-use daedalus_proto::{ContainerHealth, PortMapping, PortSource, WorkspaceId};
+use daedalus_proto::{ContainerHealth, GitWorkspaceStatus, PortMapping, PortSource, WorkspaceId};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -17,6 +19,7 @@ const DOCKER_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceMonitorTarget {
     pub workspace_id: WorkspaceId,
+    pub root_dir: PathBuf,
     pub compose_project_name: Option<String>,
     pub root_pids: Vec<u32>,
 }
@@ -343,25 +346,36 @@ pub fn spawn_runtime_monitor(
                 continue;
             }
 
-            let local_targets: Vec<(WorkspaceId, Vec<u32>)> = targets
+            let local_targets: Vec<(WorkspaceId, Vec<u32>, PathBuf)> = targets
                 .iter()
-                .map(|t| (t.workspace_id, t.root_pids.clone()))
+                .map(|t| (t.workspace_id, t.root_pids.clone(), t.root_dir.clone()))
                 .collect();
 
-            let local_ports_fut = tokio::task::spawn_blocking(move || {
+            let local_probe_fut = tokio::task::spawn_blocking(move || {
                 local_targets
                     .into_iter()
-                    .map(|(ws_id, roots)| (ws_id, discover_local_ports_for_roots(&roots)))
-                    .collect::<HashMap<WorkspaceId, Vec<PortMapping>>>()
+                    .map(|(ws_id, roots, root_dir)| {
+                        let ports = discover_local_ports_for_roots(&roots);
+                        let (git_status, git_branch) =
+                            match worktree::git_workspace_status_and_branch(&root_dir) {
+                                Some((status, branch)) => (Some(status), branch),
+                                None => (None, None),
+                            };
+                        (ws_id, (ports, git_status, git_branch))
+                    })
+                    .collect::<HashMap<
+                        WorkspaceId,
+                        (Vec<PortMapping>, Option<GitWorkspaceStatus>, Option<String>),
+                    >>()
             });
 
             let mut local_by_ws = tokio::select! {
                 biased;
                 _ = wait_for_shutdown(&mut shutdown) => break,
-                res = local_ports_fut => match res {
+                res = local_probe_fut => match res {
                     Ok(map) => map,
                     Err(e) => {
-                        debug!(error = %e, "local port discovery task failed");
+                        debug!(error = %e, "local port and git discovery task failed");
                         HashMap::new()
                     }
                 }
@@ -428,12 +442,23 @@ pub fn spawn_runtime_monitor(
                     }
                 }
 
-                if let Some(local_ports) = local_by_ws.remove(&target.workspace_id) {
+                let (git_status, git_branch) = if let Some((local_ports, git_status, git_branch)) =
+                    local_by_ws.remove(&target.workspace_id)
+                {
                     bound_ports.extend(local_ports);
-                }
+                    (git_status, git_branch)
+                } else {
+                    (None, None)
+                };
 
                 registry
-                    .update_workspace_runtime(target.workspace_id, bound_ports, containers)
+                    .update_workspace_runtime(
+                        target.workspace_id,
+                        bound_ports,
+                        containers,
+                        git_status,
+                        git_branch,
+                    )
                     .await;
             }
         }
