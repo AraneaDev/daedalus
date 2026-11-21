@@ -104,6 +104,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for upcoming `v0.0.x` milestones, including native `libghostty-vt` C ABI wiring, persistence/config, macOS (Metal/`libproc`), and Windows (ConPTY/Job Objects/WSL2 bridge) support.
+
 ## License
 
 MIT
