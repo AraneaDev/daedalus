@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.3](https://github.com/AraneaDev/daedalus/compare/v0.0.2...v0.0.3) (2026-11-21)
+
+
+### Features
+
+* deeper agent and worktree workflows (v0.0.3) ([#18](https://github.com/AraneaDev/daedalus/issues/18)) ([2f59882](https://github.com/AraneaDev/daedalus/commit/2f59882b2d173a39382970db48ca97e48bbc6200))
+
 ## [0.0.2](https://github.com/AraneaDev/daedalus/compare/v0.0.1...v0.0.2) (2026-11-21)
 
 
