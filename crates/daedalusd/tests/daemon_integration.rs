@@ -177,6 +177,8 @@ async fn bash_osc133_captures_failure_trace_and_survives_client_reconnect() {
         ClientMessage::CloseWorkspace {
             id: ws.id,
             compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
         },
     )
     .await;
@@ -289,6 +291,8 @@ async fn zsh_osc133_captures_failure_trace_when_zsh_installed() {
         ClientMessage::CloseWorkspace {
             id: ws.id,
             compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
         },
     )
     .await;
@@ -526,6 +530,8 @@ async fn get_scrollback_returns_lines_scrolled_above_viewport() {
         ClientMessage::CloseWorkspace {
             id: ws.id,
             compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
         },
     )
     .await;
@@ -754,6 +760,8 @@ async fn create_worktree_workspace_isolates_ports_and_injects_env() {
         ClientMessage::CloseWorkspace {
             id: wt_ws.id,
             compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
         },
     )
     .await;
@@ -763,6 +771,8 @@ async fn create_worktree_workspace_isolates_ports_and_injects_env() {
         ClientMessage::CloseWorkspace {
             id: primary_ws.id,
             compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
         },
     )
     .await;
@@ -1080,6 +1090,8 @@ async fn persistence_restores_dormant_workspaces_across_daemon_restart_and_skips
         ClientMessage::CloseWorkspace {
             id: ws_keep.id,
             compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
         },
     )
     .await;
@@ -1341,6 +1353,8 @@ async fn fish_osc133_captures_failure_trace_when_fish_installed() {
         ClientMessage::CloseWorkspace {
             id: ws.id,
             compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
         },
     )
     .await;

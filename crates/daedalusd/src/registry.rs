@@ -48,6 +48,7 @@ impl WorkspaceRecord {
             port_offset: self.port_offset,
             compose_project_name: self.compose_project_name.clone(),
             git_branch: self.git_branch.clone(),
+            git_status: None,
             bound_ports: self.bound_ports.clone(),
             containers: self.containers.clone(),
             external_statuses: self.external_statuses.clone(),
@@ -805,6 +806,8 @@ impl Registry {
                 workspace_id,
                 bound_ports,
                 containers,
+                git_status: None,
+                git_branch: None,
             });
         }
         changed

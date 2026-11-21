@@ -82,6 +82,40 @@ pub enum PaneStatus {
     Exited { code: Option<i32> },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentState {
+    Idle,
+    Thinking,
+    WaitingForApproval,
+    Error,
+}
+
+impl AgentState {
+    pub fn from_cli_name(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "idle" => Some(Self::Idle),
+            "thinking" => Some(Self::Thinking),
+            "waiting" | "approval" | "waiting_for_approval" | "waiting-for-approval" => {
+                Some(Self::WaitingForApproval)
+            }
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for AgentState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Idle => write!(f, "idle"),
+            Self::Thinking => write!(f, "thinking"),
+            Self::WaitingForApproval => write!(f, "waiting_for_approval"),
+            Self::Error => write!(f, "error"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSummary {
     pub id: PaneId,
@@ -93,6 +127,8 @@ pub struct PaneSummary {
     pub cwd: Option<PathBuf>,
     pub last_exit_code: Option<i32>,
     pub has_failure_trace: bool,
+    #[serde(default)]
+    pub agent_state: Option<AgentState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +138,14 @@ pub struct GitWorktreeInfo {
     pub head: String,
     pub is_primary: bool,
     pub is_detached: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct GitWorkspaceStatus {
+    pub is_worktree: bool,
+    pub dirty: bool,
+    pub ahead: u32,
+    pub behind: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -173,6 +217,8 @@ pub struct WorkspaceInfo {
     #[serde(default)]
     pub git_branch: Option<String>,
     #[serde(default)]
+    pub git_status: Option<GitWorkspaceStatus>,
+    #[serde(default)]
     pub bound_ports: Vec<PortMapping>,
     #[serde(default)]
     pub containers: Vec<ContainerHealth>,
@@ -190,6 +236,10 @@ pub struct FailureTrace {
     pub cwd: Option<PathBuf>,
     pub output: String,
     pub captured_at_ms: u64,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub git_diff_stat: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

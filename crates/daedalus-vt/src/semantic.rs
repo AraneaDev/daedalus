@@ -103,6 +103,8 @@ impl CommandTracker {
                             cwd: self.cwd.clone(),
                             output,
                             captured_at_ms,
+                            git_branch: None,
+                            git_diff_stat: None,
                         });
                         true
                     } else {

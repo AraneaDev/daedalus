@@ -279,6 +279,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .request(ClientMessage::CloseWorkspace {
                             id: WorkspaceId(id),
                             compose_down,
+                            remove_worktree: false,
+                            force_remove_worktree: false,
                         })
                         .await?,
                 )?;

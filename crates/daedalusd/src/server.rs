@@ -201,6 +201,7 @@ impl SubscriptionFilter {
         match event {
             ServerEvent::GridDelta(d) => allowed.contains(&d.pane_id),
             ServerEvent::PaneStatusChanged { pane_id, .. }
+            | ServerEvent::AgentStateChanged { pane_id, .. }
             | ServerEvent::CommandFinished { pane_id, .. }
             | ServerEvent::PaneExited { pane_id, .. }
             | ServerEvent::ResyncRequired { pane_id } => allowed.contains(pane_id),
@@ -277,10 +278,18 @@ async fn dispatch_request(
         ClientMessage::ListWorkspaces => Ok(ResponsePayload::Workspaces(
             registry.list_workspaces().await,
         )),
-        ClientMessage::CloseWorkspace { id, compose_down } => {
+        ClientMessage::CloseWorkspace {
+            id,
+            compose_down,
+            remove_worktree: _,
+            force_remove_worktree: _,
+        } => {
             registry.close_workspace(id, compose_down).await?;
             Ok(ResponsePayload::Ok)
         }
+        ClientMessage::SetAgentState { .. } | ClientMessage::ClearExternalStatus { .. } => Err(
+            ProtoError::InvalidRequest("not yet implemented".to_string()),
+        ),
         ClientMessage::DiscoverWorktrees { repo_dir } => Ok(ResponsePayload::Worktrees(
             registry.discover_worktrees(repo_dir).await?,
         )),

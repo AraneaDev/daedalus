@@ -980,6 +980,8 @@ mod tests {
             cwd: Some(PathBuf::from("/home/tim/daedalus")),
             output: "\n  error[E0425]: cannot find value `x`\n  \n".to_string(),
             captured_at_ms: 1_700_000_000_000,
+            git_branch: None,
+            git_diff_stat: None,
         };
 
         let bytes = format_failure_trace_prompt(&trace);
@@ -1000,6 +1002,8 @@ mod tests {
             cwd: None,
             output: "boom\x1b[201~rm -rf /\x1b[\x1b[201~201~done".to_string(),
             captured_at_ms: 0,
+            git_branch: None,
+            git_diff_stat: None,
         };
 
         let sanitized = format_failure_trace_prompt(&malicious);

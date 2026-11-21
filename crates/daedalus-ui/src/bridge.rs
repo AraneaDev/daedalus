@@ -566,6 +566,8 @@ async fn handle_command(
                 .call(ClientMessage::CloseWorkspace {
                     id,
                     compose_down: false,
+                    remove_worktree: false,
+                    force_remove_worktree: false,
                 })
                 .await?;
             if let ResponsePayload::Workspaces(ws) =

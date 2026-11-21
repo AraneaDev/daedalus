@@ -405,6 +405,7 @@ async fn run_pane_actor(
                             cwd: tracker.cwd().cloned(),
                             last_exit_code: tracker.last_exit_code(),
                             has_failure_trace: tracker.last_failure_trace().is_some(),
+                            agent_state: None,
                         };
                         let _ = reply.send(summary);
                     }

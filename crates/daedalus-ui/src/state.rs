@@ -748,6 +748,8 @@ impl AppState {
                 workspace_id,
                 bound_ports,
                 containers,
+                git_status: _,
+                git_branch: _,
             } => {
                 if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == workspace_id) {
                     ws.bound_ports = bound_ports;
@@ -755,6 +757,7 @@ impl AppState {
                 }
                 None
             }
+            ServerEvent::AgentStateChanged { .. } => None,
             ServerEvent::ExternalStatusUpdated {
                 workspace_id,
                 status,
@@ -842,6 +845,7 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp/repo")),
             last_exit_code: None,
             has_failure_trace: false,
+            agent_state: None,
         }
     }
 
@@ -861,6 +865,7 @@ mod tests {
             port_offset: 0,
             compose_project_name: None,
             git_branch: None,
+            git_status: None,
             bound_ports: Vec::new(),
             containers: Vec::new(),
             external_statuses: Vec::new(),
@@ -1173,6 +1178,8 @@ mod tests {
                 workspace_id: ws_id,
                 bound_ports: ports.clone(),
                 containers: containers.clone(),
+                git_status: None,
+                git_branch: None,
             }),
             None
         );
@@ -1187,6 +1194,8 @@ mod tests {
                 workspace_id: WorkspaceId::new(),
                 bound_ports: Vec::new(),
                 containers: Vec::new(),
+                git_status: None,
+                git_branch: None,
             }),
             None
         );
@@ -1354,6 +1363,7 @@ mod tests {
             port_offset: 0,
             compose_project_name: None,
             git_branch: None,
+            git_status: None,
             bound_ports: Vec::new(),
             containers: Vec::new(),
             external_statuses: Vec::new(),
