@@ -4,6 +4,7 @@ members = [
     "crates/daedalus-proto",
     "crates/daedalus-vt",
     "crates/daedalusd",
+    "crates/daedalus-ctl",
 ]
 
 [workspace.package]
