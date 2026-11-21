@@ -1,6 +1,8 @@
 pub mod external_hook;
 pub mod isolation;
+pub mod manifest;
 pub mod pane_actor;
+pub mod persistence;
 pub mod registry;
 pub mod runtime_monitor;
 pub mod server;

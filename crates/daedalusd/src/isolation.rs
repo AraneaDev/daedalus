@@ -72,6 +72,27 @@ pub fn prepare_workspace_isolation_with_reserved(
     caller_env: &HashMap<String, String>,
     reserved_ports: &HashSet<u16>,
 ) -> io::Result<IsolationPlan> {
+    prepare_workspace_isolation_with_extra_ports(
+        name,
+        root_dir,
+        slot_index,
+        caller_env,
+        reserved_ports,
+        &[],
+    )
+}
+
+/// Computes a conflict-free port offset while treating `reserved_ports` as unavailable
+/// and including `extra_ports` (e.g. from `.daedalus.toml` `[ports].extra`) in
+/// port reservation and offset remapping.
+pub fn prepare_workspace_isolation_with_extra_ports(
+    name: &str,
+    root_dir: &Path,
+    slot_index: u16,
+    caller_env: &HashMap<String, String>,
+    reserved_ports: &HashSet<u16>,
+    extra_ports: &[u16],
+) -> io::Result<IsolationPlan> {
     let env_scan = scan_env_file(root_dir)?;
     let mut env_lookup = env_scan.all_vars.clone();
     for (k, v) in caller_env {
@@ -97,6 +118,11 @@ pub fn prepare_workspace_isolation_with_reserved(
     }
     for (_, _, port) in &env_scan.url_vars {
         base_ports.insert(*port);
+    }
+    for &port in extra_ports {
+        if port > 0 {
+            base_ports.insert(port);
+        }
     }
 
     let port_offset = allocate_port_offset(slot_index, &base_ports, reserved_ports)?;
@@ -1090,5 +1116,32 @@ services:
             sanitize_compose_project("Feat/Auth_V2", 3),
             "feat-auth_v2-wt3"
         );
+    }
+
+    #[test]
+    fn extra_ports_are_remapped_and_avoid_reserved_and_bound_conflicts() {
+        let dir = tempdir().unwrap();
+        let blocker = TcpListener::bind(("127.0.0.1", 19100))
+            .expect("port 19100 must be free before blocking");
+        let reserved = HashSet::from([19280]);
+
+        let plan = prepare_workspace_isolation_with_extra_ports(
+            "extra",
+            dir.path(),
+            1,
+            &HashMap::new(),
+            &reserved,
+            &[0, 19000, 19080],
+        )
+        .unwrap();
+        drop(blocker);
+
+        // Slot 1 starts at offset 100 (19100 blocked by TCP listener),
+        // bumps to offset 200 (19280 blocked by reserved_ports),
+        // and lands on offset 300.
+        assert_eq!(plan.port_offset, 300);
+        assert_eq!(plan.remapped_ports.get(&19000), Some(&19300));
+        assert_eq!(plan.remapped_ports.get(&19080), Some(&19380));
+        assert!(!plan.remapped_ports.contains_key(&0));
     }
 }

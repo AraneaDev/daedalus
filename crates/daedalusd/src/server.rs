@@ -1,11 +1,12 @@
 use crate::external_hook::ExternalHookServer;
+use crate::persistence::StateStore;
 use crate::registry::Registry;
 use crate::runtime_monitor;
 use crate::shell_integration::ShellIntegration;
 use crate::supervisor::Supervisor;
 use daedalus_proto::{
     ClientMessage, PaneId, ProtoError, Request, ResponsePayload, ServerEvent, ServerMessage,
-    default_events_socket_path, read_frame, write_frame,
+    default_events_socket_path, default_state_file_path, read_frame, write_frame,
 };
 use daedalus_vt::{VtConfig, create_vt_engine};
 use std::collections::HashSet;
@@ -29,10 +30,11 @@ pub struct DaemonServer {
 impl DaemonServer {
     pub async fn bind(socket_path: PathBuf, runtime_dir: PathBuf) -> std::io::Result<Self> {
         let supervisor = Supervisor::detect();
-        Self::bind_with_events_socket(
+        Self::bind_with_options(
             socket_path,
             runtime_dir,
             Some(default_events_socket_path()),
+            Some(default_state_file_path()),
             supervisor,
         )
         .await
@@ -43,13 +45,30 @@ impl DaemonServer {
         runtime_dir: PathBuf,
         supervisor: Supervisor,
     ) -> std::io::Result<Self> {
-        Self::bind_with_events_socket(socket_path, runtime_dir, None, supervisor).await
+        Self::bind_with_options(socket_path, runtime_dir, None, None, supervisor).await
     }
 
     pub async fn bind_with_events_socket(
         socket_path: PathBuf,
         runtime_dir: PathBuf,
         events_socket_path: Option<PathBuf>,
+        supervisor: Supervisor,
+    ) -> std::io::Result<Self> {
+        Self::bind_with_options(
+            socket_path,
+            runtime_dir,
+            events_socket_path,
+            None,
+            supervisor,
+        )
+        .await
+    }
+
+    pub async fn bind_with_options(
+        socket_path: PathBuf,
+        runtime_dir: PathBuf,
+        events_socket_path: Option<PathBuf>,
+        state_path: Option<PathBuf>,
         supervisor: Supervisor,
     ) -> std::io::Result<Self> {
         if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -77,7 +96,12 @@ impl DaemonServer {
 
         let shell_integration = ShellIntegration::prepare(&runtime_dir)?;
         let (event_tx, _) = broadcast::channel(1024);
-        let registry = Arc::new(Registry::new(supervisor, shell_integration, event_tx));
+        let registry = Arc::new(Registry::new_with_state_store(
+            supervisor,
+            shell_integration,
+            event_tx,
+            state_path.map(StateStore::new),
+        ));
         let listener = UnixListener::bind(&socket_path)?;
         let external_hook = match events_socket_path {
             Some(events_path) => {
@@ -91,6 +115,7 @@ impl DaemonServer {
             }
             None => None,
         };
+        registry.restore_persisted_workspaces().await;
         info!(socket = %socket_path.display(), "daedalusd listening");
 
         Ok(Self {

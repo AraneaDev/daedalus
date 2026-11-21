@@ -1,18 +1,20 @@
 use crate::isolation;
+use crate::manifest;
 use crate::pane_actor::PaneHandle;
+use crate::persistence::{PersistedState, PersistedWorkspace, STATE_VERSION, StateStore};
 use crate::runtime_monitor::WorkspaceMonitorTarget;
 use crate::shell_integration::ShellIntegration;
 use crate::supervisor::{IsolationMode, Supervisor};
 use crate::worktree;
 use daedalus_proto::{
     ContainerHealth, ExternalStatus, GitWorktreeInfo, PaneId, PaneRole, PaneSummary, PortMapping,
-    ProtoError, ServerEvent, StatusLevel, WorkspaceId, WorkspaceInfo,
+    ProtoError, ServerEvent, StatusLevel, WorkspaceId, WorkspaceInfo, WorkspaceManifest,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, broadcast};
-use tracing::warn;
+use tracing::{info, warn};
 
 const MAX_EXTERNAL_STATUSES: usize = 16;
 
@@ -31,6 +33,7 @@ struct WorkspaceRecord {
     bound_ports: Vec<PortMapping>,
     containers: Vec<ContainerHealth>,
     external_statuses: Vec<ExternalStatus>,
+    manifest: Option<WorkspaceManifest>,
 }
 
 impl WorkspaceRecord {
@@ -48,8 +51,88 @@ impl WorkspaceRecord {
             bound_ports: self.bound_ports.clone(),
             containers: self.containers.clone(),
             external_statuses: self.external_statuses.clone(),
-            manifest: None,
+            manifest: self.manifest.clone(),
         }
+    }
+
+    fn to_persisted(&self) -> PersistedWorkspace {
+        PersistedWorkspace {
+            id: self.id,
+            name: self.name.clone(),
+            root_dir: self.root_dir.clone(),
+            slot_index: self.slot_index,
+            agent_preset: self.manifest.as_ref().and_then(|m| m.agent_preset.clone()),
+        }
+    }
+}
+
+struct PreparedWorkspaceComponents {
+    plan: isolation::IsolationPlan,
+    git_branch: Option<String>,
+    canonical_root_dir: PathBuf,
+    manifest: Option<WorkspaceManifest>,
+}
+
+fn prepare_workspace_components(
+    name: &str,
+    root_dir: &Path,
+    slot_index: u16,
+    caller_env: HashMap<String, String>,
+    reserved_ports: &HashSet<u16>,
+) -> std::io::Result<PreparedWorkspaceComponents> {
+    let loaded_manifest = manifest::load_project_manifest(root_dir);
+    let extra_ports = loaded_manifest
+        .as_ref()
+        .map(|m| m.extra_ports.as_slice())
+        .unwrap_or(&[]);
+    let mut merged_env = loaded_manifest
+        .as_ref()
+        .map(|m| m.env.clone())
+        .unwrap_or_default();
+    merged_env.extend(caller_env);
+
+    let plan = isolation::prepare_workspace_isolation_with_extra_ports(
+        name,
+        root_dir,
+        slot_index,
+        &merged_env,
+        reserved_ports,
+        extra_ports,
+    )?;
+    let git_branch = worktree::current_branch(root_dir);
+    let canonical_root_dir =
+        std::fs::canonicalize(root_dir).unwrap_or_else(|_| root_dir.to_path_buf());
+    Ok(PreparedWorkspaceComponents {
+        plan,
+        git_branch,
+        canonical_root_dir,
+        manifest: loaded_manifest.map(|m| m.workspace_manifest),
+    })
+}
+
+fn build_workspace_record(
+    id: WorkspaceId,
+    name: String,
+    root_dir: PathBuf,
+    prepared: PreparedWorkspaceComponents,
+) -> WorkspaceRecord {
+    let reserved_ports: HashSet<u16> = prepared.plan.remapped_ports.values().copied().collect();
+    WorkspaceRecord {
+        id,
+        name,
+        root_dir,
+        canonical_root_dir: prepared.canonical_root_dir,
+        slot_index: prepared.plan.slot_index,
+        port_offset: prepared.plan.port_offset,
+        compose_project_name: prepared.plan.compose_project_name,
+        git_branch: prepared.git_branch,
+        injected_env: prepared.plan.injected_env,
+        reserved_ports,
+        pane_ids: Vec::new(),
+        bound_ports: Vec::new(),
+        containers: Vec::new(),
+        external_statuses: Vec::new(),
+        manifest: prepared.manifest,
     }
 }
 
@@ -57,6 +140,8 @@ pub struct Registry {
     supervisor: Supervisor,
     shell_integration: ShellIntegration,
     event_tx: broadcast::Sender<ServerEvent>,
+    state_store: Option<StateStore>,
+    persist_lock: Mutex<()>,
     create_lock: Mutex<()>,
     worktrees_dir: std::sync::RwLock<Option<PathBuf>>,
     workspaces: RwLock<HashMap<WorkspaceId, WorkspaceRecord>>,
@@ -69,15 +154,181 @@ impl Registry {
         shell_integration: ShellIntegration,
         event_tx: broadcast::Sender<ServerEvent>,
     ) -> Self {
+        Self::new_with_state_store(supervisor, shell_integration, event_tx, None)
+    }
+
+    pub fn new_with_state_store(
+        supervisor: Supervisor,
+        shell_integration: ShellIntegration,
+        event_tx: broadcast::Sender<ServerEvent>,
+        state_store: Option<StateStore>,
+    ) -> Self {
         Self {
             supervisor,
             shell_integration,
             event_tx,
+            state_store,
+            persist_lock: Mutex::new(()),
             create_lock: Mutex::new(()),
             worktrees_dir: std::sync::RwLock::new(None),
             workspaces: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
         }
+    }
+
+    async fn persist_state(&self) {
+        let Some(store) = self.state_store.clone() else {
+            return;
+        };
+        let _persist_guard = self.persist_lock.lock().await;
+        let mut workspaces: Vec<PersistedWorkspace> = {
+            let ws_map = self.workspaces.read().await;
+            ws_map.values().map(WorkspaceRecord::to_persisted).collect()
+        };
+        workspaces.sort_by_key(|ws| ws.slot_index);
+        let state = PersistedState {
+            version: STATE_VERSION,
+            workspaces,
+        };
+        match tokio::task::spawn_blocking(move || store.save(&state)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                warn!(error = %err, "failed to persist daemon workspace state");
+            }
+            Err(err) => {
+                warn!(error = %err, "state persistence task panicked");
+            }
+        }
+    }
+
+    /// Restores persisted workspaces from `state.json` as dormant workspaces (`panes: []`),
+    /// skipping entries whose `root_dir` no longer exists and refreshing isolation, git branch,
+    /// and `.daedalus.toml` manifest.
+    pub async fn restore_persisted_workspaces(&self) -> usize {
+        let Some(store) = self.state_store.clone() else {
+            return 0;
+        };
+
+        let _create_guard = self.create_lock.lock().await;
+        let load_path = store.path().to_path_buf();
+        let mut persisted_state = match tokio::task::spawn_blocking(move || store.load()).await {
+            Ok(Ok(state)) => state,
+            Ok(Err(err)) => {
+                warn!(path = %load_path.display(), error = %err, "failed to load persisted state; starting empty");
+                return 0;
+            }
+            Err(err) => {
+                warn!(path = %load_path.display(), error = %err, "state restore task panicked; starting empty");
+                return 0;
+            }
+        };
+
+        if persisted_state.workspaces.is_empty() {
+            return 0;
+        }
+
+        persisted_state.workspaces.sort_by_key(|ws| ws.slot_index);
+
+        let (mut used_slots, mut reserved_ports, mut existing_ids) = {
+            let ws_map = self.workspaces.read().await;
+            let used_slots: HashSet<u16> = ws_map.values().map(|ws| ws.slot_index).collect();
+            let reserved_ports: HashSet<u16> = ws_map
+                .values()
+                .flat_map(|ws| ws.reserved_ports.iter().copied())
+                .collect();
+            let existing_ids: HashSet<WorkspaceId> = ws_map.keys().copied().collect();
+            (used_slots, reserved_ports, existing_ids)
+        };
+
+        let mut restored_records = Vec::new();
+        let mut needs_resave = false;
+
+        for entry in persisted_state.workspaces {
+            if existing_ids.contains(&entry.id) {
+                needs_resave = true;
+                continue;
+            }
+            if !entry.root_dir.is_dir() {
+                info!(
+                    workspace_id = %entry.id,
+                    root_dir = %entry.root_dir.display(),
+                    "skipping persisted workspace whose root_dir no longer exists"
+                );
+                needs_resave = true;
+                continue;
+            }
+
+            let slot_index = if !used_slots.contains(&entry.slot_index) {
+                entry.slot_index
+            } else if let Some(slot) = (0..=u16::MAX).find(|s| !used_slots.contains(s)) {
+                needs_resave = true;
+                slot
+            } else {
+                warn!(workspace_id = %entry.id, "no workspace slots available during restore");
+                needs_resave = true;
+                continue;
+            };
+
+            let name_clone = entry.name.clone();
+            let root_clone = entry.root_dir.clone();
+            let reserved_clone = reserved_ports.clone();
+            let prepared_res = tokio::task::spawn_blocking(move || {
+                prepare_workspace_components(
+                    &name_clone,
+                    &root_clone,
+                    slot_index,
+                    HashMap::new(),
+                    &reserved_clone,
+                )
+            })
+            .await;
+
+            let prepared = match prepared_res {
+                Ok(Ok(p)) => p,
+                Ok(Err(err)) => {
+                    warn!(
+                        workspace_id = %entry.id,
+                        root_dir = %entry.root_dir.display(),
+                        error = %err,
+                        "failed to prepare isolation for persisted workspace; skipping"
+                    );
+                    needs_resave = true;
+                    continue;
+                }
+                Err(err) => {
+                    warn!(workspace_id = %entry.id, error = %err, "workspace restore task panicked");
+                    needs_resave = true;
+                    continue;
+                }
+            };
+
+            let record = build_workspace_record(entry.id, entry.name, entry.root_dir, prepared);
+            used_slots.insert(record.slot_index);
+            reserved_ports.extend(record.reserved_ports.iter().copied());
+            existing_ids.insert(record.id);
+            restored_records.push(record);
+        }
+
+        let restored_count = restored_records.len();
+        if restored_count > 0 {
+            let mut ws_map = self.workspaces.write().await;
+            for record in restored_records {
+                ws_map.insert(record.id, record);
+            }
+        }
+        drop(_create_guard);
+
+        if needs_resave {
+            self.persist_state().await;
+        }
+        if restored_count > 0 {
+            info!(
+                count = restored_count,
+                "restored dormant workspaces from state.json"
+            );
+        }
+
+        restored_count
     }
 
     pub fn set_worktrees_dir(&self, dir: PathBuf) {
@@ -132,44 +383,19 @@ impl Registry {
 
         let name_clone = name.clone();
         let root_clone = root_dir.clone();
-        let env_clone = env.clone();
-        let (plan_res, git_branch, canonical_root_dir) = tokio::task::spawn_blocking(move || {
-            let plan = isolation::prepare_workspace_isolation_with_reserved(
-                &name_clone,
-                &root_clone,
-                slot_index,
-                &env_clone,
-                &reserved_ports,
-            );
-            let branch = worktree::current_branch(&root_clone);
-            let canonical = std::fs::canonicalize(&root_clone).unwrap_or(root_clone);
-            (plan, branch, canonical)
+        let prepared = tokio::task::spawn_blocking(move || {
+            prepare_workspace_components(&name_clone, &root_clone, slot_index, env, &reserved_ports)
         })
         .await
-        .map_err(|e| ProtoError::Internal(format!("workspace preparation task failed: {e}")))?;
-
-        let plan = plan_res.map_err(|e| ProtoError::IoError(e.to_string()))?;
-        let reserved_ports: HashSet<u16> = plan.remapped_ports.values().copied().collect();
+        .map_err(|e| ProtoError::Internal(format!("workspace preparation task failed: {e}")))?
+        .map_err(|e| ProtoError::IoError(e.to_string()))?;
 
         let id = WorkspaceId::new();
-        let record = WorkspaceRecord {
-            id,
-            name,
-            root_dir,
-            canonical_root_dir,
-            slot_index: plan.slot_index,
-            port_offset: plan.port_offset,
-            compose_project_name: plan.compose_project_name,
-            git_branch,
-            injected_env: plan.injected_env,
-            reserved_ports,
-            pane_ids: Vec::new(),
-            bound_ports: Vec::new(),
-            containers: Vec::new(),
-            external_statuses: Vec::new(),
-        };
+        let record = build_workspace_record(id, name, root_dir, prepared);
         let info = record.to_info(Vec::new());
         self.workspaces.write().await.insert(id, record);
+        drop(_create_guard);
+        self.persist_state().await;
         Ok(info)
     }
 
@@ -367,6 +593,16 @@ impl Registry {
         workspace_id: WorkspaceId,
         compose_down: bool,
     ) -> Result<(), ProtoError> {
+        self.close_workspace_internal(workspace_id, compose_down, true)
+            .await
+    }
+
+    async fn close_workspace_internal(
+        &self,
+        workspace_id: WorkspaceId,
+        compose_down: bool,
+        persist: bool,
+    ) -> Result<(), ProtoError> {
         let ws = self
             .workspaces
             .write()
@@ -384,6 +620,10 @@ impl Registry {
         }
         for handle in handles {
             handle.close().await;
+        }
+
+        if persist {
+            self.persist_state().await;
         }
 
         if compose_down && let Some(project) = ws.compose_project_name {
@@ -417,10 +657,12 @@ impl Registry {
         Ok(())
     }
 
+    /// Closes all active workspaces and their PTY panes during daemon shutdown
+    /// without clearing persisted `state.json`.
     pub async fn close_all(&self) {
         let ws_ids: Vec<WorkspaceId> = self.workspaces.read().await.keys().copied().collect();
         for id in ws_ids {
-            let _ = self.close_workspace(id, false).await;
+            let _ = self.close_workspace_internal(id, false, false).await;
         }
     }
 
@@ -1005,5 +1247,169 @@ mod tests {
             }
             assert!(registry.panes.read().await.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn create_workspace_loads_manifest_merges_env_and_reserves_extra_ports() {
+        let dir = TempDir::new().unwrap();
+        let app_dir = dir.path().join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join(".env"), "PORT=17000\nFROM_DOTENV=dotenv_val\n").unwrap();
+        std::fs::write(
+            app_dir.join(".daedalus.toml"),
+            r#"
+[agent]
+preset = "claude"
+command = ["claude", "--model", "sonnet"]
+
+[service]
+command = ["npm", "run", "dev"]
+
+[runner]
+command = ["cargo", "test"]
+
+[ports]
+extra = [17100]
+
+[env]
+RUST_LOG = "info"
+SHARED_KEY = "from_manifest"
+"#,
+        )
+        .unwrap();
+
+        let registry = test_registry(dir.path());
+        let ws0 = registry
+            .create_workspace(
+                "primary".to_string(),
+                app_dir.clone(),
+                HashMap::from([("SHARED_KEY".to_string(), "from_caller".to_string())]),
+            )
+            .await
+            .unwrap();
+
+        let manifest = ws0.manifest.expect("manifest should be populated");
+        assert_eq!(manifest.agent_preset.as_deref(), Some("claude"));
+        assert_eq!(
+            manifest.agent_command,
+            Some(vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string()
+            ])
+        );
+        assert_eq!(
+            manifest.service_command,
+            Some(vec![
+                "npm".to_string(),
+                "run".to_string(),
+                "dev".to_string()
+            ])
+        );
+        assert_eq!(
+            manifest.runner_command,
+            Some(vec!["cargo".to_string(), "test".to_string()])
+        );
+        assert_eq!(
+            ws0.injected_env.get("RUST_LOG").map(String::as_str),
+            Some("info")
+        );
+        assert_eq!(
+            ws0.injected_env.get("SHARED_KEY").map(String::as_str),
+            Some("from_caller")
+        );
+
+        let ws1 = registry
+            .create_workspace("wt1".to_string(), app_dir.clone(), HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(ws1.slot_index, 1);
+        assert_eq!(ws1.port_offset, 100);
+        // ws1 reserved 17000+100=17100 and 17100+100=17200.
+        // ws2 starts at slot 2 (offset 200 -> 17200 and 17300), must skip 17200 -> offset 300.
+        let ws2 = registry
+            .create_workspace("wt2".to_string(), app_dir, HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(ws2.slot_index, 2);
+        assert_eq!(ws2.port_offset, 300);
+    }
+
+    #[tokio::test]
+    async fn persistence_saves_on_create_close_and_restores_dormant_skipping_deleted_dirs() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state").join("state.json");
+        let keep_dir = dir.path().join("keep");
+        let drop_dir = dir.path().join("drop");
+        std::fs::create_dir_all(&keep_dir).unwrap();
+        std::fs::create_dir_all(&drop_dir).unwrap();
+        std::fs::write(
+            keep_dir.join(".daedalus.toml"),
+            "[agent]\npreset = \"agy\"\n[env]\nSECRET_ENV = \"should_not_be_in_state_json\"\n",
+        )
+        .unwrap();
+
+        let reg1 = Registry::new_with_state_store(
+            Supervisor::with_mode(IsolationMode::PgidFallback),
+            ShellIntegration::prepare(dir.path()).unwrap(),
+            broadcast::channel(64).0,
+            Some(StateStore::new(state_path.clone())),
+        );
+        let ws_keep = reg1
+            .create_workspace("keep".to_string(), keep_dir.clone(), HashMap::new())
+            .await
+            .unwrap();
+        let ws_drop = reg1
+            .create_workspace("drop".to_string(), drop_dir.clone(), HashMap::new())
+            .await
+            .unwrap();
+
+        let raw_json = std::fs::read_to_string(&state_path).unwrap();
+        assert!(
+            !raw_json.contains("should_not_be_in_state_json"),
+            "state.json must not persist raw [env] values: {raw_json}"
+        );
+
+        // Clean shutdown must preserve state.json.
+        reg1.close_all().await;
+        assert!(state_path.is_file());
+
+        // Delete drop_dir before restart.
+        std::fs::remove_dir_all(&drop_dir).unwrap();
+
+        let reg2 = Registry::new_with_state_store(
+            Supervisor::with_mode(IsolationMode::PgidFallback),
+            ShellIntegration::prepare(dir.path()).unwrap(),
+            broadcast::channel(64).0,
+            Some(StateStore::new(state_path.clone())),
+        );
+        let restored = reg2.restore_persisted_workspaces().await;
+        assert_eq!(restored, 1);
+
+        let listed = reg2.list_workspaces().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, ws_keep.id);
+        assert!(listed[0].panes.is_empty());
+        assert_eq!(
+            listed[0].injected_env.get("SECRET_ENV").map(String::as_str),
+            Some("should_not_be_in_state_json")
+        );
+        assert_eq!(
+            listed[0]
+                .manifest
+                .as_ref()
+                .and_then(|m| m.agent_preset.as_deref()),
+            Some("agy")
+        );
+
+        // Deleted entry was pruned from state.json.
+        let reloaded = StateStore::new(state_path.clone()).load().unwrap();
+        assert_eq!(reloaded.workspaces.len(), 1);
+        assert_ne!(reloaded.workspaces[0].id, ws_drop.id);
+
+        // Closing workspace removes it from state.json.
+        reg2.close_workspace(ws_keep.id, false).await.unwrap();
+        let after_close = StateStore::new(state_path).load().unwrap();
+        assert!(after_close.workspaces.is_empty());
     }
 }
