@@ -7,7 +7,8 @@ pub use rpc::{ClientMessage, ProtoError, Request, ResponsePayload, ServerEvent, 
 pub use types::{
     Cell, CellFlags, Color, ContainerHealth, CursorState, ExternalStatus, FailureTrace,
     GitWorktreeInfo, GridDelta, GridRow, GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary,
-    PortMapping, PortSource, StatusLevel, WorkspaceId, WorkspaceInfo, wrap_bracketed_paste,
+    PortMapping, PortSource, SearchMatch, StatusLevel, WorkspaceId, WorkspaceInfo,
+    WorkspaceManifest, wrap_bracketed_paste,
 };
 
 use std::path::PathBuf;
@@ -47,6 +48,81 @@ pub fn default_events_socket_path() -> PathBuf {
     resolve_events_socket_path(
         std::env::var("DAEDALUS_EVENTS_SOCKET").ok().as_deref(),
         std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+    )
+}
+
+fn resolve_user_file_path(
+    env_override: Option<&str>,
+    xdg_dir: Option<&str>,
+    home: Option<&str>,
+    home_rel: &[&str],
+    filename: &str,
+) -> PathBuf {
+    if let Some(path) = env_override
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    if let Some(xdg) = xdg_dir
+        && !xdg.is_empty()
+    {
+        return PathBuf::from(xdg).join("daedalus").join(filename);
+    }
+    if let Some(home_dir) = home
+        && !home_dir.is_empty()
+    {
+        let mut path = PathBuf::from(home_dir);
+        for segment in home_rel {
+            path.push(segment);
+        }
+        return path.join("daedalus").join(filename);
+    }
+    std::env::temp_dir()
+        .join(format!("daedalus-{}", nix::unistd::Uid::current()))
+        .join(filename)
+}
+
+fn resolve_state_file_path(
+    env_override: Option<&str>,
+    xdg_state_home: Option<&str>,
+    home: Option<&str>,
+) -> PathBuf {
+    resolve_user_file_path(
+        env_override,
+        xdg_state_home,
+        home,
+        &[".local", "state"],
+        "state.json",
+    )
+}
+
+pub fn default_state_file_path() -> PathBuf {
+    resolve_state_file_path(
+        std::env::var("DAEDALUS_STATE_FILE").ok().as_deref(),
+        std::env::var("XDG_STATE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+fn resolve_config_file_path(
+    env_override: Option<&str>,
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+) -> PathBuf {
+    resolve_user_file_path(
+        env_override,
+        xdg_config_home,
+        home,
+        &[".config"],
+        "config.toml",
+    )
+}
+
+pub fn default_config_file_path() -> PathBuf {
+    resolve_config_file_path(
+        std::env::var("DAEDALUS_CONFIG").ok().as_deref(),
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
     )
 }
 
@@ -276,6 +352,7 @@ mod tests {
             bound_ports: vec![port_mapping.clone(), local_port.clone()],
             containers: vec![container.clone()],
             external_statuses: vec![ext_status.clone()],
+            manifest: None,
         };
 
         let server_msgs = vec![
@@ -340,6 +417,7 @@ mod tests {
         assert!(decoded_ws.bound_ports.is_empty());
         assert!(decoded_ws.containers.is_empty());
         assert!(decoded_ws.external_statuses.is_empty());
+        assert_eq!(decoded_ws.manifest, None);
 
         let legacy_close = LegacyClientMessage::CloseWorkspace { id: ws_id };
         let close_bytes = rmp_serde::to_vec_named(&legacy_close).unwrap();
@@ -350,6 +428,125 @@ mod tests {
                 id: ws_id,
                 compose_down: false,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn round_trips_manifest_and_search_rpcs() {
+        let (mut client, mut server) = duplex(8192);
+        let ws_id = WorkspaceId::new();
+        let pane_id = PaneId::new();
+
+        let search_req = Request {
+            id: 42,
+            payload: ClientMessage::SearchPane {
+                pane_id,
+                query: "needle".to_string(),
+                case_sensitive: false,
+            },
+        };
+        write_frame(&mut client, &search_req).await.unwrap();
+        let decoded_req: Request = read_frame(&mut server).await.unwrap().unwrap();
+        assert_eq!(decoded_req, search_req);
+
+        let search_resp = ServerMessage::Response {
+            id: 42,
+            result: Ok(ResponsePayload::SearchMatches {
+                pane_id,
+                total_scrollback: 120,
+                matches: vec![
+                    SearchMatch {
+                        abs_row: 5,
+                        start_col: 2,
+                        end_col: 8,
+                    },
+                    SearchMatch {
+                        abs_row: 125,
+                        start_col: 0,
+                        end_col: 6,
+                    },
+                ],
+            }),
+        };
+        write_frame(&mut server, &search_resp).await.unwrap();
+        let decoded_resp: ServerMessage = read_frame(&mut client).await.unwrap().unwrap();
+        assert_eq!(decoded_resp, search_resp);
+
+        let manifest = WorkspaceManifest {
+            agent_preset: Some("agy".to_string()),
+            agent_command: Some(vec!["agy".to_string(), "--fast".to_string()]),
+            service_command: Some(vec!["docker".to_string(), "compose".to_string()]),
+            runner_command: Some(vec!["cargo".to_string(), "test".to_string()]),
+        };
+        let ws_info = WorkspaceInfo {
+            id: ws_id,
+            name: "manifest-ws".to_string(),
+            root_dir: PathBuf::from("/tmp/manifest-ws"),
+            slot_index: 0,
+            injected_env: HashMap::new(),
+            panes: Vec::new(),
+            port_offset: 0,
+            compose_project_name: None,
+            git_branch: None,
+            bound_ports: Vec::new(),
+            containers: Vec::new(),
+            external_statuses: Vec::new(),
+            manifest: Some(manifest),
+        };
+        let ws_resp = ServerMessage::Response {
+            id: 43,
+            result: Ok(ResponsePayload::WorkspaceCreated(ws_info)),
+        };
+        write_frame(&mut server, &ws_resp).await.unwrap();
+        let decoded_ws_resp: ServerMessage = read_frame(&mut client).await.unwrap().unwrap();
+        assert_eq!(decoded_ws_resp, ws_resp);
+    }
+
+    #[test]
+    fn resolves_state_and_config_file_paths() {
+        assert_eq!(
+            resolve_state_file_path(
+                Some("/tmp/custom-state.json"),
+                Some("/xdg/state"),
+                Some("/home/alice"),
+            ),
+            PathBuf::from("/tmp/custom-state.json")
+        );
+        assert_eq!(
+            resolve_state_file_path(Some(""), Some("/xdg/state"), Some("/home/alice")),
+            PathBuf::from("/xdg/state/daedalus/state.json")
+        );
+        assert_eq!(
+            resolve_state_file_path(None, Some(""), Some("/home/alice")),
+            PathBuf::from("/home/alice/.local/state/daedalus/state.json")
+        );
+
+        assert_eq!(
+            resolve_config_file_path(
+                Some("/tmp/custom-config.toml"),
+                Some("/xdg/config"),
+                Some("/home/alice"),
+            ),
+            PathBuf::from("/tmp/custom-config.toml")
+        );
+        assert_eq!(
+            resolve_config_file_path(Some(""), Some("/xdg/config"), Some("/home/alice")),
+            PathBuf::from("/xdg/config/daedalus/config.toml")
+        );
+        assert_eq!(
+            resolve_config_file_path(None, None, Some("/home/alice")),
+            PathBuf::from("/home/alice/.config/daedalus/config.toml")
+        );
+
+        let fallback_prefix =
+            std::env::temp_dir().join(format!("daedalus-{}", nix::unistd::Uid::current()));
+        assert_eq!(
+            resolve_state_file_path(None, None, None),
+            fallback_prefix.join("state.json")
+        );
+        assert_eq!(
+            resolve_config_file_path(None, None, Some("")),
+            fallback_prefix.join("config.toml")
         );
     }
 }

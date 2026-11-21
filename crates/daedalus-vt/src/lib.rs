@@ -3,11 +3,11 @@ pub mod builtin;
 pub mod ghostty;
 pub mod semantic;
 
-use daedalus_proto::{CursorState, GridDelta, GridRow, GridSnapshot, PaneId};
+use daedalus_proto::{CursorState, GridDelta, GridRow, GridSnapshot, PaneId, SearchMatch};
 use std::path::PathBuf;
 
 pub use builtin::BuiltinVt;
-pub use builtin::grid::MAX_TRACE_BYTES;
+pub use builtin::grid::{MAX_SEARCH_MATCHES, MAX_TRACE_BYTES};
 pub use semantic::{CommandTracker, TrackedOutcome};
 
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +42,7 @@ pub trait VtEngine: Send {
     fn snapshot(&self, pane_id: PaneId, seq: u64) -> GridSnapshot;
     fn scrollback_len(&self) -> usize;
     fn scrollback_window(&self, offset_from_bottom: usize, count: usize) -> Vec<GridRow>;
+    fn search(&self, query: &str, case_sensitive: bool) -> Vec<SearchMatch>;
     fn take_dirty_delta(&mut self, pane_id: PaneId, seq: u64) -> Option<GridDelta>;
     fn slice_plain_text(&self, start_abs_row: u64, end_abs_row: u64) -> String;
     fn row_text_from(&self, abs_row: u64, start_col: u16) -> String;
@@ -291,5 +292,95 @@ mod tests {
             row_texts(vt.scrollback_window(999, 3)),
             vec!["line0", "line1", "line2"]
         );
+    }
+
+    #[test]
+    fn search_scans_scrollback_and_viewport_with_case_and_unicode() {
+        let mut vt = BuiltinVt::new(VtConfig {
+            cols: 40,
+            rows: 3,
+            scrollback_limit: 50,
+        });
+        vt.feed(b"Alpha hit0\r\nnoise\r\n-> HIT1 and hit2\r\nmore\r\nviewport Hit3");
+
+        assert!(vt.search("", false).is_empty());
+        assert!(vt.search("", true).is_empty());
+
+        let ci = vt.search("hit", false);
+        assert_eq!(
+            ci,
+            vec![
+                SearchMatch {
+                    abs_row: 0,
+                    start_col: 6,
+                    end_col: 9,
+                },
+                SearchMatch {
+                    abs_row: 2,
+                    start_col: 3,
+                    end_col: 6,
+                },
+                SearchMatch {
+                    abs_row: 2,
+                    start_col: 12,
+                    end_col: 15,
+                },
+                SearchMatch {
+                    abs_row: 4,
+                    start_col: 9,
+                    end_col: 12,
+                },
+            ]
+        );
+
+        let cs = vt.search("HIT", true);
+        assert_eq!(
+            cs,
+            vec![SearchMatch {
+                abs_row: 2,
+                start_col: 3,
+                end_col: 6,
+            }]
+        );
+
+        // Multi-byte UTF-8 prefix shifts byte offset relative to cell column index.
+        let mut utf8_vt = BuiltinVt::new(VtConfig {
+            cols: 20,
+            rows: 2,
+            scrollback_limit: 10,
+        });
+        utf8_vt.feed("→ Café foo".as_bytes());
+        assert_eq!(
+            utf8_vt.search("foo", true),
+            vec![SearchMatch {
+                abs_row: 0,
+                start_col: 7,
+                end_col: 10,
+            }]
+        );
+        assert_eq!(
+            utf8_vt.search("café", false),
+            vec![SearchMatch {
+                abs_row: 0,
+                start_col: 2,
+                end_col: 6,
+            }]
+        );
+    }
+
+    #[test]
+    fn search_caps_results_at_max_search_matches() {
+        let mut vt = BuiltinVt::new(VtConfig {
+            cols: 80,
+            rows: 10,
+            scrollback_limit: 3_000,
+        });
+        for i in 0..2_500 {
+            vt.feed(format!("match-{i:04}\r\n").as_bytes());
+        }
+        let matches = vt.search("match-", true);
+        assert_eq!(matches.len(), MAX_SEARCH_MATCHES);
+        assert_eq!(matches[0].start_col, 0);
+        assert_eq!(matches[0].end_col, 6);
     }
 }

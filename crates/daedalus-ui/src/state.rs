@@ -659,6 +659,7 @@ mod tests {
             bound_ports: Vec::new(),
             containers: Vec::new(),
             external_statuses: Vec::new(),
+            manifest: None,
         };
         (ws, ids.0, ids.1, ids.2)
     }

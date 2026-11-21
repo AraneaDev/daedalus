@@ -450,9 +450,34 @@ async fn get_scrollback_returns_lines_scrolled_above_viewport() {
     let top_text = rows_to_text(&top_rows);
     assert_eq!(top_text, vec!["LINE_1", "LINE_2", "LINE_3", "LINE_4"]);
 
-    send_rpc(
+    match send_rpc(
         &mut client,
         6,
+        ClientMessage::SearchPane {
+            pane_id: pane.id,
+            query: "line_".to_string(),
+            case_sensitive: false,
+        },
+    )
+    .await
+    {
+        ResponsePayload::SearchMatches {
+            pane_id,
+            total_scrollback: search_scrollback,
+            matches,
+        } => {
+            assert_eq!(pane_id, pane.id);
+            assert_eq!(search_scrollback, 7);
+            assert_eq!(matches.len(), 10);
+            assert_eq!(matches[0].start_col, 0);
+            assert_eq!(matches[0].end_col, 5);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    send_rpc(
+        &mut client,
+        7,
         ClientMessage::CloseWorkspace {
             id: ws.id,
             compose_down: false,

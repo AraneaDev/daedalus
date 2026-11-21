@@ -330,6 +330,22 @@ async fn dispatch_request(
                 rows,
             })
         }
+        ClientMessage::SearchPane {
+            pane_id,
+            query,
+            case_sensitive,
+        } => {
+            let (total_scrollback, matches) = registry
+                .get_pane(pane_id)
+                .await?
+                .search(query, case_sensitive)
+                .await?;
+            Ok(ResponsePayload::SearchMatches {
+                pane_id,
+                total_scrollback,
+                matches,
+            })
+        }
         ClientMessage::GetFailureTrace { pane_id } => Ok(ResponsePayload::FailureTrace(
             registry.get_pane(pane_id).await?.failure_trace().await?,
         )),

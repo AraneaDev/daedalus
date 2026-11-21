@@ -146,6 +146,18 @@ pub struct ExternalStatus {
     pub updated_at_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WorkspaceManifest {
+    #[serde(default)]
+    pub agent_preset: Option<String>,
+    #[serde(default)]
+    pub agent_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub service_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub runner_command: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceInfo {
     pub id: WorkspaceId,
@@ -166,6 +178,8 @@ pub struct WorkspaceInfo {
     pub containers: Vec<ContainerHealth>,
     #[serde(default)]
     pub external_statuses: Vec<ExternalStatus>,
+    #[serde(default)]
+    pub manifest: Option<WorkspaceManifest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +267,14 @@ pub struct GridDelta {
     pub rows: u16,
     pub cursor: CursorState,
     pub dirty_rows: Vec<GridRow>,
+}
+
+/// A single substring match in a pane's scrollback/viewport history (`end_col` is exclusive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchMatch {
+    pub abs_row: u64,
+    pub start_col: u16,
+    pub end_col: u16,
 }
 
 const BRACKETED_PASTE_FORBIDDEN: &[&[u8]] = &[b"\x1b[201~", b"\x1b[200~", b"\x9b201~", b"\x9b200~"];

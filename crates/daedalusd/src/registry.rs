@@ -48,6 +48,7 @@ impl WorkspaceRecord {
             bound_ports: self.bound_ports.clone(),
             containers: self.containers.clone(),
             external_statuses: self.external_statuses.clone(),
+            manifest: None,
         }
     }
 }

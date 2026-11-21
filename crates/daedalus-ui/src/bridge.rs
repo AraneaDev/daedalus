@@ -91,6 +91,7 @@ pub enum UiCommand {
 
 /// Events emitted by `DaemonBridge` back to the UI thread.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum UiEvent {
     Connected,
     Disconnected,

@@ -983,6 +983,7 @@ mod tests {
             bound_ports: Vec::new(),
             containers: Vec::new(),
             external_statuses: Vec::new(),
+            manifest: None,
         };
 
         let mut state = AppState::new();
