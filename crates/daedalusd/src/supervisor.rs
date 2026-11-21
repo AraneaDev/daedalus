@@ -6,7 +6,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -48,6 +48,8 @@ impl Supervisor {
     pub fn detect() -> Self {
         let ok = Command::new("systemd-run")
             .args(["--user", "--scope", "--quiet", "--", "true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -182,7 +184,7 @@ impl ProcessHandle {
         }
         self.torn_down = true;
 
-        if self.try_wait_exit().is_some() && !self.has_live_pgid_processes() {
+        if self.try_wait_exit().is_some() && !self.has_live_processes() {
             self.reset_failed_unit();
             return;
         }
@@ -190,7 +192,7 @@ impl ProcessHandle {
         self.send_signal(Signal::SIGTERM);
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            if self.try_wait_exit().is_some() && !self.has_live_pgid_processes() {
+            if self.try_wait_exit().is_some() && !self.has_live_processes() {
                 self.reset_failed_unit();
                 return;
             }
@@ -201,6 +203,16 @@ impl ProcessHandle {
         let _ = self.child.kill();
         let _ = self.child.wait();
         self.reset_failed_unit();
+    }
+
+    fn has_live_processes(&self) -> bool {
+        self.has_live_pgid_processes() || self.has_active_systemd_unit()
+    }
+
+    fn has_active_systemd_unit(&self) -> bool {
+        self.systemd_unit
+            .as_deref()
+            .is_some_and(|unit| run_systemctl_quiet(&["is-active", "--quiet", unit]))
     }
 
     fn has_live_pgid_processes(&self) -> bool {
@@ -223,9 +235,7 @@ impl ProcessHandle {
             _ => "SIGTERM",
         };
         if let Some(unit) = &self.systemd_unit {
-            let _ = Command::new("systemctl")
-                .args(["--user", "kill", "-s", sig_name, unit])
-                .status();
+            let _ = run_systemctl_quiet(&["kill", "-s", sig_name, unit]);
         }
         if let Some(pid) = self.pid {
             let _ = killpg(Pid::from_raw(pid as i32), sig);
@@ -234,11 +244,20 @@ impl ProcessHandle {
 
     fn reset_failed_unit(&self) {
         if let Some(unit) = &self.systemd_unit {
-            let _ = Command::new("systemctl")
-                .args(["--user", "reset-failed", unit])
-                .status();
+            let _ = run_systemctl_quiet(&["reset-failed", unit]);
         }
     }
+}
+
+fn run_systemctl_quiet(args: &[&str]) -> bool {
+    Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn parse_proc_stat(stat: &str) -> Option<(char, i32)> {
