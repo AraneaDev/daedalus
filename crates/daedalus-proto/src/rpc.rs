@@ -1,0 +1,122 @@
+use crate::types::{
+    FailureTrace, GridDelta, GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary, WorkspaceId,
+    WorkspaceInfo,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use thiserror::Error;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Request {
+    pub id: u64,
+    pub payload: ClientMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientMessage {
+    Ping,
+    CreateWorkspace {
+        name: String,
+        root_dir: PathBuf,
+        env: HashMap<String, String>,
+    },
+    ListWorkspaces,
+    CloseWorkspace {
+        id: WorkspaceId,
+    },
+    SpawnPane {
+        workspace_id: WorkspaceId,
+        role: PaneRole,
+        command: Option<Vec<String>>,
+        shell: Option<String>,
+        cols: u16,
+        rows: u16,
+        env: HashMap<String, String>,
+    },
+    ClosePane {
+        pane_id: PaneId,
+    },
+    SendInput {
+        pane_id: PaneId,
+        data: Vec<u8>,
+    },
+    ResizePane {
+        pane_id: PaneId,
+        cols: u16,
+        rows: u16,
+    },
+    GetSnapshot {
+        pane_id: PaneId,
+    },
+    GetFailureTrace {
+        pane_id: PaneId,
+    },
+    Subscribe {
+        pane_ids: Option<Vec<PaneId>>,
+    },
+    Unsubscribe,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServerMessage {
+    Response {
+        id: u64,
+        result: Result<ResponsePayload, ProtoError>,
+    },
+    Event(ServerEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResponsePayload {
+    Pong {
+        version: String,
+        vt_backend: String,
+        isolation_mode: String,
+    },
+    WorkspaceCreated(WorkspaceInfo),
+    Workspaces(Vec<WorkspaceInfo>),
+    PaneSpawned(PaneSummary),
+    Snapshot(GridSnapshot),
+    FailureTrace(Option<FailureTrace>),
+    Ok,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServerEvent {
+    GridDelta(GridDelta),
+    PaneStatusChanged {
+        pane_id: PaneId,
+        status: PaneStatus,
+        cwd: Option<PathBuf>,
+    },
+    CommandFinished {
+        pane_id: PaneId,
+        command: Option<String>,
+        exit_code: i32,
+        has_failure_trace: bool,
+    },
+    PaneExited {
+        pane_id: PaneId,
+        exit_code: Option<i32>,
+    },
+    ResyncRequired {
+        pane_id: PaneId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
+pub enum ProtoError {
+    #[error("workspace not found: {0}")]
+    WorkspaceNotFound(WorkspaceId),
+    #[error("pane not found: {0}")]
+    PaneNotFound(PaneId),
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+    #[error("failed to spawn process: {0}")]
+    SpawnFailed(String),
+    #[error("i/o error: {0}")]
+    IoError(String),
+    #[error("internal daemon error: {0}")]
+    Internal(String),
+}
