@@ -3,7 +3,7 @@ mod client;
 use clap::{Parser, Subcommand, ValueEnum};
 use client::DaemonClient;
 use daedalus_proto::{
-    ClientMessage, PaneId, PaneRole, ResponsePayload, StatusLevel, WorkspaceId,
+    AgentState, ClientMessage, PaneId, PaneRole, ResponsePayload, StatusLevel, WorkspaceId,
     default_socket_path, wrap_bracketed_paste,
 };
 use std::collections::HashMap;
@@ -41,6 +41,15 @@ enum Commands {
         #[command(subcommand)]
         action: PaneAction,
     },
+    AgentState {
+        #[command(subcommand)]
+        action: AgentStateAction,
+    },
+    FailureTrace {
+        pane_id: Uuid,
+        #[arg(long)]
+        json: bool,
+    },
     Events {
         #[arg(long)]
         pane: Option<Uuid>,
@@ -63,6 +72,10 @@ enum WorkspaceAction {
         id: Uuid,
         #[arg(long)]
         compose_down: bool,
+        #[arg(long)]
+        remove_worktree: bool,
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -102,11 +115,63 @@ impl From<LevelArg> for StatusLevel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StatusPreset {
+    Phrourion,
+    Cassandra,
+}
+
+impl StatusPreset {
+    fn canonical_source(self) -> &'static str {
+        match self {
+            Self::Phrourion => "phrourion",
+            Self::Cassandra => "cassandra",
+        }
+    }
+}
+
+fn resolve_status_source(
+    preset: Option<StatusPreset>,
+    source: Option<String>,
+) -> Result<String, String> {
+    match (source, preset) {
+        (Some(s), _) if !s.trim().is_empty() => Ok(s),
+        (Some(_), Some(p)) => Ok(p.canonical_source().to_string()),
+        (Some(_), None) => Err("status source cannot be empty".to_string()),
+        (None, Some(p)) => Ok(p.canonical_source().to_string()),
+        (None, None) => Err("either --preset or source must be provided".to_string()),
+    }
+}
+
+fn parse_agent_state(s: &str) -> Result<AgentState, String> {
+    AgentState::from_cli_name(s).ok_or_else(|| {
+        format!(
+            "invalid agent state '{s}'; expected one of: idle, thinking, waiting, approval, waiting_for_approval, error"
+        )
+    })
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentStateAction {
+    Set {
+        #[arg(value_parser = parse_agent_state)]
+        state: AgentState,
+        #[arg(long, conflicts_with_all = ["workspace", "dir"])]
+        pane: Option<Uuid>,
+        #[arg(long, conflicts_with_all = ["pane", "dir"])]
+        workspace: Option<Uuid>,
+        #[arg(long, conflicts_with_all = ["pane", "workspace"])]
+        dir: Option<PathBuf>,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum StatusAction {
     Publish {
-        #[arg(long)]
-        source: String,
+        #[arg(long, value_enum)]
+        preset: Option<StatusPreset>,
+        #[arg(long, required_unless_present = "preset")]
+        source: Option<String>,
         #[arg(long)]
         label: String,
         #[arg(long, value_enum, default_value_t = LevelArg::Info)]
@@ -117,6 +182,16 @@ enum StatusAction {
         dir: Option<PathBuf>,
         #[arg(long)]
         detail: Option<String>,
+    },
+    Clear {
+        #[arg(required_unless_present = "preset")]
+        source: Option<String>,
+        #[arg(long, value_enum)]
+        preset: Option<StatusPreset>,
+        #[arg(long, conflicts_with = "dir")]
+        workspace: Option<Uuid>,
+        #[arg(long, conflicts_with = "workspace")]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -200,6 +275,17 @@ fn resolve_dir(dir: Option<PathBuf>) -> Result<PathBuf, std::io::Error> {
     }
 }
 
+fn resolve_target_root_dir(
+    has_direct_id: bool,
+    dir: Option<PathBuf>,
+) -> Result<Option<PathBuf>, std::io::Error> {
+    if has_direct_id {
+        Ok(None)
+    } else {
+        Ok(Some(resolve_dir(dir)?))
+    }
+}
+
 fn unexpected_response(payload: ResponsePayload) -> Box<dyn std::error::Error> {
     format!("unexpected response payload: {payload:?}").into()
 }
@@ -273,14 +359,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 other => return Err(unexpected_response(other)),
             },
-            WorkspaceAction::Close { id, compose_down } => {
+            WorkspaceAction::Close {
+                id,
+                compose_down,
+                remove_worktree,
+                force,
+            } => {
                 expect_ok(
                     client
                         .request(ClientMessage::CloseWorkspace {
                             id: WorkspaceId(id),
                             compose_down,
-                            remove_worktree: false,
-                            force_remove_worktree: false,
+                            remove_worktree,
+                            force_remove_worktree: force,
                         })
                         .await?,
                 )?;
@@ -329,6 +420,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Commands::Status { action } => match action {
             StatusAction::Publish {
+                preset,
                 source,
                 label,
                 level,
@@ -336,11 +428,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dir,
                 detail,
             } => {
-                let root_dir = if workspace.is_some() {
-                    None
-                } else {
-                    Some(resolve_dir(dir)?)
-                };
+                let source = resolve_status_source(preset, source)?;
+                let root_dir = resolve_target_root_dir(workspace.is_some(), dir)?;
                 expect_ok(
                     client
                         .request(ClientMessage::PublishExternalStatus {
@@ -354,6 +443,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await?,
                 )?;
                 println!("published");
+            }
+            StatusAction::Clear {
+                source,
+                preset,
+                workspace,
+                dir,
+            } => {
+                let source = resolve_status_source(preset, source)?;
+                let root_dir = resolve_target_root_dir(workspace.is_some(), dir)?;
+                expect_ok(
+                    client
+                        .request(ClientMessage::ClearExternalStatus {
+                            workspace_id: workspace.map(WorkspaceId),
+                            root_dir,
+                            source,
+                        })
+                        .await?,
+                )?;
+                println!("cleared");
             }
         },
         Commands::Pane { action } => match action {
@@ -474,6 +582,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
+        Commands::AgentState { action } => match action {
+            AgentStateAction::Set {
+                state,
+                pane,
+                workspace,
+                dir,
+            } => {
+                let root_dir = resolve_target_root_dir(pane.is_some() || workspace.is_some(), dir)?;
+                expect_ok(
+                    client
+                        .request(ClientMessage::SetAgentState {
+                            pane_id: pane.map(PaneId),
+                            workspace_id: workspace.map(WorkspaceId),
+                            root_dir,
+                            state,
+                        })
+                        .await?,
+                )?;
+                println!("agent state set to {state}");
+            }
+        },
+        Commands::FailureTrace { pane_id, json } => {
+            match client
+                .request(ClientMessage::GetFailureTrace {
+                    pane_id: PaneId(pane_id),
+                })
+                .await?
+            {
+                ResponsePayload::FailureTrace(trace) => match trace {
+                    Some(t) => {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&t)?);
+                        } else {
+                            println!("pane_id: {}", t.pane_id);
+                            println!("exit_code: {}", t.exit_code);
+                            println!("command: {}", t.command.as_deref().unwrap_or("<unknown>"));
+                            if let Some(cwd) = &t.cwd {
+                                println!("cwd: {}", cwd.display());
+                            }
+                            if let Some(branch) = &t.git_branch {
+                                println!("git_branch: {branch}");
+                            }
+                            if let Some(diff_stat) = &t.git_diff_stat {
+                                println!("git_diff_stat:\n{diff_stat}");
+                            }
+                            println!("output:\n{}", t.output);
+                        }
+                    }
+                    None => {
+                        if json {
+                            println!("null");
+                        } else {
+                            println!("No failure trace captured for pane {pane_id}");
+                        }
+                    }
+                },
+                other => return Err(unexpected_response(other)),
+            }
+        }
         Commands::Events { pane, json } => {
             expect_ok(
                 client
@@ -580,6 +747,7 @@ mod tests {
             Commands::Status {
                 action:
                     StatusAction::Publish {
+                        preset,
                         source,
                         label,
                         level,
@@ -588,7 +756,8 @@ mod tests {
                         detail,
                     },
             } => {
-                assert_eq!(source, "phrourion");
+                assert!(preset.is_none());
+                assert_eq!(source.as_deref(), Some("phrourion"));
                 assert_eq!(label, "2 dirty");
                 assert_eq!(StatusLevel::from(level), StatusLevel::Warn);
                 assert!(workspace.is_none());
@@ -612,6 +781,212 @@ mod tests {
             "/repo",
         ]);
         assert!(conflict.is_err());
+    }
+
+    #[test]
+    fn parses_v0_0_3_cli_subcommands_and_presets() {
+        let id = Uuid::new_v4();
+        let id_str = id.to_string();
+
+        let ws_close = Cli::try_parse_from([
+            "daedalus-ctl",
+            "workspace",
+            "close",
+            &id_str,
+            "--compose-down",
+            "--remove-worktree",
+            "--force",
+        ])
+        .expect("parse workspace close with worktree flags");
+        assert!(matches!(
+            ws_close.command,
+            Commands::Workspace {
+                action: WorkspaceAction::Close {
+                    id: parsed_id,
+                    compose_down: true,
+                    remove_worktree: true,
+                    force: true,
+                }
+            } if parsed_id == id
+        ));
+
+        for (raw, expected) in [
+            ("idle", AgentState::Idle),
+            ("thinking", AgentState::Thinking),
+            ("waiting", AgentState::WaitingForApproval),
+            ("approval", AgentState::WaitingForApproval),
+            ("waiting_for_approval", AgentState::WaitingForApproval),
+            ("error", AgentState::Error),
+        ] {
+            let parsed =
+                Cli::try_parse_from(["daedalus-ctl", "agent-state", "set", raw, "--pane", &id_str])
+                    .unwrap_or_else(|e| panic!("parse agent-state set {raw}: {e}"));
+            match parsed.command {
+                Commands::AgentState {
+                    action:
+                        AgentStateAction::Set {
+                            state,
+                            pane,
+                            workspace,
+                            dir,
+                        },
+                } => {
+                    assert_eq!(state, expected);
+                    assert_eq!(pane, Some(id));
+                    assert!(workspace.is_none());
+                    assert!(dir.is_none());
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }
+
+        assert!(
+            Cli::try_parse_from(["daedalus-ctl", "agent-state", "set", "bogus"]).is_err(),
+            "invalid agent state should fail CLI parsing"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "daedalus-ctl",
+                "agent-state",
+                "set",
+                "idle",
+                "--pane",
+                &id_str,
+                "--workspace",
+                &id_str,
+            ])
+            .is_err(),
+            "--pane and --workspace should conflict"
+        );
+
+        let default_target = resolve_target_root_dir(false, None).expect("resolve default cwd");
+        assert_eq!(default_target, Some(std::env::current_dir().unwrap()));
+        assert_eq!(
+            resolve_target_root_dir(true, None).expect("direct id skips root_dir"),
+            None
+        );
+
+        let ft_json = Cli::try_parse_from(["daedalus-ctl", "failure-trace", &id_str, "--json"])
+            .expect("parse failure-trace --json");
+        assert!(matches!(
+            ft_json.command,
+            Commands::FailureTrace {
+                pane_id,
+                json: true
+            } if pane_id == id
+        ));
+
+        let ft_plain = Cli::try_parse_from(["daedalus-ctl", "failure-trace", &id_str])
+            .expect("parse failure-trace without --json");
+        assert!(matches!(
+            ft_plain.command,
+            Commands::FailureTrace {
+                pane_id,
+                json: false
+            } if pane_id == id
+        ));
+
+        let pub_preset = Cli::try_parse_from([
+            "daedalus-ctl",
+            "status",
+            "publish",
+            "--preset",
+            "cassandra",
+            "--label",
+            "retrying",
+        ])
+        .expect("parse status publish --preset");
+        match pub_preset.command {
+            Commands::Status {
+                action: StatusAction::Publish { preset, source, .. },
+            } => {
+                assert_eq!(preset, Some(StatusPreset::Cassandra));
+                assert!(source.is_none());
+                assert_eq!(
+                    resolve_status_source(preset, source).expect("preset resolves source"),
+                    "cassandra"
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["daedalus-ctl", "status", "publish", "--label", "missing"])
+                .is_err(),
+            "status publish without --source or --preset should fail"
+        );
+
+        let clear_pos = Cli::try_parse_from([
+            "daedalus-ctl",
+            "status",
+            "clear",
+            "phrourion",
+            "--dir",
+            "/repo",
+        ])
+        .expect("parse status clear positional");
+        match clear_pos.command {
+            Commands::Status {
+                action:
+                    StatusAction::Clear {
+                        source,
+                        preset,
+                        workspace,
+                        dir,
+                    },
+            } => {
+                assert_eq!(
+                    resolve_status_source(preset, source).expect("positional source"),
+                    "phrourion"
+                );
+                assert!(workspace.is_none());
+                assert_eq!(dir, Some(PathBuf::from("/repo")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let clear_preset = Cli::try_parse_from([
+            "daedalus-ctl",
+            "status",
+            "clear",
+            "--preset",
+            "phrourion",
+            "--workspace",
+            &id_str,
+        ])
+        .expect("parse status clear --preset");
+        match clear_preset.command {
+            Commands::Status {
+                action:
+                    StatusAction::Clear {
+                        source,
+                        preset,
+                        workspace,
+                        dir,
+                    },
+            } => {
+                assert_eq!(
+                    resolve_status_source(preset, source).expect("preset resolves clear source"),
+                    "phrourion"
+                );
+                assert_eq!(workspace, Some(id));
+                assert!(dir.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["daedalus-ctl", "status", "clear"]).is_err(),
+            "status clear without source or --preset should fail"
+        );
+
+        assert!(resolve_status_source(None, None).is_err());
+        assert!(resolve_status_source(None, Some("   ".to_string())).is_err());
+        assert_eq!(
+            resolve_status_source(Some(StatusPreset::Phrourion), Some("custom".to_string()))
+                .unwrap(),
+            "custom"
+        );
     }
 
     #[test]

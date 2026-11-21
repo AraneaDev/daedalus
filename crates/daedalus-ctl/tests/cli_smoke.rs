@@ -1,6 +1,11 @@
+use daedalus_proto::{
+    AgentState, ClientMessage, FailureTrace, Request, ResponsePayload, ServerMessage, WorkspaceId,
+    WorkspaceInfo, read_frame, write_frame,
+};
 use daedalusd::server::DaemonServer;
 use daedalusd::supervisor::{IsolationMode, Supervisor};
 use tempfile::TempDir;
+use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::sync::oneshot;
 
@@ -323,6 +328,487 @@ async fn cli_smoke_worktree_create_list_and_compose_down() {
         .await
         .unwrap();
     assert!(close.status.success());
+
+    let _ = shutdown_tx.send(());
+    srv_handle.await.unwrap();
+}
+
+async fn list_workspaces_rpc(sock: &std::path::Path) -> Vec<WorkspaceInfo> {
+    let mut stream = UnixStream::connect(sock).await.unwrap();
+    let req = Request {
+        id: 1,
+        payload: ClientMessage::ListWorkspaces,
+    };
+    write_frame(&mut stream, &req).await.unwrap();
+    loop {
+        let msg: ServerMessage = read_frame(&mut stream).await.unwrap().unwrap();
+        if let ServerMessage::Response { id: 1, result } = msg {
+            match result.unwrap() {
+                ResponsePayload::Workspaces(list) => return list,
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn cli_smoke_v0_0_3_agent_state_failure_trace_status_presets_and_worktree_cleanup() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daedalusd.sock");
+    let runtime = dir.path().join("runtime");
+    let repo = dir.path().join("repo");
+    let worktrees_dir = dir.path().join("worktrees");
+    tokio::fs::create_dir_all(&repo).await.unwrap();
+
+    run_git(&repo, &["init", "-b", "main"]).await;
+    run_git(&repo, &["config", "user.name", "Smoke Test"]).await;
+    run_git(&repo, &["config", "user.email", "smoke@example.com"]).await;
+    tokio::fs::write(repo.join("README.md"), b"smoke\n")
+        .await
+        .unwrap();
+    run_git(&repo, &["add", "README.md"]).await;
+    run_git(&repo, &["commit", "-m", "initial"]).await;
+
+    let server = DaemonServer::bind_with_supervisor(
+        sock.clone(),
+        runtime,
+        Supervisor::with_mode(IsolationMode::PgidFallback),
+    )
+    .await
+    .unwrap();
+    server.set_worktrees_dir(worktrees_dir.clone());
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let bin = env!("CARGO_BIN_EXE_daedalus-ctl");
+    let sock_str = sock.to_str().unwrap();
+
+    // Create clean secondary worktree workspace
+    let wt_create = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "worktree",
+            "create",
+            "feat/cleanup",
+            "--dir",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        wt_create.status.success(),
+        "worktree create failed: {}",
+        String::from_utf8_lossy(&wt_create.stderr)
+    );
+    let wt_ws_id = String::from_utf8_lossy(&wt_create.stdout)
+        .trim()
+        .to_string();
+    let wt_ws_uuid: uuid::Uuid = wt_ws_id.parse().unwrap();
+
+    let workspaces = list_workspaces_rpc(&sock).await;
+    let wt_ws = workspaces
+        .iter()
+        .find(|ws| ws.id == WorkspaceId(wt_ws_uuid))
+        .expect("created worktree workspace should exist");
+    let wt_path = wt_ws.root_dir.clone();
+    assert!(wt_path.exists());
+
+    // Spawn an agent pane and exercise `agent-state set` via --pane, --workspace, and default cwd
+    let spawn_agent = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "pane",
+            "spawn",
+            &wt_ws_id,
+            "--role",
+            "agent",
+            "--shell",
+            "/bin/bash",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(spawn_agent.status.success());
+    let agent_pane_id = String::from_utf8_lossy(&spawn_agent.stdout)
+        .trim()
+        .to_string();
+
+    let set_waiting = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "agent-state",
+            "set",
+            "waiting",
+            "--pane",
+            &agent_pane_id,
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        set_waiting.status.success(),
+        "agent-state set waiting failed: {}",
+        String::from_utf8_lossy(&set_waiting.stderr)
+    );
+    let workspaces = list_workspaces_rpc(&sock).await;
+    let agent_summary = workspaces
+        .iter()
+        .find(|ws| ws.id == WorkspaceId(wt_ws_uuid))
+        .unwrap()
+        .panes
+        .iter()
+        .find(|p| p.id.to_string() == agent_pane_id)
+        .unwrap();
+    assert_eq!(
+        agent_summary.agent_state,
+        Some(AgentState::WaitingForApproval)
+    );
+
+    let set_thinking = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "agent-state",
+            "set",
+            "thinking",
+            "--workspace",
+            &wt_ws_id,
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(set_thinking.status.success());
+    let workspaces = list_workspaces_rpc(&sock).await;
+    let agent_summary = workspaces
+        .iter()
+        .find(|ws| ws.id == WorkspaceId(wt_ws_uuid))
+        .unwrap()
+        .panes
+        .iter()
+        .find(|p| p.id.to_string() == agent_pane_id)
+        .unwrap();
+    assert_eq!(agent_summary.agent_state, Some(AgentState::Thinking));
+
+    // Default cwd fallback when neither --pane, --workspace, nor --dir is passed
+    let set_idle_cwd = Command::new(bin)
+        .current_dir(&wt_path)
+        .args(["--socket", sock_str, "agent-state", "set", "idle"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        set_idle_cwd.status.success(),
+        "agent-state set idle from cwd failed: {}",
+        String::from_utf8_lossy(&set_idle_cwd.stderr)
+    );
+    let workspaces = list_workspaces_rpc(&sock).await;
+    let agent_summary = workspaces
+        .iter()
+        .find(|ws| ws.id == WorkspaceId(wt_ws_uuid))
+        .unwrap()
+        .panes
+        .iter()
+        .find(|p| p.id.to_string() == agent_pane_id)
+        .unwrap();
+    assert_eq!(agent_summary.agent_state, Some(AgentState::Idle));
+
+    // Exercise `status publish --preset phrourion` and `status clear`
+    let pub_phr = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "status",
+            "publish",
+            "--preset",
+            "phrourion",
+            "--dir",
+            wt_path.to_str().unwrap(),
+            "--level",
+            "warn",
+            "--label",
+            "1 dirty",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        pub_phr.status.success(),
+        "status publish --preset phrourion failed: {}",
+        String::from_utf8_lossy(&pub_phr.stderr)
+    );
+
+    let ws_list = Command::new(bin)
+        .args(["--socket", sock_str, "workspace", "list"])
+        .output()
+        .await
+        .unwrap();
+    assert!(ws_list.status.success());
+    assert!(String::from_utf8_lossy(&ws_list.stdout).contains("phrourion:1 dirty"));
+
+    let clear_phr = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "status",
+            "clear",
+            "phrourion",
+            "--dir",
+            wt_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        clear_phr.status.success(),
+        "status clear phrourion failed: {}",
+        String::from_utf8_lossy(&clear_phr.stderr)
+    );
+
+    let ws_list_after_clear = Command::new(bin)
+        .args(["--socket", sock_str, "workspace", "list"])
+        .output()
+        .await
+        .unwrap();
+    assert!(ws_list_after_clear.status.success());
+    assert!(!String::from_utf8_lossy(&ws_list_after_clear.stdout).contains("phrourion:"));
+
+    // Also test `status clear --preset cassandra --workspace <id>`
+    let pub_cas = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "status",
+            "publish",
+            "--preset",
+            "cassandra",
+            "--workspace",
+            &wt_ws_id,
+            "--level",
+            "info",
+            "--label",
+            "running",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(pub_cas.status.success());
+
+    let clear_cas = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "status",
+            "clear",
+            "--preset",
+            "cassandra",
+            "--workspace",
+            &wt_ws_id,
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(clear_cas.status.success());
+    let workspaces = list_workspaces_rpc(&sock).await;
+    let wt_ws = workspaces
+        .iter()
+        .find(|ws| ws.id == WorkspaceId(wt_ws_uuid))
+        .unwrap();
+    assert!(wt_ws.external_statuses.is_empty());
+
+    // Exercise `failure-trace` before and after a failing command in a runner pane
+    let spawn_runner = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "pane",
+            "spawn",
+            &wt_ws_id,
+            "--role",
+            "runner",
+            "--shell",
+            "/bin/bash",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(spawn_runner.status.success());
+    let runner_pane_id = String::from_utf8_lossy(&spawn_runner.stdout)
+        .trim()
+        .to_string();
+
+    let empty_trace_json = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "failure-trace",
+            &runner_pane_id,
+            "--json",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(empty_trace_json.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&empty_trace_json.stdout).trim(),
+        "null"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let send_fail = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "pane",
+            "send",
+            &runner_pane_id,
+            "sh -c 'echo FAIL_SMOKE; exit 17'",
+            "--newline",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(send_fail.status.success());
+
+    let mut captured_trace: Option<FailureTrace> = None;
+    for _ in 0..30 {
+        let out = Command::new(bin)
+            .args([
+                "--socket",
+                sock_str,
+                "failure-trace",
+                &runner_pane_id,
+                "--json",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stdout.trim() != "null" {
+            captured_trace = Some(serde_json::from_str(stdout.trim()).unwrap());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let trace = captured_trace.expect("expected failure trace after exiting 17");
+    assert_eq!(trace.exit_code, 17);
+    assert!(trace.output.contains("FAIL_SMOKE"));
+    assert_eq!(trace.git_branch.as_deref(), Some("feat/cleanup"));
+
+    let plain_trace = Command::new(bin)
+        .args(["--socket", sock_str, "failure-trace", &runner_pane_id])
+        .output()
+        .await
+        .unwrap();
+    assert!(plain_trace.status.success());
+    let plain_out = String::from_utf8_lossy(&plain_trace.stdout);
+    assert!(plain_out.contains("exit_code: 17"));
+    assert!(plain_out.contains("git_branch: feat/cleanup"));
+    assert!(plain_out.contains("FAIL_SMOKE"));
+
+    // Exercise `workspace close --remove-worktree` on clean worktree
+    let close_clean = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "workspace",
+            "close",
+            &wt_ws_id,
+            "--remove-worktree",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        close_clean.status.success(),
+        "workspace close --remove-worktree failed: {}",
+        String::from_utf8_lossy(&close_clean.stderr)
+    );
+    assert!(!wt_path.exists(), "worktree directory should be removed");
+    assert!(
+        !list_workspaces_rpc(&sock)
+            .await
+            .iter()
+            .any(|ws| ws.id == WorkspaceId(wt_ws_uuid))
+    );
+
+    // Exercise dirty worktree rejection without --force and cleanup with --force
+    let dirty_create = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "worktree",
+            "create",
+            "feat/dirty",
+            "--dir",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(dirty_create.status.success());
+    let dirty_ws_id = String::from_utf8_lossy(&dirty_create.stdout)
+        .trim()
+        .to_string();
+    let dirty_ws_uuid: uuid::Uuid = dirty_ws_id.parse().unwrap();
+    let dirty_path = list_workspaces_rpc(&sock)
+        .await
+        .into_iter()
+        .find(|ws| ws.id == WorkspaceId(dirty_ws_uuid))
+        .unwrap()
+        .root_dir;
+    tokio::fs::write(dirty_path.join("untracked.txt"), b"dirty\n")
+        .await
+        .unwrap();
+
+    let close_dirty_no_force = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "workspace",
+            "close",
+            &dirty_ws_id,
+            "--remove-worktree",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        !close_dirty_no_force.status.success(),
+        "dirty worktree close without --force should fail"
+    );
+    assert!(dirty_path.exists());
+
+    let close_dirty_force = Command::new(bin)
+        .args([
+            "--socket",
+            sock_str,
+            "workspace",
+            "close",
+            &dirty_ws_id,
+            "--remove-worktree",
+            "--force",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        close_dirty_force.status.success(),
+        "dirty worktree close with --force failed: {}",
+        String::from_utf8_lossy(&close_dirty_force.stderr)
+    );
+    assert!(!dirty_path.exists());
 
     let _ = shutdown_tx.send(());
     srv_handle.await.unwrap();
