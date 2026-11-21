@@ -26,6 +26,7 @@ struct WorkspaceRecord {
     compose_project_name: Option<String>,
     git_branch: Option<String>,
     injected_env: HashMap<String, String>,
+    reserved_ports: HashSet<u16>,
     pane_ids: Vec<PaneId>,
     bound_ports: Vec<PortMapping>,
     containers: Vec<ContainerHealth>,
@@ -115,23 +116,29 @@ impl Registry {
         }
 
         let _create_guard = self.create_lock.lock().await;
-        let slot_index = {
+        let (slot_index, reserved_ports) = {
             let ws_map = self.workspaces.read().await;
             let used_slots: HashSet<u16> = ws_map.values().map(|ws| ws.slot_index).collect();
-            (0..=u16::MAX)
+            let slot_index = (0..=u16::MAX)
                 .find(|slot| !used_slots.contains(slot))
-                .ok_or_else(|| ProtoError::Internal("no workspace slots available".to_string()))?
+                .ok_or_else(|| ProtoError::Internal("no workspace slots available".to_string()))?;
+            let reserved_ports: HashSet<u16> = ws_map
+                .values()
+                .flat_map(|ws| ws.reserved_ports.iter().copied())
+                .collect();
+            (slot_index, reserved_ports)
         };
 
         let name_clone = name.clone();
         let root_clone = root_dir.clone();
         let env_clone = env.clone();
         let (plan_res, git_branch, canonical_root_dir) = tokio::task::spawn_blocking(move || {
-            let plan = isolation::prepare_workspace_isolation(
+            let plan = isolation::prepare_workspace_isolation_with_reserved(
                 &name_clone,
                 &root_clone,
                 slot_index,
                 &env_clone,
+                &reserved_ports,
             );
             let branch = worktree::current_branch(&root_clone);
             let canonical = std::fs::canonicalize(&root_clone).unwrap_or(root_clone);
@@ -141,6 +148,7 @@ impl Registry {
         .map_err(|e| ProtoError::Internal(format!("workspace preparation task failed: {e}")))?;
 
         let plan = plan_res.map_err(|e| ProtoError::IoError(e.to_string()))?;
+        let reserved_ports: HashSet<u16> = plan.remapped_ports.values().copied().collect();
 
         let id = WorkspaceId::new();
         let record = WorkspaceRecord {
@@ -153,6 +161,7 @@ impl Registry {
             compose_project_name: plan.compose_project_name,
             git_branch,
             injected_env: plan.injected_env,
+            reserved_ports,
             pane_ids: Vec::new(),
             bound_ports: Vec::new(),
             containers: Vec::new(),
@@ -676,6 +685,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ws_reused.slot_index, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_workspace_creation_avoids_unbound_reserved_ports() {
+        let dir = TempDir::new().unwrap();
+        let ws_dir = dir.path().join("app");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::write(ws_dir.join(".env"), "PORT=18000\n").unwrap();
+
+        let registry = test_registry(dir.path());
+        let _primary = registry
+            .create_workspace("primary".to_string(), ws_dir.clone(), HashMap::new())
+            .await
+            .unwrap();
+
+        let blocker = std::net::TcpListener::bind(("127.0.0.1", 18100))
+            .expect("port 18100 must be free before blocking");
+
+        // Slot 1 bumps past 18100 to 18200 (without binding 18200 yet).
+        let ws1 = registry
+            .create_workspace("wt1".to_string(), ws_dir.clone(), HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(ws1.slot_index, 1);
+        assert_eq!(ws1.port_offset, 200);
+        assert_eq!(ws1.injected_env.get("PORT").map(String::as_str), Some("18200"));
+
+        // Slot 2 must skip 18200 (reserved by ws1) and allocate 18300.
+        let ws2 = registry
+            .create_workspace("wt2".to_string(), ws_dir, HashMap::new())
+            .await
+            .unwrap();
+        drop(blocker);
+
+        assert_eq!(ws2.slot_index, 2);
+        assert_eq!(ws2.port_offset, 300);
+        assert_eq!(ws2.injected_env.get("PORT").map(String::as_str), Some("18300"));
     }
 
     #[tokio::test]

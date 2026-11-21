@@ -2,7 +2,7 @@ use serde_yml::{
     Mapping, Sequence, Value,
     value::{Tag, TaggedValue},
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, ErrorKind, Read};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -56,6 +56,25 @@ pub fn prepare_workspace_isolation(
     slot_index: u16,
     caller_env: &HashMap<String, String>,
 ) -> io::Result<IsolationPlan> {
+    prepare_workspace_isolation_with_reserved(
+        name,
+        root_dir,
+        slot_index,
+        caller_env,
+        &HashSet::new(),
+    )
+}
+
+/// Computes a conflict-free port offset while treating `reserved_ports` as unavailable,
+/// rewrites `.env` port/URL variables, and generates `.daedalus/compose.override.yml`
+/// when a Compose file exists.
+pub fn prepare_workspace_isolation_with_reserved(
+    name: &str,
+    root_dir: &Path,
+    slot_index: u16,
+    caller_env: &HashMap<String, String>,
+    reserved_ports: &HashSet<u16>,
+) -> io::Result<IsolationPlan> {
     let env_scan = scan_env_file(root_dir)?;
     let mut env_lookup = env_scan.all_vars.clone();
     for (k, v) in caller_env {
@@ -83,7 +102,7 @@ pub fn prepare_workspace_isolation(
         base_ports.insert(*port);
     }
 
-    let port_offset = allocate_port_offset(slot_index, &base_ports)?;
+    let port_offset = allocate_port_offset(slot_index, &base_ports, reserved_ports)?;
 
     let mut remapped_ports = HashMap::new();
     if port_offset > 0 {
@@ -686,7 +705,11 @@ fn rewrite_localhost_url_port(url: &str, offset: u16) -> Option<String> {
     Some(out)
 }
 
-fn allocate_port_offset(slot_index: u16, base_ports: &BTreeSet<u16>) -> io::Result<u16> {
+fn allocate_port_offset(
+    slot_index: u16,
+    base_ports: &BTreeSet<u16>,
+    reserved_ports: &HashSet<u16>,
+) -> io::Result<u16> {
     if slot_index == 0 {
         return Ok(0);
     }
@@ -709,7 +732,7 @@ fn allocate_port_offset(slot_index: u16, base_ports: &BTreeSet<u16>) -> io::Resu
         let block_ok = base_ports.iter().all(|&base| {
             base.checked_add(offset)
                 .filter(|&p| p > 0)
-                .is_some_and(is_port_available)
+                .is_some_and(|p| !reserved_ports.contains(&p) && is_port_available(p))
         });
         if block_ok {
             return Ok(offset);
@@ -915,6 +938,27 @@ LOCAL_NO_PORT_URL=http://localhost/health
         assert_eq!(plan.port_offset, 200);
         assert_eq!(plan.remapped_ports.get(&3000), Some(&3200));
         assert_eq!(plan.injected_env.get("PORT").map(String::as_str), Some("3200"));
+    }
+
+    #[test]
+    fn skips_reserved_ports_from_other_workspaces() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "PORT=3000\n").unwrap();
+
+        let reserved = HashSet::from([3200]);
+        let plan = prepare_workspace_isolation_with_reserved(
+            "wt-reserved",
+            dir.path(),
+            2,
+            &HashMap::new(),
+            &reserved,
+        )
+        .unwrap();
+
+        assert_eq!(plan.slot_index, 2);
+        assert_eq!(plan.port_offset, 300);
+        assert_eq!(plan.remapped_ports.get(&3000), Some(&3300));
+        assert_eq!(plan.injected_env.get("PORT").map(String::as_str), Some("3300"));
     }
 
     #[test]

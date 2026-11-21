@@ -302,14 +302,19 @@ pub fn create_worktree(
 
     let repo_root_raw = PathBuf::from(toplevel_out.stdout.trim_end_matches(['\r', '\n']));
     let repo_root = std::fs::canonicalize(&repo_root_raw).unwrap_or(repo_root_raw);
-    let repo_name = repo_root
+    let primary_root = discover_worktrees(&repo_root)
+        .ok()
+        .and_then(|mut worktrees| (!worktrees.is_empty()).then(|| worktrees.remove(0).path))
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .unwrap_or_else(|| repo_root.clone());
+    let repo_name = primary_root
         .file_name()
         .and_then(|n| n.to_str())
         .filter(|n| !n.is_empty())
         .ok_or_else(|| {
             format!(
                 "failed to determine repository name from {}",
-                repo_root.display()
+                primary_root.display()
             )
         })?;
 
@@ -582,5 +587,25 @@ detached\r\n";
             .unwrap();
         assert!(detached_entry.is_detached);
         assert_eq!(detached_entry.branch, None);
+    }
+
+    #[test]
+    fn creates_chained_worktree_under_primary_repo_name() {
+        let root = TempDir::new().unwrap();
+        let base_dir = TempDir::new().unwrap();
+        let repo = init_temp_repo(root.path(), "primary-repo");
+
+        let wt1 = create_worktree(&repo, "feat/one", true, base_dir.path()).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&wt1.path).unwrap(),
+            std::fs::canonicalize(base_dir.path().join("primary-repo").join("feat-one")).unwrap()
+        );
+
+        let wt2 = create_worktree(&wt1.path, "feat/two", true, base_dir.path()).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&wt2.path).unwrap(),
+            std::fs::canonicalize(base_dir.path().join("primary-repo").join("feat-two")).unwrap()
+        );
+        assert!(!base_dir.path().join("feat-one").join("feat-two").exists());
     }
 }

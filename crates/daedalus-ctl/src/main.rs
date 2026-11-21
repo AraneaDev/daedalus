@@ -188,6 +188,10 @@ fn parse_env_pairs(pairs: &[String]) -> Result<HashMap<String, String>, String> 
 
 fn resolve_dir(dir: Option<PathBuf>) -> Result<PathBuf, std::io::Error> {
     match dir {
+        Some(d) if d.is_relative() => {
+            let joined = std::env::current_dir()?.join(d);
+            Ok(std::fs::canonicalize(&joined).unwrap_or(joined))
+        }
         Some(d) => Ok(d),
         None => std::env::current_dir(),
     }
@@ -223,11 +227,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Commands::Workspace { action } => match action {
             WorkspaceAction::Create { name, dir, env } => {
+                let root_dir = resolve_dir(Some(dir))?;
                 let env_map = parse_env_pairs(&env)?;
                 match client
                     .request(ClientMessage::CreateWorkspace {
                         name,
-                        root_dir: dir,
+                        root_dir,
                         env: env_map,
                     })
                     .await?
@@ -326,10 +331,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dir,
                 detail,
             } => {
-                let root_dir = match (workspace, dir) {
-                    (Some(_), _) => None,
-                    (None, Some(d)) => Some(d),
-                    (None, None) => Some(std::env::current_dir()?),
+                let root_dir = if workspace.is_some() {
+                    None
+                } else {
+                    Some(resolve_dir(dir)?)
                 };
                 expect_ok(
                     client
@@ -597,5 +602,18 @@ mod tests {
             "/repo",
         ]);
         assert!(conflict.is_err());
+    }
+
+    #[test]
+    fn resolve_dir_makes_relative_paths_absolute() {
+        let resolved = resolve_dir(Some(PathBuf::from("."))).expect("resolve '.'");
+        assert!(
+            resolved.is_absolute(),
+            "expected absolute path, got {}",
+            resolved.display()
+        );
+        let cwd = std::env::current_dir().unwrap();
+        let expected = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+        assert_eq!(resolved, expected);
     }
 }
