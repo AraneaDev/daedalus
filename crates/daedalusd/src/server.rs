@@ -201,6 +201,7 @@ impl SubscriptionFilter {
         match event {
             ServerEvent::GridDelta(d) => allowed.contains(&d.pane_id),
             ServerEvent::PaneStatusChanged { pane_id, .. }
+            | ServerEvent::AgentStateChanged { pane_id, .. }
             | ServerEvent::CommandFinished { pane_id, .. }
             | ServerEvent::PaneExited { pane_id, .. }
             | ServerEvent::ResyncRequired { pane_id } => allowed.contains(pane_id),
@@ -277,8 +278,36 @@ async fn dispatch_request(
         ClientMessage::ListWorkspaces => Ok(ResponsePayload::Workspaces(
             registry.list_workspaces().await,
         )),
-        ClientMessage::CloseWorkspace { id, compose_down } => {
-            registry.close_workspace(id, compose_down).await?;
+        ClientMessage::CloseWorkspace {
+            id,
+            compose_down,
+            remove_worktree,
+            force_remove_worktree,
+        } => {
+            registry
+                .close_workspace(id, compose_down, remove_worktree, force_remove_worktree)
+                .await?;
+            Ok(ResponsePayload::Ok)
+        }
+        ClientMessage::SetAgentState {
+            pane_id,
+            workspace_id,
+            root_dir,
+            state,
+        } => {
+            registry
+                .set_agent_state(pane_id, workspace_id, root_dir, state)
+                .await?;
+            Ok(ResponsePayload::Ok)
+        }
+        ClientMessage::ClearExternalStatus {
+            workspace_id,
+            root_dir,
+            source,
+        } => {
+            registry
+                .clear_external_status(workspace_id, root_dir, source)
+                .await?;
             Ok(ResponsePayload::Ok)
         }
         ClientMessage::DiscoverWorktrees { repo_dir } => Ok(ResponsePayload::Worktrees(
@@ -372,7 +401,7 @@ async fn dispatch_request(
             })
         }
         ClientMessage::GetFailureTrace { pane_id } => Ok(ResponsePayload::FailureTrace(
-            registry.get_pane(pane_id).await?.failure_trace().await?,
+            registry.get_failure_trace(pane_id).await?,
         )),
         ClientMessage::Subscribe { pane_ids } => {
             let mut f = filter.write().await;

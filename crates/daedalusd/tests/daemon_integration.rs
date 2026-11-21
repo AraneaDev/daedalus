@@ -1,6 +1,6 @@
 use daedalus_proto::{
-    ClientMessage, PaneRole, Request, ResponsePayload, ServerEvent, ServerMessage, StatusLevel,
-    read_frame, write_frame,
+    AgentState, ClientMessage, PaneRole, ProtoError, Request, ResponsePayload, ServerEvent,
+    ServerMessage, StatusLevel, read_frame, write_frame,
 };
 use daedalusd::server::DaemonServer;
 use daedalusd::supervisor::{IsolationMode, Supervisor};
@@ -13,7 +13,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 
-async fn send_rpc(stream: &mut UnixStream, id: u64, payload: ClientMessage) -> ResponsePayload {
+async fn send_rpc_result(
+    stream: &mut UnixStream,
+    id: u64,
+    payload: ClientMessage,
+) -> Result<ResponsePayload, ProtoError> {
     write_frame(stream, &Request { id, payload }).await.unwrap();
     loop {
         match read_frame::<_, ServerMessage>(stream)
@@ -21,11 +25,15 @@ async fn send_rpc(stream: &mut UnixStream, id: u64, payload: ClientMessage) -> R
             .unwrap()
             .unwrap()
         {
-            ServerMessage::Response { id: rid, result } if rid == id => return result.unwrap(),
+            ServerMessage::Response { id: rid, result } if rid == id => return result,
             ServerMessage::Event(_) => continue,
             other => panic!("unexpected server message: {other:?}"),
         }
     }
+}
+
+async fn send_rpc(stream: &mut UnixStream, id: u64, payload: ClientMessage) -> ResponsePayload {
+    send_rpc_result(stream, id, payload).await.unwrap()
 }
 
 async fn wait_for_command_finished(
@@ -177,6 +185,8 @@ async fn bash_osc133_captures_failure_trace_and_survives_client_reconnect() {
         ClientMessage::CloseWorkspace {
             id: ws.id,
             compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
         },
     )
     .await;
@@ -289,6 +299,8 @@ async fn zsh_osc133_captures_failure_trace_when_zsh_installed() {
         ClientMessage::CloseWorkspace {
             id: ws.id,
             compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
         },
     )
     .await;
@@ -526,6 +538,8 @@ async fn get_scrollback_returns_lines_scrolled_above_viewport() {
         ClientMessage::CloseWorkspace {
             id: ws.id,
             compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
         },
     )
     .await;
@@ -754,6 +768,8 @@ async fn create_worktree_workspace_isolates_ports_and_injects_env() {
         ClientMessage::CloseWorkspace {
             id: wt_ws.id,
             compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
         },
     )
     .await;
@@ -763,6 +779,8 @@ async fn create_worktree_workspace_isolates_ports_and_injects_env() {
         ClientMessage::CloseWorkspace {
             id: primary_ws.id,
             compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
         },
     )
     .await;
@@ -1080,6 +1098,8 @@ async fn persistence_restores_dormant_workspaces_across_daemon_restart_and_skips
         ClientMessage::CloseWorkspace {
             id: ws_keep.id,
             compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
         },
     )
     .await;
@@ -1341,9 +1361,562 @@ async fn fish_osc133_captures_failure_trace_when_fish_installed() {
         ClientMessage::CloseWorkspace {
             id: ws.id,
             compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
         },
     )
     .await;
+    let _ = shutdown_tx.send(());
+    srv_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn set_agent_state_and_hook_events_broadcast_and_clear_status() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daedalusd.sock");
+    let events_sock = dir.path().join("events.sock");
+    let runtime = dir.path().join("runtime");
+    let ws_dir = dir.path().join("agent-proj");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let server = DaemonServer::bind_with_events_socket(
+        sock.clone(),
+        runtime,
+        Some(events_sock.clone()),
+        Supervisor::with_mode(IsolationMode::PgidFallback),
+    )
+    .await
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let mut client = UnixStream::connect(&sock).await.unwrap();
+    let ws = match send_rpc(
+        &mut client,
+        1,
+        ClientMessage::CreateWorkspace {
+            name: "agent-ws".to_string(),
+            root_dir: ws_dir.clone(),
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::WorkspaceCreated(ws) => ws,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    let agent_pane = match send_rpc(
+        &mut client,
+        2,
+        ClientMessage::SpawnPane {
+            workspace_id: ws.id,
+            role: PaneRole::Agent,
+            command: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 10".to_string(),
+            ]),
+            shell: None,
+            cols: 80,
+            rows: 24,
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::PaneSpawned(p) => p,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(agent_pane.agent_state, Some(AgentState::Idle));
+
+    let runner_pane = match send_rpc(
+        &mut client,
+        3,
+        ClientMessage::SpawnPane {
+            workspace_id: ws.id,
+            role: PaneRole::Runner,
+            command: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 10".to_string(),
+            ]),
+            shell: None,
+            cols: 80,
+            rows: 24,
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::PaneSpawned(p) => p,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(runner_pane.agent_state, None);
+
+    // Explicitly setting state on a non-Agent pane must fail cleanly.
+    let non_agent_err = send_rpc_result(
+        &mut client,
+        4,
+        ClientMessage::SetAgentState {
+            pane_id: Some(runner_pane.id),
+            workspace_id: None,
+            root_dir: None,
+            state: AgentState::Thinking,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(non_agent_err, ProtoError::InvalidRequest(_)));
+
+    let mut sub_client = UnixStream::connect(&sock).await.unwrap();
+    send_rpc(
+        &mut sub_client,
+        10,
+        ClientMessage::Subscribe { pane_ids: None },
+    )
+    .await;
+
+    // 1. SetAgentState RPC targeting workspace_id
+    let resp = send_rpc(
+        &mut client,
+        5,
+        ClientMessage::SetAgentState {
+            pane_id: None,
+            workspace_id: Some(ws.id),
+            root_dir: None,
+            state: AgentState::WaitingForApproval,
+        },
+    )
+    .await;
+    assert_eq!(resp, ResponsePayload::Ok);
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(ServerMessage::Event(ServerEvent::AgentStateChanged {
+                workspace_id,
+                pane_id,
+                state,
+            })) = read_frame::<_, ServerMessage>(&mut sub_client)
+                .await
+                .unwrap()
+                && workspace_id == ws.id
+                && pane_id == agent_pane.id
+                && state == AgentState::WaitingForApproval
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for AgentStateChanged from RPC");
+
+    // 2. events.sock agent_state + status + clear_status ingestion
+    let mut hook_stream = UnixStream::connect(&events_sock).await.unwrap();
+    let payload = format!(
+        "{{\"kind\":\"agent_state\",\"root_dir\":\"{}\",\"state\":\"thinking\"}}\n\
+         {{\"kind\":\"status\",\"root_dir\":\"{}\",\"source\":\"phrourion\",\"level\":\"warn\",\"label\":\"2 dirty\"}}\n\
+         {{\"kind\":\"clear_status\",\"workspace_id\":\"{}\",\"source\":\"phrourion\"}}\n",
+        ws_dir.display(),
+        ws_dir.display(),
+        ws.id,
+    );
+    hook_stream.write_all(payload.as_bytes()).await.unwrap();
+    hook_stream.shutdown().await.unwrap();
+    drop(hook_stream);
+
+    let mut saw_thinking = false;
+    let mut saw_status_set = false;
+    let mut saw_status_cleared = false;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !(saw_thinking && saw_status_set && saw_status_cleared) {
+            match read_frame::<_, ServerMessage>(&mut sub_client)
+                .await
+                .unwrap()
+            {
+                Some(ServerMessage::Event(ServerEvent::AgentStateChanged {
+                    workspace_id,
+                    pane_id,
+                    state: AgentState::Thinking,
+                })) if workspace_id == ws.id && pane_id == agent_pane.id => {
+                    saw_thinking = true;
+                }
+                Some(ServerMessage::Event(ServerEvent::ExternalStatusUpdated {
+                    workspace_id,
+                    status,
+                })) if workspace_id == ws.id && status.source == "phrourion" => {
+                    if status.label == "2 dirty" {
+                        saw_status_set = true;
+                    } else if status.label.is_empty() {
+                        saw_status_cleared = true;
+                    }
+                }
+                Some(ServerMessage::Event(_)) => continue,
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for hook events");
+
+    let listed = match send_rpc(&mut client, 6, ClientMessage::ListWorkspaces).await {
+        ResponsePayload::Workspaces(list) => list,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].external_statuses.is_empty());
+    let listed_agent = listed[0]
+        .panes
+        .iter()
+        .find(|p| p.id == agent_pane.id)
+        .unwrap();
+    assert_eq!(listed_agent.agent_state, Some(AgentState::Thinking));
+
+    // 3. ClearExternalStatus RPC removes published status and broadcasts ExternalStatusUpdated
+    send_rpc(
+        &mut client,
+        7,
+        ClientMessage::PublishExternalStatus {
+            workspace_id: Some(ws.id),
+            root_dir: None,
+            source: "cassandra".to_string(),
+            level: StatusLevel::Error,
+            label: "rate limited".to_string(),
+            detail: None,
+        },
+    )
+    .await;
+    let clear_resp = send_rpc(
+        &mut client,
+        8,
+        ClientMessage::ClearExternalStatus {
+            workspace_id: None,
+            root_dir: Some(ws_dir.clone()),
+            source: "cassandra".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(clear_resp, ResponsePayload::Ok);
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(ServerMessage::Event(ServerEvent::ExternalStatusUpdated {
+                workspace_id,
+                status,
+            })) = read_frame::<_, ServerMessage>(&mut sub_client)
+                .await
+                .unwrap()
+                && workspace_id == ws.id
+                && status.source == "cassandra"
+                && status.label.is_empty()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for ClearExternalStatus broadcast");
+
+    let listed_after_clear = match send_rpc(&mut client, 9, ClientMessage::ListWorkspaces).await {
+        ResponsePayload::Workspaces(list) => list,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert!(listed_after_clear[0].external_statuses.is_empty());
+
+    let _ = shutdown_tx.send(());
+    srv_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn get_failure_trace_includes_git_branch_and_diff_stat_for_dirty_repo() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daedalusd.sock");
+    let runtime = dir.path().join("runtime");
+    let repo_dir = dir.path().join("dirty-repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    run_git(&repo_dir, &["init", "-b", "main"]);
+    std::fs::write(repo_dir.join("README.md"), "# initial\n").unwrap();
+    run_git(&repo_dir, &["add", "README.md"]);
+    run_git(
+        &repo_dir,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+    // Make repo dirty with both modified tracked file and untracked file
+    std::fs::write(repo_dir.join("README.md"), "# initial\nmodified line\n").unwrap();
+    std::fs::write(repo_dir.join("notes.txt"), "untracked\n").unwrap();
+
+    let server = DaemonServer::bind_with_supervisor(
+        sock.clone(),
+        runtime,
+        Supervisor::with_mode(IsolationMode::PgidFallback),
+    )
+    .await
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let mut client = UnixStream::connect(&sock).await.unwrap();
+    let ws = match send_rpc(
+        &mut client,
+        1,
+        ClientMessage::CreateWorkspace {
+            name: "dirty-repo".to_string(),
+            root_dir: repo_dir.clone(),
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::WorkspaceCreated(ws) => ws,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    let pane = match send_rpc(
+        &mut client,
+        2,
+        ClientMessage::SpawnPane {
+            workspace_id: ws.id,
+            role: PaneRole::Runner,
+            command: None,
+            shell: Some("/bin/bash".to_string()),
+            cols: 120,
+            rows: 30,
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::PaneSpawned(p) => p,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    send_rpc(
+        &mut client,
+        3,
+        ClientMessage::Subscribe {
+            pane_ids: Some(vec![pane.id]),
+        },
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    send_rpc(
+        &mut client,
+        4,
+        ClientMessage::SendInput {
+            pane_id: pane.id,
+            data: b"sh -c 'echo FAIL_GIT_CTX; exit 23'\n".to_vec(),
+        },
+    )
+    .await;
+    let (_, code, has_trace) = wait_for_command_finished(&mut client, 23).await;
+    assert_eq!(code, 23);
+    assert!(has_trace);
+
+    let trace = match send_rpc(
+        &mut client,
+        5,
+        ClientMessage::GetFailureTrace { pane_id: pane.id },
+    )
+    .await
+    {
+        ResponsePayload::FailureTrace(Some(t)) => t,
+        other => panic!("expected failure trace, got: {other:?}"),
+    };
+    assert_eq!(trace.exit_code, 23);
+    assert_eq!(trace.git_branch.as_deref(), Some("main"));
+    let diff_stat = trace
+        .git_diff_stat
+        .expect("dirty repo failure trace should include git_diff_stat");
+    assert!(diff_stat.contains("README.md"));
+    assert!(diff_stat.contains("notes.txt"));
+
+    let _ = shutdown_tx.send(());
+    srv_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn close_workspace_removes_linked_worktree_and_refuses_primary_checkout() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daedalusd.sock");
+    let runtime = dir.path().join("runtime");
+    let worktrees_dir = dir.path().join("worktrees");
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    run_git(&repo_dir, &["init", "-b", "main"]);
+    std::fs::write(repo_dir.join("README.md"), "# repo\n").unwrap();
+    run_git(&repo_dir, &["add", "README.md"]);
+    run_git(
+        &repo_dir,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+
+    let server = DaemonServer::bind_with_supervisor(
+        sock.clone(),
+        runtime,
+        Supervisor::with_mode(IsolationMode::PgidFallback),
+    )
+    .await
+    .unwrap();
+    server.set_worktrees_dir(worktrees_dir);
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let mut client = UnixStream::connect(&sock).await.unwrap();
+
+    let primary_ws = match send_rpc(
+        &mut client,
+        1,
+        ClientMessage::CreateWorkspace {
+            name: "primary".to_string(),
+            root_dir: repo_dir.clone(),
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::WorkspaceCreated(ws) => ws,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    let wt_ws = match send_rpc(
+        &mut client,
+        2,
+        ClientMessage::CreateWorktreeWorkspace {
+            repo_dir: repo_dir.clone(),
+            branch: "feat/cleanup".to_string(),
+            create_branch: true,
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::WorkspaceCreated(ws) => ws,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(wt_ws.root_dir.is_dir());
+    assert!(
+        wt_ws
+            .git_status
+            .expect("worktree git_status should be populated")
+            .is_worktree
+    );
+
+    // Refusing to remove primary repo checkout must keep workspace and directory intact
+    let primary_err = send_rpc_result(
+        &mut client,
+        3,
+        ClientMessage::CloseWorkspace {
+            id: primary_ws.id,
+            compose_down: false,
+            remove_worktree: true,
+            force_remove_worktree: true,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(primary_err, ProtoError::InvalidRequest(_)));
+    assert!(repo_dir.is_dir());
+
+    // Dirty linked worktree without force must fail and preserve the workspace
+    std::fs::write(wt_ws.root_dir.join("dirty.txt"), "unsaved\n").unwrap();
+    let dirty_err = send_rpc_result(
+        &mut client,
+        4,
+        ClientMessage::CloseWorkspace {
+            id: wt_ws.id,
+            compose_down: false,
+            remove_worktree: true,
+            force_remove_worktree: false,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(dirty_err, ProtoError::InvalidRequest(_)));
+    assert!(wt_ws.root_dir.is_dir());
+
+    // With force = true, linked worktree is removed cleanly
+    let ok = send_rpc(
+        &mut client,
+        5,
+        ClientMessage::CloseWorkspace {
+            id: wt_ws.id,
+            compose_down: false,
+            remove_worktree: true,
+            force_remove_worktree: true,
+        },
+    )
+    .await;
+    assert_eq!(ok, ResponsePayload::Ok);
+    assert!(!wt_ws.root_dir.exists());
+
+    let remaining_wts = match send_rpc(
+        &mut client,
+        6,
+        ClientMessage::DiscoverWorktrees {
+            repo_dir: repo_dir.clone(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::Worktrees(wts) => wts,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(remaining_wts.len(), 1);
+    assert!(remaining_wts[0].is_primary);
+
+    // Clean close of primary workspace without remove_worktree succeeds
+    send_rpc(
+        &mut client,
+        7,
+        ClientMessage::CloseWorkspace {
+            id: primary_ws.id,
+            compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
+        },
+    )
+    .await;
+    assert!(repo_dir.is_dir());
+
     let _ = shutdown_tx.send(());
     srv_handle.await.unwrap();
 }

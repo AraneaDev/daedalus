@@ -1,7 +1,7 @@
 use crate::types::{
-    ContainerHealth, ExternalStatus, FailureTrace, GitWorktreeInfo, GridDelta, GridRow,
-    GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary, PortMapping, SearchMatch, StatusLevel,
-    WorkspaceId, WorkspaceInfo,
+    AgentState, ContainerHealth, ExternalStatus, FailureTrace, GitWorkspaceStatus, GitWorktreeInfo,
+    GridDelta, GridRow, GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary, PortMapping,
+    SearchMatch, StatusLevel, WorkspaceId, WorkspaceInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -36,6 +36,16 @@ pub enum ClientMessage {
         id: WorkspaceId,
         #[serde(default)]
         compose_down: bool,
+        #[serde(default)]
+        remove_worktree: bool,
+        #[serde(default)]
+        force_remove_worktree: bool,
+    },
+    SetAgentState {
+        pane_id: Option<PaneId>,
+        workspace_id: Option<WorkspaceId>,
+        root_dir: Option<PathBuf>,
+        state: AgentState,
     },
     PublishExternalStatus {
         workspace_id: Option<WorkspaceId>,
@@ -44,6 +54,11 @@ pub enum ClientMessage {
         level: StatusLevel,
         label: String,
         detail: Option<String>,
+    },
+    ClearExternalStatus {
+        workspace_id: Option<WorkspaceId>,
+        root_dir: Option<PathBuf>,
+        source: String,
     },
     SpawnPane {
         workspace_id: WorkspaceId,
@@ -146,10 +161,19 @@ pub enum ServerEvent {
     ResyncRequired {
         pane_id: PaneId,
     },
+    AgentStateChanged {
+        workspace_id: WorkspaceId,
+        pane_id: PaneId,
+        state: AgentState,
+    },
     WorkspaceRuntimeUpdated {
         workspace_id: WorkspaceId,
         bound_ports: Vec<PortMapping>,
         containers: Vec<ContainerHealth>,
+        #[serde(default)]
+        git_status: Option<GitWorkspaceStatus>,
+        #[serde(default)]
+        git_branch: Option<String>,
     },
     ExternalStatusUpdated {
         workspace_id: WorkspaceId,

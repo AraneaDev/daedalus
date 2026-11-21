@@ -5,10 +5,10 @@ pub mod types;
 pub use codec::{CodecError, MAX_FRAME_SIZE, read_frame, write_frame};
 pub use rpc::{ClientMessage, ProtoError, Request, ResponsePayload, ServerEvent, ServerMessage};
 pub use types::{
-    Cell, CellFlags, Color, ContainerHealth, CursorState, ExternalStatus, FailureTrace,
-    GitWorktreeInfo, GridDelta, GridRow, GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary,
-    PortMapping, PortSource, SearchMatch, StatusLevel, WorkspaceId, WorkspaceInfo,
-    WorkspaceManifest, wrap_bracketed_paste,
+    AgentState, Cell, CellFlags, Color, ContainerHealth, CursorState, ExternalStatus, FailureTrace,
+    GitWorkspaceStatus, GitWorktreeInfo, GridDelta, GridRow, GridSnapshot, PaneId, PaneRole,
+    PaneStatus, PaneSummary, PortMapping, PortSource, SearchMatch, StatusLevel, WorkspaceId,
+    WorkspaceInfo, WorkspaceManifest, wrap_bracketed_paste,
 };
 
 use std::path::PathBuf;
@@ -274,6 +274,8 @@ mod tests {
                 payload: ClientMessage::CloseWorkspace {
                     id: ws_id,
                     compose_down: true,
+                    remove_worktree: false,
+                    force_remove_worktree: false,
                 },
             },
             Request {
@@ -349,6 +351,7 @@ mod tests {
             port_offset: 100,
             compose_project_name: Some("daedalus-wt1".to_string()),
             git_branch: Some("feat/auth".to_string()),
+            git_status: None,
             bound_ports: vec![port_mapping.clone(), local_port.clone()],
             containers: vec![container.clone()],
             external_statuses: vec![ext_status.clone()],
@@ -368,6 +371,8 @@ mod tests {
                 workspace_id: ws_id,
                 bound_ports: vec![port_mapping, local_port],
                 containers: vec![container],
+                git_status: None,
+                git_branch: None,
             }),
             ServerMessage::Event(ServerEvent::ExternalStatusUpdated {
                 workspace_id: ws_id,
@@ -427,6 +432,8 @@ mod tests {
             ClientMessage::CloseWorkspace {
                 id: ws_id,
                 compose_down: false,
+                remove_worktree: false,
+                force_remove_worktree: false,
             }
         );
     }
@@ -488,6 +495,7 @@ mod tests {
             port_offset: 0,
             compose_project_name: None,
             git_branch: None,
+            git_status: None,
             bound_ports: Vec::new(),
             containers: Vec::new(),
             external_statuses: Vec::new(),
@@ -547,6 +555,327 @@ mod tests {
         assert_eq!(
             resolve_config_file_path(None, None, Some("")),
             fallback_prefix.join("config.toml")
+        );
+    }
+
+    #[test]
+    fn agent_state_from_cli_name_and_display() {
+        assert_eq!(AgentState::from_cli_name("idle"), Some(AgentState::Idle));
+        assert_eq!(AgentState::from_cli_name("IDLE"), Some(AgentState::Idle));
+        assert_eq!(
+            AgentState::from_cli_name("Thinking"),
+            Some(AgentState::Thinking)
+        );
+        assert_eq!(
+            AgentState::from_cli_name("waiting"),
+            Some(AgentState::WaitingForApproval)
+        );
+        assert_eq!(
+            AgentState::from_cli_name("approval"),
+            Some(AgentState::WaitingForApproval)
+        );
+        assert_eq!(
+            AgentState::from_cli_name("waiting_for_approval"),
+            Some(AgentState::WaitingForApproval)
+        );
+        assert_eq!(
+            AgentState::from_cli_name("waiting-for-approval"),
+            Some(AgentState::WaitingForApproval)
+        );
+        assert_eq!(
+            AgentState::from_cli_name("WAITING-FOR-APPROVAL"),
+            Some(AgentState::WaitingForApproval)
+        );
+        assert_eq!(AgentState::from_cli_name("error"), Some(AgentState::Error));
+        assert_eq!(AgentState::from_cli_name("ERROR"), Some(AgentState::Error));
+        assert_eq!(AgentState::from_cli_name("unknown"), None);
+        assert_eq!(AgentState::from_cli_name(""), None);
+
+        assert_eq!(AgentState::Idle.to_string(), "idle");
+        assert_eq!(AgentState::Thinking.to_string(), "thinking");
+        assert_eq!(
+            AgentState::WaitingForApproval.to_string(),
+            "waiting_for_approval"
+        );
+        assert_eq!(AgentState::Error.to_string(), "error");
+    }
+
+    #[tokio::test]
+    async fn round_trips_v0_0_3_types_rpcs_and_events() {
+        let (mut client, mut server) = duplex(16384);
+        let ws_id = WorkspaceId::new();
+        let pane_id = PaneId::new();
+
+        for state in [
+            AgentState::Idle,
+            AgentState::Thinking,
+            AgentState::WaitingForApproval,
+            AgentState::Error,
+        ] {
+            let encoded = rmp_serde::to_vec_named(&state).unwrap();
+            let decoded: AgentState = rmp_serde::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, state);
+        }
+
+        let git_status = GitWorkspaceStatus {
+            is_worktree: true,
+            dirty: true,
+            ahead: 2,
+            behind: 1,
+        };
+        let encoded_gs = rmp_serde::to_vec_named(&git_status).unwrap();
+        let decoded_gs: GitWorkspaceStatus = rmp_serde::from_slice(&encoded_gs).unwrap();
+        assert_eq!(decoded_gs, git_status);
+
+        let requests = vec![
+            Request {
+                id: 101,
+                payload: ClientMessage::CloseWorkspace {
+                    id: ws_id,
+                    compose_down: true,
+                    remove_worktree: true,
+                    force_remove_worktree: true,
+                },
+            },
+            Request {
+                id: 102,
+                payload: ClientMessage::SetAgentState {
+                    pane_id: Some(pane_id),
+                    workspace_id: Some(ws_id),
+                    root_dir: Some(PathBuf::from("/tmp/wt1")),
+                    state: AgentState::WaitingForApproval,
+                },
+            },
+            Request {
+                id: 103,
+                payload: ClientMessage::ClearExternalStatus {
+                    workspace_id: None,
+                    root_dir: Some(PathBuf::from("/tmp/wt1")),
+                    source: "phrourion".to_string(),
+                },
+            },
+        ];
+
+        for req in requests {
+            write_frame(&mut client, &req).await.unwrap();
+            let decoded: Request = read_frame(&mut server).await.unwrap().unwrap();
+            assert_eq!(decoded, req);
+        }
+
+        let trace = FailureTrace {
+            pane_id,
+            command: Some("cargo test".to_string()),
+            exit_code: 101,
+            cwd: Some(PathBuf::from("/tmp/wt1")),
+            output: "assertion failed".to_string(),
+            captured_at_ms: 1_760_000_000_999,
+            git_branch: Some("feat/v0.0.3".to_string()),
+            git_diff_stat: Some(" crates/daedalus-proto/src/types.rs | 10 ++++\n".to_string()),
+        };
+
+        let pane_summary = PaneSummary {
+            id: pane_id,
+            workspace_id: ws_id,
+            role: PaneRole::Agent,
+            status: PaneStatus::Busy,
+            cols: 120,
+            rows: 40,
+            cwd: Some(PathBuf::from("/tmp/wt1")),
+            last_exit_code: None,
+            has_failure_trace: false,
+            agent_state: Some(AgentState::Thinking),
+        };
+
+        let ws_info = WorkspaceInfo {
+            id: ws_id,
+            name: "wt1".to_string(),
+            root_dir: PathBuf::from("/tmp/wt1"),
+            slot_index: 1,
+            injected_env: HashMap::new(),
+            panes: vec![pane_summary.clone()],
+            port_offset: 100,
+            compose_project_name: None,
+            git_branch: Some("feat/v0.0.3".to_string()),
+            git_status: Some(git_status),
+            bound_ports: Vec::new(),
+            containers: Vec::new(),
+            external_statuses: Vec::new(),
+            manifest: None,
+        };
+
+        let server_msgs = vec![
+            ServerMessage::Response {
+                id: 101,
+                result: Ok(ResponsePayload::FailureTrace(Some(trace))),
+            },
+            ServerMessage::Response {
+                id: 102,
+                result: Ok(ResponsePayload::PaneSpawned(pane_summary)),
+            },
+            ServerMessage::Response {
+                id: 103,
+                result: Ok(ResponsePayload::WorkspaceCreated(ws_info)),
+            },
+            ServerMessage::Event(ServerEvent::AgentStateChanged {
+                workspace_id: ws_id,
+                pane_id,
+                state: AgentState::WaitingForApproval,
+            }),
+            ServerMessage::Event(ServerEvent::WorkspaceRuntimeUpdated {
+                workspace_id: ws_id,
+                bound_ports: Vec::new(),
+                containers: Vec::new(),
+                git_status: Some(git_status),
+                git_branch: Some("feat/v0.0.3".to_string()),
+            }),
+        ];
+
+        for msg in server_msgs {
+            write_frame(&mut server, &msg).await.unwrap();
+            let decoded: ServerMessage = read_frame(&mut client).await.unwrap().unwrap();
+            assert_eq!(decoded, msg);
+        }
+    }
+
+    #[test]
+    fn serde_defaults_preserve_backward_compatibility_for_v0_0_3_fields() {
+        #[derive(serde::Serialize)]
+        struct LegacyPaneSummary {
+            id: PaneId,
+            workspace_id: WorkspaceId,
+            role: PaneRole,
+            status: PaneStatus,
+            cols: u16,
+            rows: u16,
+            cwd: Option<PathBuf>,
+            last_exit_code: Option<i32>,
+            has_failure_trace: bool,
+        }
+
+        #[derive(serde::Serialize)]
+        struct LegacyWorkspaceInfoV02 {
+            id: WorkspaceId,
+            name: String,
+            root_dir: PathBuf,
+            slot_index: u16,
+            injected_env: HashMap<String, String>,
+            panes: Vec<LegacyPaneSummary>,
+            port_offset: u16,
+            compose_project_name: Option<String>,
+            git_branch: Option<String>,
+            bound_ports: Vec<PortMapping>,
+            containers: Vec<ContainerHealth>,
+            external_statuses: Vec<ExternalStatus>,
+            manifest: Option<WorkspaceManifest>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct LegacyFailureTrace {
+            pane_id: PaneId,
+            command: Option<String>,
+            exit_code: i32,
+            cwd: Option<PathBuf>,
+            output: String,
+            captured_at_ms: u64,
+        }
+
+        #[derive(serde::Serialize)]
+        enum LegacyClientMessageV02 {
+            CloseWorkspace { id: WorkspaceId, compose_down: bool },
+        }
+
+        #[derive(serde::Serialize)]
+        enum LegacyServerEventV02 {
+            WorkspaceRuntimeUpdated {
+                workspace_id: WorkspaceId,
+                bound_ports: Vec<PortMapping>,
+                containers: Vec<ContainerHealth>,
+            },
+        }
+
+        let ws_id = WorkspaceId::new();
+        let pane_id = PaneId::new();
+
+        let legacy_pane = LegacyPaneSummary {
+            id: pane_id,
+            workspace_id: ws_id,
+            role: PaneRole::Agent,
+            status: PaneStatus::Idle,
+            cols: 80,
+            rows: 24,
+            cwd: None,
+            last_exit_code: None,
+            has_failure_trace: false,
+        };
+        let pane_bytes = rmp_serde::to_vec_named(&legacy_pane).unwrap();
+        let decoded_pane: PaneSummary = rmp_serde::from_slice(&pane_bytes).unwrap();
+        assert_eq!(decoded_pane.agent_state, None);
+
+        let legacy_ws = LegacyWorkspaceInfoV02 {
+            id: ws_id,
+            name: "v0.0.2".to_string(),
+            root_dir: PathBuf::from("/tmp/v02"),
+            slot_index: 0,
+            injected_env: HashMap::new(),
+            panes: vec![legacy_pane],
+            port_offset: 0,
+            compose_project_name: None,
+            git_branch: Some("main".to_string()),
+            bound_ports: Vec::new(),
+            containers: Vec::new(),
+            external_statuses: Vec::new(),
+            manifest: None,
+        };
+        let ws_bytes = rmp_serde::to_vec_named(&legacy_ws).unwrap();
+        let decoded_ws: WorkspaceInfo = rmp_serde::from_slice(&ws_bytes).unwrap();
+        assert_eq!(decoded_ws.git_status, None);
+        assert_eq!(decoded_ws.panes[0].agent_state, None);
+
+        let legacy_trace = LegacyFailureTrace {
+            pane_id,
+            command: Some("make test".to_string()),
+            exit_code: 2,
+            cwd: None,
+            output: "failed".to_string(),
+            captured_at_ms: 42,
+        };
+        let trace_bytes = rmp_serde::to_vec_named(&legacy_trace).unwrap();
+        let decoded_trace: FailureTrace = rmp_serde::from_slice(&trace_bytes).unwrap();
+        assert_eq!(decoded_trace.git_branch, None);
+        assert_eq!(decoded_trace.git_diff_stat, None);
+
+        let legacy_close = LegacyClientMessageV02::CloseWorkspace {
+            id: ws_id,
+            compose_down: true,
+        };
+        let close_bytes = rmp_serde::to_vec_named(&legacy_close).unwrap();
+        let decoded_close: ClientMessage = rmp_serde::from_slice(&close_bytes).unwrap();
+        assert_eq!(
+            decoded_close,
+            ClientMessage::CloseWorkspace {
+                id: ws_id,
+                compose_down: true,
+                remove_worktree: false,
+                force_remove_worktree: false,
+            }
+        );
+
+        let legacy_runtime = LegacyServerEventV02::WorkspaceRuntimeUpdated {
+            workspace_id: ws_id,
+            bound_ports: Vec::new(),
+            containers: Vec::new(),
+        };
+        let runtime_bytes = rmp_serde::to_vec_named(&legacy_runtime).unwrap();
+        let decoded_runtime: ServerEvent = rmp_serde::from_slice(&runtime_bytes).unwrap();
+        assert_eq!(
+            decoded_runtime,
+            ServerEvent::WorkspaceRuntimeUpdated {
+                workspace_id: ws_id,
+                bound_ports: Vec::new(),
+                containers: Vec::new(),
+                git_status: None,
+                git_branch: None,
+            }
         );
     }
 }

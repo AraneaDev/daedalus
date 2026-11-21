@@ -5,16 +5,16 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use daedalus_proto::{
-    CellFlags, ContainerHealth, ExternalStatus, PaneRole, PaneStatus, PortMapping, StatusLevel,
-    WorkspaceInfo,
+    AgentState, CellFlags, ContainerHealth, ExternalStatus, GitWorkspaceStatus, PaneRole,
+    PaneStatus, PortMapping, StatusLevel, WorkspaceInfo,
 };
 use winit::window::Window;
 
 use crate::layout::{
     PaneRect, Rect, WorkspaceLayout, sidebar_new_workspace_rect, sidebar_new_worktree_rect,
-    sidebar_workspace_rect,
+    sidebar_workspace_close_rect, sidebar_workspace_rect,
 };
-use crate::state::{AgentPreset, AppState};
+use crate::state::{AgentPreset, AppState, CloseWorkspaceModalState};
 use crate::theme::{Rgba, Theme};
 
 use self::quads::{QuadInstance, QuadPipeline, rgba_to_wgpu_clear_color};
@@ -34,6 +34,14 @@ const WORKTREE_PAD_LOGICAL: f32 = 14.0;
 
 const SEARCH_BAR_LOGICAL_WIDTH: f32 = 340.0;
 const SEARCH_BAR_LOGICAL_HEIGHT: f32 = 30.0;
+
+const CLOSE_MODAL_LOGICAL_WIDTH: f32 = 440.0;
+const CLOSE_MODAL_LOGICAL_HEIGHT: f32 = 272.0;
+pub(super) const CLOSE_MODAL_HEADER_LOGICAL_HEIGHT: f32 = 38.0;
+const CLOSE_MODAL_PAD_LOGICAL: f32 = 16.0;
+const CLOSE_MODAL_ROW_LOGICAL_HEIGHT: f32 = 26.0;
+const CLOSE_MODAL_ROW_LOGICAL_GAP: f32 = 6.0;
+const CLOSE_MODAL_BTN_LOGICAL_HEIGHT: f32 = 30.0;
 
 fn sanitize_scale(scale_factor: f32) -> f32 {
     if scale_factor.is_finite() && scale_factor > 0.0 {
@@ -103,21 +111,254 @@ pub fn search_bar_rect(pane_rect: &PaneRect, scale_factor: f32) -> Rect {
     Rect::new(x, y, bar_w, bar_h)
 }
 
-pub(super) fn workspace_branch_badge(ws: &WorkspaceInfo) -> Option<(String, bool)> {
-    match (&ws.git_branch, ws.slot_index > 0) {
-        (Some(branch), true) => Some((format!("wt{} · {branch}", ws.slot_index), true)),
-        (Some(branch), false) => Some((branch.clone(), false)),
-        (None, true) => Some((format!("wt{}", ws.slot_index), true)),
-        (None, false) => None,
+/// Computes the centered physical-pixel rectangle of the "Close Workspace" confirmation modal.
+pub fn close_workspace_modal_rect(window_w: f32, window_h: f32, scale_factor: f32) -> Rect {
+    let s = sanitize_scale(scale_factor);
+    let modal_w = (CLOSE_MODAL_LOGICAL_WIDTH * s).min((window_w - 24.0 * s).max(200.0));
+    let modal_h = (CLOSE_MODAL_LOGICAL_HEIGHT * s).min((window_h - 24.0 * s).max(160.0));
+    let x = ((window_w - modal_w) * 0.5).max(0.0);
+    let y = ((window_h - modal_h) * 0.5).max(0.0);
+    Rect::new(x, y, modal_w, modal_h)
+}
+
+pub(super) fn close_modal_dirty_banner_rect(modal: Rect, scale_factor: f32) -> Rect {
+    let s = sanitize_scale(scale_factor);
+    let pad = CLOSE_MODAL_PAD_LOGICAL * s;
+    Rect::new(
+        modal.x + pad,
+        modal.y + 72.0 * s,
+        (modal.width - 2.0 * pad).max(0.0),
+        24.0 * s,
+    )
+}
+
+fn close_modal_checkbox_start_y(
+    modal: Rect,
+    close_state: &CloseWorkspaceModalState,
+    s: f32,
+) -> f32 {
+    if close_state.is_dirty {
+        modal.y + 104.0 * s
+    } else {
+        modal.y + 74.0 * s
     }
 }
 
-pub(super) fn sidebar_branch_badge_rect(row_rect: Rect, label: &str, scale_factor: f32) -> Rect {
+fn close_modal_row_rect(modal: Rect, y: f32, s: f32) -> Rect {
+    let pad = CLOSE_MODAL_PAD_LOGICAL * s;
+    Rect::new(
+        modal.x + pad,
+        y,
+        (modal.width - 2.0 * pad).max(0.0),
+        CLOSE_MODAL_ROW_LOGICAL_HEIGHT * s,
+    )
+}
+
+/// Rectangle for the "Stop Docker Compose (c)" checkbox row inside the close modal.
+pub fn close_modal_compose_rect(
+    modal: Rect,
+    close_state: &CloseWorkspaceModalState,
+    scale_factor: f32,
+) -> Rect {
+    let s = sanitize_scale(scale_factor);
+    let y = close_modal_checkbox_start_y(modal, close_state, s);
+    close_modal_row_rect(modal, y, s)
+}
+
+/// Rectangle for the "Remove git worktree (w)" checkbox row inside the close modal (when `is_worktree`).
+pub fn close_modal_worktree_rect(
+    modal: Rect,
+    close_state: &CloseWorkspaceModalState,
+    scale_factor: f32,
+) -> Option<Rect> {
+    if !close_state.is_worktree {
+        return None;
+    }
+    let s = sanitize_scale(scale_factor);
+    let step = (CLOSE_MODAL_ROW_LOGICAL_HEIGHT + CLOSE_MODAL_ROW_LOGICAL_GAP) * s;
+    let y = close_modal_checkbox_start_y(modal, close_state, s) + step;
+    Some(close_modal_row_rect(modal, y, s))
+}
+
+/// Rectangle for the "Force remove dirty worktree (f)" checkbox row (when `is_worktree && is_dirty && remove_worktree`).
+pub fn close_modal_force_rect(
+    modal: Rect,
+    close_state: &CloseWorkspaceModalState,
+    scale_factor: f32,
+) -> Option<Rect> {
+    if !(close_state.is_worktree && close_state.is_dirty && close_state.remove_worktree) {
+        return None;
+    }
+    let s = sanitize_scale(scale_factor);
+    let step = (CLOSE_MODAL_ROW_LOGICAL_HEIGHT + CLOSE_MODAL_ROW_LOGICAL_GAP) * s;
+    let y = close_modal_checkbox_start_y(modal, close_state, s) + 2.0 * step;
+    Some(close_modal_row_rect(modal, y, s))
+}
+
+/// Rectangle for the Cancel button inside the close modal.
+pub fn close_modal_cancel_rect(modal: Rect, scale_factor: f32) -> Rect {
+    let s = sanitize_scale(scale_factor);
+    let pad = CLOSE_MODAL_PAD_LOGICAL * s;
+    let gap = 10.0 * s;
+    let btn_w = ((modal.width - 2.0 * pad - gap) * 0.5).max(0.0);
+    let btn_h = CLOSE_MODAL_BTN_LOGICAL_HEIGHT * s;
+    let y = modal.bottom() - btn_h - 28.0 * s;
+    Rect::new(modal.x + pad, y, btn_w, btn_h)
+}
+
+/// Rectangle for the Confirm button inside the close modal.
+pub fn close_modal_confirm_rect(modal: Rect, scale_factor: f32) -> Rect {
+    let s = sanitize_scale(scale_factor);
+    let cancel = close_modal_cancel_rect(modal, s);
+    let gap = 10.0 * s;
+    let pad = CLOSE_MODAL_PAD_LOGICAL * s;
+    let btn_w = (modal.right() - pad - (cancel.right() + gap)).max(0.0);
+    Rect::new(cancel.right() + gap, cancel.y, btn_w, cancel.height)
+}
+
+/// Formats `(label, color)` for an [`AgentState`] badge.
+pub fn agent_state_badge(state: AgentState, theme: &Theme) -> (&'static str, Rgba) {
+    match state {
+        AgentState::WaitingForApproval => ("APPROVAL", theme.status_busy),
+        AgentState::Thinking => ("THINKING", theme.border_focused),
+        AgentState::Idle => ("IDLE", theme.status_ok),
+        AgentState::Error => ("ERROR", theme.status_err),
+    }
+}
+
+/// Computes the Agent pane header state badge rectangle to the left of `action_pill`.
+pub fn pane_agent_state_pill_rect(
+    pane_rect: &PaneRect,
+    label: &str,
+    scale_factor: f32,
+) -> Option<Rect> {
+    if pane_rect.role != PaneRole::Agent {
+        return None;
+    }
+    let s = sanitize_scale(scale_factor);
+    let header = pane_rect.header;
+    let right_edge = pane_rect
+        .action_pill
+        .map_or(header.right() - 6.0 * s, |p| p.x - 6.0 * s);
+    let desired_w = ((label.chars().count() as f32) * 6.8 + 14.0) * s;
+    let max_w = (right_edge - header.x - 24.0 * s).max(0.0);
+    let pill_w = desired_w.min(max_w);
+    let pill_h = (header.height - 6.0 * s).max(0.0);
+    if pill_w >= 24.0 * s && pill_h > 0.0 {
+        Some(Rect::new(
+            right_edge - pill_w,
+            header.y + 3.0 * s,
+            pill_w,
+            pill_h,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Computes the compact Agent state badge rectangle on Line 2 right side of a sidebar workspace card.
+pub fn sidebar_agent_state_pill_rect(row_rect: Rect, label: &str, scale_factor: f32) -> Rect {
+    let s = sanitize_scale(scale_factor);
+    let w = ((label.chars().count() as f32) * 6.5 + 12.0) * s;
+    let max_w = (row_rect.width - 28.0 * s).max(0.0);
+    let clamped_w = w.min(max_w);
+    Rect::new(
+        row_rect.right() - clamped_w - 6.0 * s,
+        row_rect.y + 24.0 * s,
+        clamped_w,
+        15.0 * s,
+    )
+}
+
+/// Formats compact git status indicators (`*`, `↑n`, `↓n`).
+pub fn format_git_status_suffix(gs: &GitWorkspaceStatus) -> String {
+    let mut parts = String::new();
+    if gs.dirty {
+        parts.push('*');
+    }
+    if gs.ahead > 0 {
+        if !parts.is_empty() {
+            parts.push(' ');
+        }
+        parts.push_str(&format!("↑{}", gs.ahead));
+    }
+    if gs.behind > 0 {
+        if !parts.is_empty() {
+            parts.push(' ');
+        }
+        parts.push_str(&format!("↓{}", gs.behind));
+    }
+    parts
+}
+
+/// Formats a compact uppercase source tag for external tool badges (`[PHR]`, `[CAS]`, etc.).
+pub fn format_external_source_tag(source: &str) -> String {
+    let trimmed = source.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "phrourion" => "[PHR]".to_string(),
+        "cassandra" => "[CAS]".to_string(),
+        _ => {
+            let short: String = trimmed
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .take(3)
+                .flat_map(|c| c.to_uppercase())
+                .collect();
+            if short.is_empty() {
+                "[EXT]".to_string()
+            } else {
+                format!("[{short}]")
+            }
+        }
+    }
+}
+
+pub(super) fn active_external_detail_preview(ws: &WorkspaceInfo) -> Option<String> {
+    ws.external_statuses.iter().rev().find_map(|ext| {
+        let detail = ext
+            .detail
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())?;
+        let tag = format_external_source_tag(&ext.source);
+        Some(format!("{tag} {detail}"))
+    })
+}
+
+pub(super) fn workspace_branch_badge(ws: &WorkspaceInfo) -> Option<(String, bool)> {
+    let is_wt = ws.slot_index > 0 || ws.git_status.is_some_and(|g| g.is_worktree);
+    let mut label = match (&ws.git_branch, ws.slot_index > 0) {
+        (Some(branch), true) => format!("wt{} · {branch}", ws.slot_index),
+        (Some(branch), false) => branch.clone(),
+        (None, true) => format!("wt{}", ws.slot_index),
+        (None, false) => return None,
+    };
+    if let Some(ref gs) = ws.git_status {
+        let suffix = format_git_status_suffix(gs);
+        if !suffix.is_empty() {
+            label.push(' ');
+            label.push_str(&suffix);
+        }
+    }
+    Some((label, is_wt))
+}
+
+pub(super) fn sidebar_branch_badge_rect_with_reserve(
+    row_rect: Rect,
+    label: &str,
+    reserve_right: f32,
+    scale_factor: f32,
+) -> Rect {
     let s = sanitize_scale(scale_factor);
     let left_x = row_rect.x + 22.0 * s;
-    let max_w = (row_rect.right() - left_x - 8.0 * s).max(0.0);
+    let max_w = (row_rect.right() - left_x - 8.0 * s - reserve_right).max(0.0);
     let est_w = ((label.chars().count() as f32) * 6.8 + 12.0) * s;
     Rect::new(left_x, row_rect.y + 24.0 * s, est_w.min(max_w), 15.0 * s)
+}
+
+#[cfg(test)]
+pub(super) fn sidebar_branch_badge_rect(row_rect: Rect, label: &str, scale_factor: f32) -> Rect {
+    sidebar_branch_badge_rect_with_reserve(row_rect, label, 0.0, scale_factor)
 }
 
 pub(super) fn format_ports_summary(bound_ports: &[PortMapping]) -> (String, bool) {
@@ -327,23 +568,42 @@ pub fn collect_quads(
                 quads.push(QuadInstance::new(row_rect, theme.bg_pane.with_alpha(0.55)));
             }
 
-            // Agent status dot
+            // Agent status dot (highlighted in amber/error when agent_state demands attention)
             let agent_status = ws
                 .panes
                 .iter()
                 .rev()
                 .find(|p| p.role == PaneRole::Agent)
                 .map_or(PaneStatus::Exited { code: None }, |p| p.status);
+            let agent_state = state.workspace_agent_state(ws);
+            let dot_color = match agent_state {
+                Some(AgentState::WaitingForApproval) => theme.status_busy,
+                Some(AgentState::Error) => theme.status_err,
+                _ => status_dot_color(agent_status, theme),
+            };
             let dot_size = 7.0 * s;
             quads.push(QuadInstance::from_xywh(
                 row_rect.x + 9.0 * s,
                 row_rect.y + 11.0 * s,
                 dot_size,
                 dot_size,
-                status_dot_color(agent_status, theme),
+                dot_color,
             ));
 
-            // Runner status pill backdrop
+            // Sidebar workspace `×` close button
+            let close_rect = sidebar_workspace_close_rect(row_rect, s);
+            quads.push(QuadInstance::new(
+                close_rect,
+                theme.bg_window.with_alpha(0.55),
+            ));
+            push_rect_border(
+                &mut quads,
+                close_rect,
+                border_w,
+                theme.border_unfocused.with_alpha(0.75),
+            );
+
+            // Runner status pill backdrop (shifted left of `×` button)
             if let Some(runner) = ws.panes.iter().rev().find(|p| p.role == PaneRole::Runner) {
                 let pill_bg = if runner.has_failure_trace {
                     Some(theme.status_err.with_alpha(0.22))
@@ -354,7 +614,7 @@ pub fn collect_quads(
                 };
                 if let Some(bg) = pill_bg {
                     quads.push(QuadInstance::from_xywh(
-                        row_rect.right() - 52.0 * s,
+                        row_rect.right() - 70.0 * s,
                         row_rect.y + 5.0 * s,
                         46.0 * s,
                         18.0 * s,
@@ -363,9 +623,35 @@ pub fn collect_quads(
                 }
             }
 
+            // Compact Agent state badge on Line 2 right side
+            let agent_pill_reserve = if let Some(ast) = agent_state {
+                let (label, color) = agent_state_badge(ast, theme);
+                let pill_rect = sidebar_agent_state_pill_rect(row_rect, label, s);
+                let (fill_alpha, border_alpha) = if ast == AgentState::WaitingForApproval {
+                    (0.28, 0.90)
+                } else {
+                    (0.18, 0.60)
+                };
+                quads.push(QuadInstance::new(pill_rect, color.with_alpha(fill_alpha)));
+                push_rect_border(
+                    &mut quads,
+                    pill_rect,
+                    border_w,
+                    color.with_alpha(border_alpha),
+                );
+                pill_rect.width + 6.0 * s
+            } else {
+                0.0
+            };
+
             // Git branch / worktree slot badge backdrop
             if let Some((branch_label, is_wt)) = workspace_branch_badge(ws) {
-                let badge_rect = sidebar_branch_badge_rect(row_rect, &branch_label, s);
+                let badge_rect = sidebar_branch_badge_rect_with_reserve(
+                    row_rect,
+                    &branch_label,
+                    agent_pill_reserve,
+                    s,
+                );
                 let bg = if is_wt {
                     theme.border_focused.with_alpha(0.18)
                 } else {
@@ -499,6 +785,104 @@ pub fn collect_quads(
         let input_rect = worktree_input_rect(modal, s);
         quads.push(QuadInstance::new(input_rect, theme.bg_window));
         push_rect_border(&mut quads, input_rect, border_w, theme.border_focused);
+    } else if state.close_modal.open {
+        // Dimmed backdrop scrim
+        quads.push(QuadInstance::from_xywh(
+            0.0,
+            0.0,
+            screen_w,
+            screen_h,
+            Rgba::new(0.0, 0.0, 0.0, 0.55),
+        ));
+
+        let modal = close_workspace_modal_rect(screen_w, screen_h, s);
+        quads.push(QuadInstance::new(modal, theme.picker_bg));
+        push_rect_border(&mut quads, modal, border_w, theme.border_focused);
+
+        // Header divider
+        quads.push(QuadInstance::from_xywh(
+            modal.x + border_w,
+            modal.y + (CLOSE_MODAL_HEADER_LOGICAL_HEIGHT - 2.0) * s,
+            (modal.width - 2.0 * border_w).max(0.0),
+            border_w,
+            theme.border_unfocused,
+        ));
+
+        // Dirty worktree warning banner
+        if state.close_modal.is_dirty {
+            let warn_rect = close_modal_dirty_banner_rect(modal, s);
+            quads.push(QuadInstance::new(
+                warn_rect,
+                theme.status_busy.with_alpha(0.18),
+            ));
+            push_rect_border(
+                &mut quads,
+                warn_rect,
+                border_w,
+                theme.status_busy.with_alpha(0.75),
+            );
+        }
+
+        // Interactive checkbox rows
+        let mut draw_checkbox_row = |rect: Rect, checked: bool, accent: Rgba| {
+            let fill = if checked {
+                accent.with_alpha(0.14)
+            } else {
+                theme.bg_window.with_alpha(0.55)
+            };
+            let border = if checked {
+                accent.with_alpha(0.65)
+            } else {
+                theme.border_unfocused
+            };
+            quads.push(QuadInstance::new(rect, fill));
+            push_rect_border(&mut quads, rect, border_w, border);
+        };
+
+        let compose_rect = close_modal_compose_rect(modal, &state.close_modal, s);
+        draw_checkbox_row(
+            compose_rect,
+            state.close_modal.compose_down,
+            theme.border_focused,
+        );
+
+        if let Some(wt_rect) = close_modal_worktree_rect(modal, &state.close_modal, s) {
+            draw_checkbox_row(
+                wt_rect,
+                state.close_modal.remove_worktree,
+                theme.status_busy,
+            );
+        }
+
+        if let Some(force_rect) = close_modal_force_rect(modal, &state.close_modal, s) {
+            draw_checkbox_row(
+                force_rect,
+                state.close_modal.force_remove_worktree,
+                theme.status_err,
+            );
+        }
+
+        // Cancel & Confirm buttons
+        let cancel_rect = close_modal_cancel_rect(modal, s);
+        quads.push(QuadInstance::new(cancel_rect, theme.bg_header));
+        push_rect_border(&mut quads, cancel_rect, border_w, theme.border_unfocused);
+
+        let confirm_rect = close_modal_confirm_rect(modal, s);
+        let confirm_accent = if state.close_modal.remove_worktree {
+            theme.status_err
+        } else {
+            theme.border_focused
+        };
+        quads.push(QuadInstance::new(
+            confirm_rect,
+            confirm_accent.with_alpha(0.24),
+        ));
+        push_rect_border(
+            &mut quads,
+            confirm_rect,
+            border_w,
+            confirm_accent.with_alpha(0.85),
+        );
     } else if let Some(ref search) = state.search
         && let Some(pane_rect) = layout
             .panes
@@ -545,6 +929,22 @@ fn collect_pane_quads(
         dot_size,
         dot_color,
     ));
+
+    // Agent state badge pill (left of action_pill in Agent pane header)
+    if pane_rect.role == PaneRole::Agent
+        && let Some(agent_state) = pane_state.and_then(|p| p.summary.agent_state)
+    {
+        let (label, color) = agent_state_badge(agent_state, theme);
+        if let Some(pill) = pane_agent_state_pill_rect(pane_rect, label, scale_factor) {
+            let fill_alpha = if agent_state == AgentState::WaitingForApproval {
+                0.28
+            } else {
+                0.20
+            };
+            quads.push(QuadInstance::new(pill, color.with_alpha(fill_alpha)));
+            push_rect_border(quads, pill, border_w, color.with_alpha(0.70));
+        }
+    }
 
     // Action pill background + border
     if let Some(pill) = pane_rect.action_pill {
@@ -1024,6 +1424,7 @@ impl GpuRenderer {
             if total_quad_count > base_quad_count
                 || state.picker.open
                 || state.worktree_modal.open
+                || state.close_modal.open
                 || state.search.is_some()
             {
                 self.quad_pipeline
@@ -1073,10 +1474,12 @@ mod tests {
                 cwd: Some(PathBuf::from("/tmp/repo")),
                 last_exit_code: None,
                 has_failure_trace: false,
+                agent_state: None,
             }],
             port_offset: 0,
             compose_project_name: None,
             git_branch: None,
+            git_status: None,
             bound_ports: Vec::new(),
             containers: Vec::new(),
             external_statuses: Vec::new(),
@@ -1436,5 +1839,112 @@ mod tests {
                 && (q.rect[0] - bar.x).abs() < 1e-3
                 && (q.rect[1] - bar.y).abs() < 1e-3
         }));
+    }
+
+    #[test]
+    fn agent_state_git_status_and_external_source_tag_helpers() {
+        let theme = Theme::dark();
+        assert_eq!(
+            agent_state_badge(AgentState::WaitingForApproval, &theme),
+            ("APPROVAL", theme.status_busy)
+        );
+        assert_eq!(
+            agent_state_badge(AgentState::Thinking, &theme),
+            ("THINKING", theme.border_focused)
+        );
+        assert_eq!(
+            agent_state_badge(AgentState::Idle, &theme),
+            ("IDLE", theme.status_ok)
+        );
+        assert_eq!(
+            agent_state_badge(AgentState::Error, &theme),
+            ("ERROR", theme.status_err)
+        );
+
+        assert_eq!(format_external_source_tag("phrourion"), "[PHR]");
+        assert_eq!(format_external_source_tag("Phrourion"), "[PHR]");
+        assert_eq!(format_external_source_tag("cassandra"), "[CAS]");
+        assert_eq!(format_external_source_tag("custom-ci"), "[CUS]");
+        assert_eq!(format_external_source_tag("ci"), "[CI]");
+        assert_eq!(format_external_source_tag("  "), "[EXT]");
+
+        assert_eq!(
+            format_git_status_suffix(&GitWorkspaceStatus {
+                is_worktree: true,
+                dirty: true,
+                ahead: 2,
+                behind: 1,
+            }),
+            "* ↑2 ↓1"
+        );
+        assert_eq!(
+            format_git_status_suffix(&GitWorkspaceStatus {
+                is_worktree: false,
+                dirty: false,
+                ahead: 3,
+                behind: 0,
+            }),
+            "↑3"
+        );
+        assert_eq!(format_git_status_suffix(&GitWorkspaceStatus::default()), "");
+    }
+
+    #[test]
+    fn collect_quads_renders_agent_badges_and_close_workspace_modal() {
+        let (mut state, layout) = make_state_with_agent_row();
+        let theme = Theme::dark();
+        let ws_id = state.active_workspace_id.unwrap();
+        let agent_id = state.pane_id_for_role(PaneRole::Agent).unwrap();
+        state.apply_agent_state(ws_id, agent_id, AgentState::WaitingForApproval);
+        {
+            let ws = state.active_workspace_mut().unwrap();
+            ws.slot_index = 1;
+            ws.compose_project_name = Some("daedalus-wt1".to_string());
+            ws.git_branch = Some("feat/agent-badges".to_string());
+            ws.git_status = Some(GitWorkspaceStatus {
+                is_worktree: true,
+                dirty: true,
+                ahead: 1,
+                behind: 0,
+            });
+        }
+
+        let (quads, base_count) =
+            collect_quads(&state, &layout, &theme, 1200.0, 800.0, 1.0, (8.0, 19.0));
+        assert_eq!(base_count as usize, quads.len());
+
+        // Sidebar and Agent pane header both emit amber APPROVAL pill quads
+        let sidebar_approval_bg = theme.status_busy.with_alpha(0.28).to_array();
+        assert!(
+            quads
+                .iter()
+                .filter(|q| q.color == sidebar_approval_bg)
+                .count()
+                >= 2
+        );
+
+        // Open close modal with worktree + dirty + remove_worktree enabled
+        assert!(state.open_close_modal_for_workspace(ws_id));
+        state.close_modal.toggle_worktree();
+        let (quads_modal, base_modal) =
+            collect_quads(&state, &layout, &theme, 1200.0, 800.0, 1.0, (8.0, 19.0));
+        assert_eq!(base_modal, base_count);
+        assert!(quads_modal.len() > base_modal as usize);
+
+        let modal = close_workspace_modal_rect(1200.0, 800.0, 1.0);
+        let compose = close_modal_compose_rect(modal, &state.close_modal, 1.0);
+        let worktree = close_modal_worktree_rect(modal, &state.close_modal, 1.0).unwrap();
+        let force = close_modal_force_rect(modal, &state.close_modal, 1.0).unwrap();
+        let cancel = close_modal_cancel_rect(modal, 1.0);
+        let confirm = close_modal_confirm_rect(modal, 1.0);
+
+        for r in [compose, worktree, force, cancel, confirm] {
+            assert!(r.x >= modal.x && r.right() <= modal.right());
+            assert!(r.y >= modal.y && r.bottom() <= modal.bottom());
+        }
+        assert!(compose.bottom() <= worktree.y);
+        assert!(worktree.bottom() <= force.y);
+        assert!(force.bottom() <= cancel.y);
+        assert!(cancel.right() <= confirm.x);
     }
 }

@@ -1,5 +1,5 @@
 use crate::registry::Registry;
-use daedalus_proto::{StatusLevel, WorkspaceId};
+use daedalus_proto::{AgentState, PaneId, StatusLevel, WorkspaceId};
 use serde::Deserialize;
 use std::future::Future;
 use std::io::ErrorKind;
@@ -18,15 +18,23 @@ fn default_info_level() -> StatusLevel {
     StatusLevel::Info
 }
 
+fn default_hook_kind() -> String {
+    "status".to_string()
+}
+
 #[derive(Debug, Deserialize)]
-struct ExternalStatusIngest {
+struct HookEventIngest {
+    #[serde(default = "default_hook_kind")]
+    kind: String,
+    pane_id: Option<PaneId>,
     workspace_id: Option<WorkspaceId>,
     root_dir: Option<PathBuf>,
-    source: String,
+    source: Option<String>,
     #[serde(default = "default_info_level")]
     level: StatusLevel,
-    label: String,
+    label: Option<String>,
     detail: Option<String>,
+    state: Option<String>,
 }
 
 /// NDJSON Unix domain socket listener that ingests external status updates (e.g. from
@@ -205,26 +213,69 @@ async fn process_line(raw: &[u8], registry: &Registry) {
         return;
     }
 
-    let ingest: ExternalStatusIngest = match serde_json::from_str(line) {
+    let ingest: HookEventIngest = match serde_json::from_str(line) {
         Ok(parsed) => parsed,
         Err(e) => {
-            warn!(error = %e, "ignoring invalid external status JSON line");
+            warn!(error = %e, "ignoring invalid external hook JSON line");
             return;
         }
     };
 
-    if let Err(e) = registry
-        .publish_external_status(
-            ingest.workspace_id,
-            ingest.root_dir,
-            ingest.source,
-            ingest.level,
-            ingest.label,
-            ingest.detail,
-        )
-        .await
-    {
-        warn!(error = %e, "failed to publish external status");
+    match ingest.kind.trim().to_ascii_lowercase().as_str() {
+        "status" => {
+            let Some(source) = ingest.source else {
+                warn!("ignoring status hook event missing 'source'");
+                return;
+            };
+            let Some(label) = ingest.label else {
+                warn!("ignoring status hook event missing 'label'");
+                return;
+            };
+            if let Err(e) = registry
+                .publish_external_status(
+                    ingest.workspace_id,
+                    ingest.root_dir,
+                    source,
+                    ingest.level,
+                    label,
+                    ingest.detail,
+                )
+                .await
+            {
+                warn!(error = %e, "failed to publish external status");
+            }
+        }
+        "clear_status" | "clear" => {
+            let Some(source) = ingest.source else {
+                warn!("ignoring clear_status hook event missing 'source'");
+                return;
+            };
+            if let Err(e) = registry
+                .clear_external_status(ingest.workspace_id, ingest.root_dir, source)
+                .await
+            {
+                warn!(error = %e, "failed to clear external status");
+            }
+        }
+        "agent_state" => {
+            let Some(raw_state) = ingest.state.as_deref() else {
+                warn!("ignoring agent_state hook event missing 'state'");
+                return;
+            };
+            let Some(state) = AgentState::from_cli_name(raw_state) else {
+                warn!(state = %raw_state, "ignoring agent_state hook event with unknown state");
+                return;
+            };
+            if let Err(e) = registry
+                .set_agent_state(ingest.pane_id, ingest.workspace_id, ingest.root_dir, state)
+                .await
+            {
+                warn!(error = %e, "failed to set agent state from hook");
+            }
+        }
+        other => {
+            warn!(kind = %other, "ignoring unknown external hook event kind");
+        }
     }
 }
 

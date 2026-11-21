@@ -1,7 +1,8 @@
+use crate::agent_detector::AgentStateDetector;
 use crate::supervisor::SpawnedPty;
 use daedalus_proto::{
-    FailureTrace, GridRow, GridSnapshot, PaneId, PaneRole, PaneSummary, ProtoError, SearchMatch,
-    ServerEvent, WorkspaceId,
+    AgentState, FailureTrace, GridRow, GridSnapshot, PaneId, PaneRole, PaneSummary, ProtoError,
+    SearchMatch, ServerEvent, WorkspaceId,
 };
 use daedalus_vt::{CommandTracker, VtConfig, create_vt_engine};
 use portable_pty::PtySize;
@@ -38,6 +39,10 @@ enum PaneCmd {
     },
     GetSummary {
         reply: oneshot::Sender<PaneSummary>,
+    },
+    SetAgentState {
+        state: AgentState,
+        reply: oneshot::Sender<Result<(), ProtoError>>,
     },
     Close {
         reply: oneshot::Sender<()>,
@@ -245,6 +250,21 @@ impl PaneHandle {
         rx.await.map_err(|_| ProtoError::PaneNotFound(self.id))
     }
 
+    pub async fn set_agent_state(&self, state: AgentState) -> Result<(), ProtoError> {
+        if self.role != PaneRole::Agent {
+            return Err(ProtoError::InvalidRequest(format!(
+                "pane {} is not an agent pane",
+                self.id
+            )));
+        }
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(PaneCmd::SetAgentState { state, reply: tx })
+            .await
+            .map_err(|_| ProtoError::PaneNotFound(self.id))?;
+        rx.await.map_err(|_| ProtoError::PaneNotFound(self.id))?
+    }
+
     pub async fn close(&self) {
         let (tx, rx) = oneshot::channel();
         if self.cmd_tx.send(PaneCmd::Close { reply: tx }).await.is_ok() {
@@ -276,11 +296,24 @@ async fn run_pane_actor(
         scrollback_limit: 10_000,
     });
     let mut tracker = CommandTracker::new(pane_id, engine);
+    let mut detector = (role == PaneRole::Agent).then(AgentStateDetector::new);
     let mut seq: u64 = 0;
     let mut has_pending_delta = false;
     let mut pty_open = true;
     let mut delta_tick = tokio::time::interval(Duration::from_millis(16));
     delta_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut agent_tick = tokio::time::interval(Duration::from_millis(250));
+    agent_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let emit_agent_state = |state: Option<AgentState>| {
+        if let Some(state) = state {
+            let _ = event_tx.send(ServerEvent::AgentStateChanged {
+                workspace_id,
+                pane_id,
+                state,
+            });
+        }
+    };
 
     loop {
         tokio::select! {
@@ -304,6 +337,9 @@ async fn run_pane_actor(
                                 has_failure_trace,
                             });
                         }
+                        if let Some(det) = detector.as_mut() {
+                            emit_agent_state(det.observe_output(&bytes, Instant::now()));
+                        }
                     }
                     Some(PtyOutput::Closed) | None => {
                         pty_open = false;
@@ -325,6 +361,9 @@ async fn run_pane_actor(
                             }
                         }
                         tracker.mark_exited(exit_code);
+                        if let Some(det) = detector.as_mut() {
+                            emit_agent_state(det.observe_exit(exit_code));
+                        }
                         let _ = event_tx.send(ServerEvent::PaneExited { pane_id, exit_code });
                     }
                 }
@@ -334,6 +373,11 @@ async fn run_pane_actor(
                 seq += 1;
                 if let Some(delta) = tracker.engine_mut().take_dirty_delta(pane_id, seq) {
                     let _ = event_tx.send(ServerEvent::GridDelta(delta));
+                }
+            }
+            _ = agent_tick.tick(), if detector.is_some() => {
+                if let Some(det) = detector.as_mut() {
+                    emit_agent_state(det.observe_tick(Instant::now()));
                 }
             }
             maybe_cmd = cmd_rx.recv() => {
@@ -405,8 +449,24 @@ async fn run_pane_actor(
                             cwd: tracker.cwd().cloned(),
                             last_exit_code: tracker.last_exit_code(),
                             has_failure_trace: tracker.last_failure_trace().is_some(),
+                            agent_state: detector.as_ref().map(AgentStateDetector::state),
                         };
                         let _ = reply.send(summary);
+                    }
+                    Some(PaneCmd::SetAgentState { state, reply }) => {
+                        let res = if let Some(det) = detector.as_mut() {
+                            emit_agent_state(det.set_override(
+                                state,
+                                Instant::now(),
+                                Duration::from_secs(30),
+                            ));
+                            Ok(())
+                        } else {
+                            Err(ProtoError::InvalidRequest(format!(
+                                "pane {pane_id} is not an agent pane"
+                            )))
+                        };
+                        let _ = reply.send(res);
                     }
                     Some(PaneCmd::Close { reply }) => {
                         teardown_pane(write_tx, master, writer_handle, proc_handle).await;

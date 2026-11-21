@@ -1,3 +1,4 @@
+pub mod agent_detector;
 pub mod external_hook;
 pub mod isolation;
 pub mod manifest;

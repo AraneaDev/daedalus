@@ -7,7 +7,7 @@ pub const VIEWPORT_LOGICAL_PAD: f32 = 6.0;
 pub const AGENT_WIDTH_RATIO: f32 = 0.55;
 
 pub const SIDEBAR_HEADER_LOGICAL_HEIGHT: f32 = 32.0;
-pub const SIDEBAR_ROW_LOGICAL_HEIGHT: f32 = 84.0;
+pub const SIDEBAR_ROW_LOGICAL_HEIGHT: f32 = 96.0;
 pub const SIDEBAR_ROW_LOGICAL_GAP: f32 = 4.0;
 pub const SIDEBAR_PAD_LOGICAL: f32 = 8.0;
 pub const SIDEBAR_NEW_BTN_LOGICAL_HEIGHT: f32 = 34.0;
@@ -140,6 +140,7 @@ impl WorkspaceLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
     SidebarWorkspace(usize),
+    SidebarWorkspaceClose(usize),
     SidebarNewWorkspace,
     SidebarNewWorktree,
     PaneHeaderAction(PaneRole),
@@ -319,6 +320,21 @@ pub fn sidebar_workspace_rect(sidebar: Rect, index: usize, scale_factor: f32) ->
     Rect::new(x, y, w, m.sidebar_row_height)
 }
 
+/// Computes the compact `×` close button rectangle in the top-right corner of a sidebar workspace card.
+pub fn sidebar_workspace_close_rect(card: Rect, scale_factor: f32) -> Rect {
+    let s = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let size = 16.0 * s;
+    let w = size.min(card.width.max(0.0));
+    let h = size.min(card.height.max(0.0));
+    let x = (card.right() - w - 4.0 * s).max(card.x);
+    let y = card.y + 5.0 * s;
+    Rect::new(x, y, w, h)
+}
+
 fn sidebar_footer_buttons_y(sidebar: Rect, workspace_count: usize, m: &LayoutMetrics) -> f32 {
     sidebar.y
         + m.sidebar_header_height
@@ -368,6 +384,10 @@ pub fn hit_test(
         for i in 0..workspace_count {
             let row_rect = sidebar_workspace_rect(sidebar, i, scale_factor);
             if row_rect.contains(x, y) {
+                let close_rect = sidebar_workspace_close_rect(row_rect, scale_factor);
+                if close_rect.contains(x, y) {
+                    return HitTarget::SidebarWorkspaceClose(i);
+                }
                 return HitTarget::SidebarWorkspace(i);
             }
         }
@@ -597,9 +617,24 @@ mod tests {
             HitTarget::PaneHeaderAction(PaneRole::Runner)
         );
 
-        // Hit sidebar workspace 1 and "+ New Workspace" button
+        // Hit sidebar workspace 1, its close button, and "+ New Workspace" button
         let sidebar = layout.sidebar.unwrap();
         let ws1 = sidebar_workspace_rect(sidebar, 1, input.scale_factor);
+        let close1 = sidebar_workspace_close_rect(ws1, input.scale_factor);
+        assert!(close1.x >= ws1.x && close1.right() <= ws1.right());
+        assert!(close1.y >= ws1.y && close1.bottom() <= ws1.bottom());
+        assert_eq!(
+            hit_test(
+                &layout,
+                2,
+                input.scale_factor,
+                input.cell_w,
+                input.cell_h,
+                close1.x + 2.0,
+                close1.y + 2.0,
+            ),
+            HitTarget::SidebarWorkspaceClose(1)
+        );
         assert_eq!(
             hit_test(
                 &layout,

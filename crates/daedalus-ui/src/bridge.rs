@@ -9,9 +9,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use daedalus_proto::{
-    ClientMessage, GridRow, GridSnapshot, PaneId, PaneRole, PaneSummary, ProtoError, Request,
-    ResponsePayload, SearchMatch, ServerEvent, ServerMessage, WorkspaceId, WorkspaceInfo,
-    WorkspaceManifest, read_frame, write_frame,
+    AgentState, ClientMessage, ContainerHealth, GitWorkspaceStatus, GridRow, GridSnapshot, PaneId,
+    PaneRole, PaneSummary, PortMapping, ProtoError, Request, ResponsePayload, SearchMatch,
+    ServerEvent, ServerMessage, WorkspaceId, WorkspaceInfo, WorkspaceManifest, read_frame,
+    write_frame,
 };
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -57,6 +58,9 @@ pub enum UiCommand {
     },
     CloseWorkspace {
         id: WorkspaceId,
+        compose_down: bool,
+        remove_worktree: bool,
+        force_remove_worktree: bool,
     },
     ReplaceAgentPreset {
         workspace_id: WorkspaceId,
@@ -129,6 +133,18 @@ pub enum UiEvent {
         generation: u64,
         total_scrollback: usize,
         matches: Vec<SearchMatch>,
+    },
+    AgentStateChanged {
+        workspace_id: WorkspaceId,
+        pane_id: PaneId,
+        state: AgentState,
+    },
+    WorkspaceRuntimeUpdated {
+        workspace_id: WorkspaceId,
+        bound_ports: Vec<PortMapping>,
+        containers: Vec<ContainerHealth>,
+        git_status: Option<GitWorkspaceStatus>,
+        git_branch: Option<String>,
     },
     ServerEvent(ServerEvent),
     Toast {
@@ -233,9 +249,37 @@ impl RpcConnection {
         let reader_task = tokio::spawn(async move {
             loop {
                 match read_frame::<_, ServerMessage>(&mut reader).await {
-                    Ok(Some(ServerMessage::Event(event))) => {
-                        sink.emit(UiEvent::ServerEvent(event));
-                    }
+                    Ok(Some(ServerMessage::Event(event))) => match event {
+                        ServerEvent::AgentStateChanged {
+                            workspace_id,
+                            pane_id,
+                            state,
+                        } => {
+                            sink.emit(UiEvent::AgentStateChanged {
+                                workspace_id,
+                                pane_id,
+                                state,
+                            });
+                        }
+                        ServerEvent::WorkspaceRuntimeUpdated {
+                            workspace_id,
+                            bound_ports,
+                            containers,
+                            git_status,
+                            git_branch,
+                        } => {
+                            sink.emit(UiEvent::WorkspaceRuntimeUpdated {
+                                workspace_id,
+                                bound_ports,
+                                containers,
+                                git_status,
+                                git_branch,
+                            });
+                        }
+                        other => {
+                            sink.emit(UiEvent::ServerEvent(other));
+                        }
+                    },
                     Ok(Some(ServerMessage::Response { id, result })) => {
                         let tx = reader_pending
                             .lock()
@@ -561,11 +605,18 @@ async fn handle_command(
             )
             .await?;
         }
-        UiCommand::CloseWorkspace { id } => {
+        UiCommand::CloseWorkspace {
+            id,
+            compose_down,
+            remove_worktree,
+            force_remove_worktree,
+        } => {
             let _ = conn
                 .call(ClientMessage::CloseWorkspace {
                     id,
-                    compose_down: false,
+                    compose_down,
+                    remove_worktree,
+                    force_remove_worktree,
                 })
                 .await?;
             if let ResponsePayload::Workspaces(ws) =

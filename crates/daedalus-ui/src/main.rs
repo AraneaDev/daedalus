@@ -3,14 +3,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use daedalus_proto::{PaneId, PaneRole, default_socket_path, wrap_bracketed_paste};
+use daedalus_proto::{PaneId, PaneRole, WorkspaceId, default_socket_path, wrap_bracketed_paste};
 use daedalus_ui::bridge::{BridgeConfig, DaemonBridge, UiCommand, UiEvent, UiEventSink};
 use daedalus_ui::config::UiConfig;
 use daedalus_ui::input::{UiAction, filter_modal_text, translate_key};
 use daedalus_ui::layout::{HitTarget, LayoutInput, WorkspaceLayout, compute_layout, hit_test};
 use daedalus_ui::links::{detect_link_in_row, open_link};
 use daedalus_ui::renderer::{
-    GpuRenderer, RenderError, picker_item_rect, picker_modal_rect, search_bar_rect,
+    GpuRenderer, RenderError, close_modal_cancel_rect, close_modal_compose_rect,
+    close_modal_confirm_rect, close_modal_force_rect, close_modal_worktree_rect,
+    close_workspace_modal_rect, picker_item_rect, picker_modal_rect, search_bar_rect,
     worktree_modal_rect,
 };
 use daedalus_ui::selection::{CellPos, Selection, extract_selected_text, select_word_at};
@@ -286,6 +288,42 @@ impl DaedalusApp {
         self.request_redraw();
     }
 
+    fn open_close_modal_for_workspace(&mut self, workspace_id: WorkspaceId) {
+        if self.state.open_close_modal_for_workspace(workspace_id) {
+            self.request_redraw();
+        }
+    }
+
+    fn confirm_close_workspace(&mut self) {
+        let Some(id) = self.state.close_modal.workspace_id else {
+            self.state.close_modal.close();
+            self.request_redraw();
+            return;
+        };
+        let compose_down = self.state.close_modal.compose_down;
+        let remove_worktree = self.state.close_modal.remove_worktree;
+        let force_remove_worktree = self.state.close_modal.force_remove_worktree;
+        self.state.close_modal.close();
+        self.send_command(UiCommand::CloseWorkspace {
+            id,
+            compose_down,
+            remove_worktree,
+            force_remove_worktree,
+        });
+        self.request_redraw();
+    }
+
+    fn switch_workspace_by(&mut self, delta: isize) {
+        let prev_id = self.state.active_workspace_id;
+        if let Some(next_id) = self.state.cycle_workspace(delta) {
+            self.ensure_active_workspace_panes();
+            if Some(next_id) != prev_id {
+                self.schedule_resize_flush();
+            }
+            self.request_redraw();
+        }
+    }
+
     fn submit_worktree_modal(&mut self) {
         let branch = self.state.worktree_modal.branch_input.trim().to_string();
         if branch.is_empty() {
@@ -558,6 +596,13 @@ impl DaedalusApp {
                 self.state.toggle_worktree_modal();
                 self.request_redraw();
             }
+            UiAction::OpenCloseWorkspaceModal => {
+                if let Some(ws_id) = self.state.active_workspace_id {
+                    self.open_close_modal_for_workspace(ws_id);
+                } else {
+                    self.show_toast("No active workspace to close", true);
+                }
+            }
             UiAction::ToggleSearch => {
                 if let Some(pane_id) = self.state.focused_pane_id() {
                     self.state.toggle_search(pane_id);
@@ -565,6 +610,8 @@ impl DaedalusApp {
                 }
             }
             UiAction::NewWorkspace => self.create_new_workspace(),
+            UiAction::SwitchWorkspaceNext => self.switch_workspace_by(1),
+            UiAction::SwitchWorkspacePrev => self.switch_workspace_by(-1),
             UiAction::CopySelection => self.copy_focused_selection(),
             UiAction::PasteClipboard => self.paste_clipboard_to_focused(),
             UiAction::ForwardFailureToAgent => self.forward_runner_failure_to_agent(),
@@ -628,6 +675,23 @@ impl DaedalusApp {
             UiAction::WorktreeModalConfirm => self.submit_worktree_modal(),
             UiAction::WorktreeModalCancel => {
                 self.state.worktree_modal.close();
+                self.request_redraw();
+            }
+            UiAction::CloseModalToggleCompose => {
+                self.state.close_modal.toggle_compose();
+                self.request_redraw();
+            }
+            UiAction::CloseModalToggleWorktree => {
+                self.state.close_modal.toggle_worktree();
+                self.request_redraw();
+            }
+            UiAction::CloseModalToggleForce => {
+                self.state.close_modal.toggle_force();
+                self.request_redraw();
+            }
+            UiAction::CloseModalConfirm => self.confirm_close_workspace(),
+            UiAction::CloseModalCancel => {
+                self.state.close_modal.close();
                 self.request_redraw();
             }
             UiAction::SearchText(text) => {
@@ -706,6 +770,46 @@ impl DaedalusApp {
             return;
         }
 
+        if self.state.close_modal.open {
+            let modal =
+                close_workspace_modal_rect(size.width as f32, size.height as f32, scale_factor);
+            if !modal.contains(x, y) {
+                self.state.close_modal.close();
+                self.request_redraw();
+                return;
+            }
+            if close_modal_compose_rect(modal, &self.state.close_modal, scale_factor).contains(x, y)
+            {
+                self.state.close_modal.toggle_compose();
+                self.request_redraw();
+                return;
+            }
+            if close_modal_worktree_rect(modal, &self.state.close_modal, scale_factor)
+                .is_some_and(|r| r.contains(x, y))
+            {
+                self.state.close_modal.toggle_worktree();
+                self.request_redraw();
+                return;
+            }
+            if close_modal_force_rect(modal, &self.state.close_modal, scale_factor)
+                .is_some_and(|r| r.contains(x, y))
+            {
+                self.state.close_modal.toggle_force();
+                self.request_redraw();
+                return;
+            }
+            if close_modal_cancel_rect(modal, scale_factor).contains(x, y) {
+                self.state.close_modal.close();
+                self.request_redraw();
+                return;
+            }
+            if close_modal_confirm_rect(modal, scale_factor).contains(x, y) {
+                self.confirm_close_workspace();
+                return;
+            }
+            return;
+        }
+
         let Some(layout) = self.compute_current_layout() else {
             return;
         };
@@ -741,6 +845,11 @@ impl DaedalusApp {
                         self.schedule_resize_flush();
                         self.request_redraw();
                     }
+                }
+            }
+            HitTarget::SidebarWorkspaceClose(idx) => {
+                if let Some(ws_id) = self.state.workspaces.get(idx).map(|ws| ws.id) {
+                    self.open_close_modal_for_workspace(ws_id);
                 }
             }
             HitTarget::SidebarNewWorkspace => self.create_new_workspace(),
@@ -845,7 +954,7 @@ impl DaedalusApp {
     }
 
     fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
-        if self.state.picker.open || self.state.worktree_modal.open {
+        if self.state.picker.open || self.state.worktree_modal.open || self.state.close_modal.open {
             return;
         }
         let scroll_lines = match delta {
@@ -1028,6 +1137,28 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
                     self.scroll_to_active_search_match();
                 }
             }
+            UiEvent::AgentStateChanged {
+                workspace_id,
+                pane_id,
+                state,
+            } => {
+                self.state.apply_agent_state(workspace_id, pane_id, state);
+            }
+            UiEvent::WorkspaceRuntimeUpdated {
+                workspace_id,
+                bound_ports,
+                containers,
+                git_status,
+                git_branch,
+            } => {
+                self.state.apply_workspace_runtime(
+                    workspace_id,
+                    bound_ports,
+                    containers,
+                    git_status,
+                    git_branch,
+                );
+            }
             UiEvent::ServerEvent(server_event) => {
                 if let Some(resync_pane_id) = self.state.apply_server_event(server_event) {
                     self.send_command(UiCommand::RequestSnapshot {
@@ -1100,14 +1231,15 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
                         self.modifiers,
                         self.state.picker.open,
                         self.state.worktree_modal.open,
+                        self.state.close_modal.open,
                         self.state.search.is_some(),
                     );
                     self.handle_ui_action(action);
                 }
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                if self.state.picker.open {
-                    // Picker swallows IME text.
+                if self.state.picker.open || self.state.close_modal.open {
+                    // Picker and close modal swallow IME text.
                 } else if self.state.worktree_modal.open {
                     if let Some(cleaned) = filter_modal_text(&text, false) {
                         self.handle_ui_action(UiAction::WorktreeModalText(cleaned));
