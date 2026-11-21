@@ -283,7 +283,16 @@ impl Grid {
     }
 
     pub fn leave_alt_screen(&mut self) {
-        if let Some(main) = self.saved_main.take() {
+        if let Some(mut main) = self.saved_main.take() {
+            Self::conform_rows(
+                &mut main,
+                self.cols,
+                self.rows,
+                &mut self.next_abs_row,
+                &mut self.scrollback,
+                self.scrollback_limit,
+                true,
+            );
             self.viewport = main;
             self.dirty.fill(true);
         }
@@ -292,25 +301,16 @@ impl Grid {
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let cols = cols.max(1);
         let rows = rows.max(1);
-        for row in &mut self.viewport {
-            row.cells.resize(cols as usize, Cell::default());
-        }
-        while self.viewport.len() < rows as usize {
-            self.viewport.push(StoredRow {
-                abs_row: self.next_abs_row,
-                cells: vec![Cell::default(); cols as usize],
-            });
-            self.next_abs_row += 1;
-        }
-        while self.viewport.len() > rows as usize {
-            let removed = self.viewport.remove(0);
-            if self.saved_main.is_none() && self.scrollback_limit > 0 {
-                if self.scrollback.len() >= self.scrollback_limit {
-                    self.scrollback.pop_front();
-                }
-                self.scrollback.push_back(removed);
-            }
-        }
+        let push_to_scrollback = self.saved_main.is_none();
+        Self::conform_rows(
+            &mut self.viewport,
+            cols,
+            rows,
+            &mut self.next_abs_row,
+            &mut self.scrollback,
+            self.scrollback_limit,
+            push_to_scrollback,
+        );
         self.cols = cols;
         self.rows = rows;
         self.scroll_top = 0;
@@ -318,6 +318,37 @@ impl Grid {
         self.cursor_col = self.cursor_col.min(cols - 1);
         self.cursor_row = self.cursor_row.min(rows - 1);
         self.dirty = vec![true; rows as usize];
+    }
+
+    /// Resize a row buffer to `(cols, rows)`, optionally pushing evicted top rows to scrollback.
+    fn conform_rows(
+        buf: &mut Vec<StoredRow>,
+        cols: u16,
+        rows: u16,
+        next_abs_row: &mut u64,
+        scrollback: &mut VecDeque<StoredRow>,
+        scrollback_limit: usize,
+        push_to_scrollback: bool,
+    ) {
+        for row in buf.iter_mut() {
+            row.cells.resize(cols as usize, Cell::default());
+        }
+        while buf.len() < rows as usize {
+            buf.push(StoredRow {
+                abs_row: *next_abs_row,
+                cells: vec![Cell::default(); cols as usize],
+            });
+            *next_abs_row += 1;
+        }
+        while buf.len() > rows as usize {
+            let removed = buf.remove(0);
+            if push_to_scrollback && scrollback_limit > 0 {
+                if scrollback.len() >= scrollback_limit {
+                    scrollback.pop_front();
+                }
+                scrollback.push_back(removed);
+            }
+        }
     }
 
     pub fn snapshot(&self, pane_id: PaneId, seq: u64) -> GridSnapshot {

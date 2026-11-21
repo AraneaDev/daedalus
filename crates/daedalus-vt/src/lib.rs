@@ -115,4 +115,54 @@ mod tests {
         assert!(sliced.len() <= MAX_TRACE_BYTES);
         assert!(sliced.contains("row-0899-"));
     }
+
+    #[test]
+    fn resizes_safely_during_alt_screen_and_conforms_restored_main() {
+        let pane_id = PaneId::new();
+        let mut vt = BuiltinVt::new(VtConfig {
+            cols: 20,
+            rows: 5,
+            scrollback_limit: 50,
+        });
+        vt.feed(b"main0\r\nmain1\r\nmain2");
+
+        // Enter alt screen and resize larger
+        vt.feed(b"\x1b[?1049halt");
+        vt.resize(30, 8);
+        vt.feed(b"\x1b[?1049l");
+
+        let delta = vt
+            .take_dirty_delta(pane_id, 1)
+            .expect("expected dirty delta after leaving alt screen");
+        assert_eq!(delta.cols, 30);
+        assert_eq!(delta.rows, 8);
+        assert_eq!(delta.dirty_rows.len(), 8);
+        assert!(delta.dirty_rows.iter().all(|r| r.cells.len() == 30));
+
+        let snap = vt.snapshot(pane_id, 2);
+        assert_eq!(snap.cols, 30);
+        assert_eq!(snap.rows, 8);
+        assert_eq!(snap.rows_data.len(), 8);
+        assert!(snap.rows_data.iter().all(|r| r.cells.len() == 30));
+        assert_eq!(vt.row_text_from(snap.rows_data[0].abs_row, 0), "main0");
+
+        // Enter alt screen again and resize smaller
+        vt.feed(b"\x1b[?1049h");
+        vt.resize(10, 3);
+        vt.feed(b"\x1b[?1049l");
+
+        let delta = vt
+            .take_dirty_delta(pane_id, 3)
+            .expect("expected dirty delta after shrinking in alt screen");
+        assert_eq!(delta.cols, 10);
+        assert_eq!(delta.rows, 3);
+        assert_eq!(delta.dirty_rows.len(), 3);
+        assert!(delta.dirty_rows.iter().all(|r| r.cells.len() == 10));
+
+        let snap = vt.snapshot(pane_id, 4);
+        assert_eq!(snap.cols, 10);
+        assert_eq!(snap.rows, 3);
+        assert_eq!(snap.rows_data.len(), 3);
+        assert!(snap.rows_data.iter().all(|r| r.cells.len() == 10));
+    }
 }
