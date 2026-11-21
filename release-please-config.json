@@ -3,6 +3,8 @@
   "package-name": "daedalus",
   "changelog-path": "CHANGELOG.md",
   "include-component-in-tag": false,
+  "bump-minor-pre-major": false,
+  "bump-patch-for-minor-pre-major": true,
   "release-label": "release",
   "extra-files": [
     {
