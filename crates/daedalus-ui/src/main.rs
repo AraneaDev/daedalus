@@ -10,7 +10,8 @@ use daedalus_ui::input::{UiAction, filter_modal_text, translate_key};
 use daedalus_ui::layout::{HitTarget, LayoutInput, WorkspaceLayout, compute_layout, hit_test};
 use daedalus_ui::links::{detect_link_in_row, open_link};
 use daedalus_ui::renderer::{
-    GpuRenderer, RenderError, picker_item_rect, picker_modal_rect, worktree_modal_rect,
+    GpuRenderer, RenderError, picker_item_rect, picker_modal_rect, search_bar_rect,
+    worktree_modal_rect,
 };
 use daedalus_ui::selection::{CellPos, Selection, extract_selected_text, select_word_at};
 use daedalus_ui::state::{AgentPreset, AppState};
@@ -708,6 +709,17 @@ impl DaedalusApp {
         let Some(layout) = self.compute_current_layout() else {
             return;
         };
+        if let Some(search) = self.state.search.as_ref()
+            && let Some(role) = self
+                .state
+                .active_workspace()
+                .and_then(|ws| ws.panes.iter().find(|p| p.id == search.pane_id))
+                .map(|p| p.role)
+            && let Some(pane_rect) = layout.pane(role)
+            && search_bar_rect(pane_rect, scale_factor).contains(x, y)
+        {
+            return;
+        }
         let target = hit_test(
             &layout,
             self.state.workspaces.len(),

@@ -1023,6 +1023,7 @@ fn resolve_pane_launch_specs(
             .or_else(|| cmd.first().and_then(|b| AgentPreset::from_cli_name(b)))
             .unwrap_or(base_preset);
         if let Some(bin) = cmd.first()
+            && (!bin.contains('/') || Path::new(bin).is_absolute())
             && !has_binary(bin)
         {
             warnings.push(format!(
@@ -1034,6 +1035,7 @@ fn resolve_pane_launch_specs(
         }
     } else if let Some(cmd) = base_preset.command() {
         if let Some(bin) = cmd.first()
+            && (!bin.contains('/') || Path::new(bin).is_absolute())
             && !has_binary(bin)
         {
             warnings.push(format!(

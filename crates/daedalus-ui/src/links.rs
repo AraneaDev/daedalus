@@ -433,7 +433,7 @@ fn build_open_command_with_env(
                 return Some(("xdg-open".to_string(), vec![path_str]));
             };
 
-            let has_placeholders = tokens
+            let has_placeholders = rest
                 .iter()
                 .any(|t| t.contains("{path}") || t.contains("{line}") || t.contains("{col}"));
 
@@ -447,9 +447,9 @@ fn build_open_command_with_env(
                         had_path = true;
                     }
                     let substituted = arg
-                        .replace("{path}", &path_str)
                         .replace("{line}", &line_str)
-                        .replace("{col}", &col_str);
+                        .replace("{col}", &col_str)
+                        .replace("{path}", &path_str);
                     args.push(substituted);
                 }
                 if !had_path {
