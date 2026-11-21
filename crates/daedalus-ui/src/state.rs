@@ -172,6 +172,9 @@ impl PaneViewState {
 
     /// Patches only the rows present in `delta` and records their indices for incremental shaping.
     pub fn apply_delta(&mut self, delta: GridDelta) {
+        if self.last_seq != 0 && delta.seq <= self.last_seq {
+            return;
+        }
         let resized = self.cols != delta.cols || self.rows != delta.rows;
         self.cols = delta.cols;
         self.rows = delta.rows;
@@ -613,6 +616,79 @@ mod tests {
         assert_eq!(row_text(&pane.visible_rows()[1]), "PATCHED!");
         assert_eq!(row_text(&pane.visible_rows()[2]), "line two");
         assert_eq!(pane.cursor.col, 5);
+    }
+
+    #[test]
+    fn apply_delta_ignores_stale_or_duplicate_seq_after_snapshot() {
+        let ws_id = WorkspaceId::new();
+        let summary = make_pane_summary(ws_id, PaneRole::Agent);
+        let mut pane = PaneViewState::from_summary(summary);
+
+        // Initial delta when last_seq == 0 should still apply
+        pane.apply_delta(GridDelta {
+            pane_id: pane.summary.id,
+            seq: 1,
+            cols: 10,
+            rows: 2,
+            cursor: CursorState::default(),
+            dirty_rows: vec![make_row(0, 0, "initial")],
+        });
+        assert_eq!(pane.last_seq, 1);
+        assert_eq!(row_text(&pane.visible_rows()[0]), "initial");
+
+        // Newer snapshot advances last_seq to 5
+        pane.apply_snapshot(GridSnapshot {
+            pane_id: pane.summary.id,
+            seq: 5,
+            cols: 10,
+            rows: 2,
+            cursor: CursorState {
+                col: 1,
+                row: 0,
+                visible: true,
+            },
+            rows_data: vec![make_row(0, 10, "fresh-row"), make_row(1, 11, "row-one")],
+            scrollback_len: 0,
+        });
+        let _ = pane.take_dirty_rows();
+
+        // Older (seq < last_seq) and duplicate (seq == last_seq) deltas must be ignored
+        for stale_seq in [4, 5] {
+            pane.apply_delta(GridDelta {
+                pane_id: pane.summary.id,
+                seq: stale_seq,
+                cols: 10,
+                rows: 2,
+                cursor: CursorState {
+                    col: 9,
+                    row: 1,
+                    visible: true,
+                },
+                dirty_rows: vec![make_row(0, 10, "STALE")],
+            });
+            assert_eq!(pane.last_seq, 5);
+            assert_eq!(row_text(&pane.visible_rows()[0]), "fresh-row");
+            assert_eq!(pane.cursor.col, 1);
+            assert!(pane.dirty_row_indices.is_empty());
+        }
+
+        // Newer delta (seq > last_seq) applies normally
+        pane.apply_delta(GridDelta {
+            pane_id: pane.summary.id,
+            seq: 6,
+            cols: 10,
+            rows: 2,
+            cursor: CursorState {
+                col: 4,
+                row: 0,
+                visible: true,
+            },
+            dirty_rows: vec![make_row(0, 10, "newer-row")],
+        });
+        assert_eq!(pane.last_seq, 6);
+        assert_eq!(row_text(&pane.visible_rows()[0]), "newer-row");
+        assert_eq!(pane.cursor.col, 4);
+        assert_eq!(pane.dirty_row_indices, vec![0]);
     }
 
     #[test]

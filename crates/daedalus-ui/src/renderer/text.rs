@@ -531,38 +531,21 @@ impl TextRenderer {
         }
 
         // Top banner (disconnected or toast)
-        if let Some(banner) = layout.banner {
-            let (msg, color) = if !state.connected {
-                (
-                    "Disconnected from daedalusd — reconnecting...".to_string(),
-                    theme.status_busy,
-                )
-            } else if let Some((ref msg, is_error, _)) = state.toast {
-                (
-                    msg.clone(),
-                    if is_error {
-                        theme.status_err
-                    } else {
-                        theme.status_ok
-                    },
-                )
-            } else {
-                (String::new(), theme.text_primary)
-            };
-
-            if !msg.is_empty() {
-                self.push_chrome_line(ChromeLineSpec {
-                    text: &msg,
-                    left: banner.x + 10.0 * s,
-                    top: banner.y + (banner.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                    max_w: banner.width - 20.0 * s,
-                    bounds: banner,
-                    font_size_logical: CHROME_FONT_SIZE_LOGICAL,
-                    line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
-                    color,
-                    bold: true,
-                });
-            }
+        if let Some(banner) = layout.banner
+            && let (_, Some((msg, color))) = super::banner_appearance(state, theme)
+            && !msg.is_empty()
+        {
+            self.push_chrome_line(ChromeLineSpec {
+                text: &msg,
+                left: banner.x + 10.0 * s,
+                top: banner.y + (banner.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                max_w: banner.width - 20.0 * s,
+                bounds: banner,
+                font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                color,
+                bold: true,
+            });
         }
 
         // Pane headers & action pills

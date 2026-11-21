@@ -173,6 +173,16 @@ pub fn translate_key(
 }
 
 fn translate_picker_key(key: &Key, mods: ModifiersState) -> UiAction {
+    if mods.control_key()
+        && mods.shift_key()
+        && !mods.alt_key()
+        && !mods.super_key()
+        && let Key::Character(ch) = key
+        && ch.eq_ignore_ascii_case("p")
+    {
+        return UiAction::ToggleAgentPicker;
+    }
+
     match key {
         Key::Named(NamedKey::ArrowUp) => UiAction::PickerUp,
         Key::Named(NamedKey::ArrowDown) => UiAction::PickerDown,
@@ -478,6 +488,32 @@ mod tests {
         );
         assert_eq!(
             translate_key(&char_key("k"), None, ModifiersState::CONTROL, true),
+            UiAction::Ignore
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_p_toggles_picker_closed_when_already_open() {
+        let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(
+            translate_key(&char_key("P"), Some("P"), cs, true),
+            UiAction::ToggleAgentPicker
+        );
+        assert_eq!(
+            translate_key(&char_key("p"), Some("p"), cs, true),
+            UiAction::ToggleAgentPicker
+        );
+        assert_eq!(
+            translate_key(
+                &char_key("P"),
+                None,
+                cs | ModifiersState::ALT,
+                true
+            ),
+            UiAction::Ignore
+        );
+        assert_eq!(
+            translate_key(&char_key("p"), None, ModifiersState::CONTROL, true),
             UiAction::Ignore
         );
     }

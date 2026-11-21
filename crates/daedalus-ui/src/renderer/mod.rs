@@ -98,6 +98,39 @@ fn status_dot_color(status: PaneStatus, theme: &Theme) -> Rgba {
     }
 }
 
+pub(super) fn banner_appearance(state: &AppState, theme: &Theme) -> (Rgba, Option<(String, Rgba)>) {
+    if !state.connected {
+        if let Some((ref msg, true, _)) = state.toast {
+            (
+                theme.status_err.with_alpha(0.26),
+                Some((format!("Disconnected — {msg}"), theme.status_err)),
+            )
+        } else {
+            (
+                theme.status_busy.with_alpha(0.24),
+                Some((
+                    "Disconnected from daedalusd — reconnecting...".to_string(),
+                    theme.status_busy,
+                )),
+            )
+        }
+    } else if let Some((ref msg, is_error, _)) = state.toast {
+        if is_error {
+            (
+                theme.status_err.with_alpha(0.26),
+                Some((msg.clone(), theme.status_err)),
+            )
+        } else {
+            (
+                theme.status_ok.with_alpha(0.22),
+                Some((msg.clone(), theme.status_ok)),
+            )
+        }
+    } else {
+        (theme.bg_header, None)
+    }
+}
+
 /// Pure Pass 1 quad collector (headless-testable without a GPU).
 ///
 /// Returns `(quads, base_quad_count)` where `0..base_quad_count` are rendered beneath base text
@@ -194,17 +227,7 @@ pub fn collect_quads(
 
     // 2. Top disconnect / toast banner.
     if let Some(banner) = layout.banner {
-        let banner_bg = if !state.connected {
-            theme.status_busy.with_alpha(0.24)
-        } else if let Some((_, is_error, _)) = state.toast {
-            if is_error {
-                theme.status_err.with_alpha(0.26)
-            } else {
-                theme.status_ok.with_alpha(0.22)
-            }
-        } else {
-            theme.bg_header
-        };
+        let (banner_bg, _) = banner_appearance(state, theme);
         quads.push(QuadInstance::new(banner, banner_bg));
         quads.push(QuadInstance::from_xywh(
             banner.x,
@@ -842,5 +865,50 @@ mod tests {
             assert!(item.x >= modal.x && item.right() <= modal.right());
             assert!(item.y >= modal.y && item.bottom() <= modal.bottom());
         }
+    }
+
+    #[test]
+    fn disconnected_error_toast_renders_error_banner_instead_of_amber_reconnect() {
+        let (mut state, _) = make_state_with_agent_row();
+        state.connected = false;
+        state.show_toast("daemon handshake failed", true);
+
+        let layout = compute_layout(&LayoutInput {
+            window_w: 1200.0,
+            window_h: 800.0,
+            scale_factor: 1.0,
+            cell_w: 8.0,
+            cell_h: 19.0,
+            sidebar_visible: true,
+            has_top_banner: true,
+            zoomed: false,
+            focused_role: PaneRole::Agent,
+            runner_has_failure: false,
+        });
+        let theme = Theme::dark();
+        let banner_rect = layout.banner.expect("banner rect should exist");
+
+        let (quads, _) = collect_quads(&state, &layout, &theme, 1200.0, 800.0, 1.0, (8.0, 19.0));
+        let expected_err_bg = theme.status_err.with_alpha(0.26).to_array();
+        let banner_quad = quads
+            .iter()
+            .find(|q| {
+                (q.rect[0] - banner_rect.x).abs() < 1e-3
+                    && (q.rect[1] - banner_rect.y).abs() < 1e-3
+                    && (q.rect[2] - banner_rect.width).abs() < 1e-3
+                    && (q.rect[3] - banner_rect.height).abs() < 1e-3
+            })
+            .expect("banner quad should be emitted");
+        assert_eq!(banner_quad.color, expected_err_bg);
+
+        let (bg, text_and_color) = banner_appearance(&state, &theme);
+        assert_eq!(bg, theme.status_err.with_alpha(0.26));
+        assert_eq!(
+            text_and_color,
+            Some((
+                "Disconnected — daemon handshake failed".to_string(),
+                theme.status_err
+            ))
+        );
     }
 }

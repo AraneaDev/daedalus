@@ -12,7 +12,7 @@ pub const SIDEBAR_ROW_LOGICAL_GAP: f32 = 4.0;
 pub const SIDEBAR_PAD_LOGICAL: f32 = 8.0;
 pub const SIDEBAR_NEW_BTN_LOGICAL_HEIGHT: f32 = 34.0;
 
-const AGENT_PILL_LOGICAL_WIDTH: f32 = 96.0;
+const AGENT_PILL_LOGICAL_WIDTH: f32 = 116.0;
 const RUNNER_PILL_LOGICAL_WIDTH: f32 = 176.0;
 const PILL_MARGIN_X_LOGICAL: f32 = 6.0;
 const PILL_MARGIN_Y_LOGICAL: f32 = 3.0;
@@ -432,7 +432,7 @@ mod tests {
         assert_eq!(runner.outer, Rect::new(790.0, 400.0, 450.0, 400.0));
 
         // Agent always gets preset action pill; Service never; Runner only on failure
-        assert!(agent.action_pill.is_some());
+        assert_eq!(agent.action_pill.unwrap().width, 116.0);
         assert!(service.action_pill.is_none());
         assert!(runner.action_pill.is_none());
     }
