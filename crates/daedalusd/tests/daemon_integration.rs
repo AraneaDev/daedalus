@@ -743,7 +743,14 @@ async fn external_status_ingests_via_ndjson_socket_and_rpc() {
         other => panic!("unexpected response: {other:?}"),
     };
 
-    send_rpc(&mut client, 2, ClientMessage::Subscribe { pane_ids: None }).await;
+    // Subscribe on a dedicated listener stream so send_rpc on `client` cannot swallow events
+    let mut sub_client = UnixStream::connect(&sock).await.unwrap();
+    send_rpc(
+        &mut sub_client,
+        2,
+        ClientMessage::Subscribe { pane_ids: None },
+    )
+    .await;
 
     // 1. Write 1-line JSON status for phrourion to events.sock
     let mut hook_stream = UnixStream::connect(&events_sock).await.unwrap();
@@ -774,7 +781,10 @@ async fn external_status_ingests_via_ndjson_socket_and_rpc() {
     let mut seen_sources = HashMap::new();
     tokio::time::timeout(Duration::from_secs(3), async {
         while seen_sources.len() < 2 {
-            match read_frame::<_, ServerMessage>(&mut client).await.unwrap() {
+            match read_frame::<_, ServerMessage>(&mut sub_client)
+                .await
+                .unwrap()
+            {
                 Some(ServerMessage::Event(ServerEvent::ExternalStatusUpdated {
                     workspace_id,
                     status,
