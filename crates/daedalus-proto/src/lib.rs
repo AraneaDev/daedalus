@@ -11,14 +11,17 @@ pub use types::{
 
 use std::path::PathBuf;
 
-pub fn default_runtime_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR")
+fn resolve_runtime_dir(xdg: Option<&str>) -> PathBuf {
+    if let Some(xdg) = xdg
         && !xdg.is_empty()
     {
         return PathBuf::from(xdg).join("daedalus");
     }
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-    std::env::temp_dir().join(format!("daedalus-{user}"))
+    std::env::temp_dir().join(format!("daedalus-{}", nix::unistd::Uid::current()))
+}
+
+pub fn default_runtime_dir() -> PathBuf {
+    resolve_runtime_dir(std::env::var("XDG_RUNTIME_DIR").ok().as_deref())
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -93,5 +96,46 @@ mod tests {
     fn wraps_bracketed_paste() {
         let wrapped = wrap_bracketed_paste(b"line1\nline2");
         assert_eq!(wrapped, b"\x1b[200~line1\nline2\x1b[201~");
+    }
+
+    #[test]
+    fn strips_embedded_and_nested_bracketed_paste_breakout_sequences() {
+        // Embedded 7-bit end marker
+        assert_eq!(
+            wrap_bracketed_paste(b"safe\x1b[201~rm -rf /"),
+            b"\x1b[200~saferm -rf /\x1b[201~"
+        );
+        // Embedded 7-bit start marker
+        assert_eq!(
+            wrap_bracketed_paste(b"a\x1b[200~b"),
+            b"\x1b[200~ab\x1b[201~"
+        );
+        // Embedded 8-bit CSI markers
+        assert_eq!(
+            wrap_bracketed_paste(b"a\x9b201~b\x9b200~c"),
+            b"\x1b[200~abc\x1b[201~"
+        );
+        // Nested breakout attempt that would reconstruct \x1b[201~ after a single pass
+        assert_eq!(
+            wrap_bracketed_paste(b"before\x1b[\x1b[201~201~after"),
+            b"\x1b[200~beforeafter\x1b[201~"
+        );
+        // Mixed 8-bit + 7-bit nested breakout attempt
+        assert_eq!(
+            wrap_bracketed_paste(b"x\x9b\x1b[200~201~y"),
+            b"\x1b[200~xy\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn runtime_dir_uses_xdg_or_uid_fallback() {
+        assert_eq!(
+            resolve_runtime_dir(Some("/run/user/1234")),
+            PathBuf::from("/run/user/1234/daedalus")
+        );
+        let expected_fallback =
+            std::env::temp_dir().join(format!("daedalus-{}", nix::unistd::Uid::current()));
+        assert_eq!(resolve_runtime_dir(None), expected_fallback);
+        assert_eq!(resolve_runtime_dir(Some("")), expected_fallback);
     }
 }

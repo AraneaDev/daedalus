@@ -228,6 +228,7 @@ name = "daedalus-proto"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.2",
+ "nix 0.29.0",
  "rmp-serde",
  "serde",
  "thiserror 2.0.21",

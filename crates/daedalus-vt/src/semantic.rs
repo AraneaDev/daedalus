@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Default)]
 pub struct TrackedOutcome {
-    pub status_changed: Option<(PaneStatus, Option<PathBuf>)>,
-    pub command_finished: Option<(Option<String>, i32, bool)>,
+    pub status_changed: Vec<(PaneStatus, Option<PathBuf>)>,
+    pub command_finished: Vec<(Option<String>, i32, bool)>,
 }
 
 pub struct CommandTracker {
@@ -64,12 +64,12 @@ impl CommandTracker {
             match event {
                 SemanticEvent::CwdChanged(path) => {
                     self.cwd = Some(path);
-                    outcome.status_changed = Some((self.status, self.cwd.clone()));
+                    outcome.status_changed.push((self.status, self.cwd.clone()));
                 }
                 SemanticEvent::PromptStart => {
                     if !matches!(self.status, PaneStatus::Exited { .. }) {
                         self.status = PaneStatus::Idle;
-                        outcome.status_changed = Some((self.status, self.cwd.clone()));
+                        outcome.status_changed.push((self.status, self.cwd.clone()));
                     }
                 }
                 SemanticEvent::CommandInputStart => {
@@ -83,7 +83,7 @@ impl CommandTracker {
                         self.active_command = if cmd.is_empty() { None } else { Some(cmd) };
                     }
                     self.command_start_abs_row = Some(self.engine.current_abs_row());
-                    outcome.status_changed = Some((self.status, self.cwd.clone()));
+                    outcome.status_changed.push((self.status, self.cwd.clone()));
                 }
                 SemanticEvent::CommandFinished { exit_code } => {
                     self.last_exit_code = Some(exit_code);
@@ -108,7 +108,9 @@ impl CommandTracker {
                     } else {
                         false
                     };
-                    outcome.command_finished = Some((command, exit_code, has_failure_trace));
+                    outcome
+                        .command_finished
+                        .push((command, exit_code, has_failure_trace));
                 }
             }
         }

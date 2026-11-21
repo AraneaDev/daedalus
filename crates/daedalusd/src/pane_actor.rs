@@ -237,14 +237,14 @@ async fn run_pane_actor(
                     Some(PtyOutput::Bytes(bytes)) => {
                         let outcome = tracker.feed(&bytes);
                         has_pending_delta = true;
-                        if let Some((status, cwd)) = outcome.status_changed {
+                        for (status, cwd) in outcome.status_changed {
                             let _ = event_tx.send(ServerEvent::PaneStatusChanged {
                                 pane_id,
                                 status,
                                 cwd,
                             });
                         }
-                        if let Some((command, exit_code, has_failure_trace)) = outcome.command_finished {
+                        for (command, exit_code, has_failure_trace) in outcome.command_finished {
                             let _ = event_tx.send(ServerEvent::CommandFinished {
                                 pane_id,
                                 command,

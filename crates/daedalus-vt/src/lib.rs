@@ -189,7 +189,10 @@ mod tests {
         let ok = tracker.feed(
             b"\x1b]7;file://localhost/tmp/work\x07\x1b]133;A\x07$ \x1b]133;B\x07echo ok\x1b]133;C\x07\r\nok\r\n\x1b]133;D;0\x07",
         );
-        assert_eq!(ok.command_finished, Some((Some("echo ok".to_string()), 0, false)));
+        assert_eq!(
+            ok.command_finished,
+            vec![(Some("echo ok".to_string()), 0, false)]
+        );
         assert!(tracker.last_failure_trace().is_none());
 
         let fail = tracker.feed(
@@ -197,7 +200,7 @@ mod tests {
         );
         assert_eq!(
             fail.command_finished,
-            Some((Some("cargo test".to_string()), 101, true))
+            vec![(Some("cargo test".to_string()), 101, true)]
         );
         let trace = tracker.last_failure_trace().expect("expected failure trace");
         assert_eq!(trace.exit_code, 101);
@@ -205,5 +208,43 @@ mod tests {
         assert_eq!(trace.cwd, Some(PathBuf::from("/tmp/work")));
         assert!(trace.output.contains("assertion failed"));
         assert!(!trace.output.contains("\x1b[31m"));
+    }
+
+    #[test]
+    fn command_tracker_preserves_multiple_events_in_single_feed() {
+        use daedalus_proto::PaneStatus;
+
+        let pane_id = PaneId::new();
+        let mut tracker = CommandTracker::new(pane_id, create_vt_engine(VtConfig::default()));
+
+        let chunk = concat!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07true\x1b]133;C\x07\r\n\x1b]133;D;0\x07",
+            "\x1b]133;A\x07$ \x1b]133;B\x07false\x1b]133;C\x07\r\nboom\r\n\x1b]133;D;1\x07",
+            "\x1b]133;A\x07$ \x1b]133;B\x07",
+        );
+        let outcome = tracker.feed(chunk.as_bytes());
+
+        assert_eq!(
+            outcome.status_changed,
+            vec![
+                (PaneStatus::Idle, None),
+                (PaneStatus::Busy, None),
+                (PaneStatus::Idle, None),
+                (PaneStatus::Busy, None),
+                (PaneStatus::Idle, None),
+            ]
+        );
+        assert_eq!(
+            outcome.command_finished,
+            vec![
+                (Some("true".to_string()), 0, false),
+                (Some("false".to_string()), 1, true),
+            ]
+        );
+        assert_eq!(tracker.status(), PaneStatus::Idle);
+        let trace = tracker.last_failure_trace().expect("expected failure trace");
+        assert_eq!(trace.command.as_deref(), Some("false"));
+        assert_eq!(trace.exit_code, 1);
+        assert!(trace.output.contains("boom"));
     }
 }

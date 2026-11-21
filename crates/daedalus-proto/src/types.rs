@@ -190,13 +190,49 @@ pub struct GridDelta {
     pub dirty_rows: Vec<GridRow>,
 }
 
+const BRACKETED_PASTE_FORBIDDEN: &[&[u8]] = &[
+    b"\x1b[201~",
+    b"\x1b[200~",
+    b"\x9b201~",
+    b"\x9b200~",
+];
+
+fn strip_bracketed_paste_markers(data: &[u8]) -> Vec<u8> {
+    let mut current = data.to_vec();
+    loop {
+        let mut next = Vec::with_capacity(current.len());
+        let mut i = 0;
+        let mut removed = false;
+        while i < current.len() {
+            if let Some(marker) = BRACKETED_PASTE_FORBIDDEN
+                .iter()
+                .find(|m| current[i..].starts_with(m))
+            {
+                i += marker.len();
+                removed = true;
+            } else {
+                next.push(current[i]);
+                i += 1;
+            }
+        }
+        if !removed {
+            return next;
+        }
+        current = next;
+    }
+}
+
 /// Wraps input bytes in XTerm bracketed paste markers (`ESC [ 200 ~` ... `ESC [ 201 ~`)
 /// so interactive CLI agents (`claude`, `codex`, `agy`) receive multi-line prompts or
 /// failure traces without premature newline submission.
+///
+/// Any embedded 7-bit or 8-bit bracketed paste markers are iteratively stripped first
+/// to prevent breakout / command injection.
 pub fn wrap_bracketed_paste(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() + 12);
+    let sanitized = strip_bracketed_paste_markers(data);
+    let mut out = Vec::with_capacity(sanitized.len() + 12);
     out.extend_from_slice(b"\x1b[200~");
-    out.extend_from_slice(data);
+    out.extend_from_slice(&sanitized);
     out.extend_from_slice(b"\x1b[201~");
     out
 }

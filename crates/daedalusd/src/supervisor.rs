@@ -46,13 +46,9 @@ pub struct SpawnedPty {
 
 impl Supervisor {
     pub fn detect() -> Self {
-        let ok = Command::new("systemd-run")
-            .args(["--user", "--scope", "--quiet", "--", "true"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let mut cmd = Command::new("systemd-run");
+        cmd.args(["--user", "--scope", "--quiet", "--", "true"]);
+        let ok = run_command_with_timeout(&mut cmd, Duration::from_secs(2));
 
         if ok {
             Self {
@@ -60,7 +56,7 @@ impl Supervisor {
             }
         } else {
             warn!(
-                "systemd user session unavailable; falling back to setsid + process-group (killpg) isolation"
+                "systemd user session unavailable or timed out; falling back to setsid + process-group (killpg) isolation"
             );
             Self {
                 mode: IsolationMode::PgidFallback,
@@ -249,6 +245,37 @@ impl ProcessHandle {
     }
 }
 
+fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> bool {
+    let Ok(mut child) = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 fn run_systemctl_quiet(args: &[&str]) -> bool {
     Command::new("systemctl")
         .arg("--user")
@@ -373,5 +400,29 @@ mod tests {
     #[test]
     fn teardown_kills_sighup_immune_orphan_descendants() {
         assert_orphan_killed("(trap '' HUP; exec sleep 60) & echo CHILD_PID=$!; wait");
+    }
+
+    #[test]
+    fn command_probe_respects_timeout_and_kills_hanging_process() {
+        let mut ok_cmd = Command::new("/bin/sh");
+        ok_cmd.args(["-c", "true"]);
+        assert!(run_command_with_timeout(&mut ok_cmd, Duration::from_secs(2)));
+
+        let mut fail_cmd = Command::new("/bin/sh");
+        fail_cmd.args(["-c", "false"]);
+        assert!(!run_command_with_timeout(&mut fail_cmd, Duration::from_secs(2)));
+
+        let start = Instant::now();
+        let mut hang_cmd = Command::new("/bin/sh");
+        hang_cmd.args(["-c", "sleep 10"]);
+        assert!(!run_command_with_timeout(
+            &mut hang_cmd,
+            Duration::from_millis(150)
+        ));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "timeout helper took too long: {:?}",
+            start.elapsed()
+        );
     }
 }
