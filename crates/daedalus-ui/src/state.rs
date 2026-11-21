@@ -204,7 +204,7 @@ impl CloseWorkspaceModalState {
     }
 
     pub fn toggle_force(&mut self) {
-        if self.is_worktree && self.remove_worktree {
+        if self.is_worktree && self.is_dirty && self.remove_worktree {
             self.force_remove_worktree = !self.force_remove_worktree;
         }
     }
@@ -978,7 +978,11 @@ fn upsert_external_status(statuses: &mut Vec<ExternalStatus>, status: ExternalSt
         .position(|existing| existing.source == status.source)
     {
         statuses.remove(pos);
-    } else if statuses.len() >= MAX_EXTERNAL_STATUSES {
+    }
+    if status.label.trim().is_empty() {
+        return;
+    }
+    if statuses.len() >= MAX_EXTERNAL_STATUSES {
         statuses.remove(0);
     }
     statuses.push(status);
@@ -1432,6 +1436,50 @@ mod tests {
     }
 
     #[test]
+    fn external_status_updated_clears_matching_source_on_empty_label() {
+        use daedalus_proto::StatusLevel;
+
+        let mut state = AppState::new();
+        let (ws, _, _, _) = make_workspace_with_three_panes();
+        let ws_id = ws.id;
+        state.set_workspaces(vec![ws]);
+
+        let mk_status = |source: &str, label: &str| ExternalStatus {
+            source: source.to_string(),
+            level: StatusLevel::Info,
+            label: label.to_string(),
+            detail: None,
+            updated_at_ms: 1,
+        };
+
+        state.apply_server_event(ServerEvent::ExternalStatusUpdated {
+            workspace_id: ws_id,
+            status: mk_status("phrourion", "3 dirty"),
+        });
+        state.apply_server_event(ServerEvent::ExternalStatusUpdated {
+            workspace_id: ws_id,
+            status: mk_status("cassandra", "ok"),
+        });
+        assert_eq!(state.active_workspace().unwrap().external_statuses.len(), 2);
+
+        // Empty-label clear signal removes matching source without leaving a blank badge
+        state.apply_server_event(ServerEvent::ExternalStatusUpdated {
+            workspace_id: ws_id,
+            status: mk_status("phrourion", ""),
+        });
+        let statuses = &state.active_workspace().unwrap().external_statuses;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].source, "cassandra");
+
+        // Clearing an unknown source with whitespace label is a no-op
+        state.apply_server_event(ServerEvent::ExternalStatusUpdated {
+            workspace_id: ws_id,
+            status: mk_status("unknown", "   "),
+        });
+        assert_eq!(state.active_workspace().unwrap().external_statuses.len(), 1);
+    }
+
+    #[test]
     fn worktree_modal_and_picker_are_mutually_exclusive() {
         let mut state = AppState::new();
         assert!(!state.picker.open);
@@ -1719,6 +1767,25 @@ mod tests {
         assert!(!state.close_modal.compose_down);
         state.close_modal.toggle_compose();
         assert!(state.close_modal.compose_down);
+
+        // Clean worktree can toggle remove_worktree, but cannot enable force_remove_worktree
+        let (mut clean_wt, _, _, _) = make_workspace_with_three_panes();
+        clean_wt.name = "clean-wt".to_string();
+        clean_wt.git_status = Some(GitWorkspaceStatus {
+            is_worktree: true,
+            dirty: false,
+            ahead: 0,
+            behind: 0,
+        });
+        let clean_wt_id = clean_wt.id;
+        state.upsert_workspace(clean_wt);
+        assert!(state.open_close_modal_for_workspace(clean_wt_id));
+        assert!(state.close_modal.is_worktree);
+        assert!(!state.close_modal.is_dirty);
+        state.close_modal.toggle_worktree();
+        assert!(state.close_modal.remove_worktree);
+        state.close_modal.toggle_force();
+        assert!(!state.close_modal.force_remove_worktree);
 
         // Primary checkout cannot enable remove_worktree or force
         assert!(state.open_close_modal_for_workspace(primary_id));
