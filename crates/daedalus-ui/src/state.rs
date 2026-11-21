@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use clap::ValueEnum;
 use daedalus_proto::{
-    CursorState, FailureTrace, GridDelta, GridRow, GridSnapshot, PaneId, PaneRole, PaneStatus,
-    PaneSummary, ServerEvent, WorkspaceId, WorkspaceInfo,
+    CursorState, ExternalStatus, FailureTrace, GridDelta, GridRow, GridSnapshot, PaneId, PaneRole,
+    PaneStatus, PaneSummary, ServerEvent, WorkspaceId, WorkspaceInfo,
 };
 
 use crate::selection::Selection;
@@ -111,6 +111,41 @@ impl PickerState {
 
     pub fn selected_preset(&self) -> AgentPreset {
         AgentPreset::ALL[self.selected_index % AgentPreset::ALL.len()]
+    }
+}
+
+/// State of the centered "New Git Worktree" branch-input modal (`Ctrl+Shift+W` / `+ Worktree`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorktreeModalState {
+    pub open: bool,
+    pub branch_input: String,
+}
+
+impl WorktreeModalState {
+    pub fn open(&mut self) {
+        self.open = true;
+        self.branch_input.clear();
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+        self.branch_input.clear();
+    }
+
+    pub fn toggle(&mut self) {
+        if self.open {
+            self.close();
+        } else {
+            self.open();
+        }
+    }
+
+    pub fn push_char(&mut self, ch: char) {
+        self.branch_input.push(ch);
+    }
+
+    pub fn pop_char(&mut self) {
+        self.branch_input.pop();
     }
 }
 
@@ -282,6 +317,7 @@ pub struct AppState {
     pub sidebar_visible: bool,
     pub zoomed: bool,
     pub picker: PickerState,
+    pub worktree_modal: WorktreeModalState,
     pub toast: Option<(String, bool, Instant)>,
     pub last_sent_sizes: HashMap<PaneId, (u16, u16)>,
 }
@@ -303,8 +339,30 @@ impl AppState {
             sidebar_visible: true,
             zoomed: false,
             picker: PickerState::default(),
+            worktree_modal: WorktreeModalState::default(),
             toast: None,
             last_sent_sizes: HashMap::new(),
+        }
+    }
+
+    /// Opens the Agent preset picker modal while ensuring the worktree modal is closed.
+    pub fn open_picker_with(&mut self, preset: AgentPreset) {
+        self.worktree_modal.close();
+        self.picker.open_with(preset);
+    }
+
+    /// Opens the Git worktree creator modal while ensuring the Agent preset picker is closed.
+    pub fn open_worktree_modal(&mut self) {
+        self.picker.close();
+        self.worktree_modal.open();
+    }
+
+    /// Toggles the Git worktree creator modal, closing the Agent preset picker if opening.
+    pub fn toggle_worktree_modal(&mut self) {
+        if self.worktree_modal.open {
+            self.worktree_modal.close();
+        } else {
+            self.open_worktree_modal();
         }
     }
 
@@ -481,8 +539,26 @@ impl AppState {
                 None
             }
             ServerEvent::ResyncRequired { pane_id } => Some(pane_id),
-            ServerEvent::WorkspaceRuntimeUpdated { .. }
-            | ServerEvent::ExternalStatusUpdated { .. } => None,
+            ServerEvent::WorkspaceRuntimeUpdated {
+                workspace_id,
+                bound_ports,
+                containers,
+            } => {
+                if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == workspace_id) {
+                    ws.bound_ports = bound_ports;
+                    ws.containers = containers;
+                }
+                None
+            }
+            ServerEvent::ExternalStatusUpdated {
+                workspace_id,
+                status,
+            } => {
+                if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == workspace_id) {
+                    upsert_external_status(&mut ws.external_statuses, status);
+                }
+                None
+            }
         }
     }
 
@@ -507,6 +583,20 @@ impl AppState {
             .flat_map(|ws| ws.panes.iter_mut())
             .find(|pane| pane.id == pane_id)
     }
+}
+
+const MAX_EXTERNAL_STATUSES: usize = 16;
+
+fn upsert_external_status(statuses: &mut Vec<ExternalStatus>, status: ExternalStatus) {
+    if let Some(pos) = statuses
+        .iter()
+        .position(|existing| existing.source == status.source)
+    {
+        statuses.remove(pos);
+    } else if statuses.len() >= MAX_EXTERNAL_STATUSES {
+        statuses.remove(0);
+    }
+    statuses.push(status);
 }
 
 #[cfg(test)]
@@ -830,5 +920,145 @@ mod tests {
         assert_eq!(state.focus_direction(FocusDirection::Left), PaneRole::Agent);
         // Moving left from Agent is a no-op
         assert_eq!(state.focus_direction(FocusDirection::Left), PaneRole::Agent);
+    }
+
+    #[test]
+    fn workspace_runtime_updated_replaces_bound_ports_and_containers() {
+        use daedalus_proto::{ContainerHealth, PortMapping, PortSource};
+
+        let mut state = AppState::new();
+        let (ws, _, _, _) = make_workspace_with_three_panes();
+        let ws_id = ws.id;
+        state.set_workspaces(vec![ws]);
+
+        let ports = vec![
+            PortMapping {
+                host_port: 3100,
+                container_port: Some(3000),
+                service: Some("web".to_string()),
+                source: PortSource::Docker,
+            },
+            PortMapping {
+                host_port: 5532,
+                container_port: None,
+                service: None,
+                source: PortSource::LocalProcess,
+            },
+        ];
+        let containers = vec![ContainerHealth {
+            name: "demo-wt1-web-1".to_string(),
+            service: Some("web".to_string()),
+            state: "running".to_string(),
+            health: Some("healthy".to_string()),
+            ports: vec![3100],
+        }];
+
+        assert_eq!(
+            state.apply_server_event(ServerEvent::WorkspaceRuntimeUpdated {
+                workspace_id: ws_id,
+                bound_ports: ports.clone(),
+                containers: containers.clone(),
+            }),
+            None
+        );
+
+        let updated = state.active_workspace().unwrap();
+        assert_eq!(updated.bound_ports, ports);
+        assert_eq!(updated.containers, containers);
+
+        // Unknown workspace ID is safely ignored
+        assert_eq!(
+            state.apply_server_event(ServerEvent::WorkspaceRuntimeUpdated {
+                workspace_id: WorkspaceId::new(),
+                bound_ports: Vec::new(),
+                containers: Vec::new(),
+            }),
+            None
+        );
+        assert_eq!(state.active_workspace().unwrap().bound_ports.len(), 2);
+    }
+
+    #[test]
+    fn external_status_updated_upserts_by_source_and_caps_at_limit() {
+        use daedalus_proto::StatusLevel;
+
+        let mut state = AppState::new();
+        let (ws, _, _, _) = make_workspace_with_three_panes();
+        let ws_id = ws.id;
+        state.set_workspaces(vec![ws]);
+
+        let mk_status = |source: &str, level: StatusLevel, label: &str| ExternalStatus {
+            source: source.to_string(),
+            level,
+            label: label.to_string(),
+            detail: None,
+            updated_at_ms: 1,
+        };
+
+        state.apply_server_event(ServerEvent::ExternalStatusUpdated {
+            workspace_id: ws_id,
+            status: mk_status("phrourion", StatusLevel::Warn, "3 dirty"),
+        });
+        state.apply_server_event(ServerEvent::ExternalStatusUpdated {
+            workspace_id: ws_id,
+            status: mk_status("cassandra", StatusLevel::Error, "retry"),
+        });
+        assert_eq!(state.active_workspace().unwrap().external_statuses.len(), 2);
+
+        // Upsert existing source updates it without duplicating
+        state.apply_server_event(ServerEvent::ExternalStatusUpdated {
+            workspace_id: ws_id,
+            status: mk_status("phrourion", StatusLevel::Ok, "clean"),
+        });
+        let statuses = &state.active_workspace().unwrap().external_statuses;
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].source, "cassandra");
+        assert_eq!(statuses[1].source, "phrourion");
+        assert_eq!(statuses[1].label, "clean");
+        assert_eq!(statuses[1].level, StatusLevel::Ok);
+
+        // Exceeding MAX_EXTERNAL_STATUSES evicts oldest
+        for i in 0..MAX_EXTERNAL_STATUSES {
+            state.apply_server_event(ServerEvent::ExternalStatusUpdated {
+                workspace_id: ws_id,
+                status: mk_status(&format!("src-{i}"), StatusLevel::Info, "ok"),
+            });
+        }
+        assert_eq!(
+            state.active_workspace().unwrap().external_statuses.len(),
+            MAX_EXTERNAL_STATUSES
+        );
+    }
+
+    #[test]
+    fn worktree_modal_and_picker_are_mutually_exclusive() {
+        let mut state = AppState::new();
+        assert!(!state.picker.open);
+        assert!(!state.worktree_modal.open);
+
+        state.open_picker_with(AgentPreset::Claude);
+        assert!(state.picker.open);
+        assert!(!state.worktree_modal.open);
+
+        // Opening worktree modal closes picker and resets branch input
+        state.open_worktree_modal();
+        assert!(!state.picker.open);
+        assert!(state.worktree_modal.open);
+        state.worktree_modal.push_char('f');
+        state.worktree_modal.push_char('e');
+        state.worktree_modal.pop_char();
+        assert_eq!(state.worktree_modal.branch_input, "f");
+
+        // Opening picker closes worktree modal and clears input
+        state.open_picker_with(AgentPreset::Agy);
+        assert!(state.picker.open);
+        assert!(!state.worktree_modal.open);
+        assert!(state.worktree_modal.branch_input.is_empty());
+
+        state.toggle_worktree_modal();
+        assert!(!state.picker.open);
+        assert!(state.worktree_modal.open);
+        state.toggle_worktree_modal();
+        assert!(!state.worktree_modal.open);
     }
 }

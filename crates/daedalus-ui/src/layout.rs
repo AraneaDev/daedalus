@@ -7,7 +7,7 @@ pub const VIEWPORT_LOGICAL_PAD: f32 = 6.0;
 pub const AGENT_WIDTH_RATIO: f32 = 0.55;
 
 pub const SIDEBAR_HEADER_LOGICAL_HEIGHT: f32 = 32.0;
-pub const SIDEBAR_ROW_LOGICAL_HEIGHT: f32 = 52.0;
+pub const SIDEBAR_ROW_LOGICAL_HEIGHT: f32 = 84.0;
 pub const SIDEBAR_ROW_LOGICAL_GAP: f32 = 4.0;
 pub const SIDEBAR_PAD_LOGICAL: f32 = 8.0;
 pub const SIDEBAR_NEW_BTN_LOGICAL_HEIGHT: f32 = 34.0;
@@ -141,6 +141,7 @@ impl WorkspaceLayout {
 pub enum HitTarget {
     SidebarWorkspace(usize),
     SidebarNewWorkspace,
+    SidebarNewWorktree,
     PaneHeaderAction(PaneRole),
     PaneViewport { role: PaneRole, col: u16, row: u16 },
     PaneHeader(PaneRole),
@@ -318,17 +319,33 @@ pub fn sidebar_workspace_rect(sidebar: Rect, index: usize, scale_factor: f32) ->
     Rect::new(x, y, w, m.sidebar_row_height)
 }
 
-/// Computes the rectangle of the "+ New Workspace" button inside the sidebar.
-pub fn sidebar_new_workspace_rect(sidebar: Rect, workspace_count: usize, scale_factor: f32) -> Rect {
-    let m = LayoutMetrics::for_scale(scale_factor);
-    let x = sidebar.x + m.sidebar_pad;
-    let w = (sidebar.width - 2.0 * m.sidebar_pad).max(0.0);
-    let y = sidebar.y
+fn sidebar_footer_buttons_y(sidebar: Rect, workspace_count: usize, m: &LayoutMetrics) -> f32 {
+    sidebar.y
         + m.sidebar_header_height
         + m.sidebar_pad
         + (workspace_count as f32) * (m.sidebar_row_height + m.sidebar_row_gap)
-        + m.sidebar_row_gap;
-    Rect::new(x, y, w, m.sidebar_new_btn_height)
+        + m.sidebar_row_gap
+}
+
+/// Computes the rectangle of the "+ Workspace" button inside the sidebar.
+pub fn sidebar_new_workspace_rect(sidebar: Rect, workspace_count: usize, scale_factor: f32) -> Rect {
+    let m = LayoutMetrics::for_scale(scale_factor);
+    let total_w = (sidebar.width - 2.0 * m.sidebar_pad).max(0.0);
+    let btn_w = ((total_w - m.sidebar_row_gap) * 0.5).max(0.0);
+    let x = sidebar.x + m.sidebar_pad;
+    let y = sidebar_footer_buttons_y(sidebar, workspace_count, &m);
+    Rect::new(x, y, btn_w, m.sidebar_new_btn_height)
+}
+
+/// Computes the rectangle of the "+ Worktree" button next to "+ Workspace" inside the sidebar.
+pub fn sidebar_new_worktree_rect(sidebar: Rect, workspace_count: usize, scale_factor: f32) -> Rect {
+    let m = LayoutMetrics::for_scale(scale_factor);
+    let total_w = (sidebar.width - 2.0 * m.sidebar_pad).max(0.0);
+    let left_w = ((total_w - m.sidebar_row_gap) * 0.5).max(0.0);
+    let right_w = (total_w - left_w - m.sidebar_row_gap).max(0.0);
+    let x = sidebar.x + m.sidebar_pad + left_w + m.sidebar_row_gap;
+    let y = sidebar_footer_buttons_y(sidebar, workspace_count, &m);
+    Rect::new(x, y, right_w, m.sidebar_new_btn_height)
 }
 
 /// Hit-tests a physical pixel coordinate `(x, y)` against the current `WorkspaceLayout`.
@@ -353,6 +370,10 @@ pub fn hit_test(
         let new_btn_rect = sidebar_new_workspace_rect(sidebar, workspace_count, scale_factor);
         if new_btn_rect.contains(x, y) {
             return HitTarget::SidebarNewWorkspace;
+        }
+        let new_wt_rect = sidebar_new_worktree_rect(sidebar, workspace_count, scale_factor);
+        if new_wt_rect.contains(x, y) {
+            return HitTarget::SidebarNewWorktree;
         }
         return HitTarget::None;
     }
@@ -580,6 +601,23 @@ mod tests {
                 new_btn.y + 10.0,
             ),
             HitTarget::SidebarNewWorkspace
+        );
+
+        let new_wt_btn = sidebar_new_worktree_rect(sidebar, 2, input.scale_factor);
+        assert_eq!(new_wt_btn.y, new_btn.y);
+        assert!(new_wt_btn.x >= new_btn.right());
+        assert!(new_wt_btn.right() <= sidebar.right());
+        assert_eq!(
+            hit_test(
+                &layout,
+                2,
+                input.scale_factor,
+                input.cell_w,
+                input.cell_h,
+                new_wt_btn.x + 10.0,
+                new_wt_btn.y + 10.0,
+            ),
+            HitTarget::SidebarNewWorktree
         );
 
         // Outside window returns None

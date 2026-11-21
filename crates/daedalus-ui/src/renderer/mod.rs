@@ -1,13 +1,18 @@
 pub mod quads;
 pub mod text;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use daedalus_proto::{CellFlags, PaneRole, PaneStatus};
+use daedalus_proto::{
+    CellFlags, ContainerHealth, ExternalStatus, PaneRole, PaneStatus, PortMapping, StatusLevel,
+    WorkspaceInfo,
+};
 use winit::window::Window;
 
 use crate::layout::{
-    PaneRect, Rect, WorkspaceLayout, sidebar_new_workspace_rect, sidebar_workspace_rect,
+    PaneRect, Rect, WorkspaceLayout, sidebar_new_workspace_rect, sidebar_new_worktree_rect,
+    sidebar_workspace_rect,
 };
 use crate::state::{AgentPreset, AppState};
 use crate::theme::{self, Rgba, Theme};
@@ -20,6 +25,12 @@ const PICKER_HEADER_LOGICAL_HEIGHT: f32 = 42.0;
 const PICKER_ITEM_LOGICAL_HEIGHT: f32 = 36.0;
 const PICKER_ITEM_LOGICAL_GAP: f32 = 4.0;
 const PICKER_PAD_LOGICAL: f32 = 12.0;
+
+const WORKTREE_MODAL_LOGICAL_WIDTH: f32 = 420.0;
+const WORKTREE_MODAL_LOGICAL_HEIGHT: f32 = 136.0;
+const WORKTREE_HEADER_LOGICAL_HEIGHT: f32 = 38.0;
+const WORKTREE_INPUT_LOGICAL_HEIGHT: f32 = 36.0;
+const WORKTREE_PAD_LOGICAL: f32 = 14.0;
 
 fn sanitize_scale(scale_factor: f32) -> f32 {
     if scale_factor.is_finite() && scale_factor > 0.0 {
@@ -54,6 +65,128 @@ pub fn picker_item_rect(modal: Rect, index: usize, scale_factor: f32) -> Rect {
         + PICKER_HEADER_LOGICAL_HEIGHT * s
         + (index as f32) * (PICKER_ITEM_LOGICAL_HEIGHT + PICKER_ITEM_LOGICAL_GAP) * s;
     Rect::new(x, y, w, PICKER_ITEM_LOGICAL_HEIGHT * s)
+}
+
+/// Computes the centered physical-pixel rectangle of the "New Git Worktree" modal.
+pub fn worktree_modal_rect(window_w: f32, window_h: f32, scale_factor: f32) -> Rect {
+    let s = sanitize_scale(scale_factor);
+    let modal_w = (WORKTREE_MODAL_LOGICAL_WIDTH * s).min((window_w - 24.0 * s).max(160.0));
+    let modal_h = (WORKTREE_MODAL_LOGICAL_HEIGHT * s).min((window_h - 24.0 * s).max(100.0));
+    let x = ((window_w - modal_w) * 0.5).max(0.0);
+    let y = ((window_h - modal_h) * 0.5).max(0.0);
+    Rect::new(x, y, modal_w, modal_h)
+}
+
+/// Computes the physical-pixel rectangle of the branch input field inside the worktree modal.
+pub fn worktree_input_rect(modal: Rect, scale_factor: f32) -> Rect {
+    let s = sanitize_scale(scale_factor);
+    let pad = WORKTREE_PAD_LOGICAL * s;
+    let x = modal.x + pad;
+    let w = (modal.width - 2.0 * pad).max(0.0);
+    let y = modal.y + (WORKTREE_HEADER_LOGICAL_HEIGHT + 10.0) * s;
+    Rect::new(x, y, w, WORKTREE_INPUT_LOGICAL_HEIGHT * s)
+}
+
+pub(super) fn workspace_branch_badge(ws: &WorkspaceInfo) -> Option<(String, bool)> {
+    match (&ws.git_branch, ws.slot_index > 0) {
+        (Some(branch), true) => Some((format!("wt{} · {branch}", ws.slot_index), true)),
+        (Some(branch), false) => Some((branch.clone(), false)),
+        (None, true) => Some((format!("wt{}", ws.slot_index), true)),
+        (None, false) => None,
+    }
+}
+
+pub(super) fn sidebar_branch_badge_rect(row_rect: Rect, label: &str, scale_factor: f32) -> Rect {
+    let s = sanitize_scale(scale_factor);
+    let left_x = row_rect.x + 22.0 * s;
+    let max_w = (row_rect.right() - left_x - 8.0 * s).max(0.0);
+    let est_w = ((label.chars().count() as f32) * 6.8 + 12.0) * s;
+    Rect::new(
+        left_x,
+        row_rect.y + 24.0 * s,
+        est_w.min(max_w),
+        15.0 * s,
+    )
+}
+
+pub(super) fn format_ports_summary(bound_ports: &[PortMapping]) -> (String, bool) {
+    let unique: BTreeSet<u16> = bound_ports.iter().map(|p| p.host_port).collect();
+    if unique.is_empty() {
+        return ("no bound ports".to_string(), false);
+    }
+    let count = unique.len();
+    let noun = if count == 1 { "port" } else { "ports" };
+    let mut preview: Vec<String> = unique.iter().take(2).map(u16::to_string).collect();
+    let suffix = if count > 2 { ", …" } else { "" };
+    if !suffix.is_empty()
+        && let Some(last) = preview.last_mut()
+    {
+        last.push_str(suffix);
+    }
+    (format!("● {count} {noun}: {}", preview.join(", ")), true)
+}
+
+pub(super) fn format_docker_health(containers: &[ContainerHealth]) -> Option<(String, bool)> {
+    if containers.is_empty() {
+        return None;
+    }
+    let total = containers.len();
+    let healthy = containers
+        .iter()
+        .filter(|c| {
+            c.state.eq_ignore_ascii_case("running") && c.health.as_deref() != Some("unhealthy")
+        })
+        .count();
+    if healthy == total {
+        Some((format!("{healthy}/{total} up"), true))
+    } else {
+        Some((format!("{healthy}/{total} up !"), false))
+    }
+}
+
+pub(super) fn sidebar_docker_pill_rect(row_rect: Rect, scale_factor: f32) -> Rect {
+    let s = sanitize_scale(scale_factor);
+    let w = 64.0 * s;
+    Rect::new(
+        row_rect.right() - w - 6.0 * s,
+        row_rect.y + 42.0 * s,
+        w,
+        15.0 * s,
+    )
+}
+
+pub(super) fn visible_external_statuses(ws: &WorkspaceInfo) -> &[ExternalStatus] {
+    let start = ws.external_statuses.len().saturating_sub(2);
+    &ws.external_statuses[start..]
+}
+
+pub(super) fn external_status_color(level: StatusLevel, theme: &Theme) -> Rgba {
+    match level {
+        StatusLevel::Info => theme.border_focused,
+        StatusLevel::Ok => theme.status_ok,
+        StatusLevel::Warn => theme.status_busy,
+        StatusLevel::Error => theme.status_err,
+    }
+}
+
+pub(super) fn sidebar_external_badge_rect(
+    row_rect: Rect,
+    badge_idx: usize,
+    badge_count: usize,
+    scale_factor: f32,
+) -> Rect {
+    let s = sanitize_scale(scale_factor);
+    let left_x = row_rect.x + 10.0 * s;
+    let total_w = (row_rect.right() - 8.0 * s - left_x).max(0.0);
+    let y = row_rect.y + 61.0 * s;
+    let h = 16.0 * s;
+    if badge_count <= 1 {
+        Rect::new(left_x, y, total_w, h)
+    } else {
+        let gap = 4.0 * s;
+        let w = ((total_w - gap) * 0.5).max(0.0);
+        Rect::new(left_x + (badge_idx as f32) * (w + gap), y, w, h)
+    }
 }
 
 fn push_rect_border(quads: &mut Vec<QuadInstance>, rect: Rect, thickness: f32, color: Rgba) {
@@ -209,12 +342,44 @@ pub fn collect_quads(
                 if let Some(bg) = pill_bg {
                     quads.push(QuadInstance::from_xywh(
                         row_rect.right() - 52.0 * s,
-                        row_rect.y + 6.0 * s,
+                        row_rect.y + 5.0 * s,
                         46.0 * s,
                         18.0 * s,
                         bg,
                     ));
                 }
+            }
+
+            // Git branch / worktree slot badge backdrop
+            if let Some((branch_label, is_wt)) = workspace_branch_badge(ws) {
+                let badge_rect = sidebar_branch_badge_rect(row_rect, &branch_label, s);
+                let bg = if is_wt {
+                    theme.border_focused.with_alpha(0.18)
+                } else {
+                    theme.bg_window.with_alpha(0.75)
+                };
+                quads.push(QuadInstance::new(badge_rect, bg));
+            }
+
+            // Docker container health pill backdrop
+            if let Some((_, is_healthy)) = format_docker_health(&ws.containers) {
+                let docker_rect = sidebar_docker_pill_rect(row_rect, s);
+                let bg = if is_healthy {
+                    theme.status_ok.with_alpha(0.15)
+                } else {
+                    theme.status_err.with_alpha(0.24)
+                };
+                quads.push(QuadInstance::new(docker_rect, bg));
+            }
+
+            // Up to 2 external status badges
+            let ext_statuses = visible_external_statuses(ws);
+            for (badge_idx, ext) in ext_statuses.iter().enumerate() {
+                let badge_rect =
+                    sidebar_external_badge_rect(row_rect, badge_idx, ext_statuses.len(), s);
+                let color = external_status_color(ext.level, theme);
+                quads.push(QuadInstance::new(badge_rect, color.with_alpha(0.18)));
+                push_rect_border(&mut quads, badge_rect, border_w, color.with_alpha(0.55));
             }
         }
 
@@ -222,6 +387,17 @@ pub fn collect_quads(
         if new_btn.y < sidebar.bottom() {
             quads.push(QuadInstance::new(new_btn, theme.bg_header));
             push_rect_border(&mut quads, new_btn, border_w, theme.border_unfocused);
+        }
+
+        let new_wt_btn = sidebar_new_worktree_rect(sidebar, state.workspaces.len(), s);
+        if new_wt_btn.y < sidebar.bottom() {
+            quads.push(QuadInstance::new(new_wt_btn, theme.bg_header));
+            push_rect_border(
+                &mut quads,
+                new_wt_btn,
+                border_w,
+                theme.border_focused.with_alpha(0.60),
+            );
         }
     }
 
@@ -290,6 +466,33 @@ pub fn collect_quads(
             border_w,
             theme.border_focused.with_alpha(0.75),
         );
+    } else if state.worktree_modal.open {
+        // Dimmed backdrop scrim
+        quads.push(QuadInstance::from_xywh(
+            0.0,
+            0.0,
+            screen_w,
+            screen_h,
+            Rgba::new(0.0, 0.0, 0.0, 0.55),
+        ));
+
+        let modal = worktree_modal_rect(screen_w, screen_h, s);
+        quads.push(QuadInstance::new(modal, theme.picker_bg));
+        push_rect_border(&mut quads, modal, border_w, theme.border_focused);
+
+        // Header divider
+        quads.push(QuadInstance::from_xywh(
+            modal.x + border_w,
+            modal.y + (WORKTREE_HEADER_LOGICAL_HEIGHT - 2.0) * s,
+            (modal.width - 2.0 * border_w).max(0.0),
+            border_w,
+            theme.border_unfocused,
+        ));
+
+        // Branch input box
+        let input_rect = worktree_input_rect(modal, s);
+        quads.push(QuadInstance::new(input_rect, theme.bg_window));
+        push_rect_border(&mut quads, input_rect, border_w, theme.border_focused);
     }
 
     (quads, base_quad_count)
@@ -711,8 +914,8 @@ impl GpuRenderer {
             // Pass 2: base text (terminal rows + UI chrome)
             self.text_renderer.render_base(&mut render_pass);
 
-            // Overlay pass (same render pass): Agent preset picker modal above base text
-            if state.picker.open {
+            // Overlay pass (same render pass): active modal above base text
+            if state.picker.open || state.worktree_modal.open {
                 self.quad_pipeline
                     .render_range(&mut render_pass, base_quad_count..total_quad_count);
                 self.text_renderer.render_modal(&mut render_pass);
@@ -915,6 +1118,144 @@ mod tests {
                 "Disconnected — daemon handshake failed".to_string(),
                 theme.status_err
             ))
+        );
+    }
+
+    #[test]
+    fn collect_quads_renders_worktree_modal_overlay_and_sidebar_external_status_badges() {
+        use daedalus_proto::{PortMapping, PortSource};
+
+        let (mut state, layout) = make_state_with_agent_row();
+        let theme = Theme::dark();
+
+        {
+            let ws = state.active_workspace_mut().unwrap();
+            ws.slot_index = 1;
+            ws.git_branch = Some("feat/auth".to_string());
+            ws.bound_ports = vec![
+                PortMapping {
+                    host_port: 3100,
+                    container_port: Some(3000),
+                    service: Some("web".to_string()),
+                    source: PortSource::Docker,
+                },
+                PortMapping {
+                    host_port: 5532,
+                    container_port: Some(5432),
+                    service: Some("db".to_string()),
+                    source: PortSource::Docker,
+                },
+            ];
+            ws.containers = vec![
+                ContainerHealth {
+                    name: "app-wt1-web-1".to_string(),
+                    service: Some("web".to_string()),
+                    state: "running".to_string(),
+                    health: Some("healthy".to_string()),
+                    ports: vec![3100],
+                },
+                ContainerHealth {
+                    name: "app-wt1-db-1".to_string(),
+                    service: Some("db".to_string()),
+                    state: "exited".to_string(),
+                    health: Some("unhealthy".to_string()),
+                    ports: vec![5532],
+                },
+            ];
+            ws.external_statuses = vec![
+                ExternalStatus {
+                    source: "ignored-oldest".to_string(),
+                    level: StatusLevel::Info,
+                    label: "old".to_string(),
+                    detail: None,
+                    updated_at_ms: 1,
+                },
+                ExternalStatus {
+                    source: "phrourion".to_string(),
+                    level: StatusLevel::Warn,
+                    label: "3 dirty".to_string(),
+                    detail: None,
+                    updated_at_ms: 2,
+                },
+                ExternalStatus {
+                    source: "cassandra".to_string(),
+                    level: StatusLevel::Error,
+                    label: "retry".to_string(),
+                    detail: None,
+                    updated_at_ms: 3,
+                },
+            ];
+        }
+
+        let (quads, base_count) = collect_quads(&state, &layout, &theme, 1200.0, 800.0, 1.0, (8.0, 19.0));
+        assert_eq!(base_count as usize, quads.len());
+
+        let sidebar = layout.sidebar.unwrap();
+        let row_rect = sidebar_workspace_rect(sidebar, 0, 1.0);
+        let branch_rect = sidebar_branch_badge_rect(row_rect, "wt1 · feat/auth", 1.0);
+        let ext_y = row_rect.y + 61.0;
+
+        // Worktree slot branch badge quad is rendered with border_focused tint
+        let info_bg = theme.border_focused.with_alpha(0.18).to_array();
+        assert!(quads.iter().any(|q| {
+            q.color == info_bg
+                && (q.rect[0] - branch_rect.x).abs() < 1e-3
+                && (q.rect[1] - branch_rect.y).abs() < 1e-3
+        }));
+
+        // Sidebar should render the 2 most recent external status badges (Warn + Error) on the badge row
+        let warn_bg = theme.status_busy.with_alpha(0.18).to_array();
+        let err_bg = theme.status_err.with_alpha(0.18).to_array();
+        assert!(
+            quads
+                .iter()
+                .any(|q| q.color == warn_bg && (q.rect[1] - ext_y).abs() < 1e-3)
+        );
+        assert!(
+            quads
+                .iter()
+                .any(|q| q.color == err_bg && (q.rect[1] - ext_y).abs() < 1e-3)
+        );
+        // The oldest Info badge was truncated beyond the 2-badge cap
+        assert!(
+            !quads
+                .iter()
+                .any(|q| q.color == info_bg && (q.rect[1] - ext_y).abs() < 1e-3),
+            "only 2 most recent external status badges should be drawn"
+        );
+
+        // Opening the worktree modal appends overlay quads strictly after base_quad_count
+        state.worktree_modal.open();
+        state.worktree_modal.branch_input = "feat/isolation".to_string();
+        let (quads_with_modal, base_count_modal) =
+            collect_quads(&state, &layout, &theme, 1200.0, 800.0, 1.0, (8.0, 19.0));
+        assert_eq!(base_count_modal, base_count);
+        assert!(quads_with_modal.len() > base_count_modal as usize);
+
+        let modal = worktree_modal_rect(1200.0, 800.0, 1.0);
+        let input = worktree_input_rect(modal, 1.0);
+        assert!((modal.x + modal.width * 0.5 - 600.0).abs() < 1e-3);
+        assert!((modal.y + modal.height * 0.5 - 400.0).abs() < 1e-3);
+        assert!(input.x > modal.x && input.right() < modal.right());
+        assert!(input.y > modal.y && input.bottom() < modal.bottom());
+
+        assert!(quads_with_modal[base_count_modal as usize..].iter().any(|q| {
+            q.color == theme.bg_window.to_array()
+                && (q.rect[0] - input.x).abs() < 1e-3
+                && (q.rect[1] - input.y).abs() < 1e-3
+                && (q.rect[2] - input.width).abs() < 1e-3
+                && (q.rect[3] - input.height).abs() < 1e-3
+        }));
+
+        // Verify port & docker formatting helpers
+        let ws = state.active_workspace().unwrap();
+        assert_eq!(
+            format_ports_summary(&ws.bound_ports),
+            ("● 2 ports: 3100, 5532".to_string(), true)
+        );
+        assert_eq!(
+            format_docker_health(&ws.containers),
+            Some(("1/2 up !".to_string(), false))
         );
     }
 }

@@ -50,6 +50,11 @@ pub enum UiCommand {
         root_dir: PathBuf,
         agent_preset: AgentPreset,
     },
+    CreateWorktreeWorkspace {
+        repo_dir: PathBuf,
+        branch: String,
+        default_agent: AgentPreset,
+    },
     CloseWorkspace {
         id: WorkspaceId,
     },
@@ -519,6 +524,22 @@ async fn handle_command(
             )
             .await?;
         }
+        UiCommand::CreateWorktreeWorkspace {
+            repo_dir,
+            branch,
+            default_agent,
+        } => {
+            create_worktree_and_populate_workspace(
+                conn,
+                sink,
+                repo_dir,
+                branch,
+                default_agent,
+                DEFAULT_PANE_COLS,
+                DEFAULT_PANE_ROWS,
+            )
+            .await?;
+        }
         UiCommand::CloseWorkspace { id } => {
             let _ = conn
                 .call(ClientMessage::CloseWorkspace {
@@ -707,6 +728,61 @@ async fn create_and_populate_workspace(
         }
     };
 
+    populate_workspace_panes(conn, sink, ws, requested_agent, cols, rows).await
+}
+
+async fn create_worktree_and_populate_workspace(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+    repo_dir: PathBuf,
+    branch: String,
+    requested_agent: AgentPreset,
+    cols: u16,
+    rows: u16,
+) -> Result<(), RpcError> {
+    let first_attempt = conn
+        .call(ClientMessage::CreateWorktreeWorkspace {
+            repo_dir: repo_dir.clone(),
+            branch: branch.clone(),
+            create_branch: true,
+            env: HashMap::new(),
+        })
+        .await;
+
+    let response = match first_attempt {
+        Err(RpcError::Proto(ProtoError::InvalidRequest(ref msg)))
+            if msg.contains("git worktree add failed") && msg.contains("already exists") =>
+        {
+            conn.call(ClientMessage::CreateWorktreeWorkspace {
+                repo_dir,
+                branch,
+                create_branch: false,
+                env: HashMap::new(),
+            })
+            .await?
+        }
+        other => other?,
+    };
+
+    let ws = match response {
+        ResponsePayload::WorkspaceCreated(ws) => ws,
+        other => {
+            warn!(response = ?other, "unexpected response to CreateWorktreeWorkspace");
+            return Ok(());
+        }
+    };
+
+    populate_workspace_panes(conn, sink, ws, requested_agent, cols, rows).await
+}
+
+async fn populate_workspace_panes(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+    ws: WorkspaceInfo,
+    requested_agent: AgentPreset,
+    cols: u16,
+    rows: u16,
+) -> Result<(), RpcError> {
     let ws_id = ws.id;
     sink.emit(UiEvent::WorkspaceCreated(ws));
 

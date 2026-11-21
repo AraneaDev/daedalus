@@ -7,7 +7,7 @@ use daedalus_proto::{PaneId, PaneRole, default_socket_path, wrap_bracketed_paste
 use daedalus_ui::bridge::{BridgeConfig, DaemonBridge, UiCommand, UiEvent, UiEventSink};
 use daedalus_ui::input::{UiAction, translate_key};
 use daedalus_ui::layout::{HitTarget, LayoutInput, WorkspaceLayout, compute_layout, hit_test};
-use daedalus_ui::renderer::{GpuRenderer, picker_item_rect, picker_modal_rect};
+use daedalus_ui::renderer::{GpuRenderer, picker_item_rect, picker_modal_rect, worktree_modal_rect};
 use daedalus_ui::selection::{CellPos, Selection, extract_selected_text, select_word_at};
 use daedalus_ui::state::{AgentPreset, AppState};
 use tracing::{error, warn};
@@ -268,7 +268,32 @@ impl DaedalusApp {
             .pane_for_role(PaneRole::Agent)
             .and_then(|p| p.agent_preset)
             .unwrap_or(self.config.default_agent);
-        self.state.picker.open_with(current);
+        self.state.open_picker_with(current);
+        self.request_redraw();
+    }
+
+    fn open_worktree_modal(&mut self) {
+        self.state.open_worktree_modal();
+        self.request_redraw();
+    }
+
+    fn submit_worktree_modal(&mut self) {
+        let branch = self.state.worktree_modal.branch_input.trim().to_string();
+        if branch.is_empty() {
+            self.show_toast("Branch name cannot be empty", true);
+            return;
+        }
+        self.state.worktree_modal.close();
+        let repo_dir = self
+            .state
+            .active_workspace()
+            .map(|ws| ws.root_dir.clone())
+            .unwrap_or_else(|| self.config.initial_dir.clone());
+        self.send_command(UiCommand::CreateWorktreeWorkspace {
+            repo_dir,
+            branch,
+            default_agent: self.config.default_agent,
+        });
         self.request_redraw();
     }
 
@@ -390,6 +415,10 @@ impl DaedalusApp {
                     self.open_agent_picker();
                 }
             }
+            UiAction::ToggleWorktreeModal => {
+                self.state.toggle_worktree_modal();
+                self.request_redraw();
+            }
             UiAction::NewWorkspace => self.create_new_workspace(),
             UiAction::CopySelection => self.copy_focused_selection(),
             UiAction::PasteClipboard => self.paste_clipboard_to_focused(),
@@ -440,6 +469,19 @@ impl DaedalusApp {
                 self.state.picker.close();
                 self.request_redraw();
             }
+            UiAction::WorktreeModalChar(ch) => {
+                self.state.worktree_modal.push_char(ch);
+                self.request_redraw();
+            }
+            UiAction::WorktreeModalBackspace => {
+                self.state.worktree_modal.pop_char();
+                self.request_redraw();
+            }
+            UiAction::WorktreeModalConfirm => self.submit_worktree_modal(),
+            UiAction::WorktreeModalCancel => {
+                self.state.worktree_modal.close();
+                self.request_redraw();
+            }
             UiAction::Ignore => {}
         }
     }
@@ -474,6 +516,15 @@ impl DaedalusApp {
             return;
         }
 
+        if self.state.worktree_modal.open {
+            let modal = worktree_modal_rect(size.width as f32, size.height as f32, scale_factor);
+            if !modal.contains(x, y) {
+                self.state.worktree_modal.close();
+                self.request_redraw();
+            }
+            return;
+        }
+
         let Some(layout) = self.compute_current_layout() else {
             return;
         };
@@ -499,6 +550,7 @@ impl DaedalusApp {
                 }
             }
             HitTarget::SidebarNewWorkspace => self.create_new_workspace(),
+            HitTarget::SidebarNewWorktree => self.open_worktree_modal(),
             HitTarget::PaneHeaderAction(PaneRole::Agent) => {
                 self.state.focused_role = PaneRole::Agent;
                 self.open_agent_picker();
@@ -591,7 +643,7 @@ impl DaedalusApp {
     }
 
     fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
-        if self.state.picker.open {
+        if self.state.picker.open || self.state.worktree_modal.open {
             return;
         }
         let scroll_lines = match delta {
@@ -808,6 +860,7 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
                         event.text.as_deref(),
                         self.modifiers,
                         self.state.picker.open,
+                        self.state.worktree_modal.open,
                     );
                     self.handle_ui_action(action);
                 }

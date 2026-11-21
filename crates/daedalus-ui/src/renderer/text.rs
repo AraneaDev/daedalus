@@ -9,19 +9,27 @@ use glyphon::{
 
 use crate::layout::{
     LayoutMetrics, PaneRect, Rect, WorkspaceLayout, sidebar_new_workspace_rect,
-    sidebar_workspace_rect,
+    sidebar_new_worktree_rect, sidebar_workspace_rect,
 };
 use crate::state::{AgentPreset, AppState};
 use crate::theme::{self, Theme};
 
-use super::{picker_item_rect, picker_modal_rect};
+use super::{
+    external_status_color, format_docker_health, format_ports_summary, picker_item_rect,
+    picker_modal_rect, sidebar_branch_badge_rect, sidebar_docker_pill_rect,
+    sidebar_external_badge_rect, visible_external_statuses, workspace_branch_badge,
+    worktree_input_rect, worktree_modal_rect,
+};
 
 pub const FONT_SIZE_LOGICAL: f32 = 14.0;
 pub const LINE_HEIGHT_LOGICAL: f32 = 19.0;
 const CHROME_FONT_SIZE_LOGICAL: f32 = 12.5;
 const CHROME_LINE_HEIGHT_LOGICAL: f32 = 16.0;
+const CHROME_BTN_FONT_SIZE_LOGICAL: f32 = 11.5;
 const CHROME_SUB_FONT_SIZE_LOGICAL: f32 = 11.0;
 const CHROME_SUB_LINE_HEIGHT_LOGICAL: f32 = 14.0;
+const CHROME_BADGE_FONT_SIZE_LOGICAL: f32 = 10.0;
+const CHROME_BADGE_LINE_HEIGHT_LOGICAL: f32 = 12.0;
 const MODAL_TITLE_FONT_SIZE_LOGICAL: f32 = 13.5;
 const MODAL_TITLE_LINE_HEIGHT_LOGICAL: f32 = 18.0;
 
@@ -376,11 +384,16 @@ impl TextRenderer {
             tracing::warn!(%err, "glyphon base text prepare failed");
         }
 
-        // 4. Rebuild & prepare modal text pass if the Agent preset picker is open.
+        // 4. Rebuild & prepare modal text pass if a centered modal is open.
         self.modal_items.clear();
-        self.has_modal_text = state.picker.open;
-        if state.picker.open {
-            self.build_picker_items(state, theme, screen_w, screen_h);
+        let modal_open = state.picker.open || state.worktree_modal.open;
+        self.has_modal_text = modal_open;
+        if modal_open {
+            if state.picker.open {
+                self.build_picker_items(state, theme, screen_w, screen_h);
+            } else if state.worktree_modal.open {
+                self.build_worktree_modal_items(state, theme, screen_w, screen_h);
+            }
             let modal_areas: Vec<TextArea<'_>> = self
                 .modal_items
                 .iter()
@@ -517,15 +530,30 @@ impl TextRenderer {
             let new_btn = sidebar_new_workspace_rect(sidebar, state.workspaces.len(), s);
             if new_btn.y < sidebar.bottom() {
                 self.push_chrome_line(ChromeLineSpec {
-                    text: "+ New Workspace",
-                    left: new_btn.x + 12.0 * s,
+                    text: "+ Workspace",
+                    left: new_btn.x + 8.0 * s,
                     top: new_btn.y + (new_btn.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                    max_w: new_btn.width - 20.0 * s,
+                    max_w: new_btn.width - 12.0 * s,
                     bounds: new_btn,
-                    font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+                    font_size_logical: CHROME_BTN_FONT_SIZE_LOGICAL,
                     line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
                     color: theme.text_primary,
                     bold: false,
+                });
+            }
+
+            let new_wt_btn = sidebar_new_worktree_rect(sidebar, state.workspaces.len(), s);
+            if new_wt_btn.y < sidebar.bottom() {
+                self.push_chrome_line(ChromeLineSpec {
+                    text: "+ Worktree",
+                    left: new_wt_btn.x + 8.0 * s,
+                    top: new_wt_btn.y + (new_wt_btn.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                    max_w: new_wt_btn.width - 12.0 * s,
+                    bounds: new_wt_btn,
+                    font_size_logical: CHROME_BTN_FONT_SIZE_LOGICAL,
+                    line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                    color: theme.border_focused,
+                    bold: true,
                 });
             }
         }
@@ -591,7 +619,7 @@ impl TextRenderer {
         self.push_chrome_line(ChromeLineSpec {
             text: &ws.name,
             left: left_x,
-            top: row_rect.y + 7.0 * s,
+            top: row_rect.y + 6.0 * s,
             max_w: name_max_w,
             bounds: Rect::new(left_x, row_rect.y, name_max_w, row_rect.height),
             font_size_logical: CHROME_FONT_SIZE_LOGICAL,
@@ -605,7 +633,7 @@ impl TextRenderer {
             self.push_chrome_line(ChromeLineSpec {
                 text: &label,
                 left: pill_x,
-                top: row_rect.y + 8.0 * s,
+                top: row_rect.y + 7.0 * s,
                 max_w: 44.0 * s,
                 bounds: row_rect,
                 font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
@@ -615,36 +643,121 @@ impl TextRenderer {
             });
         }
 
-        let dir_name = ws
-            .root_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(".");
-        let agent_status = ws
-            .panes
-            .iter()
-            .rev()
-            .find(|p| p.role == PaneRole::Agent)
-            .map(|p| match p.status {
-                PaneStatus::Starting => "starting",
-                PaneStatus::Idle => "idle",
-                PaneStatus::Busy => "busy",
-                PaneStatus::Exited { .. } => "exited",
-            })
-            .unwrap_or("none");
-        let subtitle = format!("{dir_name} · agent:{agent_status}");
-        let sub_max_w = (row_rect.right() - left_x - 8.0 * s).max(1.0);
+        // Line 2: Git branch / worktree slot badge (or directory + agent status fallback)
+        if let Some((branch_label, is_wt)) = workspace_branch_badge(ws) {
+            let badge_rect = sidebar_branch_badge_rect(row_rect, &branch_label, s);
+            self.push_chrome_line(ChromeLineSpec {
+                text: &branch_label,
+                left: badge_rect.x + 5.0 * s,
+                top: badge_rect.y + 1.0 * s,
+                max_w: (badge_rect.width - 8.0 * s).max(1.0),
+                bounds: badge_rect,
+                font_size_logical: CHROME_BADGE_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_BADGE_LINE_HEIGHT_LOGICAL,
+                color: if is_wt {
+                    theme.border_focused
+                } else {
+                    theme.text_muted
+                },
+                bold: is_wt,
+            });
+        } else {
+            let dir_name = ws
+                .root_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(".");
+            let agent_status = ws
+                .panes
+                .iter()
+                .rev()
+                .find(|p| p.role == PaneRole::Agent)
+                .map(|p| match p.status {
+                    PaneStatus::Starting => "starting",
+                    PaneStatus::Idle => "idle",
+                    PaneStatus::Busy => "busy",
+                    PaneStatus::Exited { .. } => "exited",
+                })
+                .unwrap_or("none");
+            let subtitle = format!("{dir_name} · agent:{agent_status}");
+            let sub_max_w = (row_rect.right() - left_x - 8.0 * s).max(1.0);
+            self.push_chrome_line(ChromeLineSpec {
+                text: &subtitle,
+                left: left_x,
+                top: row_rect.y + 24.0 * s,
+                max_w: sub_max_w,
+                bounds: row_rect,
+                font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
+                color: theme.text_muted,
+                bold: false,
+            });
+        }
+
+        // Line 3: Bound ports summary + Docker container health
+        let docker_health = format_docker_health(&ws.containers);
+        let docker_reserve = if docker_health.is_some() {
+            72.0 * s
+        } else {
+            8.0 * s
+        };
+        let (ports_label, has_ports) = format_ports_summary(&ws.bound_ports);
+        let ports_left = row_rect.x + 10.0 * s;
+        let ports_max_w = (row_rect.right() - ports_left - docker_reserve).max(1.0);
         self.push_chrome_line(ChromeLineSpec {
-            text: &subtitle,
-            left: left_x,
-            top: row_rect.y + 27.0 * s,
-            max_w: sub_max_w,
-            bounds: row_rect,
-            font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
-            line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
-            color: theme.text_muted,
-            bold: false,
+            text: &ports_label,
+            left: ports_left,
+            top: row_rect.y + 42.0 * s,
+            max_w: ports_max_w,
+            bounds: Rect::new(ports_left, row_rect.y + 40.0 * s, ports_max_w, 16.0 * s),
+            font_size_logical: CHROME_BADGE_FONT_SIZE_LOGICAL,
+            line_height_logical: CHROME_BADGE_LINE_HEIGHT_LOGICAL,
+            color: if has_ports {
+                theme.status_ok
+            } else {
+                theme.text_muted
+            },
+            bold: has_ports,
         });
+
+        if let Some((docker_label, is_healthy)) = docker_health {
+            let docker_rect = sidebar_docker_pill_rect(row_rect, s);
+            self.push_chrome_line(ChromeLineSpec {
+                text: &docker_label,
+                left: docker_rect.x + 5.0 * s,
+                top: docker_rect.y + 1.5 * s,
+                max_w: (docker_rect.width - 8.0 * s).max(1.0),
+                bounds: docker_rect,
+                font_size_logical: CHROME_BADGE_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_BADGE_LINE_HEIGHT_LOGICAL,
+                color: if is_healthy {
+                    theme.status_ok
+                } else {
+                    theme.status_err
+                },
+                bold: true,
+            });
+        }
+
+        // Line 4: Up to 2 color-coded external status badges
+        let ext_statuses = visible_external_statuses(ws);
+        for (badge_idx, ext) in ext_statuses.iter().enumerate() {
+            let badge_rect =
+                sidebar_external_badge_rect(row_rect, badge_idx, ext_statuses.len(), s);
+            let badge_text = format!("{}: {}", ext.source, ext.label);
+            let color = external_status_color(ext.level, theme);
+            self.push_chrome_line(ChromeLineSpec {
+                text: &badge_text,
+                left: badge_rect.x + 5.0 * s,
+                top: badge_rect.y + 2.0 * s,
+                max_w: (badge_rect.width - 8.0 * s).max(1.0),
+                bounds: badge_rect,
+                font_size_logical: CHROME_BADGE_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_BADGE_LINE_HEIGHT_LOGICAL,
+                color,
+                bold: true,
+            });
+        }
     }
 
     fn build_pane_header_text(&mut self, pane_rect: &PaneRect, state: &AppState, theme: &Theme) {
@@ -772,6 +885,81 @@ impl TextRenderer {
                 bold: selected,
             });
         }
+    }
+
+    fn build_worktree_modal_items(
+        &mut self,
+        state: &AppState,
+        theme: &Theme,
+        screen_w: f32,
+        screen_h: f32,
+    ) {
+        let s = self.scale_factor;
+        let modal = worktree_modal_rect(screen_w, screen_h, s);
+        let input_rect = worktree_input_rect(modal, s);
+
+        self.push_modal_line(ChromeLineSpec {
+            text: "New Git Worktree",
+            left: modal.x + 14.0 * s,
+            top: modal.y + 10.0 * s,
+            max_w: (modal.width - 28.0 * s).max(1.0),
+            bounds: modal,
+            font_size_logical: MODAL_TITLE_FONT_SIZE_LOGICAL,
+            line_height_logical: MODAL_TITLE_LINE_HEIGHT_LOGICAL,
+            color: theme.text_primary,
+            bold: true,
+        });
+
+        let text_top = input_rect.y + (input_rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5;
+        if state.worktree_modal.branch_input.is_empty() {
+            self.push_modal_line(ChromeLineSpec {
+                text: "|",
+                left: input_rect.x + 10.0 * s,
+                top: text_top,
+                max_w: 12.0 * s,
+                bounds: input_rect,
+                font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                color: theme.border_focused,
+                bold: true,
+            });
+            self.push_modal_line(ChromeLineSpec {
+                text: "feat/...",
+                left: input_rect.x + 20.0 * s,
+                top: text_top,
+                max_w: (input_rect.width - 28.0 * s).max(1.0),
+                bounds: input_rect,
+                font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                color: theme.text_muted,
+                bold: false,
+            });
+        } else {
+            let typed = format!("{}|", state.worktree_modal.branch_input);
+            self.push_modal_line(ChromeLineSpec {
+                text: &typed,
+                left: input_rect.x + 10.0 * s,
+                top: text_top,
+                max_w: (input_rect.width - 20.0 * s).max(1.0),
+                bounds: input_rect,
+                font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                color: theme.text_primary,
+                bold: false,
+            });
+        }
+
+        self.push_modal_line(ChromeLineSpec {
+            text: "Enter to create • Esc to cancel",
+            left: modal.x + 14.0 * s,
+            top: input_rect.bottom() + 12.0 * s,
+            max_w: (modal.width - 28.0 * s).max(1.0),
+            bounds: modal,
+            font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+            line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
+            color: theme.text_muted,
+            bold: false,
+        });
     }
 }
 
