@@ -16,7 +16,7 @@ license = "MIT"
 [workspace.dependencies]
 arboard = "3"
 bitflags = { version = "2", features = ["serde"] }
-bollard = "0.18"
+bollard = "0.21"
 bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive", "env"] }
 glyphon = "0.8"
