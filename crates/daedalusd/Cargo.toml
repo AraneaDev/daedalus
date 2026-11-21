@@ -9,11 +9,15 @@ default = []
 ghostty-vt = ["daedalus-vt/ghostty-vt"]
 
 [dependencies]
+bollard.workspace = true
 clap.workspace = true
 daedalus-proto = { path = "../daedalus-proto" }
 daedalus-vt = { path = "../daedalus-vt" }
 nix.workspace = true
 portable-pty.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yml.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
