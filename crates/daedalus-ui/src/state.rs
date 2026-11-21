@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use clap::ValueEnum;
@@ -165,13 +166,19 @@ pub struct SearchState {
     pub current_index: usize,
 }
 
+static NEXT_SEARCH_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 impl SearchState {
+    fn next_generation() -> u64 {
+        NEXT_SEARCH_GENERATION.fetch_add(1, Ordering::Relaxed)
+    }
+
     pub fn new(pane_id: PaneId) -> Self {
         Self {
             pane_id,
             query: String::new(),
             case_sensitive: false,
-            generation: 0,
+            generation: Self::next_generation(),
             total_scrollback: 0,
             matches: Vec::new(),
             current_index: 0,
@@ -181,7 +188,7 @@ impl SearchState {
     pub fn push_text(&mut self, text: &str) {
         if !text.is_empty() {
             self.query.push_str(text);
-            self.generation = self.generation.wrapping_add(1);
+            self.generation = Self::next_generation();
             self.matches.clear();
             self.current_index = 0;
         }
@@ -190,7 +197,7 @@ impl SearchState {
     pub fn pop_char(&mut self) -> bool {
         let popped = self.query.pop().is_some();
         if popped {
-            self.generation = self.generation.wrapping_add(1);
+            self.generation = Self::next_generation();
             self.matches.clear();
             self.current_index = 0;
         }
@@ -1380,15 +1387,15 @@ mod tests {
         state.toggle_search(agent_id);
 
         let search = state.search.as_mut().unwrap();
-        assert_eq!(search.generation, 0);
+        let gen_init = search.generation;
         search.push_text("err");
         let gen_err = search.generation;
-        assert_eq!(gen_err, 1);
+        assert!(gen_err > gen_init);
 
         // User keeps typing before the response for "err" comes back
         search.push_text("or");
         let gen_error = search.generation;
-        assert_eq!(gen_error, 2);
+        assert!(gen_error > gen_err);
 
         let stale_match = vec![SearchMatch {
             abs_row: 3,
@@ -1420,5 +1427,43 @@ mod tests {
         assert!(state.search.as_ref().unwrap().query.is_empty());
         assert!(!state.apply_search_results(agent_id, gen_error, 20, fresh_match));
         assert!(state.search.as_ref().unwrap().matches.is_empty());
+    }
+
+    #[test]
+    fn closing_and_reopening_search_rejects_earlier_session_results() {
+        let mut state = AppState::new();
+        let (ws, agent_id, _, _) = make_workspace_with_three_panes();
+        state.set_workspaces(vec![ws]);
+
+        // Session 1: open search, type "a", then close
+        state.toggle_search(agent_id);
+        state.search.as_mut().unwrap().push_text("a");
+        let gen_session1 = state.search.as_ref().unwrap().generation;
+        state.close_search();
+
+        // Session 2: reopen search on same pane and type "z"
+        state.toggle_search(agent_id);
+        state.search.as_mut().unwrap().push_text("z");
+        let gen_session2 = state.search.as_ref().unwrap().generation;
+        assert_ne!(gen_session1, gen_session2);
+
+        let old_match = vec![SearchMatch {
+            abs_row: 1,
+            start_col: 0,
+            end_col: 1,
+        }];
+        let new_match = vec![SearchMatch {
+            abs_row: 4,
+            start_col: 2,
+            end_col: 3,
+        }];
+
+        // Late response from session 1 is rejected even though query length matches
+        assert!(!state.apply_search_results(agent_id, gen_session1, 10, old_match));
+        assert!(state.search.as_ref().unwrap().matches.is_empty());
+
+        // Current session 2 response applies cleanly
+        assert!(state.apply_search_results(agent_id, gen_session2, 10, new_match.clone()));
+        assert_eq!(state.search.as_ref().unwrap().matches, new_match);
     }
 }
