@@ -1,10 +1,14 @@
 pub mod builtin;
+#[cfg(feature = "ghostty-vt")]
+pub mod ghostty;
+pub mod semantic;
 
 use daedalus_proto::{CursorState, GridDelta, GridSnapshot, PaneId};
 use std::path::PathBuf;
 
 pub use builtin::BuiltinVt;
 pub use builtin::grid::MAX_TRACE_BYTES;
+pub use semantic::{CommandTracker, TrackedOutcome};
 
 #[derive(Debug, Clone, Copy)]
 pub struct VtConfig {
@@ -42,6 +46,17 @@ pub trait VtEngine: Send {
     fn cursor(&self) -> CursorState;
     fn current_abs_row(&self) -> u64;
     fn backend_name(&self) -> &'static str;
+}
+
+pub fn create_vt_engine(config: VtConfig) -> Box<dyn VtEngine> {
+    #[cfg(feature = "ghostty-vt")]
+    {
+        Box::new(ghostty::GhosttyVt::new(config))
+    }
+    #[cfg(not(feature = "ghostty-vt"))]
+    {
+        Box::new(BuiltinVt::new(config))
+    }
 }
 
 #[cfg(test)]
@@ -164,5 +179,31 @@ mod tests {
         assert_eq!(snap.rows, 3);
         assert_eq!(snap.rows_data.len(), 3);
         assert!(snap.rows_data.iter().all(|r| r.cells.len() == 10));
+    }
+
+    #[test]
+    fn command_tracker_captures_failure_trace_on_nonzero_exit_only() {
+        let pane_id = PaneId::new();
+        let mut tracker = CommandTracker::new(pane_id, create_vt_engine(VtConfig::default()));
+
+        let ok = tracker.feed(
+            b"\x1b]7;file://localhost/tmp/work\x07\x1b]133;A\x07$ \x1b]133;B\x07echo ok\x1b]133;C\x07\r\nok\r\n\x1b]133;D;0\x07",
+        );
+        assert_eq!(ok.command_finished, Some((Some("echo ok".to_string()), 0, false)));
+        assert!(tracker.last_failure_trace().is_none());
+
+        let fail = tracker.feed(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07cargo test\x1b]133;C\x07\r\n\x1b[31massertion failed\x1b[0m\r\n\x1b]133;D;101\x07",
+        );
+        assert_eq!(
+            fail.command_finished,
+            Some((Some("cargo test".to_string()), 101, true))
+        );
+        let trace = tracker.last_failure_trace().expect("expected failure trace");
+        assert_eq!(trace.exit_code, 101);
+        assert_eq!(trace.command.as_deref(), Some("cargo test"));
+        assert_eq!(trace.cwd, Some(PathBuf::from("/tmp/work")));
+        assert!(trace.output.contains("assertion failed"));
+        assert!(!trace.output.contains("\x1b[31m"));
     }
 }
