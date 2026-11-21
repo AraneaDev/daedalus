@@ -15,7 +15,7 @@ use crate::layout::{
     sidebar_workspace_rect,
 };
 use crate::state::{AgentPreset, AppState};
-use crate::theme::{self, Rgba, Theme};
+use crate::theme::{Rgba, Theme};
 
 use self::quads::{QuadInstance, QuadPipeline, rgba_to_wgpu_clear_color};
 use self::text::TextRenderer;
@@ -31,6 +31,9 @@ const WORKTREE_MODAL_LOGICAL_HEIGHT: f32 = 136.0;
 const WORKTREE_HEADER_LOGICAL_HEIGHT: f32 = 38.0;
 const WORKTREE_INPUT_LOGICAL_HEIGHT: f32 = 36.0;
 const WORKTREE_PAD_LOGICAL: f32 = 14.0;
+
+const SEARCH_BAR_LOGICAL_WIDTH: f32 = 340.0;
+const SEARCH_BAR_LOGICAL_HEIGHT: f32 = 30.0;
 
 fn sanitize_scale(scale_factor: f32) -> f32 {
     if scale_factor.is_finite() && scale_factor > 0.0 {
@@ -85,6 +88,19 @@ pub fn worktree_input_rect(modal: Rect, scale_factor: f32) -> Rect {
     let w = (modal.width - 2.0 * pad).max(0.0);
     let y = modal.y + (WORKTREE_HEADER_LOGICAL_HEIGHT + 10.0) * s;
     Rect::new(x, y, w, WORKTREE_INPUT_LOGICAL_HEIGHT * s)
+}
+
+/// Computes the top-right floating physical-pixel rectangle of the scrollback search bar
+/// inside `pane_rect`.
+pub fn search_bar_rect(pane_rect: &PaneRect, scale_factor: f32) -> Rect {
+    let s = sanitize_scale(scale_factor);
+    let margin = 8.0 * s;
+    let bar_w =
+        (SEARCH_BAR_LOGICAL_WIDTH * s).min((pane_rect.outer.width - 2.0 * margin).max(120.0));
+    let bar_h = SEARCH_BAR_LOGICAL_HEIGHT * s;
+    let x = (pane_rect.outer.right() - bar_w - margin).max(pane_rect.outer.x + 4.0 * s);
+    let y = pane_rect.header.bottom() + 6.0 * s;
+    Rect::new(x, y, bar_w, bar_h)
 }
 
 pub(super) fn workspace_branch_badge(ws: &WorkspaceInfo) -> Option<(String, bool)> {
@@ -483,6 +499,16 @@ pub fn collect_quads(
         let input_rect = worktree_input_rect(modal, s);
         quads.push(QuadInstance::new(input_rect, theme.bg_window));
         push_rect_border(&mut quads, input_rect, border_w, theme.border_focused);
+    } else if let Some(ref search) = state.search
+        && let Some(pane_rect) = layout
+            .panes
+            .iter()
+            .find(|p| state.pane_id_for_role(p.role) == Some(search.pane_id))
+            .or_else(|| layout.pane(state.focused_role))
+    {
+        let bar = search_bar_rect(pane_rect, s);
+        quads.push(QuadInstance::new(bar, theme.picker_bg));
+        push_rect_border(&mut quads, bar, border_w, theme.border_focused);
     }
 
     (quads, base_quad_count)
@@ -565,7 +591,7 @@ fn collect_pane_quads(
                     continue;
                 }
                 let span = (cell.width as usize).min((pane_rect.cols as usize) - col_idx);
-                let (_fg, bg_opt) = theme::resolve_cell_colors(cell.fg, cell.bg, cell.flags);
+                let (_fg, bg_opt) = theme.resolve_cell_colors(cell.fg, cell.bg, cell.flags);
 
                 match (active_run, bg_opt) {
                     (Some((start, end, prev_bg)), Some(bg)) if end == col_idx && prev_bg == bg => {
@@ -583,6 +609,47 @@ fn collect_pane_quads(
             }
             if let Some((start, end, bg)) = active_run {
                 emit_cell_run_quad(quads, vp, row_y, start, end, cell_w, cell_h, bg);
+            }
+        }
+
+        // Search match highlights (visible rows matching active search)
+        if let Some(ref search) = state.search
+            && search.pane_id == pane.summary.id
+            && !search.matches.is_empty()
+        {
+            let active_idx = search.current_index;
+            for (row_idx, grid_row) in visible_rows.iter().take(max_rows).enumerate() {
+                let row_y = vp.y + (row_idx as f32) * cell_h;
+                for (match_idx, m) in search.matches.iter().enumerate() {
+                    if m.abs_row != grid_row.abs_row {
+                        continue;
+                    }
+                    let start_col = (m.start_col as usize).min(pane_rect.cols as usize);
+                    let end_col = (m.end_col as usize).min(pane_rect.cols as usize);
+                    if end_col <= start_col {
+                        continue;
+                    }
+                    let is_active = match_idx == active_idx;
+                    let fill = if is_active {
+                        theme.status_busy.with_alpha(0.55)
+                    } else {
+                        theme.status_busy.with_alpha(0.24)
+                    };
+                    emit_cell_run_quad(quads, vp, row_y, start_col, end_col, cell_w, cell_h, fill);
+                    if is_active {
+                        let x = vp.x + (start_col as f32) * cell_w;
+                        let w = (((end_col - start_col) as f32) * cell_w)
+                            .min((vp.right() - x).max(0.0));
+                        if w > 0.0 {
+                            push_rect_border(
+                                quads,
+                                Rect::new(x, row_y, w, cell_h),
+                                border_w,
+                                theme.status_busy,
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -636,7 +703,7 @@ fn collect_pane_quads(
                 if !has_underline && !has_strike {
                     continue;
                 }
-                let (fg, _bg) = theme::resolve_cell_colors(cell.fg, cell.bg, cell.flags);
+                let (fg, _bg) = theme.resolve_cell_colors(cell.fg, cell.bg, cell.flags);
                 let span = (cell.width as usize).min((pane_rect.cols as usize) - col_idx);
                 let x = vp.x + (col_idx as f32) * cell_w;
                 let w = ((span as f32) * cell_w).min((vp.right() - x).max(0.0));
@@ -743,7 +810,12 @@ pub struct GpuRenderer {
 }
 
 impl GpuRenderer {
-    pub fn new(window: Arc<Window>) -> Result<Self, String> {
+    pub fn new(
+        window: Arc<Window>,
+        theme: Theme,
+        font_size: f32,
+        font_family: Option<&str>,
+    ) -> Result<Self, String> {
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
@@ -817,7 +889,16 @@ impl GpuRenderer {
         surface.configure(&device, &config);
 
         let quad_pipeline = QuadPipeline::new(&device, format);
-        let text_renderer = TextRenderer::new(&device, &queue, format, width, height, scale_factor);
+        let text_renderer = TextRenderer::new(
+            &device,
+            &queue,
+            format,
+            width,
+            height,
+            scale_factor,
+            font_size,
+            font_family,
+        );
 
         Ok(Self {
             surface,
@@ -825,10 +906,22 @@ impl GpuRenderer {
             queue,
             config,
             scale_factor,
-            theme: Theme::dark(),
+            theme,
             quad_pipeline,
             text_renderer,
         })
+    }
+
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
+    pub fn font_size(&self) -> f32 {
+        self.text_renderer.font_size()
+    }
+
+    pub fn set_font_size(&mut self, font_size: f32) -> bool {
+        self.text_renderer.set_font_size(font_size)
     }
 
     pub fn resize(&mut self, width: u32, height: u32, scale_factor: f32) {
@@ -927,8 +1020,12 @@ impl GpuRenderer {
             // Pass 2: base text (terminal rows + UI chrome)
             self.text_renderer.render_base(&mut render_pass);
 
-            // Overlay pass (same render pass): active modal above base text
-            if state.picker.open || state.worktree_modal.open {
+            // Overlay pass (same render pass): active modal or search bar above base text
+            if total_quad_count > base_quad_count
+                || state.picker.open
+                || state.worktree_modal.open
+                || state.search.is_some()
+            {
                 self.quad_pipeline
                     .render_range(&mut render_pass, base_quad_count..total_quad_count);
                 self.text_renderer.render_modal(&mut render_pass);
@@ -1280,5 +1377,64 @@ mod tests {
             format_docker_health(&ws.containers),
             Some(("1/2 up !".to_string(), false))
         );
+    }
+
+    #[test]
+    fn collect_quads_renders_search_match_highlights_and_overlay_bar() {
+        use crate::state::SearchState;
+        use daedalus_proto::SearchMatch;
+
+        let (mut state, layout) = make_state_with_agent_row();
+        let pane_id = state.pane_id_for_role(PaneRole::Agent).unwrap();
+        let theme = Theme::from_preset(crate::theme::ThemeName::SolarizedLight);
+
+        let mut search = SearchState::new(pane_id);
+        search.query = "ab".to_string();
+        search.set_results(
+            0,
+            vec![
+                SearchMatch {
+                    abs_row: 0,
+                    start_col: 0,
+                    end_col: 1,
+                },
+                SearchMatch {
+                    abs_row: 0,
+                    start_col: 2,
+                    end_col: 3,
+                },
+            ],
+        );
+        state.search = Some(search);
+
+        let (quads, base_count) =
+            collect_quads(&state, &layout, &theme, 1200.0, 800.0, 1.0, (8.0, 19.0));
+
+        // Base quads contain active + inactive match highlights plus pane background in light theme
+        let active_fill = theme.status_busy.with_alpha(0.55).to_array();
+        let inactive_fill = theme.status_busy.with_alpha(0.24).to_array();
+        assert!(
+            quads[..base_count as usize]
+                .iter()
+                .any(|q| q.color == active_fill)
+        );
+        assert!(
+            quads[..base_count as usize]
+                .iter()
+                .any(|q| q.color == inactive_fill)
+        );
+        assert!(
+            quads[..base_count as usize]
+                .iter()
+                .any(|q| q.color == theme.bg_pane.to_array())
+        );
+
+        // Overlay quads contain search bar backdrop after base_count
+        let bar = search_bar_rect(layout.pane(PaneRole::Agent).unwrap(), 1.0);
+        assert!(quads[base_count as usize..].iter().any(|q| {
+            q.color == theme.picker_bg.to_array()
+                && (q.rect[0] - bar.x).abs() < 1e-3
+                && (q.rect[1] - bar.y).abs() < 1e-3
+        }));
     }
 }

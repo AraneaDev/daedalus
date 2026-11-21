@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use daedalus_proto::{
     ClientMessage, GridRow, GridSnapshot, PaneId, PaneRole, PaneSummary, ProtoError, Request,
-    ResponsePayload, ServerEvent, ServerMessage, WorkspaceId, WorkspaceInfo, read_frame,
-    write_frame,
+    ResponsePayload, SearchMatch, ServerEvent, ServerMessage, WorkspaceId, WorkspaceInfo,
+    WorkspaceManifest, read_frame, write_frame,
 };
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -82,6 +82,16 @@ pub enum UiCommand {
         offset_from_bottom: usize,
         count: usize,
     },
+    SearchPane {
+        pane_id: PaneId,
+        query: String,
+        case_sensitive: bool,
+    },
+    EnsureWorkspacePanes {
+        workspace_id: WorkspaceId,
+        default_agent: AgentPreset,
+        manifest: Option<WorkspaceManifest>,
+    },
     ForwardRunnerFailureToAgent {
         runner_pane_id: PaneId,
         agent_pane_id: PaneId,
@@ -97,6 +107,9 @@ pub enum UiEvent {
     Disconnected,
     WorkspacesLoaded(Vec<WorkspaceInfo>),
     WorkspaceCreated(WorkspaceInfo),
+    WorkspacePanesEnsured {
+        workspace_id: WorkspaceId,
+    },
     PaneSpawned {
         summary: PaneSummary,
         agent_preset: Option<AgentPreset>,
@@ -109,6 +122,11 @@ pub enum UiEvent {
         pane_id: PaneId,
         total_scrollback: usize,
         rows: Vec<GridRow>,
+    },
+    SearchResults {
+        pane_id: PaneId,
+        total_scrollback: usize,
+        matches: Vec<SearchMatch>,
     },
     ServerEvent(ServerEvent),
     Toast {
@@ -664,6 +682,51 @@ async fn handle_command(
                 });
             }
         }
+        UiCommand::SearchPane {
+            pane_id,
+            query,
+            case_sensitive,
+        } => {
+            match conn
+                .call(ClientMessage::SearchPane {
+                    pane_id,
+                    query,
+                    case_sensitive,
+                })
+                .await?
+            {
+                ResponsePayload::SearchMatches {
+                    pane_id,
+                    total_scrollback,
+                    matches,
+                } => {
+                    sink.emit(UiEvent::SearchResults {
+                        pane_id,
+                        total_scrollback,
+                        matches,
+                    });
+                }
+                other => {
+                    warn!(response = ?other, "unexpected response to SearchPane");
+                }
+            }
+        }
+        UiCommand::EnsureWorkspacePanes {
+            workspace_id,
+            default_agent,
+            manifest,
+        } => {
+            ensure_workspace_panes(
+                conn,
+                sink,
+                workspace_id,
+                default_agent,
+                manifest,
+                DEFAULT_PANE_COLS,
+                DEFAULT_PANE_ROWS,
+            )
+            .await?;
+        }
         UiCommand::ForwardRunnerFailureToAgent {
             runner_pane_id,
             agent_pane_id,
@@ -785,35 +848,133 @@ async fn populate_workspace_panes(
     rows: u16,
 ) -> Result<(), RpcError> {
     let ws_id = ws.id;
+    let manifest = ws.manifest.clone();
     sink.emit(UiEvent::WorkspaceCreated(ws));
 
-    let effective_agent = resolve_agent_preset(requested_agent, sink);
+    spawn_workspace_panes(
+        conn,
+        sink,
+        ws_id,
+        requested_agent,
+        manifest.as_ref(),
+        cols,
+        rows,
+    )
+    .await
+}
 
-    let pane_specs = [
-        (
-            PaneRole::Agent,
-            effective_agent.command(),
-            Some(effective_agent),
-        ),
-        (PaneRole::Service, None, None),
-        (PaneRole::Runner, None, None),
-    ];
+async fn ensure_workspace_panes(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+    workspace_id: WorkspaceId,
+    default_agent: AgentPreset,
+    manifest: Option<WorkspaceManifest>,
+    cols: u16,
+    rows: u16,
+) -> Result<(), RpcError> {
+    let result = async {
+        let workspaces = match conn.call(ClientMessage::ListWorkspaces).await? {
+            ResponsePayload::Workspaces(ws) => ws,
+            _ => Vec::new(),
+        };
+        let Some(ws) = workspaces.into_iter().find(|w| w.id == workspace_id) else {
+            return Ok(());
+        };
+        if !ws.panes.is_empty() {
+            for pane in &ws.panes {
+                sink.emit(UiEvent::PaneSpawned {
+                    summary: pane.clone(),
+                    agent_preset: None,
+                });
+                if let ResponsePayload::Snapshot(snapshot) = conn
+                    .call(ClientMessage::GetSnapshot { pane_id: pane.id })
+                    .await?
+                {
+                    sink.emit(UiEvent::Snapshot(snapshot));
+                }
+            }
+            return Ok(());
+        }
+        let effective_manifest = ws.manifest.or(manifest);
+        spawn_workspace_panes(
+            conn,
+            sink,
+            workspace_id,
+            default_agent,
+            effective_manifest.as_ref(),
+            cols,
+            rows,
+        )
+        .await
+    }
+    .await;
+
+    sink.emit(UiEvent::WorkspacePanesEnsured { workspace_id });
+    result
+}
+
+async fn spawn_workspace_panes(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+    ws_id: WorkspaceId,
+    requested_agent: AgentPreset,
+    manifest: Option<&WorkspaceManifest>,
+    cols: u16,
+    rows: u16,
+) -> Result<(), RpcError> {
+    let (pane_specs, warnings) = resolve_pane_launch_specs(requested_agent, manifest, |bin| {
+        find_binary_on_path(bin).is_some()
+    });
+    for message in warnings {
+        sink.emit(UiEvent::Toast {
+            message,
+            is_error: true,
+        });
+    }
 
     for (role, command, agent_preset) in pane_specs {
-        let summary = match conn
+        let spawn_result = conn
             .call(ClientMessage::SpawnPane {
                 workspace_id: ws_id,
                 role,
-                command,
+                command: command.clone(),
                 shell: None,
                 cols,
                 rows,
                 env: HashMap::new(),
             })
-            .await?
-        {
-            ResponsePayload::PaneSpawned(summary) => summary,
-            other => {
+            .await;
+
+        let summary = match spawn_result {
+            Ok(ResponsePayload::PaneSpawned(summary)) => summary,
+            Err(RpcError::Proto(ProtoError::SpawnFailed(err))) if command.is_some() => {
+                sink.emit(UiEvent::Toast {
+                    message: format!(
+                        "Failed to start {role} command ({err}); falling back to shell"
+                    ),
+                    is_error: true,
+                });
+                match conn
+                    .call(ClientMessage::SpawnPane {
+                        workspace_id: ws_id,
+                        role,
+                        command: None,
+                        shell: None,
+                        cols,
+                        rows,
+                        env: HashMap::new(),
+                    })
+                    .await?
+                {
+                    ResponsePayload::PaneSpawned(summary) => summary,
+                    other => {
+                        warn!(role = ?role, response = ?other, "unexpected response to fallback SpawnPane");
+                        continue;
+                    }
+                }
+            }
+            Err(err) => return Err(err),
+            Ok(other) => {
                 warn!(role = ?role, response = ?other, "unexpected response to SpawnPane");
                 continue;
             }
@@ -835,18 +996,68 @@ async fn populate_workspace_panes(
     Ok(())
 }
 
-fn resolve_agent_preset(requested: AgentPreset, sink: &Arc<dyn UiEventSink>) -> AgentPreset {
-    if let Some(command) = requested.command()
-        && let Some(binary) = command.first()
-        && find_binary_on_path(binary).is_none()
+type PaneLaunchSpec = (PaneRole, Option<Vec<String>>, Option<AgentPreset>);
+
+fn resolve_pane_launch_specs(
+    requested_agent: AgentPreset,
+    manifest: Option<&WorkspaceManifest>,
+    has_binary: impl Fn(&str) -> bool,
+) -> ([PaneLaunchSpec; 3], Vec<String>) {
+    let mut warnings = Vec::new();
+    let base_preset = manifest
+        .and_then(|m| m.agent_preset.as_deref())
+        .and_then(AgentPreset::from_cli_name)
+        .unwrap_or(requested_agent);
+
+    let (agent_cmd, effective_agent) = if let Some(cmd) = manifest
+        .and_then(|m| m.agent_command.as_ref())
+        .filter(|c| !c.is_empty())
     {
-        sink.emit(UiEvent::Toast {
-            message: format!("Agent CLI '{binary}' not found on $PATH; falling back to shell"),
-            is_error: true,
-        });
-        return AgentPreset::Shell;
-    }
-    requested
+        let inferred_preset = manifest
+            .and_then(|m| m.agent_preset.as_deref())
+            .and_then(AgentPreset::from_cli_name)
+            .or_else(|| cmd.first().and_then(|b| AgentPreset::from_cli_name(b)))
+            .unwrap_or(base_preset);
+        if let Some(bin) = cmd.first()
+            && !has_binary(bin)
+        {
+            warnings.push(format!(
+                "Agent command '{bin}' not found on $PATH; falling back to shell"
+            ));
+            (None, AgentPreset::Shell)
+        } else {
+            (Some(cmd.clone()), inferred_preset)
+        }
+    } else if let Some(cmd) = base_preset.command() {
+        if let Some(bin) = cmd.first()
+            && !has_binary(bin)
+        {
+            warnings.push(format!(
+                "Agent CLI '{bin}' not found on $PATH; falling back to shell"
+            ));
+            (None, AgentPreset::Shell)
+        } else {
+            (Some(cmd), base_preset)
+        }
+    } else {
+        (None, base_preset)
+    };
+
+    let service_cmd = manifest
+        .and_then(|m| m.service_command.clone())
+        .filter(|c| !c.is_empty());
+    let runner_cmd = manifest
+        .and_then(|m| m.runner_command.clone())
+        .filter(|c| !c.is_empty());
+
+    (
+        [
+            (PaneRole::Agent, agent_cmd, Some(effective_agent)),
+            (PaneRole::Service, service_cmd, None),
+            (PaneRole::Runner, runner_cmd, None),
+        ],
+        warnings,
+    )
 }
 
 fn workspace_name_from_dir(dir: &Path) -> String {
@@ -1016,5 +1227,72 @@ mod tests {
         peer_task.await.unwrap();
         assert!(conn.pending.lock().unwrap().is_empty());
         conn.close();
+    }
+
+    #[test]
+    fn resolve_pane_launch_specs_honors_manifest_commands_and_falls_back_cleanly() {
+        let manifest = WorkspaceManifest {
+            agent_preset: Some("claude".to_string()),
+            agent_command: Some(vec!["claude".to_string(), "--fast".to_string()]),
+            service_command: Some(vec![
+                "docker".to_string(),
+                "compose".to_string(),
+                "up".to_string(),
+            ]),
+            runner_command: Some(vec!["cargo".to_string(), "test".to_string()]),
+        };
+
+        let (specs, warnings) =
+            resolve_pane_launch_specs(AgentPreset::Shell, Some(&manifest), |_| true);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            specs[0],
+            (
+                PaneRole::Agent,
+                Some(vec!["claude".to_string(), "--fast".to_string()]),
+                Some(AgentPreset::Claude),
+            )
+        );
+        assert_eq!(
+            specs[1],
+            (
+                PaneRole::Service,
+                Some(vec![
+                    "docker".to_string(),
+                    "compose".to_string(),
+                    "up".to_string()
+                ]),
+                None,
+            )
+        );
+        assert_eq!(
+            specs[2],
+            (
+                PaneRole::Runner,
+                Some(vec!["cargo".to_string(), "test".to_string()]),
+                None,
+            )
+        );
+
+        // Missing binary falls back to Shell with warning
+        let (specs_fallback, warnings) =
+            resolve_pane_launch_specs(AgentPreset::Shell, Some(&manifest), |bin| bin != "claude");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            specs_fallback[0],
+            (PaneRole::Agent, None, Some(AgentPreset::Shell))
+        );
+        assert_eq!(
+            specs_fallback[1],
+            (
+                PaneRole::Service,
+                Some(vec![
+                    "docker".to_string(),
+                    "compose".to_string(),
+                    "up".to_string()
+                ]),
+                None,
+            )
+        );
     }
 }

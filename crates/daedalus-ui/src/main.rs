@@ -5,18 +5,21 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use daedalus_proto::{PaneId, PaneRole, default_socket_path, wrap_bracketed_paste};
 use daedalus_ui::bridge::{BridgeConfig, DaemonBridge, UiCommand, UiEvent, UiEventSink};
-use daedalus_ui::input::{UiAction, translate_key};
+use daedalus_ui::config::UiConfig;
+use daedalus_ui::input::{UiAction, filter_modal_text, translate_key};
 use daedalus_ui::layout::{HitTarget, LayoutInput, WorkspaceLayout, compute_layout, hit_test};
+use daedalus_ui::links::{detect_link_in_row, open_link};
 use daedalus_ui::renderer::{
     GpuRenderer, RenderError, picker_item_rect, picker_modal_rect, worktree_modal_rect,
 };
 use daedalus_ui::selection::{CellPos, Selection, extract_selected_text, select_word_at};
 use daedalus_ui::state::{AgentPreset, AppState};
+use daedalus_ui::theme::Theme;
 use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
@@ -41,9 +44,13 @@ struct Args {
     #[arg(long)]
     dir: Option<PathBuf>,
 
-    /// Default Agent pane preset.
-    #[arg(long, value_enum, default_value_t = AgentPreset::Shell)]
-    agent: AgentPreset,
+    /// Default Agent pane preset (overrides `config.toml` `default_agent` when set).
+    #[arg(long, value_enum)]
+    agent: Option<AgentPreset>,
+
+    /// Optional path to UI `config.toml` (defaults to `$DAEDALUS_CONFIG` or `~/.config/daedalus/config.toml`).
+    #[arg(long, env = "DAEDALUS_CONFIG")]
+    config: Option<PathBuf>,
 
     /// Disable automatic `daedalusd` launch if the daemon is not running.
     #[arg(long)]
@@ -60,6 +67,7 @@ impl UiEventSink for EventLoopProxySink {
 
 struct DaedalusApp {
     config: BridgeConfig,
+    ui_config: UiConfig,
     proxy: EventLoopProxy<UiEvent>,
     window: Option<Arc<Window>>,
     renderer: Option<GpuRenderer>,
@@ -74,9 +82,10 @@ struct DaedalusApp {
 }
 
 impl DaedalusApp {
-    fn new(config: BridgeConfig, proxy: EventLoopProxy<UiEvent>) -> Self {
+    fn new(config: BridgeConfig, ui_config: UiConfig, proxy: EventLoopProxy<UiEvent>) -> Self {
         Self {
             config,
+            ui_config,
             proxy,
             window: None,
             renderer: None,
@@ -380,6 +389,135 @@ impl DaedalusApp {
         self.request_redraw();
     }
 
+    fn ensure_active_workspace_panes(&mut self) {
+        let Some(ws) = self.state.active_dormant_workspace() else {
+            return;
+        };
+        let workspace_id = ws.id;
+        let manifest = ws.manifest.clone();
+        if self.state.mark_workspace_spawning(workspace_id) {
+            self.send_command(UiCommand::EnsureWorkspacePanes {
+                workspace_id,
+                default_agent: self.config.default_agent,
+                manifest,
+            });
+        }
+    }
+
+    fn run_pane_search(&self) {
+        let Some(ref search) = self.state.search else {
+            return;
+        };
+        if search.query.is_empty() {
+            return;
+        }
+        self.send_command(UiCommand::SearchPane {
+            pane_id: search.pane_id,
+            query: search.query.clone(),
+            case_sensitive: search.case_sensitive,
+        });
+    }
+
+    fn scroll_to_active_search_match(&mut self) {
+        let Some(ref search) = self.state.search else {
+            return;
+        };
+        let Some(active) = search.active_match() else {
+            return;
+        };
+        let pane_id = search.pane_id;
+        let request = {
+            let Some(pane) = self.state.panes.get_mut(&pane_id) else {
+                return;
+            };
+            pane.scrollback_len = search.total_scrollback;
+            if pane
+                .visible_rows()
+                .iter()
+                .any(|r| r.abs_row == active.abs_row)
+            {
+                None
+            } else {
+                let viewport_rows = (pane.rows as usize).max(1);
+                let live_start = pane
+                    .viewport_rows
+                    .last()
+                    .and_then(|r| (r.abs_row + 1).checked_sub(viewport_rows as u64))
+                    .max(Some(search.total_scrollback as u64));
+                let target_offset = search
+                    .target_scroll_offset_with_live_start(viewport_rows, live_start)
+                    .unwrap_or(0);
+                if target_offset == 0 {
+                    pane.reset_scroll();
+                    None
+                } else {
+                    pane.scroll_offset = target_offset;
+                    Some((target_offset, viewport_rows))
+                }
+            }
+        };
+
+        if let Some((offset_from_bottom, count)) = request {
+            self.send_command(UiCommand::RequestScrollback {
+                pane_id,
+                offset_from_bottom,
+                count,
+            });
+        }
+    }
+
+    fn apply_font_size_delta(&mut self, delta: f32) {
+        let current = self
+            .renderer
+            .as_ref()
+            .map_or(self.ui_config.font_size, GpuRenderer::font_size);
+        self.set_font_size(current + delta);
+    }
+
+    fn set_font_size(&mut self, size: f32) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let prev = renderer.font_size();
+        let metrics_changed = renderer.set_font_size(size);
+        let next = renderer.font_size();
+        if (next - prev).abs() > 1e-4 {
+            for pane in self.state.panes.values_mut() {
+                pane.mark_all_visible_dirty();
+            }
+            if metrics_changed {
+                self.schedule_resize_flush();
+            }
+            self.request_redraw();
+        }
+    }
+
+    fn open_clicked_link(&mut self, role: PaneRole, col: u16, row: u16) {
+        let link = {
+            let Some(pane) = self.state.pane_for_role(role) else {
+                return;
+            };
+            let Some(grid_row) = pane.visible_rows().get(row as usize) else {
+                return;
+            };
+            let cwd = pane.summary.cwd.as_deref();
+            let root_dir = self
+                .state
+                .active_workspace()
+                .map(|ws| ws.root_dir.as_path());
+            detect_link_in_row(grid_row, col as usize, cwd, root_dir)
+        };
+
+        let Some(link) = link else {
+            return;
+        };
+
+        if let Err(err) = open_link(&link, self.ui_config.editor.as_deref()) {
+            warn!(error = %err, link = ?link, "failed to open clicked link");
+            self.show_toast(format!("Failed to open link: {err}"), true);
+        }
+    }
+
     fn handle_ui_action(&mut self, action: UiAction) {
         match action {
             UiAction::FocusRole(role) => {
@@ -418,10 +556,19 @@ impl DaedalusApp {
                 self.state.toggle_worktree_modal();
                 self.request_redraw();
             }
+            UiAction::ToggleSearch => {
+                if let Some(pane_id) = self.state.focused_pane_id() {
+                    self.state.toggle_search(pane_id);
+                    self.request_redraw();
+                }
+            }
             UiAction::NewWorkspace => self.create_new_workspace(),
             UiAction::CopySelection => self.copy_focused_selection(),
             UiAction::PasteClipboard => self.paste_clipboard_to_focused(),
             UiAction::ForwardFailureToAgent => self.forward_runner_failure_to_agent(),
+            UiAction::FontZoomIn => self.apply_font_size_delta(1.0),
+            UiAction::FontZoomOut => self.apply_font_size_delta(-1.0),
+            UiAction::FontZoomReset => self.set_font_size(self.ui_config.font_size),
             UiAction::ScrollPageUp => {
                 let page = self
                     .state
@@ -468,8 +615,8 @@ impl DaedalusApp {
                 self.state.picker.close();
                 self.request_redraw();
             }
-            UiAction::WorktreeModalChar(ch) => {
-                self.state.worktree_modal.push_char(ch);
+            UiAction::WorktreeModalText(text) => {
+                self.state.worktree_modal.push_text(&text);
                 self.request_redraw();
             }
             UiAction::WorktreeModalBackspace => {
@@ -479,6 +626,39 @@ impl DaedalusApp {
             UiAction::WorktreeModalConfirm => self.submit_worktree_modal(),
             UiAction::WorktreeModalCancel => {
                 self.state.worktree_modal.close();
+                self.request_redraw();
+            }
+            UiAction::SearchText(text) => {
+                if let Some(ref mut search) = self.state.search {
+                    search.push_text(&text);
+                    self.run_pane_search();
+                    self.request_redraw();
+                }
+            }
+            UiAction::SearchBackspace => {
+                if let Some(ref mut search) = self.state.search
+                    && search.pop_char()
+                {
+                    self.run_pane_search();
+                    self.request_redraw();
+                }
+            }
+            UiAction::SearchNext => {
+                if let Some(ref mut search) = self.state.search {
+                    search.step_next();
+                }
+                self.scroll_to_active_search_match();
+                self.request_redraw();
+            }
+            UiAction::SearchPrev => {
+                if let Some(ref mut search) = self.state.search {
+                    search.step_prev();
+                }
+                self.scroll_to_active_search_match();
+                self.request_redraw();
+            }
+            UiAction::SearchCancel => {
+                self.state.close_search();
                 self.request_redraw();
             }
             UiAction::Ignore => {}
@@ -543,6 +723,8 @@ impl DaedalusApp {
                     let ws_id = ws.id;
                     if self.state.active_workspace_id != Some(ws_id) {
                         self.state.active_workspace_id = Some(ws_id);
+                        self.state.close_search();
+                        self.ensure_active_workspace_panes();
                         self.schedule_resize_flush();
                         self.request_redraw();
                     }
@@ -563,6 +745,14 @@ impl DaedalusApp {
             }
             HitTarget::PaneViewport { role, col, row } => {
                 self.state.focused_role = role;
+                if self.modifiers.control_key()
+                    && !self.modifiers.alt_key()
+                    && !self.modifiers.super_key()
+                {
+                    self.open_clicked_link(role, col, row);
+                    self.request_redraw();
+                    return;
+                }
                 let now = Instant::now();
                 let is_double_click =
                     self.last_click
@@ -724,7 +914,13 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
             }
         };
 
-        let renderer = match GpuRenderer::new(Arc::clone(&window)) {
+        let theme = Theme::from_preset(self.ui_config.theme);
+        let renderer = match GpuRenderer::new(
+            Arc::clone(&window),
+            theme,
+            self.ui_config.font_size,
+            self.ui_config.font_family.as_deref(),
+        ) {
             Ok(r) => r,
             Err(err) => {
                 error!(error = %err, "failed to initialize GPU renderer");
@@ -751,17 +947,23 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
             UiEvent::Disconnected => {
                 self.state.connected = false;
                 self.state.last_sent_sizes.clear();
+                self.state.spawning_workspaces.clear();
                 self.schedule_resize_flush();
             }
             UiEvent::WorkspacesLoaded(workspaces) => {
                 self.state.set_workspaces(workspaces);
+                self.ensure_active_workspace_panes();
                 self.schedule_resize_flush();
             }
             UiEvent::WorkspaceCreated(ws) => {
                 let ws_id = ws.id;
                 self.state.upsert_workspace(ws);
                 self.state.active_workspace_id = Some(ws_id);
+                self.state.close_search();
                 self.schedule_resize_flush();
+            }
+            UiEvent::WorkspacePanesEnsured { workspace_id } => {
+                self.state.clear_workspace_spawning(workspace_id);
             }
             UiEvent::PaneSpawned {
                 summary,
@@ -773,6 +975,14 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
             UiEvent::PaneClosed { pane_id } => {
                 self.state.panes.remove(&pane_id);
                 self.state.last_sent_sizes.remove(&pane_id);
+                if self
+                    .state
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| search.pane_id == pane_id)
+                {
+                    self.state.close_search();
+                }
                 for ws in &mut self.state.workspaces {
                     ws.panes.retain(|p| p.id != pane_id);
                 }
@@ -789,6 +999,19 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
             } => {
                 if let Some(pane) = self.state.panes.get_mut(&pane_id) {
                     pane.apply_scrollback(total_scrollback, rows);
+                }
+            }
+            UiEvent::SearchResults {
+                pane_id,
+                total_scrollback,
+                matches,
+            } => {
+                if let Some(ref mut search) = self.state.search
+                    && search.pane_id == pane_id
+                    && !search.query.is_empty()
+                {
+                    search.set_results(total_scrollback, matches);
+                    self.scroll_to_active_search_match();
                 }
             }
             UiEvent::ServerEvent(server_event) => {
@@ -863,8 +1086,24 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
                         self.modifiers,
                         self.state.picker.open,
                         self.state.worktree_modal.open,
+                        self.state.search.is_some(),
                     );
                     self.handle_ui_action(action);
+                }
+            }
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                if self.state.picker.open {
+                    // Picker swallows IME text.
+                } else if self.state.worktree_modal.open {
+                    if let Some(cleaned) = filter_modal_text(&text, false) {
+                        self.handle_ui_action(UiAction::WorktreeModalText(cleaned));
+                    }
+                } else if self.state.search.is_some() {
+                    if let Some(cleaned) = filter_modal_text(&text, true) {
+                        self.handle_ui_action(UiAction::SearchText(cleaned));
+                    }
+                } else if !text.is_empty() && !text.chars().all(char::is_control) {
+                    self.handle_ui_action(UiAction::SendBytes(text.into_bytes()));
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -963,6 +1202,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    let ui_config = UiConfig::load(args.config.as_deref());
+    let default_agent = args.agent.unwrap_or(ui_config.default_agent);
     let socket_path = args.socket.unwrap_or_else(default_socket_path);
     let initial_dir = args
         .dir
@@ -971,13 +1212,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = BridgeConfig {
         socket_path,
         initial_dir,
-        default_agent: args.agent,
+        default_agent,
         auto_spawn_daemon: !args.no_auto_spawn,
     };
 
     let event_loop: EventLoop<UiEvent> = EventLoop::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
-    let mut app = DaedalusApp::new(config, proxy);
+    let mut app = DaedalusApp::new(config, ui_config, proxy);
     event_loop.run_app(&mut app)?;
     Ok(())
 }

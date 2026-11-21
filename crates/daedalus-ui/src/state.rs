@@ -4,7 +4,7 @@ use std::time::Instant;
 use clap::ValueEnum;
 use daedalus_proto::{
     CursorState, ExternalStatus, FailureTrace, GridDelta, GridRow, GridSnapshot, PaneId, PaneRole,
-    PaneStatus, PaneSummary, ServerEvent, WorkspaceId, WorkspaceInfo,
+    PaneStatus, PaneSummary, SearchMatch, ServerEvent, WorkspaceId, WorkspaceInfo,
 };
 
 use crate::selection::Selection;
@@ -144,8 +144,120 @@ impl WorktreeModalState {
         self.branch_input.push(ch);
     }
 
+    pub fn push_text(&mut self, text: &str) {
+        self.branch_input.push_str(text);
+    }
+
     pub fn pop_char(&mut self) {
         self.branch_input.pop();
+    }
+}
+
+/// State of the per-pane scrollback search overlay (`Ctrl+Shift+F`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchState {
+    pub pane_id: PaneId,
+    pub query: String,
+    pub case_sensitive: bool,
+    pub total_scrollback: usize,
+    pub matches: Vec<SearchMatch>,
+    pub current_index: usize,
+}
+
+impl SearchState {
+    pub fn new(pane_id: PaneId) -> Self {
+        Self {
+            pane_id,
+            query: String::new(),
+            case_sensitive: false,
+            total_scrollback: 0,
+            matches: Vec::new(),
+            current_index: 0,
+        }
+    }
+
+    pub fn push_text(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.query.push_str(text);
+            self.matches.clear();
+            self.current_index = 0;
+        }
+    }
+
+    pub fn pop_char(&mut self) -> bool {
+        let popped = self.query.pop().is_some();
+        if popped {
+            self.matches.clear();
+            self.current_index = 0;
+        }
+        popped
+    }
+
+    pub fn set_results(&mut self, total_scrollback: usize, matches: Vec<SearchMatch>) {
+        self.total_scrollback = total_scrollback;
+        self.matches = matches;
+        self.current_index = 0;
+    }
+
+    pub fn active_match(&self) -> Option<SearchMatch> {
+        self.matches.get(self.current_index).copied()
+    }
+
+    pub fn step_next(&mut self) -> Option<SearchMatch> {
+        if self.matches.is_empty() {
+            self.current_index = 0;
+            return None;
+        }
+        self.current_index = (self.current_index + 1) % self.matches.len();
+        self.active_match()
+    }
+
+    pub fn step_prev(&mut self) -> Option<SearchMatch> {
+        if self.matches.is_empty() {
+            self.current_index = 0;
+            return None;
+        }
+        self.current_index = if self.current_index == 0 {
+            self.matches.len() - 1
+        } else {
+            self.current_index - 1
+        };
+        self.active_match()
+    }
+
+    pub fn display_counter(&self) -> (usize, usize) {
+        if self.matches.is_empty() {
+            (0, 0)
+        } else {
+            (self.current_index + 1, self.matches.len())
+        }
+    }
+
+    /// Computes the desired `scrollback_offset` to center/reveal the active [`SearchMatch`]
+    /// in a viewport of `viewport_rows` rows, where `abs_row` spans
+    /// `0..total_scrollback + viewport_rows` and the live viewport starts at `total_scrollback`.
+    pub fn target_scroll_offset(&self, viewport_rows: usize) -> Option<usize> {
+        self.target_scroll_offset_with_live_start(viewport_rows, None)
+    }
+
+    /// Computes the desired `scrollback_offset` using an optional explicit `live_start_abs_row`
+    /// (supporting panes where oldest scrollback rows have been evicted past the history cap).
+    pub fn target_scroll_offset_with_live_start(
+        &self,
+        viewport_rows: usize,
+        live_start_abs_row: Option<u64>,
+    ) -> Option<usize> {
+        let active = self.active_match()?;
+        let vp = viewport_rows.max(1);
+        let live_start = live_start_abs_row.unwrap_or(self.total_scrollback as u64);
+        if active.abs_row >= live_start {
+            return Some(0);
+        }
+        let rows_above_live = (live_start - active.abs_row) as usize;
+        let offset = rows_above_live
+            .saturating_add(vp / 2)
+            .min(self.total_scrollback);
+        Some(offset)
     }
 }
 
@@ -300,7 +412,7 @@ impl PaneViewState {
         std::mem::take(&mut self.dirty_row_indices)
     }
 
-    fn mark_all_visible_dirty(&mut self) {
+    pub fn mark_all_visible_dirty(&mut self) {
         let len = self.visible_rows().len();
         self.dirty_row_indices = (0..len).collect();
     }
@@ -318,6 +430,8 @@ pub struct AppState {
     pub zoomed: bool,
     pub picker: PickerState,
     pub worktree_modal: WorktreeModalState,
+    pub search: Option<SearchState>,
+    pub spawning_workspaces: HashSet<WorkspaceId>,
     pub toast: Option<(String, bool, Instant)>,
     pub last_sent_sizes: HashMap<PaneId, (u16, u16)>,
 }
@@ -340,9 +454,47 @@ impl AppState {
             zoomed: false,
             picker: PickerState::default(),
             worktree_modal: WorktreeModalState::default(),
+            search: None,
+            spawning_workspaces: HashSet::new(),
             toast: None,
             last_sent_sizes: HashMap::new(),
         }
+    }
+
+    /// Toggles the scrollback search overlay for `pane_id`, closing modals if opening.
+    pub fn toggle_search(&mut self, pane_id: PaneId) {
+        if self
+            .search
+            .as_ref()
+            .is_some_and(|search| search.pane_id == pane_id)
+        {
+            self.search = None;
+        } else {
+            self.picker.close();
+            self.worktree_modal.close();
+            self.search = Some(SearchState::new(pane_id));
+        }
+    }
+
+    pub fn close_search(&mut self) {
+        self.search = None;
+    }
+
+    /// Returns the active workspace if it is dormant (`panes.is_empty()`) and not already
+    /// spawning its default 3 panes.
+    pub fn active_dormant_workspace(&self) -> Option<&WorkspaceInfo> {
+        self.active_workspace()
+            .filter(|ws| ws.panes.is_empty() && !self.spawning_workspaces.contains(&ws.id))
+    }
+
+    /// Marks `workspace_id` as having an in-flight `EnsureWorkspacePanes` request.
+    /// Returns `true` if it was not already marked.
+    pub fn mark_workspace_spawning(&mut self, workspace_id: WorkspaceId) -> bool {
+        self.spawning_workspaces.insert(workspace_id)
+    }
+
+    pub fn clear_workspace_spawning(&mut self, workspace_id: WorkspaceId) {
+        self.spawning_workspaces.remove(&workspace_id);
     }
 
     /// Opens the Agent preset picker modal while ensuring the worktree modal is closed.
@@ -422,8 +574,17 @@ impl AppState {
         }
         self.panes.retain(|id, _| live_panes.contains(id));
         self.last_sent_sizes.retain(|id, _| live_panes.contains(id));
+        if self
+            .search
+            .as_ref()
+            .is_some_and(|search| !live_panes.contains(&search.pane_id))
+        {
+            self.search = None;
+        }
 
         self.workspaces = workspaces;
+        self.spawning_workspaces
+            .retain(|ws_id| self.workspaces.iter().any(|ws| ws.id == *ws_id));
         let active_still_exists = self
             .active_workspace_id
             .is_some_and(|id| self.workspaces.iter().any(|ws| ws.id == id));
@@ -1070,5 +1231,107 @@ mod tests {
         assert!(state.worktree_modal.open);
         state.toggle_worktree_modal();
         assert!(!state.worktree_modal.open);
+    }
+
+    #[test]
+    fn search_state_steps_with_wrap_and_computes_scrollback_offset() {
+        let pane_id = PaneId::new();
+        let mut search = SearchState::new(pane_id);
+        assert_eq!(search.display_counter(), (0, 0));
+        assert_eq!(search.step_next(), None);
+        assert_eq!(search.step_prev(), None);
+        assert_eq!(search.target_scroll_offset(20), None);
+
+        search.push_text("err");
+        search.push_text("or");
+        assert_eq!(search.query, "error");
+        assert!(search.pop_char());
+        assert_eq!(search.query, "erro");
+
+        // Suppose total_scrollback = 100, viewport_rows = 20 -> live viewport is abs_row 100..120
+        let matches = vec![
+            SearchMatch {
+                abs_row: 5,
+                start_col: 0,
+                end_col: 4,
+            },
+            SearchMatch {
+                abs_row: 50,
+                start_col: 2,
+                end_col: 6,
+            },
+            SearchMatch {
+                abs_row: 112,
+                start_col: 1,
+                end_col: 5,
+            },
+        ];
+        search.set_results(100, matches.clone());
+        assert_eq!(search.display_counter(), (1, 3));
+        assert_eq!(search.active_match(), Some(matches[0]));
+        // abs_row=5 near top clamps to total_scrollback=100 (window 0..20)
+        assert_eq!(search.target_scroll_offset(20), Some(100));
+
+        // Step next -> abs_row=50 centered in 20-row window: offset = (100 - 50) + 10 = 60 (window 40..60)
+        assert_eq!(search.step_next(), Some(matches[1]));
+        assert_eq!(search.display_counter(), (2, 3));
+        assert_eq!(search.target_scroll_offset(20), Some(60));
+
+        // Step next -> abs_row=112 in live viewport (100..120): offset = 0
+        assert_eq!(search.step_next(), Some(matches[2]));
+        assert_eq!(search.display_counter(), (3, 3));
+        assert_eq!(search.target_scroll_offset(20), Some(0));
+
+        // Wrap forward -> index 0; wrap backward -> index 2
+        assert_eq!(search.step_next(), Some(matches[0]));
+        assert_eq!(search.current_index, 0);
+        assert_eq!(search.step_prev(), Some(matches[2]));
+        assert_eq!(search.current_index, 2);
+        assert_eq!(search.step_prev(), Some(matches[1]));
+        assert_eq!(search.current_index, 1);
+
+        // Editing query clears stale matches and resets index
+        search.push_text("r");
+        assert!(search.matches.is_empty());
+        assert_eq!(search.display_counter(), (0, 0));
+    }
+
+    #[test]
+    fn dormant_workspace_helpers_prevent_double_spawning() {
+        let mut state = AppState::new();
+        let ws_id = WorkspaceId::new();
+        let dormant = WorkspaceInfo {
+            id: ws_id,
+            name: "dormant".to_string(),
+            root_dir: PathBuf::from("/tmp/dormant"),
+            slot_index: 0,
+            injected_env: HashMap::new(),
+            panes: Vec::new(),
+            port_offset: 0,
+            compose_project_name: None,
+            git_branch: None,
+            bound_ports: Vec::new(),
+            containers: Vec::new(),
+            external_statuses: Vec::new(),
+            manifest: None,
+        };
+        state.set_workspaces(vec![dormant]);
+
+        // Dormant active workspace is detected before spawning begins
+        assert_eq!(state.active_dormant_workspace().map(|w| w.id), Some(ws_id));
+        assert!(state.mark_workspace_spawning(ws_id));
+        // Second mark returns false and active_dormant_workspace suppresses double-spawn
+        assert!(!state.mark_workspace_spawning(ws_id));
+        assert!(state.active_dormant_workspace().is_none());
+
+        // Clearing spawning flag without panes still sees it as dormant again
+        state.clear_workspace_spawning(ws_id);
+        assert_eq!(state.active_dormant_workspace().map(|w| w.id), Some(ws_id));
+
+        // Once a pane spawns, it is no longer dormant
+        assert!(state.mark_workspace_spawning(ws_id));
+        state.register_pane(make_pane_summary(ws_id, PaneRole::Agent), None);
+        state.clear_workspace_spawning(ws_id);
+        assert!(state.active_dormant_workspace().is_none());
     }
 }
