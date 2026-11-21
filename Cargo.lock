@@ -653,6 +653,7 @@ dependencies = [
  "daedalusd",
  "glyphon",
  "nix 0.32.0",
+ "serde",
  "tempfile",
  "tokio",
  "toml",
