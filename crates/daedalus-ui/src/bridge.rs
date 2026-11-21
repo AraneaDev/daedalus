@@ -186,6 +186,7 @@ impl RpcConnection {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
 
+        let writer_pending = Arc::clone(&pending);
         let writer_disconnect = disconnect_tx.clone();
         let writer_task = tokio::spawn(async move {
             while let Some(req) = write_rx.recv().await {
@@ -194,6 +195,10 @@ impl RpcConnection {
                     break;
                 }
             }
+            writer_pending
+                .lock()
+                .expect("pending mutex poisoned")
+                .clear();
             let _ = writer_disconnect.send(true);
         });
 
@@ -243,6 +248,11 @@ impl RpcConnection {
     }
 
     async fn call(&self, payload: ClientMessage) -> Result<ResponsePayload, RpcError> {
+        let mut disconnect_rx = self.disconnect_rx.clone();
+        if *disconnect_rx.borrow() {
+            return Err(RpcError::Disconnected);
+        }
+
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
@@ -258,10 +268,20 @@ impl RpcConnection {
             return Err(RpcError::Disconnected);
         }
 
-        match rx.await {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(proto_err)) => Err(RpcError::Proto(proto_err)),
-            Err(_) => Err(RpcError::Disconnected),
+        tokio::select! {
+            biased;
+            res = rx => match res {
+                Ok(Ok(resp)) => Ok(resp),
+                Ok(Err(proto_err)) => Err(RpcError::Proto(proto_err)),
+                Err(_) => Err(RpcError::Disconnected),
+            },
+            _ = disconnect_rx.wait_for(|&disconnected| disconnected) => {
+                self.pending
+                    .lock()
+                    .expect("pending mutex poisoned")
+                    .remove(&id);
+                Err(RpcError::Disconnected)
+            }
         }
     }
 
@@ -315,6 +335,12 @@ async fn run_bridge(
                             message: format!("Daemon error: {err}"),
                             is_error: true,
                         });
+                        conn.close();
+                        sink.emit(UiEvent::Disconnected);
+                        if !sleep_or_shutdown(RECONNECT_DELAY, &mut cmd_rx).await {
+                            return;
+                        }
+                        continue;
                     }
                 }
 
@@ -405,7 +431,6 @@ async fn initialize_session(
     };
 
     if workspaces.is_empty() && !*bootstrapped {
-        *bootstrapped = true;
         let name = workspace_name_from_dir(&config.initial_dir);
         create_and_populate_workspace(
             conn,
@@ -417,6 +442,7 @@ async fn initialize_session(
             DEFAULT_PANE_ROWS,
         )
         .await?;
+        *bootstrapped = true;
     } else {
         *bootstrapped = true;
         sink.emit(UiEvent::WorkspacesLoaded(workspaces.clone()));
@@ -444,6 +470,7 @@ async fn session_loop(
 ) -> bool {
     loop {
         tokio::select! {
+            biased;
             _ = conn.disconnected() => {
                 return false;
             }
@@ -773,7 +800,8 @@ fn spawn_daemon_detached(socket_path: &Path) -> std::io::Result<PathBuf> {
     // into its own session so it outlives the UI process cleanly.
     unsafe {
         cmd.pre_exec(|| {
-            nix::unistd::setsid().map_err(std::io::Error::other)?;
+            nix::unistd::setsid()
+                .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
             Ok(())
         });
     }
@@ -862,5 +890,47 @@ mod tests {
         fs::write(&sibling, "#!/bin/sh\n").unwrap();
         fs::set_permissions(&sibling, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(resolve_daemon_binary(Some(&fake_ui)), sibling);
+    }
+
+    struct NoopSink;
+    impl UiEventSink for NoopSink {
+        fn emit(&self, _event: UiEvent) {}
+    }
+
+    #[tokio::test]
+    async fn rpc_call_fails_immediately_when_disconnected_before_or_during_call() {
+        // Case 1: peer closes before `call()` is invoked
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let mut conn = RpcConnection::new(client_stream, Arc::new(NoopSink));
+        drop(server_stream);
+
+        tokio::time::timeout(Duration::from_secs(2), conn.disconnected())
+            .await
+            .expect("expected connection to notice peer EOF");
+
+        let res = tokio::time::timeout(Duration::from_secs(2), conn.call(ClientMessage::Ping))
+            .await
+            .expect("call() deadlocked after disconnect");
+        assert!(matches!(res, Err(RpcError::Disconnected)));
+        assert!(conn.pending.lock().unwrap().is_empty());
+        conn.close();
+
+        // Case 2: peer closes while `call()` is awaiting a response
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let conn = RpcConnection::new(client_stream, Arc::new(NoopSink));
+
+        let peer_task = tokio::spawn(async move {
+            // Read the request so it's definitely in flight, then drop without replying.
+            let _req: Option<Request> = read_frame(&mut server_stream).await.unwrap();
+            drop(server_stream);
+        });
+
+        let res = tokio::time::timeout(Duration::from_secs(2), conn.call(ClientMessage::Ping))
+            .await
+            .expect("call() deadlocked when peer dropped mid-RPC");
+        assert!(matches!(res, Err(RpcError::Disconnected)));
+        peer_task.await.unwrap();
+        assert!(conn.pending.lock().unwrap().is_empty());
+        conn.close();
     }
 }

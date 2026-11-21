@@ -202,3 +202,128 @@ async fn daemon_bridge_bootstraps_three_panes_and_forwards_runner_failure_to_age
         .expect("timed out waiting for DaemonServer shutdown")
         .expect("DaemonServer task panicked");
 }
+
+#[tokio::test]
+async fn daemon_bridge_handles_mid_session_disconnect_and_reconnects_cleanly() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daedalusd.sock");
+    let runtime = dir.path().join("runtime");
+
+    // Run server1 inside its own Tokio runtime so shutting it down drops all spawned
+    // `handle_client` tasks and closes the UDS socket with EOF, matching a real daemon restart.
+    let (ready1_tx, ready1_rx) = oneshot::channel::<()>();
+    let (shutdown1_tx, shutdown1_rx) = oneshot::channel::<()>();
+    let sock1 = sock.clone();
+    let runtime1 = runtime.clone();
+    let srv1_thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let server1 = DaemonServer::bind_with_supervisor(
+                sock1,
+                runtime1,
+                Supervisor::with_mode(IsolationMode::PgidFallback),
+            )
+            .await
+            .unwrap();
+            let _ = ready1_tx.send(());
+            let _ = server1
+                .serve(async {
+                    let _ = shutdown1_rx.await;
+                })
+                .await;
+        });
+        // Dropping `rt` cancels any lingering `handle_client` tasks and closes the client socket.
+        rt.shutdown_timeout(Duration::from_millis(200));
+    });
+    ready1_rx.await.expect("server1 failed to bind");
+
+    let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
+    let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink { tx: evt_tx });
+    let bridge = DaemonBridge::start(
+        BridgeConfig {
+            socket_path: sock.clone(),
+            initial_dir: dir.path().to_path_buf(),
+            default_agent: AgentPreset::Shell,
+            auto_spawn_daemon: false,
+        },
+        sink,
+    );
+
+    // Wait for initial bootstrap to finish completely (3 panes spawned + 3 initial snapshots).
+    let mut initial_panes = 0usize;
+    let mut initial_snapshots = 0usize;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while initial_panes < 3 || initial_snapshots < 3 {
+            match evt_rx.recv().await.expect("event channel closed") {
+                UiEvent::PaneSpawned { .. } => initial_panes += 1,
+                UiEvent::Snapshot(_) => initial_snapshots += 1,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for initial bootstrap");
+
+    // Shut down daemon 1 mid-session and verify DaemonBridge emits Disconnected without hanging.
+    let _ = shutdown1_tx.send(());
+    tokio::task::spawn_blocking(move || srv1_thread.join().unwrap())
+        .await
+        .expect("server1 thread panicked");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                evt_rx.recv().await.expect("event channel closed"),
+                UiEvent::Disconnected
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for UiEvent::Disconnected");
+
+    // Start daemon 2 on the same socket and verify DaemonBridge reconnects and reloads workspaces.
+    let server2 = DaemonServer::bind_with_supervisor(
+        sock.clone(),
+        runtime,
+        Supervisor::with_mode(IsolationMode::PgidFallback),
+    )
+    .await
+    .unwrap();
+    let (shutdown2_tx, shutdown2_rx) = oneshot::channel::<()>();
+    let srv2_handle = tokio::spawn(async move {
+        let _ = server2
+            .serve(async {
+                let _ = shutdown2_rx.await;
+            })
+            .await;
+    });
+
+    let mut reconnected = false;
+    let mut reloaded_workspaces = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !reconnected || !reloaded_workspaces {
+            match evt_rx.recv().await.expect("event channel closed") {
+                UiEvent::Connected => reconnected = true,
+                UiEvent::WorkspacesLoaded(_) => reloaded_workspaces = true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for bridge reconnect + WorkspacesLoaded");
+
+    tokio::task::spawn_blocking(move || bridge.shutdown())
+        .await
+        .expect("bridge shutdown task panicked");
+
+    let _ = shutdown2_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), srv2_handle)
+        .await
+        .expect("timed out waiting for server2 shutdown")
+        .expect("server2 panicked");
+}
