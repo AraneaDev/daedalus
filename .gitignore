@@ -1,0 +1,25 @@
+# Superpowers specs, plans, and scratch state (untracked by design)
+docs/superpowers/
+.superpowers/
+
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Daedalus runtime artifacts
+.daedalus/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Editor & OS files
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+.momus/
