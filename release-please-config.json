@@ -1,9 +1,16 @@
 {
-  "release-type": "rust",
+  "release-type": "simple",
   "package-name": "daedalus",
   "changelog-path": "CHANGELOG.md",
   "include-component-in-tag": false,
   "release-label": "release",
+  "extra-files": [
+    {
+      "type": "toml",
+      "path": "Cargo.toml",
+      "jsonpath": "$.workspace.package.version"
+    }
+  ],
   "changelog-sections": [
     { "type": "feat", "section": "Features" },
     { "type": "fix", "section": "Bug Fixes" },
