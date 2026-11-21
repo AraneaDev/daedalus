@@ -10,16 +10,20 @@ use glyphon::{
 use crate::config::clamp_font_size;
 use crate::layout::{
     LayoutMetrics, PaneRect, Rect, WorkspaceLayout, sidebar_new_workspace_rect,
-    sidebar_new_worktree_rect, sidebar_workspace_rect,
+    sidebar_new_worktree_rect, sidebar_workspace_close_rect, sidebar_workspace_rect,
 };
 use crate::state::{AgentPreset, AppState, SearchState};
 use crate::theme::{self, Theme};
 
 use super::{
-    external_status_color, format_docker_health, format_ports_summary, picker_item_rect,
-    picker_modal_rect, search_bar_rect, sidebar_branch_badge_rect, sidebar_docker_pill_rect,
-    sidebar_external_badge_rect, visible_external_statuses, workspace_branch_badge,
-    worktree_input_rect, worktree_modal_rect,
+    CLOSE_MODAL_HEADER_LOGICAL_HEIGHT, active_external_detail_preview, agent_state_badge,
+    close_modal_cancel_rect, close_modal_compose_rect, close_modal_confirm_rect,
+    close_modal_dirty_banner_rect, close_modal_force_rect, close_modal_worktree_rect,
+    close_workspace_modal_rect, external_status_color, format_docker_health,
+    format_external_source_tag, format_ports_summary, pane_agent_state_pill_rect, picker_item_rect,
+    picker_modal_rect, search_bar_rect, sidebar_agent_state_pill_rect,
+    sidebar_branch_badge_rect_with_reserve, sidebar_docker_pill_rect, sidebar_external_badge_rect,
+    visible_external_statuses, workspace_branch_badge, worktree_input_rect, worktree_modal_rect,
 };
 
 pub const FONT_SIZE_LOGICAL: f32 = 14.0;
@@ -117,6 +121,30 @@ pub fn truncate_left_with_ellipsis(input: &str, max_chars: usize) -> String {
     let mut out = String::with_capacity('…'.len_utf8() + (input.len() - byte_start));
     out.push('…');
     out.push_str(&input[byte_start..]);
+    out
+}
+
+/// Right-truncates `input` to at most `max_chars` Unicode scalar values, appending `'…'`
+/// when truncated.
+pub fn truncate_right_with_ellipsis(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let char_count = input.chars().count();
+    if char_count <= max_chars {
+        return input.to_string();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let keep = max_chars - 1;
+    let byte_end = input
+        .char_indices()
+        .nth(keep)
+        .map_or(input.len(), |(idx, _)| idx);
+    let mut out = String::with_capacity(byte_end + '…'.len_utf8());
+    out.push_str(&input[..byte_end]);
+    out.push('…');
     out
 }
 
@@ -502,13 +530,18 @@ impl TextRenderer {
 
         // 4. Rebuild & prepare overlay text pass if a modal or search bar is open.
         self.modal_items.clear();
-        let modal_open = state.picker.open || state.worktree_modal.open || state.search.is_some();
+        let modal_open = state.picker.open
+            || state.worktree_modal.open
+            || state.close_modal.open
+            || state.search.is_some();
         self.has_modal_text = modal_open;
         if modal_open {
             if state.picker.open {
                 self.build_picker_items(state, theme, screen_w, screen_h);
             } else if state.worktree_modal.open {
                 self.build_worktree_modal_items(state, theme, screen_w, screen_h);
+            } else if state.close_modal.open {
+                self.build_close_modal_items(state, theme, screen_w, screen_h);
             } else if let Some(ref search) = state.search {
                 self.build_search_bar_items(search, state, layout, theme);
             }
@@ -723,9 +756,9 @@ impl TextRenderer {
         });
 
         let pill_reserve = if pill_text.is_some() {
-            54.0 * s
+            74.0 * s
         } else {
-            8.0 * s
+            24.0 * s
         };
         let name_max_w = (row_rect.right() - left_x - pill_reserve).max(1.0);
         let title_color = if is_active {
@@ -746,8 +779,22 @@ impl TextRenderer {
             bold: is_active,
         });
 
+        // Compact `×` close button in top-right corner
+        let close_rect = sidebar_workspace_close_rect(row_rect, s);
+        self.push_chrome_line(ChromeLineSpec {
+            text: "×",
+            left: close_rect.x + 4.0 * s,
+            top: close_rect.y + 1.0 * s,
+            max_w: (close_rect.width - 4.0 * s).max(1.0),
+            bounds: close_rect,
+            font_size_logical: CHROME_BTN_FONT_SIZE_LOGICAL,
+            line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
+            color: theme.text_muted,
+            bold: true,
+        });
+
         if let Some((label, color)) = pill_text {
-            let pill_x = row_rect.right() - 48.0 * s;
+            let pill_x = row_rect.right() - 66.0 * s;
             self.push_chrome_line(ChromeLineSpec {
                 text: &label,
                 left: pill_x,
@@ -761,9 +808,33 @@ impl TextRenderer {
             });
         }
 
-        // Line 2: Git branch / worktree slot badge (or directory + agent status fallback)
+        // Line 2: Git branch / worktree slot badge + compact Agent state badge on right
+        let agent_pill_reserve = if let Some(ast) = state.workspace_agent_state(ws) {
+            let (label, color) = agent_state_badge(ast, theme);
+            let pill_rect = sidebar_agent_state_pill_rect(row_rect, label, s);
+            self.push_chrome_line(ChromeLineSpec {
+                text: label,
+                left: pill_rect.x + 5.0 * s,
+                top: pill_rect.y + 1.5 * s,
+                max_w: (pill_rect.width - 8.0 * s).max(1.0),
+                bounds: pill_rect,
+                font_size_logical: CHROME_BADGE_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_BADGE_LINE_HEIGHT_LOGICAL,
+                color,
+                bold: true,
+            });
+            pill_rect.width + 6.0 * s
+        } else {
+            0.0
+        };
+
         if let Some((branch_label, is_wt)) = workspace_branch_badge(ws) {
-            let badge_rect = sidebar_branch_badge_rect(row_rect, &branch_label, s);
+            let badge_rect = sidebar_branch_badge_rect_with_reserve(
+                row_rect,
+                &branch_label,
+                agent_pill_reserve,
+                s,
+            );
             self.push_chrome_line(ChromeLineSpec {
                 text: &branch_label,
                 left: badge_rect.x + 5.0 * s,
@@ -798,13 +869,13 @@ impl TextRenderer {
                 })
                 .unwrap_or("none");
             let subtitle = format!("{dir_name} · agent:{agent_status}");
-            let sub_max_w = (row_rect.right() - left_x - 8.0 * s).max(1.0);
+            let sub_max_w = (row_rect.right() - left_x - 8.0 * s - agent_pill_reserve).max(1.0);
             self.push_chrome_line(ChromeLineSpec {
                 text: &subtitle,
                 left: left_x,
                 top: row_rect.y + 24.0 * s,
                 max_w: sub_max_w,
-                bounds: row_rect,
+                bounds: Rect::new(left_x, row_rect.y + 22.0 * s, sub_max_w, 18.0 * s),
                 font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
                 line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
                 color: theme.text_muted,
@@ -857,12 +928,12 @@ impl TextRenderer {
             });
         }
 
-        // Line 4: Up to 2 color-coded external status badges
+        // Line 4: Up to 2 color-coded external status badges with compact source tags
         let ext_statuses = visible_external_statuses(ws);
         for (badge_idx, ext) in ext_statuses.iter().enumerate() {
             let badge_rect =
                 sidebar_external_badge_rect(row_rect, badge_idx, ext_statuses.len(), s);
-            let badge_text = format!("{}: {}", ext.source, ext.label);
+            let badge_text = format!("{} {}", format_external_source_tag(&ext.source), ext.label);
             let color = external_status_color(ext.level, theme);
             self.push_chrome_line(ChromeLineSpec {
                 text: &badge_text,
@@ -874,6 +945,26 @@ impl TextRenderer {
                 line_height_logical: CHROME_BADGE_LINE_HEIGHT_LOGICAL,
                 color,
                 bold: true,
+            });
+        }
+
+        // Line 5 (active workspace only): truncated external status detail preview
+        if is_active && let Some(preview) = active_external_detail_preview(ws) {
+            let detail_left = row_rect.x + 10.0 * s;
+            let detail_max_w = (row_rect.right() - detail_left - 8.0 * s).max(1.0);
+            let approx_char_w = (CHROME_BADGE_FONT_SIZE_LOGICAL * s * 0.62).max(1.0);
+            let max_chars = ((detail_max_w / approx_char_w).floor() as usize).max(8);
+            let truncated = truncate_right_with_ellipsis(&preview, max_chars);
+            self.push_chrome_line(ChromeLineSpec {
+                text: &truncated,
+                left: detail_left,
+                top: row_rect.y + 79.0 * s,
+                max_w: detail_max_w,
+                bounds: Rect::new(detail_left, row_rect.y + 77.0 * s, detail_max_w, 17.0 * s),
+                font_size_logical: CHROME_BADGE_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_BADGE_LINE_HEIGHT_LOGICAL,
+                color: theme.text_muted,
+                bold: false,
             });
         }
     }
@@ -908,11 +999,23 @@ impl TextRenderer {
             .map(|p| format!("  [SCROLL -{}]", p.scroll_offset))
             .unwrap_or_default();
 
+        let agent_badge = if pane_rect.role == PaneRole::Agent {
+            pane_state
+                .and_then(|p| p.summary.agent_state)
+                .and_then(|ast| {
+                    let (label, color) = agent_state_badge(ast, theme);
+                    pane_agent_state_pill_rect(pane_rect, label, s).map(|rect| (rect, label, color))
+                })
+        } else {
+            None
+        };
+
         let title = format!("{role_label}{cwd_suffix}{scroll_suffix}");
         let text_left = header.x + 22.0 * s;
-        let text_right = pane_rect
+        let default_right = pane_rect
             .action_pill
             .map_or(header.right() - 8.0 * s, |pill| pill.x - 8.0 * s);
+        let text_right = agent_badge.map_or(default_right, |(rect, _, _)| rect.x - 8.0 * s);
         let text_w = (text_right - text_left).max(1.0);
         let title_bounds = Rect::new(text_left, header.y, text_w, header.height);
 
@@ -931,6 +1034,20 @@ impl TextRenderer {
             },
             bold: is_focused,
         });
+
+        if let Some((pill, label, color)) = agent_badge {
+            self.push_chrome_line(ChromeLineSpec {
+                text: label,
+                left: pill.x + 6.0 * s,
+                top: pill.y + (pill.height - CHROME_BADGE_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                max_w: (pill.width - 10.0 * s).max(1.0),
+                bounds: pill,
+                font_size_logical: CHROME_BADGE_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_BADGE_LINE_HEIGHT_LOGICAL,
+                color,
+                bold: true,
+            });
+        }
 
         if let Some(pill) = pane_rect.action_pill {
             let (pill_label, pill_color) = match pane_rect.role {
@@ -1079,6 +1196,158 @@ impl TextRenderer {
             left: modal.x + 14.0 * s,
             top: input_rect.bottom() + 12.0 * s,
             max_w: (modal.width - 28.0 * s).max(1.0),
+            bounds: modal,
+            font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+            line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
+            color: theme.text_muted,
+            bold: false,
+        });
+    }
+
+    fn build_close_modal_items(
+        &mut self,
+        state: &AppState,
+        theme: &Theme,
+        screen_w: f32,
+        screen_h: f32,
+    ) {
+        let s = self.scale_factor;
+        let cm = &state.close_modal;
+        let modal = close_workspace_modal_rect(screen_w, screen_h, s);
+
+        self.push_modal_line(ChromeLineSpec {
+            text: "Close Workspace",
+            left: modal.x + 16.0 * s,
+            top: modal.y + 10.0 * s,
+            max_w: (modal.width - 32.0 * s).max(1.0),
+            bounds: modal,
+            font_size_logical: MODAL_TITLE_FONT_SIZE_LOGICAL,
+            line_height_logical: MODAL_TITLE_LINE_HEIGHT_LOGICAL,
+            color: theme.text_primary,
+            bold: true,
+        });
+
+        let summary_line = match &cm.branch {
+            Some(branch) => format!("{}  ({branch})", cm.workspace_name),
+            None => cm.workspace_name.clone(),
+        };
+        self.push_modal_line(ChromeLineSpec {
+            text: &summary_line,
+            left: modal.x + 16.0 * s,
+            top: modal.y + (CLOSE_MODAL_HEADER_LOGICAL_HEIGHT + 8.0) * s,
+            max_w: (modal.width - 32.0 * s).max(1.0),
+            bounds: modal,
+            font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+            line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+            color: theme.text_primary,
+            bold: true,
+        });
+
+        if cm.is_dirty {
+            let warn_rect = close_modal_dirty_banner_rect(modal, s);
+            self.push_modal_line(ChromeLineSpec {
+                text: "⚠ Worktree has uncommitted changes",
+                left: warn_rect.x + 10.0 * s,
+                top: warn_rect.y + (warn_rect.height - CHROME_SUB_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                max_w: (warn_rect.width - 20.0 * s).max(1.0),
+                bounds: warn_rect,
+                font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
+                color: theme.status_busy,
+                bold: true,
+            });
+        }
+
+        let mut push_checkbox_text =
+            |rect: Rect, checked: bool, label: &str, color: theme::Rgba| {
+                let mark = if checked { "[x]" } else { "[ ]" };
+                let line = format!("{mark} {label}");
+                self.push_modal_line(ChromeLineSpec {
+                    text: &line,
+                    left: rect.x + 10.0 * s,
+                    top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                    max_w: (rect.width - 20.0 * s).max(1.0),
+                    bounds: rect,
+                    font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+                    line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                    color,
+                    bold: checked,
+                });
+            };
+
+        let compose_rect = close_modal_compose_rect(modal, cm, s);
+        push_checkbox_text(
+            compose_rect,
+            cm.compose_down,
+            "Stop Docker Compose (c)",
+            if cm.compose_down {
+                theme.text_primary
+            } else {
+                theme.text_muted
+            },
+        );
+
+        if let Some(wt_rect) = close_modal_worktree_rect(modal, cm, s) {
+            push_checkbox_text(
+                wt_rect,
+                cm.remove_worktree,
+                "Remove git worktree (w)",
+                if cm.remove_worktree {
+                    theme.status_busy
+                } else {
+                    theme.text_muted
+                },
+            );
+        }
+
+        if let Some(force_rect) = close_modal_force_rect(modal, cm, s) {
+            push_checkbox_text(
+                force_rect,
+                cm.force_remove_worktree,
+                "Force remove dirty worktree (f)",
+                if cm.force_remove_worktree {
+                    theme.status_err
+                } else {
+                    theme.text_muted
+                },
+            );
+        }
+
+        let cancel_rect = close_modal_cancel_rect(modal, s);
+        self.push_modal_line(ChromeLineSpec {
+            text: "Cancel",
+            left: cancel_rect.x + 12.0 * s,
+            top: cancel_rect.y + (cancel_rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+            max_w: (cancel_rect.width - 24.0 * s).max(1.0),
+            bounds: cancel_rect,
+            font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+            line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+            color: theme.text_primary,
+            bold: false,
+        });
+
+        let confirm_rect = close_modal_confirm_rect(modal, s);
+        self.push_modal_line(ChromeLineSpec {
+            text: "Confirm Close",
+            left: confirm_rect.x + 12.0 * s,
+            top: confirm_rect.y + (confirm_rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+            max_w: (confirm_rect.width - 24.0 * s).max(1.0),
+            bounds: confirm_rect,
+            font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+            line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+            color: if cm.remove_worktree {
+                theme.status_err
+            } else {
+                theme.border_focused
+            },
+            bold: true,
+        });
+
+        self.push_modal_line(ChromeLineSpec {
+            text: "Enter: Confirm · Esc: Cancel",
+            left: modal.x + 16.0 * s,
+            top: modal.bottom() - 20.0 * s,
+            max_w: (modal.width - 32.0 * s).max(1.0),
             bounds: modal,
             font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
             line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
@@ -1345,5 +1614,18 @@ mod tests {
         );
         assert_eq!(truncate_left_with_ellipsis("abcdef", 1), "…");
         assert_eq!(truncate_left_with_ellipsis("abcdef", 0), "");
+    }
+
+    #[test]
+    fn truncate_right_with_ellipsis_handles_ascii_and_multibyte_utf8() {
+        assert_eq!(truncate_right_with_ellipsis("clean", 10), "clean");
+        assert_eq!(truncate_right_with_ellipsis("clean", 5), "clean");
+        assert_eq!(
+            truncate_right_with_ellipsis("[PHR] 2 modified, 1 untracked", 14),
+            "[PHR] 2 modif…"
+        );
+        assert_eq!(truncate_right_with_ellipsis("日本語テスト🚀", 4), "日本語…");
+        assert_eq!(truncate_right_with_ellipsis("abcdef", 1), "…");
+        assert_eq!(truncate_right_with_ellipsis("abcdef", 0), "");
     }
 }

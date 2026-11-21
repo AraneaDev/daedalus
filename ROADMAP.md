@@ -13,9 +13,9 @@
 
 ---
 
-## v0.0.2 — Runtime Polish, Native `libghostty-vt` & Config/Persistence
+## v0.0.2 — Daily-Driver Workbench (Shipped)
 
-- **Native `libghostty-vt` C ABI Wiring:** Connect `GhosttyVt` directly to `libghostty-vt` 1.0 C ABI calls (cell grid, scrollback reflow, OSC 7/133 extraction) and add an optional CI matrix job building with `libghostty-vt`.
+- **Native `libghostty-vt` FFI Scaffold:** Feature-gated `--features ghostty-vt` `GhosttyVt` FFI scaffold remains ready for when `libghostty-vt` 1.0 headers are available (default `BuiltinVt` pure-Rust backend handles cell grid, scrollback reflow, search, and OSC 7/133 extraction).
 - **Project Manifest & Persistence:**
   - Per-repo `.daedalus.toml` (default Agent preset, Service startup command, Runner command, custom port/env templates).
   - Persist workspace/project metadata across `daedalusd` restarts (`~/.local/state/daedalus/state.json`).

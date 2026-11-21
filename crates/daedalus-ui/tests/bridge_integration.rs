@@ -2,12 +2,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use daedalus_proto::{GridSnapshot, PaneId, PaneRole, ServerEvent};
+use daedalus_proto::{
+    AgentState, ClientMessage, GridSnapshot, PaneId, PaneRole, Request, ResponsePayload,
+    ServerEvent, ServerMessage, read_frame, write_frame,
+};
 use daedalus_ui::bridge::{BridgeConfig, DaemonBridge, UiCommand, UiEvent, UiEventSink};
 use daedalus_ui::state::AgentPreset;
 use daedalusd::server::DaemonServer;
 use daedalusd::supervisor::{IsolationMode, Supervisor};
 use tempfile::TempDir;
+use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 
 struct ChannelSink {
@@ -47,6 +51,7 @@ async fn daemon_bridge_bootstraps_three_panes_and_forwards_runner_failure_to_age
     )
     .await
     .unwrap();
+    server.set_worktrees_dir(dir.path().join("worktrees"));
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let srv_handle = tokio::spawn(async move {
         let _ = server
@@ -520,4 +525,187 @@ command = ["sh", "-c", "echo MANIFEST_RUNNER_NEEDLE; sleep 5"]
         .unwrap();
     let _ = tx2.send(());
     handle2.await.unwrap();
+}
+
+fn init_git_repo(dir: &std::path::Path) {
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git command failed");
+        assert!(status.success(), "git {args:?} failed with {status}");
+    };
+    run(&["init"]);
+    run(&["config", "user.email", "test@example.com"]);
+    run(&["config", "user.name", "Daedalus Test"]);
+    std::fs::write(dir.join("README.md"), "# test\n").unwrap();
+    run(&["add", "README.md"]);
+    run(&["commit", "-m", "initial commit"]);
+}
+
+#[tokio::test]
+async fn daemon_bridge_delivers_agent_state_changed_and_closes_worktree_with_removal() {
+    let dir = TempDir::new().unwrap();
+    let repo_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_git_repo(&repo_dir);
+
+    let sock = dir.path().join("daedalusd.sock");
+    let runtime = dir.path().join("runtime");
+
+    let server = DaemonServer::bind_with_supervisor(
+        sock.clone(),
+        runtime,
+        Supervisor::with_mode(IsolationMode::PgidFallback),
+    )
+    .await
+    .unwrap();
+    server.set_worktrees_dir(dir.path().join("worktrees"));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
+    let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink { tx: evt_tx });
+    let bridge = DaemonBridge::start(
+        BridgeConfig {
+            socket_path: sock.clone(),
+            initial_dir: repo_dir.clone(),
+            default_agent: AgentPreset::Shell,
+            auto_spawn_daemon: false,
+        },
+        sink,
+    );
+
+    let mut primary_ws_id = None;
+    let mut agent_pane_id = None;
+    let mut spawned = 0usize;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while primary_ws_id.is_none() || spawned < 3 {
+            match evt_rx.recv().await.expect("event channel closed") {
+                UiEvent::WorkspaceCreated(ws) => primary_ws_id = Some(ws.id),
+                UiEvent::PaneSpawned { summary, .. } => {
+                    spawned += 1;
+                    if summary.role == PaneRole::Agent {
+                        agent_pane_id = Some(summary.id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for initial workspace");
+
+    let ws_id = primary_ws_id.unwrap();
+    let agent_id = agent_pane_id.unwrap();
+
+    // Trigger SetAgentState over a separate daemon connection and verify UiEvent::AgentStateChanged arrives.
+    let mut ctl_stream = UnixStream::connect(&sock).await.unwrap();
+    let req = Request {
+        id: 1,
+        payload: ClientMessage::SetAgentState {
+            pane_id: Some(agent_id),
+            workspace_id: Some(ws_id),
+            root_dir: None,
+            state: AgentState::WaitingForApproval,
+        },
+    };
+    write_frame(&mut ctl_stream, &req).await.unwrap();
+    let resp: ServerMessage = read_frame(&mut ctl_stream).await.unwrap().unwrap();
+    assert!(matches!(
+        resp,
+        ServerMessage::Response {
+            id: 1,
+            result: Ok(ResponsePayload::Ok)
+        }
+    ));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let UiEvent::AgentStateChanged {
+                workspace_id,
+                pane_id,
+                state,
+            } = evt_rx.recv().await.expect("event channel closed")
+                && workspace_id == ws_id
+                && pane_id == agent_id
+                && state == AgentState::WaitingForApproval
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for UiEvent::AgentStateChanged");
+
+    // Create a git worktree workspace through DaemonBridge, then close it with remove_worktree: true.
+    bridge.send(UiCommand::CreateWorktreeWorkspace {
+        repo_dir,
+        branch: "feat/bridge-cleanup".to_string(),
+        default_agent: AgentPreset::Shell,
+    });
+
+    let wt_ws = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let UiEvent::WorkspaceCreated(ws) =
+                evt_rx.recv().await.expect("event channel closed")
+                && ws.id != ws_id
+            {
+                break ws;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for worktree WorkspaceCreated");
+
+    assert!(
+        wt_ws.git_status.is_some_and(|gs| gs.is_worktree),
+        "expected created worktree workspace to report is_worktree=true"
+    );
+    assert!(
+        wt_ws.root_dir.exists(),
+        "expected worktree directory to exist before close"
+    );
+
+    bridge.send(UiCommand::CloseWorkspace {
+        id: wt_ws.id,
+        compose_down: false,
+        remove_worktree: true,
+        force_remove_worktree: false,
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let UiEvent::WorkspacesLoaded(wss) =
+                evt_rx.recv().await.expect("event channel closed")
+                && !wss.iter().any(|w| w.id == wt_ws.id)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for WorkspacesLoaded after CloseWorkspace");
+
+    assert!(
+        !wt_ws.root_dir.exists(),
+        "expected CloseWorkspace(remove_worktree=true) to remove {}",
+        wt_ws.root_dir.display()
+    );
+
+    tokio::task::spawn_blocking(move || bridge.shutdown())
+        .await
+        .expect("bridge shutdown task panicked");
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), srv_handle)
+        .await
+        .expect("timed out waiting for DaemonServer shutdown")
+        .expect("DaemonServer task panicked");
 }

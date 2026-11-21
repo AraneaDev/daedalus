@@ -4,8 +4,9 @@ use std::time::Instant;
 
 use clap::ValueEnum;
 use daedalus_proto::{
-    CursorState, ExternalStatus, FailureTrace, GridDelta, GridRow, GridSnapshot, PaneId, PaneRole,
-    PaneStatus, PaneSummary, SearchMatch, ServerEvent, WorkspaceId, WorkspaceInfo,
+    AgentState, ContainerHealth, CursorState, ExternalStatus, FailureTrace, GitWorkspaceStatus,
+    GridDelta, GridRow, GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary, PortMapping,
+    SearchMatch, ServerEvent, WorkspaceId, WorkspaceInfo,
 };
 
 use crate::selection::Selection;
@@ -151,6 +152,61 @@ impl WorktreeModalState {
 
     pub fn pop_char(&mut self) {
         self.branch_input.pop();
+    }
+}
+
+/// State of the centered "Close Workspace" confirmation & worktree cleanup modal (`Ctrl+Shift+D` or sidebar `×`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CloseWorkspaceModalState {
+    pub open: bool,
+    pub workspace_id: Option<WorkspaceId>,
+    pub workspace_name: String,
+    pub branch: Option<String>,
+    pub is_worktree: bool,
+    pub is_dirty: bool,
+    pub has_compose: bool,
+    pub compose_down: bool,
+    pub remove_worktree: bool,
+    pub force_remove_worktree: bool,
+}
+
+impl CloseWorkspaceModalState {
+    /// Opens the modal populated with defaults for `ws`.
+    pub fn open_for_workspace(&mut self, ws: &WorkspaceInfo) {
+        self.open = true;
+        self.workspace_id = Some(ws.id);
+        self.workspace_name = ws.name.clone();
+        self.branch = ws.git_branch.clone();
+        self.is_worktree = ws.git_status.map(|g| g.is_worktree).unwrap_or(false);
+        self.is_dirty = ws.git_status.map(|g| g.dirty).unwrap_or(false);
+        self.has_compose = ws.compose_project_name.is_some();
+        self.compose_down = ws.compose_project_name.is_some();
+        self.remove_worktree = false;
+        self.force_remove_worktree = false;
+    }
+
+    pub fn close(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn toggle_compose(&mut self) {
+        self.compose_down = !self.compose_down;
+    }
+
+    pub fn toggle_worktree(&mut self) {
+        if !self.is_worktree {
+            return;
+        }
+        self.remove_worktree = !self.remove_worktree;
+        if !self.remove_worktree {
+            self.force_remove_worktree = false;
+        }
+    }
+
+    pub fn toggle_force(&mut self) {
+        if self.is_worktree && self.remove_worktree {
+            self.force_remove_worktree = !self.force_remove_worktree;
+        }
     }
 }
 
@@ -456,6 +512,7 @@ pub struct AppState {
     pub zoomed: bool,
     pub picker: PickerState,
     pub worktree_modal: WorktreeModalState,
+    pub close_modal: CloseWorkspaceModalState,
     pub search: Option<SearchState>,
     pub spawning_workspaces: HashSet<WorkspaceId>,
     pub toast: Option<(String, bool, Instant)>,
@@ -480,6 +537,7 @@ impl AppState {
             zoomed: false,
             picker: PickerState::default(),
             worktree_modal: WorktreeModalState::default(),
+            close_modal: CloseWorkspaceModalState::default(),
             search: None,
             spawning_workspaces: HashSet::new(),
             toast: None,
@@ -498,6 +556,7 @@ impl AppState {
         } else {
             self.picker.close();
             self.worktree_modal.close();
+            self.close_modal.close();
             self.search = Some(SearchState::new(pane_id));
         }
     }
@@ -541,24 +600,124 @@ impl AppState {
         self.spawning_workspaces.remove(&workspace_id);
     }
 
-    /// Opens the Agent preset picker modal while ensuring the worktree modal is closed.
+    /// Opens the Agent preset picker modal while ensuring other modals are closed.
     pub fn open_picker_with(&mut self, preset: AgentPreset) {
         self.worktree_modal.close();
+        self.close_modal.close();
         self.picker.open_with(preset);
     }
 
-    /// Opens the Git worktree creator modal while ensuring the Agent preset picker is closed.
+    /// Opens the Git worktree creator modal while ensuring other modals are closed.
     pub fn open_worktree_modal(&mut self) {
         self.picker.close();
+        self.close_modal.close();
         self.worktree_modal.open();
     }
 
-    /// Toggles the Git worktree creator modal, closing the Agent preset picker if opening.
+    /// Toggles the Git worktree creator modal, closing other modals if opening.
     pub fn toggle_worktree_modal(&mut self) {
         if self.worktree_modal.open {
             self.worktree_modal.close();
         } else {
             self.open_worktree_modal();
+        }
+    }
+
+    /// Opens the Close Workspace confirmation modal for `workspace_id`, closing other modals/search.
+    pub fn open_close_modal_for_workspace(&mut self, workspace_id: WorkspaceId) -> bool {
+        let Some(ws) = self
+            .workspaces
+            .iter()
+            .find(|ws| ws.id == workspace_id)
+            .cloned()
+        else {
+            return false;
+        };
+        self.picker.close();
+        self.worktree_modal.close();
+        self.close_search();
+        self.close_modal.open_for_workspace(&ws);
+        true
+    }
+
+    /// Cycles the active workspace forward (`delta > 0`) or backward (`delta < 0`), wrapping cleanly.
+    pub fn cycle_workspace(&mut self, delta: isize) -> Option<WorkspaceId> {
+        let len = self.workspaces.len();
+        if len == 0 {
+            return None;
+        }
+        let next_idx = match self
+            .active_workspace_id
+            .and_then(|id| self.workspaces.iter().position(|ws| ws.id == id))
+        {
+            Some(idx) => {
+                let offset = delta.rem_euclid(len as isize) as usize;
+                (idx + offset) % len
+            }
+            None => {
+                if delta >= 0 {
+                    0
+                } else {
+                    len - 1
+                }
+            }
+        };
+        let next_id = self.workspaces[next_idx].id;
+        if self.active_workspace_id != Some(next_id) {
+            self.active_workspace_id = Some(next_id);
+            self.close_search();
+        }
+        Some(next_id)
+    }
+
+    /// Returns the `Agent` pane's current [`AgentState`] for `ws`, if any.
+    pub fn workspace_agent_state(&self, ws: &WorkspaceInfo) -> Option<AgentState> {
+        ws.panes
+            .iter()
+            .rev()
+            .find(|pane| pane.role == PaneRole::Agent)
+            .and_then(|pane| {
+                pane.agent_state.or_else(|| {
+                    self.panes
+                        .get(&pane.id)
+                        .and_then(|view| view.summary.agent_state)
+                })
+            })
+    }
+
+    /// Updates `agent_state` for `pane_id` in both `self.workspaces` and `self.panes`.
+    pub fn apply_agent_state(
+        &mut self,
+        workspace_id: WorkspaceId,
+        pane_id: PaneId,
+        state: AgentState,
+    ) {
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            pane.summary.agent_state = Some(state);
+        }
+        if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == workspace_id)
+            && let Some(summary) = ws.panes.iter_mut().find(|p| p.id == pane_id)
+        {
+            summary.agent_state = Some(state);
+        } else if let Some(summary) = self.workspace_pane_summary_mut(pane_id) {
+            summary.agent_state = Some(state);
+        }
+    }
+
+    /// Updates runtime ports, containers, and git metadata for `workspace_id`.
+    pub fn apply_workspace_runtime(
+        &mut self,
+        workspace_id: WorkspaceId,
+        bound_ports: Vec<PortMapping>,
+        containers: Vec<ContainerHealth>,
+        git_status: Option<GitWorkspaceStatus>,
+        git_branch: Option<String>,
+    ) {
+        if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == workspace_id) {
+            ws.bound_ports = bound_ports;
+            ws.containers = containers;
+            ws.git_status = git_status;
+            ws.git_branch = git_branch;
         }
     }
 
@@ -629,6 +788,14 @@ impl AppState {
         self.workspaces = workspaces;
         self.spawning_workspaces
             .retain(|ws_id| self.workspaces.iter().any(|ws| ws.id == *ws_id));
+        if self.close_modal.open
+            && self
+                .close_modal
+                .workspace_id
+                .is_none_or(|id| !self.workspaces.iter().any(|ws| ws.id == id))
+        {
+            self.close_modal.close();
+        }
         let active_still_exists = self
             .active_workspace_id
             .is_some_and(|id| self.workspaces.iter().any(|ws| ws.id == id));
@@ -748,16 +915,26 @@ impl AppState {
                 workspace_id,
                 bound_ports,
                 containers,
-                git_status: _,
-                git_branch: _,
+                git_status,
+                git_branch,
             } => {
-                if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == workspace_id) {
-                    ws.bound_ports = bound_ports;
-                    ws.containers = containers;
-                }
+                self.apply_workspace_runtime(
+                    workspace_id,
+                    bound_ports,
+                    containers,
+                    git_status,
+                    git_branch,
+                );
                 None
             }
-            ServerEvent::AgentStateChanged { .. } => None,
+            ServerEvent::AgentStateChanged {
+                workspace_id,
+                pane_id,
+                state,
+            } => {
+                self.apply_agent_state(workspace_id, pane_id, state);
+                None
+            }
             ServerEvent::ExternalStatusUpdated {
                 workspace_id,
                 status,
@@ -1475,5 +1652,150 @@ mod tests {
         // Current session 2 response applies cleanly
         assert!(state.apply_search_results(agent_id, gen_session2, 10, new_match.clone()));
         assert_eq!(state.search.as_ref().unwrap().matches, new_match);
+    }
+
+    #[test]
+    fn close_workspace_modal_defaults_toggles_and_mutual_exclusion() {
+        let mut state = AppState::new();
+        let (mut primary_ws, agent_id, _, _) = make_workspace_with_three_panes();
+        primary_ws.name = "primary".to_string();
+        primary_ws.git_branch = Some("master".to_string());
+        primary_ws.git_status = Some(GitWorkspaceStatus {
+            is_worktree: false,
+            dirty: false,
+            ahead: 0,
+            behind: 0,
+        });
+
+        let (mut wt_ws, _, _, _) = make_workspace_with_three_panes();
+        wt_ws.name = "feat-wt".to_string();
+        wt_ws.compose_project_name = Some("daedalus-wt1".to_string());
+        wt_ws.git_branch = Some("feat/wt".to_string());
+        wt_ws.git_status = Some(GitWorkspaceStatus {
+            is_worktree: true,
+            dirty: true,
+            ahead: 2,
+            behind: 1,
+        });
+        let primary_id = primary_ws.id;
+        let wt_id = wt_ws.id;
+
+        state.set_workspaces(vec![primary_ws, wt_ws]);
+        state.open_picker_with(AgentPreset::Claude);
+        state.toggle_search(agent_id);
+
+        // Opening close modal for worktree workspace closes search/modals and sets defaults
+        assert!(state.open_close_modal_for_workspace(wt_id));
+        assert!(!state.picker.open);
+        assert!(state.search.is_none());
+        assert!(state.close_modal.open);
+        assert_eq!(state.close_modal.workspace_id, Some(wt_id));
+        assert_eq!(state.close_modal.workspace_name, "feat-wt");
+        assert_eq!(state.close_modal.branch.as_deref(), Some("feat/wt"));
+        assert!(state.close_modal.is_worktree);
+        assert!(state.close_modal.is_dirty);
+        assert!(state.close_modal.has_compose);
+        assert!(state.close_modal.compose_down);
+        assert!(!state.close_modal.remove_worktree);
+        assert!(!state.close_modal.force_remove_worktree);
+
+        // Force cannot be toggled before remove_worktree is enabled
+        state.close_modal.toggle_force();
+        assert!(!state.close_modal.force_remove_worktree);
+
+        // Enable remove_worktree, then enable force
+        state.close_modal.toggle_worktree();
+        assert!(state.close_modal.remove_worktree);
+        state.close_modal.toggle_force();
+        assert!(state.close_modal.force_remove_worktree);
+
+        // Disabling remove_worktree also clears force_remove_worktree
+        state.close_modal.toggle_worktree();
+        assert!(!state.close_modal.remove_worktree);
+        assert!(!state.close_modal.force_remove_worktree);
+
+        // Toggle compose off/on
+        state.close_modal.toggle_compose();
+        assert!(!state.close_modal.compose_down);
+        state.close_modal.toggle_compose();
+        assert!(state.close_modal.compose_down);
+
+        // Primary checkout cannot enable remove_worktree or force
+        assert!(state.open_close_modal_for_workspace(primary_id));
+        assert!(!state.close_modal.is_worktree);
+        assert!(!state.close_modal.has_compose);
+        assert!(!state.close_modal.compose_down);
+        state.close_modal.toggle_worktree();
+        assert!(!state.close_modal.remove_worktree);
+        state.close_modal.toggle_force();
+        assert!(!state.close_modal.force_remove_worktree);
+    }
+
+    #[test]
+    fn agent_state_and_workspace_runtime_updates_sync_state() {
+        let mut state = AppState::new();
+        let (ws, agent_id, _, _) = make_workspace_with_three_panes();
+        let ws_id = ws.id;
+        state.set_workspaces(vec![ws]);
+
+        assert_eq!(
+            state.workspace_agent_state(state.active_workspace().unwrap()),
+            None
+        );
+
+        state.apply_server_event(ServerEvent::AgentStateChanged {
+            workspace_id: ws_id,
+            pane_id: agent_id,
+            state: AgentState::WaitingForApproval,
+        });
+
+        assert_eq!(
+            state.panes.get(&agent_id).unwrap().summary.agent_state,
+            Some(AgentState::WaitingForApproval)
+        );
+        assert_eq!(
+            state.workspace_agent_state(state.active_workspace().unwrap()),
+            Some(AgentState::WaitingForApproval)
+        );
+
+        let gs = GitWorkspaceStatus {
+            is_worktree: true,
+            dirty: true,
+            ahead: 3,
+            behind: 1,
+        };
+        state.apply_server_event(ServerEvent::WorkspaceRuntimeUpdated {
+            workspace_id: ws_id,
+            bound_ports: Vec::new(),
+            containers: Vec::new(),
+            git_status: Some(gs),
+            git_branch: Some("feat/v0.0.3".to_string()),
+        });
+        let updated = state.active_workspace().unwrap();
+        assert_eq!(updated.git_status, Some(gs));
+        assert_eq!(updated.git_branch.as_deref(), Some("feat/v0.0.3"));
+    }
+
+    #[test]
+    fn cycle_workspace_wraps_cleanly_forward_and_backward() {
+        let mut state = AppState::new();
+        assert_eq!(state.cycle_workspace(1), None);
+        assert_eq!(state.cycle_workspace(-1), None);
+
+        let (ws1, _, _, _) = make_workspace_with_three_panes();
+        let (ws2, _, _, _) = make_workspace_with_three_panes();
+        let (ws3, _, _, _) = make_workspace_with_three_panes();
+        let id1 = ws1.id;
+        let id2 = ws2.id;
+        let id3 = ws3.id;
+        state.set_workspaces(vec![ws1, ws2, ws3]);
+        assert_eq!(state.active_workspace_id, Some(id1));
+
+        assert_eq!(state.cycle_workspace(1), Some(id2));
+        assert_eq!(state.cycle_workspace(1), Some(id3));
+        assert_eq!(state.cycle_workspace(1), Some(id1));
+        assert_eq!(state.cycle_workspace(-1), Some(id3));
+        assert_eq!(state.cycle_workspace(-1), Some(id2));
+        assert_eq!(state.cycle_workspace(-1), Some(id1));
     }
 }
