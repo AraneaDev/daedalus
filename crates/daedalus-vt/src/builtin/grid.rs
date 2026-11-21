@@ -369,7 +369,41 @@ impl Grid {
             rows: self.rows,
             cursor: self.cursor(),
             rows_data,
+            scrollback_len: self.scrollback.len(),
         }
+    }
+
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    /// Returns up to `count` rows ordered top-to-bottom from the combined
+    /// `[scrollback..., viewport...]` history ending `offset_from_bottom` rows
+    /// above the bottom of the live viewport.
+    pub fn scrollback_window(&self, offset_from_bottom: usize, count: usize) -> Vec<GridRow> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let total = self.scrollback.len() + self.viewport.len();
+        let clamped_offset = offset_from_bottom.min(self.scrollback.len());
+        let end = total.saturating_sub(clamped_offset);
+        let start = end.saturating_sub(count);
+        let mut out = Vec::with_capacity(end.saturating_sub(start));
+        for (idx, row) in self
+            .scrollback
+            .iter()
+            .chain(self.viewport.iter())
+            .enumerate()
+            .skip(start)
+            .take(end - start)
+        {
+            out.push(GridRow {
+                row_index: (idx - start) as u16,
+                abs_row: row.abs_row,
+                cells: row.cells.clone(),
+            });
+        }
+        out
     }
 
     pub fn take_dirty_delta(&mut self, pane_id: PaneId, seq: u64) -> Option<GridDelta> {

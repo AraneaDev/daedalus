@@ -1,6 +1,7 @@
 use crate::supervisor::SpawnedPty;
 use daedalus_proto::{
-    FailureTrace, GridSnapshot, PaneId, PaneRole, PaneSummary, ProtoError, ServerEvent, WorkspaceId,
+    FailureTrace, GridRow, GridSnapshot, PaneId, PaneRole, PaneSummary, ProtoError, ServerEvent,
+    WorkspaceId,
 };
 use daedalus_vt::{CommandTracker, VtConfig, create_vt_engine};
 use portable_pty::PtySize;
@@ -21,6 +22,11 @@ enum PaneCmd {
     },
     GetSnapshot {
         reply: oneshot::Sender<GridSnapshot>,
+    },
+    GetScrollback {
+        offset_from_bottom: usize,
+        count: usize,
+        reply: oneshot::Sender<(usize, Vec<GridRow>)>,
     },
     GetFailureTrace {
         reply: oneshot::Sender<Option<FailureTrace>>,
@@ -184,6 +190,23 @@ impl PaneHandle {
         rx.await.map_err(|_| ProtoError::PaneNotFound(self.id))
     }
 
+    pub async fn scrollback(
+        &self,
+        offset_from_bottom: usize,
+        count: usize,
+    ) -> Result<(usize, Vec<GridRow>), ProtoError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(PaneCmd::GetScrollback {
+                offset_from_bottom,
+                count,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| ProtoError::PaneNotFound(self.id))?;
+        rx.await.map_err(|_| ProtoError::PaneNotFound(self.id))
+    }
+
     pub async fn failure_trace(&self) -> Result<Option<FailureTrace>, ProtoError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -316,6 +339,17 @@ async fn run_pane_actor(
                     }
                     Some(PaneCmd::GetSnapshot { reply }) => {
                         let _ = reply.send(tracker.engine().snapshot(pane_id, seq));
+                    }
+                    Some(PaneCmd::GetScrollback {
+                        offset_from_bottom,
+                        count,
+                        reply,
+                    }) => {
+                        let engine = tracker.engine();
+                        let _ = reply.send((
+                            engine.scrollback_len(),
+                            engine.scrollback_window(offset_from_bottom, count),
+                        ));
                     }
                     Some(PaneCmd::GetFailureTrace { reply }) => {
                         let _ = reply.send(tracker.last_failure_trace().cloned());

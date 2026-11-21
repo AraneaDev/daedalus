@@ -1,7 +1,7 @@
 pub mod grid;
 
 use crate::{SemanticEvent, VtConfig, VtEngine};
-use daedalus_proto::{CellFlags, Color, CursorState, GridDelta, GridSnapshot, PaneId};
+use daedalus_proto::{CellFlags, Color, CursorState, GridDelta, GridRow, GridSnapshot, PaneId};
 use grid::Grid;
 use std::path::PathBuf;
 use vte::{Params, Parser, Perform};
@@ -46,6 +46,14 @@ impl VtEngine for BuiltinVt {
 
     fn snapshot(&self, pane_id: PaneId, seq: u64) -> GridSnapshot {
         self.state.grid.snapshot(pane_id, seq)
+    }
+
+    fn scrollback_len(&self) -> usize {
+        self.state.grid.scrollback_len()
+    }
+
+    fn scrollback_window(&self, offset_from_bottom: usize, count: usize) -> Vec<GridRow> {
+        self.state.grid.scrollback_window(offset_from_bottom, count)
     }
 
     fn take_dirty_delta(&mut self, pane_id: PaneId, seq: u64) -> Option<GridDelta> {

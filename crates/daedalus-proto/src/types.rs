@@ -178,6 +178,8 @@ pub struct GridSnapshot {
     pub rows: u16,
     pub cursor: CursorState,
     pub rows_data: Vec<GridRow>,
+    #[serde(default)]
+    pub scrollback_len: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

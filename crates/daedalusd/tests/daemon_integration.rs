@@ -276,3 +276,162 @@ async fn zsh_osc133_captures_failure_trace_when_zsh_installed() {
     let _ = shutdown_tx.send(());
     srv_handle.await.unwrap();
 }
+
+#[tokio::test]
+async fn get_scrollback_returns_lines_scrolled_above_viewport() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daedalusd.sock");
+    let runtime = dir.path().join("runtime");
+
+    let server = DaemonServer::bind_with_supervisor(
+        sock.clone(),
+        runtime,
+        Supervisor::with_mode(IsolationMode::PgidFallback),
+    )
+    .await
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let mut client = UnixStream::connect(&sock).await.unwrap();
+    let ws = match send_rpc(
+        &mut client,
+        1,
+        ClientMessage::CreateWorkspace {
+            name: "scrollback-demo".to_string(),
+            root_dir: dir.path().to_path_buf(),
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::WorkspaceCreated(ws) => ws,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    let pane = match send_rpc(
+        &mut client,
+        2,
+        ClientMessage::SpawnPane {
+            workspace_id: ws.id,
+            role: PaneRole::Runner,
+            command: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "for i in 1 2 3 4 5 6 7 8 9 10; do echo LINE_$i; done; sleep 2".to_string(),
+            ]),
+            shell: None,
+            cols: 80,
+            rows: 4,
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::PaneSpawned(p) => p,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    let rows_to_text = |rows: &[daedalus_proto::GridRow]| -> Vec<String> {
+        rows.iter()
+            .map(|r| {
+                r.cells
+                    .iter()
+                    .map(|c| c.text.as_str())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    };
+
+    let snap = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snap = match send_rpc(
+                &mut client,
+                3,
+                ClientMessage::GetSnapshot { pane_id: pane.id },
+            )
+            .await
+            {
+                ResponsePayload::Snapshot(s) => s,
+                other => panic!("unexpected: {other:?}"),
+            };
+            let text = rows_to_text(&snap.rows_data).join("\n");
+            if text.contains("LINE_10") {
+                return snap;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for LINE_10 in snapshot");
+
+    assert!(
+        snap.scrollback_len >= 6,
+        "expected scrollback_len >= 6, got {}",
+        snap.scrollback_len
+    );
+
+    // Query with offset_from_bottom: 6, count: 4 (because echo LINE_10 emits a trailing newline
+    // that leaves row 3 blank, total_scrollback is 7 and offset 6 covers LINE_2..LINE_5;
+    // querying at offset_from_bottom = total_scrollback covers LINE_1..LINE_4).
+    let (total_scrollback, rows_at_6) = match send_rpc(
+        &mut client,
+        4,
+        ClientMessage::GetScrollback {
+            pane_id: pane.id,
+            offset_from_bottom: 6,
+            count: 4,
+        },
+    )
+    .await
+    {
+        ResponsePayload::ScrollbackRows {
+            pane_id,
+            total_scrollback,
+            rows,
+        } => {
+            assert_eq!(pane_id, pane.id);
+            (total_scrollback, rows)
+        }
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(total_scrollback, 7);
+    let text_at_6 = rows_to_text(&rows_at_6);
+    assert_eq!(text_at_6, vec!["LINE_2", "LINE_3", "LINE_4", "LINE_5"]);
+
+    let (_, top_rows) = match send_rpc(
+        &mut client,
+        5,
+        ClientMessage::GetScrollback {
+            pane_id: pane.id,
+            offset_from_bottom: total_scrollback,
+            count: 4,
+        },
+    )
+    .await
+    {
+        ResponsePayload::ScrollbackRows {
+            pane_id,
+            total_scrollback,
+            rows,
+        } => {
+            assert_eq!(pane_id, pane.id);
+            (total_scrollback, rows)
+        }
+        other => panic!("unexpected: {other:?}"),
+    };
+    let top_text = rows_to_text(&top_rows);
+    assert_eq!(top_text, vec!["LINE_1", "LINE_2", "LINE_3", "LINE_4"]);
+
+    send_rpc(&mut client, 6, ClientMessage::CloseWorkspace { id: ws.id }).await;
+    let _ = shutdown_tx.send(());
+    srv_handle.await.unwrap();
+}

@@ -3,7 +3,7 @@ pub mod builtin;
 pub mod ghostty;
 pub mod semantic;
 
-use daedalus_proto::{CursorState, GridDelta, GridSnapshot, PaneId};
+use daedalus_proto::{CursorState, GridDelta, GridRow, GridSnapshot, PaneId};
 use std::path::PathBuf;
 
 pub use builtin::BuiltinVt;
@@ -40,6 +40,8 @@ pub trait VtEngine: Send {
     fn feed(&mut self, bytes: &[u8]) -> Vec<SemanticEvent>;
     fn resize(&mut self, cols: u16, rows: u16);
     fn snapshot(&self, pane_id: PaneId, seq: u64) -> GridSnapshot;
+    fn scrollback_len(&self) -> usize;
+    fn scrollback_window(&self, offset_from_bottom: usize, count: usize) -> Vec<GridRow>;
     fn take_dirty_delta(&mut self, pane_id: PaneId, seq: u64) -> Option<GridDelta>;
     fn slice_plain_text(&self, start_abs_row: u64, end_abs_row: u64) -> String;
     fn row_text_from(&self, abs_row: u64, start_col: u16) -> String;
@@ -246,5 +248,44 @@ mod tests {
         assert_eq!(trace.command.as_deref(), Some("false"));
         assert_eq!(trace.exit_code, 1);
         assert!(trace.output.contains("boom"));
+    }
+
+    #[test]
+    fn scrollback_window_returns_clamped_historical_rows() {
+        let mut vt = BuiltinVt::new(VtConfig {
+            cols: 20,
+            rows: 3,
+            scrollback_limit: 50,
+        });
+        vt.feed(b"line0\r\nline1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7");
+
+        assert_eq!(vt.scrollback_len(), 5);
+        assert_eq!(vt.snapshot(PaneId::new(), 1).scrollback_len, 5);
+
+        let row_texts = |rows: Vec<GridRow>| -> Vec<String> {
+            rows.into_iter()
+                .map(|r| {
+                    r.cells
+                        .into_iter()
+                        .map(|c| c.text)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            row_texts(vt.scrollback_window(0, 3)),
+            vec!["line5", "line6", "line7"]
+        );
+        assert_eq!(
+            row_texts(vt.scrollback_window(2, 3)),
+            vec!["line3", "line4", "line5"]
+        );
+        assert_eq!(
+            row_texts(vt.scrollback_window(999, 3)),
+            vec!["line0", "line1", "line2"]
+        );
     }
 }

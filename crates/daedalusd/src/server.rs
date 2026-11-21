@@ -226,6 +226,22 @@ async fn dispatch_request(
         ClientMessage::GetSnapshot { pane_id } => Ok(ResponsePayload::Snapshot(
             registry.get_pane(pane_id).await?.snapshot().await?,
         )),
+        ClientMessage::GetScrollback {
+            pane_id,
+            offset_from_bottom,
+            count,
+        } => {
+            let (total_scrollback, rows) = registry
+                .get_pane(pane_id)
+                .await?
+                .scrollback(offset_from_bottom, count)
+                .await?;
+            Ok(ResponsePayload::ScrollbackRows {
+                pane_id,
+                total_scrollback,
+                rows,
+            })
+        }
         ClientMessage::GetFailureTrace { pane_id } => Ok(ResponsePayload::FailureTrace(
             registry.get_pane(pane_id).await?.failure_trace().await?,
         )),

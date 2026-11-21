@@ -1,6 +1,6 @@
 use crate::types::{
-    FailureTrace, GridDelta, GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary, WorkspaceId,
-    WorkspaceInfo,
+    FailureTrace, GridDelta, GridRow, GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary,
+    WorkspaceId, WorkspaceInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -49,6 +49,11 @@ pub enum ClientMessage {
     GetSnapshot {
         pane_id: PaneId,
     },
+    GetScrollback {
+        pane_id: PaneId,
+        offset_from_bottom: usize,
+        count: usize,
+    },
     GetFailureTrace {
         pane_id: PaneId,
     },
@@ -78,6 +83,11 @@ pub enum ResponsePayload {
     Workspaces(Vec<WorkspaceInfo>),
     PaneSpawned(PaneSummary),
     Snapshot(GridSnapshot),
+    ScrollbackRows {
+        pane_id: PaneId,
+        total_scrollback: usize,
+        rows: Vec<GridRow>,
+    },
     FailureTrace(Option<FailureTrace>),
     Ok,
 }

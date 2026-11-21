@@ -1,7 +1,7 @@
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
 
 use crate::{BuiltinVt, SemanticEvent, VtConfig, VtEngine};
-use daedalus_proto::{CursorState, GridDelta, GridSnapshot, PaneId};
+use daedalus_proto::{CursorState, GridDelta, GridRow, GridSnapshot, PaneId};
 
 pub mod ffi {
     include!(concat!(env!("OUT_DIR"), "/ghostty_vt_bindings.rs"));
@@ -34,6 +34,14 @@ impl VtEngine for GhosttyVt {
 
     fn snapshot(&self, pane_id: PaneId, seq: u64) -> GridSnapshot {
         self.shadow.snapshot(pane_id, seq)
+    }
+
+    fn scrollback_len(&self) -> usize {
+        self.shadow.scrollback_len()
+    }
+
+    fn scrollback_window(&self, offset_from_bottom: usize, count: usize) -> Vec<GridRow> {
+        self.shadow.scrollback_window(offset_from_bottom, count)
     }
 
     fn take_dirty_delta(&mut self, pane_id: PaneId, seq: u64) -> Option<GridDelta> {
