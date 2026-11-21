@@ -410,11 +410,17 @@ mod tests {
     fn command_probe_respects_timeout_and_kills_hanging_process() {
         let mut ok_cmd = Command::new("/bin/sh");
         ok_cmd.args(["-c", "true"]);
-        assert!(run_command_with_timeout(&mut ok_cmd, Duration::from_secs(2)));
+        assert!(run_command_with_timeout(
+            &mut ok_cmd,
+            Duration::from_secs(2)
+        ));
 
         let mut fail_cmd = Command::new("/bin/sh");
         fail_cmd.args(["-c", "false"]);
-        assert!(!run_command_with_timeout(&mut fail_cmd, Duration::from_secs(2)));
+        assert!(!run_command_with_timeout(
+            &mut fail_cmd,
+            Duration::from_secs(2)
+        ));
 
         let start = Instant::now();
         let mut hang_cmd = Command::new("/bin/sh");

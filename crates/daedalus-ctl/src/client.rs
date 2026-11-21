@@ -1,5 +1,5 @@
 use daedalus_proto::{
-    read_frame, write_frame, ClientMessage, Request, ResponsePayload, ServerEvent, ServerMessage,
+    ClientMessage, Request, ResponsePayload, ServerEvent, ServerMessage, read_frame, write_frame,
 };
 use std::path::Path;
 use tokio::net::UnixStream;

@@ -198,9 +198,7 @@ fn translate_picker_key(key: &Key, mods: ModifiersState) -> UiAction {
         Key::Named(NamedKey::ArrowDown) => UiAction::PickerDown,
         Key::Named(NamedKey::Enter) => UiAction::PickerConfirm,
         Key::Named(NamedKey::Escape) => UiAction::PickerCancel,
-        Key::Character(ch)
-            if !mods.control_key() && !mods.alt_key() && !mods.super_key() =>
-        {
+        Key::Character(ch) if !mods.control_key() && !mods.alt_key() && !mods.super_key() => {
             if ch.eq_ignore_ascii_case("k") {
                 UiAction::PickerUp
             } else if ch.eq_ignore_ascii_case("j") {
@@ -213,11 +211,7 @@ fn translate_picker_key(key: &Key, mods: ModifiersState) -> UiAction {
     }
 }
 
-fn translate_worktree_modal_key(
-    key: &Key,
-    text: Option<&str>,
-    mods: ModifiersState,
-) -> UiAction {
+fn translate_worktree_modal_key(key: &Key, text: Option<&str>, mods: ModifiersState) -> UiAction {
     if mods.control_key()
         && mods.shift_key()
         && !mods.alt_key()
@@ -490,7 +484,13 @@ mod tests {
         );
         // Super-modified keys are never leaked to the PTY
         assert_eq!(
-            translate_key(&char_key("l"), Some("l"), ModifiersState::SUPER, false, false),
+            translate_key(
+                &char_key("l"),
+                Some("l"),
+                ModifiersState::SUPER,
+                false,
+                false
+            ),
             UiAction::Ignore
         );
     }
@@ -507,7 +507,13 @@ mod tests {
             UiAction::PickerUp
         );
         assert_eq!(
-            translate_key(&char_key("K"), Some("K"), ModifiersState::SHIFT, true, false),
+            translate_key(
+                &char_key("K"),
+                Some("K"),
+                ModifiersState::SHIFT,
+                true,
+                false
+            ),
             UiAction::PickerUp
         );
         assert_eq!(
@@ -519,7 +525,13 @@ mod tests {
             UiAction::PickerDown
         );
         assert_eq!(
-            translate_key(&char_key("J"), Some("J"), ModifiersState::SHIFT, true, false),
+            translate_key(
+                &char_key("J"),
+                Some("J"),
+                ModifiersState::SHIFT,
+                true,
+                false
+            ),
             UiAction::PickerDown
         );
         assert_eq!(
@@ -527,7 +539,13 @@ mod tests {
             UiAction::PickerConfirm
         );
         assert_eq!(
-            translate_key(&named_key(NamedKey::Escape), Some("\x1b"), none, true, false),
+            translate_key(
+                &named_key(NamedKey::Escape),
+                Some("\x1b"),
+                none,
+                true,
+                false
+            ),
             UiAction::PickerCancel
         );
 
@@ -568,13 +586,7 @@ mod tests {
             UiAction::ToggleAgentPicker
         );
         assert_eq!(
-            translate_key(
-                &char_key("P"),
-                None,
-                cs | ModifiersState::ALT,
-                true,
-                false
-            ),
+            translate_key(&char_key("P"), None, cs | ModifiersState::ALT, true, false),
             UiAction::Ignore
         );
         assert_eq!(
@@ -597,7 +609,13 @@ mod tests {
             UiAction::WorktreeModalChar('/')
         );
         assert_eq!(
-            translate_key(&char_key("A"), Some("A"), ModifiersState::SHIFT, false, true),
+            translate_key(
+                &char_key("A"),
+                Some("A"),
+                ModifiersState::SHIFT,
+                false,
+                true
+            ),
             UiAction::WorktreeModalChar('A')
         );
         assert_eq!(
@@ -609,7 +627,13 @@ mod tests {
             UiAction::WorktreeModalConfirm
         );
         assert_eq!(
-            translate_key(&named_key(NamedKey::Escape), Some("\x1b"), none, false, true),
+            translate_key(
+                &named_key(NamedKey::Escape),
+                Some("\x1b"),
+                none,
+                false,
+                true
+            ),
             UiAction::WorktreeModalCancel
         );
         assert_eq!(

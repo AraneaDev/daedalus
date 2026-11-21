@@ -383,9 +383,10 @@ pub fn spawn_runtime_monitor(
                 let mut bound_ports = Vec::new();
                 let mut containers = Vec::new();
 
-                if let (Some(docker), Some(project)) =
-                    (docker_client.as_ref(), target.compose_project_name.as_deref())
-                {
+                if let (Some(docker), Some(project)) = (
+                    docker_client.as_ref(),
+                    target.compose_project_name.as_deref(),
+                ) {
                     let docker_res = tokio::select! {
                         biased;
                         _ = wait_for_shutdown(&mut shutdown) => break,

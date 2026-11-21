@@ -255,12 +255,7 @@ pub struct GridDelta {
     pub dirty_rows: Vec<GridRow>,
 }
 
-const BRACKETED_PASTE_FORBIDDEN: &[&[u8]] = &[
-    b"\x1b[201~",
-    b"\x1b[200~",
-    b"\x9b201~",
-    b"\x9b200~",
-];
+const BRACKETED_PASTE_FORBIDDEN: &[&[u8]] = &[b"\x1b[201~", b"\x1b[200~", b"\x9b201~", b"\x9b200~"];
 
 fn strip_bracketed_paste_markers(data: &[u8]) -> Vec<u8> {
     let mut current = data.to_vec();

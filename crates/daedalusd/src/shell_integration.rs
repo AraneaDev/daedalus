@@ -204,12 +204,14 @@ mod tests {
         let zsh = integration.build_launch_spec(None, Some("/usr/bin/zsh"));
         assert_eq!(zsh.program, "/usr/bin/zsh");
         assert_eq!(zsh.args, vec!["-i"]);
-        assert!(Path::new(zsh.extra_env.get("ZDOTDIR").unwrap()).join(".zshrc").exists());
-
-        let agy = integration.build_launch_spec(
-            Some(&["agy".to_string(), "--version".to_string()]),
-            None,
+        assert!(
+            Path::new(zsh.extra_env.get("ZDOTDIR").unwrap())
+                .join(".zshrc")
+                .exists()
         );
+
+        let agy = integration
+            .build_launch_spec(Some(&["agy".to_string(), "--version".to_string()]), None);
         assert_eq!(agy.program, "agy");
         assert_eq!(agy.args, vec!["--version"]);
         assert!(agy.extra_env.is_empty());

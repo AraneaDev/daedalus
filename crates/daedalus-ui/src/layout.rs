@@ -328,7 +328,11 @@ fn sidebar_footer_buttons_y(sidebar: Rect, workspace_count: usize, m: &LayoutMet
 }
 
 /// Computes the rectangle of the "+ Workspace" button inside the sidebar.
-pub fn sidebar_new_workspace_rect(sidebar: Rect, workspace_count: usize, scale_factor: f32) -> Rect {
+pub fn sidebar_new_workspace_rect(
+    sidebar: Rect,
+    workspace_count: usize,
+    scale_factor: f32,
+) -> Rect {
     let m = LayoutMetrics::for_scale(scale_factor);
     let total_w = (sidebar.width - 2.0 * m.sidebar_pad).max(0.0);
     let btn_w = ((total_w - m.sidebar_row_gap) * 0.5).max(0.0);
@@ -493,10 +497,22 @@ mod tests {
 
     #[test]
     fn cell_grid_size_clamps_to_at_least_one_by_one() {
-        assert_eq!(cell_grid_size(Rect::new(0.0, 0.0, 0.0, 0.0), 8.0, 16.0), (1, 1));
-        assert_eq!(cell_grid_size(Rect::new(0.0, 0.0, 3.0, 5.0), 8.0, 16.0), (1, 1));
-        assert_eq!(cell_grid_size(Rect::new(0.0, 0.0, 80.0, 160.0), 0.0, -4.0), (1, 1));
-        assert_eq!(cell_grid_size(Rect::new(0.0, 0.0, 85.0, 170.0), 8.0, 16.0), (10, 10));
+        assert_eq!(
+            cell_grid_size(Rect::new(0.0, 0.0, 0.0, 0.0), 8.0, 16.0),
+            (1, 1)
+        );
+        assert_eq!(
+            cell_grid_size(Rect::new(0.0, 0.0, 3.0, 5.0), 8.0, 16.0),
+            (1, 1)
+        );
+        assert_eq!(
+            cell_grid_size(Rect::new(0.0, 0.0, 80.0, 160.0), 0.0, -4.0),
+            (1, 1)
+        );
+        assert_eq!(
+            cell_grid_size(Rect::new(0.0, 0.0, 85.0, 170.0), 8.0, 16.0),
+            (10, 10)
+        );
 
         let mut tiny = default_input();
         tiny.window_w = 10.0;
@@ -521,7 +537,15 @@ mod tests {
         let cell_x = agent.viewport.x + 3.0 * input.cell_w + 1.0;
         let cell_y = agent.viewport.y + 2.0 * input.cell_h + 1.0;
         assert_eq!(
-            hit_test(&layout, 2, input.scale_factor, input.cell_w, input.cell_h, cell_x, cell_y),
+            hit_test(
+                &layout,
+                2,
+                input.scale_factor,
+                input.cell_w,
+                input.cell_h,
+                cell_x,
+                cell_y
+            ),
             HitTarget::PaneViewport {
                 role: PaneRole::Agent,
                 col: 3,
@@ -622,7 +646,15 @@ mod tests {
 
         // Outside window returns None
         assert_eq!(
-            hit_test(&layout, 2, input.scale_factor, input.cell_w, input.cell_h, -5.0, -5.0),
+            hit_test(
+                &layout,
+                2,
+                input.scale_factor,
+                input.cell_w,
+                input.cell_h,
+                -5.0,
+                -5.0
+            ),
             HitTarget::None
         );
     }

@@ -89,7 +89,13 @@ async fn cli_smoke_ping_workspace_and_pane_lifecycle() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     let snap = Command::new(bin)
-        .args(["--socket", sock.to_str().unwrap(), "pane", "snapshot", &pane_id])
+        .args([
+            "--socket",
+            sock.to_str().unwrap(),
+            "pane",
+            "snapshot",
+            &pane_id,
+        ])
         .output()
         .await
         .unwrap();
@@ -146,7 +152,13 @@ async fn cli_smoke_ping_workspace_and_pane_lifecycle() {
     assert!(wt_list.status.success());
 
     let close = Command::new(bin)
-        .args(["--socket", sock.to_str().unwrap(), "workspace", "close", &ws_id])
+        .args([
+            "--socket",
+            sock.to_str().unwrap(),
+            "workspace",
+            "close",
+            &ws_id,
+        ])
         .output()
         .await
         .unwrap();

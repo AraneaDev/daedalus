@@ -483,17 +483,13 @@ impl Registry {
                 let target_dir = root_dir
                     .as_deref()
                     .expect("checked workspace_id.is_none() && root_dir.is_none() above");
-                find_longest_prefix_workspace(
-                    &ws_map,
-                    target_dir,
-                    canonical_target.as_deref(),
-                )
-                .ok_or_else(|| {
-                    ProtoError::InvalidRequest(format!(
-                        "no workspace matches root_dir: {}",
-                        target_dir.display()
-                    ))
-                })?
+                find_longest_prefix_workspace(&ws_map, target_dir, canonical_target.as_deref())
+                    .ok_or_else(|| {
+                        ProtoError::InvalidRequest(format!(
+                            "no workspace matches root_dir: {}",
+                            target_dir.display()
+                        ))
+                    })?
             };
 
             let ws = ws_map
@@ -710,7 +706,10 @@ mod tests {
             .unwrap();
         assert_eq!(ws1.slot_index, 1);
         assert_eq!(ws1.port_offset, 200);
-        assert_eq!(ws1.injected_env.get("PORT").map(String::as_str), Some("18200"));
+        assert_eq!(
+            ws1.injected_env.get("PORT").map(String::as_str),
+            Some("18200")
+        );
 
         // Slot 2 must skip 18200 (reserved by ws1) and allocate 18300.
         let ws2 = registry
@@ -721,7 +720,10 @@ mod tests {
 
         assert_eq!(ws2.slot_index, 2);
         assert_eq!(ws2.port_offset, 300);
-        assert_eq!(ws2.injected_env.get("PORT").map(String::as_str), Some("18300"));
+        assert_eq!(
+            ws2.injected_env.get("PORT").map(String::as_str),
+            Some("18300")
+        );
     }
 
     #[tokio::test]

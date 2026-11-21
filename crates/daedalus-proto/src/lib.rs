@@ -2,12 +2,12 @@ pub mod codec;
 pub mod rpc;
 pub mod types;
 
-pub use codec::{read_frame, write_frame, CodecError, MAX_FRAME_SIZE};
+pub use codec::{CodecError, MAX_FRAME_SIZE, read_frame, write_frame};
 pub use rpc::{ClientMessage, ProtoError, Request, ResponsePayload, ServerEvent, ServerMessage};
 pub use types::{
-    wrap_bracketed_paste, Cell, CellFlags, Color, ContainerHealth, CursorState, ExternalStatus,
-    FailureTrace, GitWorktreeInfo, GridDelta, GridRow, GridSnapshot, PaneId, PaneRole, PaneStatus,
-    PaneSummary, PortMapping, PortSource, StatusLevel, WorkspaceId, WorkspaceInfo,
+    Cell, CellFlags, Color, ContainerHealth, CursorState, ExternalStatus, FailureTrace,
+    GitWorktreeInfo, GridDelta, GridRow, GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary,
+    PortMapping, PortSource, StatusLevel, WorkspaceId, WorkspaceInfo, wrap_bracketed_paste,
 };
 
 use std::path::PathBuf;

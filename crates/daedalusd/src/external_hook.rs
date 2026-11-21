@@ -280,7 +280,10 @@ mod tests {
 
         let _ = tx.send(());
         handle.await.unwrap();
-        assert!(!sock.exists(), "events socket should be removed on shutdown");
+        assert!(
+            !sock.exists(),
+            "events socket should be removed on shutdown"
+        );
     }
 
     #[tokio::test]

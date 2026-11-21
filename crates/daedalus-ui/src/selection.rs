@@ -227,10 +227,7 @@ mod tests {
     #[test]
     fn reverse_drag_normalizes_across_multiple_lines() {
         let sel = Selection::new(CellPos::new(3, 12), CellPos::new(6, 10));
-        assert_eq!(
-            sel.normalized(),
-            (CellPos::new(6, 10), CellPos::new(3, 12))
-        );
+        assert_eq!(sel.normalized(), (CellPos::new(6, 10), CellPos::new(3, 12)));
 
         // Start row: col >= 6
         assert!(!sel.contains(5, 10));
@@ -273,8 +270,14 @@ mod tests {
 
         // Clicking inside "cargo" (cols 2..=6)
         let sel = select_word_at(&row, 4).expect("should select cargo");
-        assert_eq!(sel, Selection::new(CellPos::new(2, 42), CellPos::new(6, 42)));
-        assert_eq!(extract_selected_text(std::slice::from_ref(&row), &sel), "cargo");
+        assert_eq!(
+            sel,
+            Selection::new(CellPos::new(2, 42), CellPos::new(6, 42))
+        );
+        assert_eq!(
+            extract_selected_text(std::slice::from_ref(&row), &sel),
+            "cargo"
+        );
 
         // Clicking inside "--workspace" (cols 13..=23)
         let flag_sel = select_word_at(&row, 18).expect("should select --workspace");

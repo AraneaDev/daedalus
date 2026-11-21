@@ -240,10 +240,7 @@ pub fn discover_worktrees(repo_dir: &Path) -> Result<Vec<GitWorktreeInfo>, Strin
         {
             return Ok(Vec::new());
         }
-        return Err(format!(
-            "git worktree list failed: {}",
-            out.stderr.trim()
-        ));
+        return Err(format!("git worktree list failed: {}", out.stderr.trim()));
     }
 
     Ok(parse_worktree_porcelain(&out.stdout))
@@ -550,7 +547,10 @@ detached\r\n";
             std::fs::canonicalize(&created_new.path).unwrap(),
             std::fs::canonicalize(base_dir.path().join("my-app").join("feat-auth")).unwrap()
         );
-        assert_eq!(current_branch(&created_new.path), Some("feat/auth".to_string()));
+        assert_eq!(
+            current_branch(&created_new.path),
+            Some("feat/auth".to_string())
+        );
 
         // Create an existing branch without checking it out in primary, then attach worktree
         run_git_test(&repo, &["branch", "hotfix/login"]);

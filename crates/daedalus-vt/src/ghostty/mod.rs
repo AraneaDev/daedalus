@@ -1,4 +1,9 @@
-#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
+#![allow(
+    non_upper_case_globals,
+    non_camel_case_types,
+    non_snake_case,
+    dead_code
+)]
 
 use crate::{BuiltinVt, SemanticEvent, VtConfig, VtEngine};
 use daedalus_proto::{CursorState, GridDelta, GridRow, GridSnapshot, PaneId};

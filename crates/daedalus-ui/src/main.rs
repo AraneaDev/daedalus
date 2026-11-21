@@ -7,7 +7,9 @@ use daedalus_proto::{PaneId, PaneRole, default_socket_path, wrap_bracketed_paste
 use daedalus_ui::bridge::{BridgeConfig, DaemonBridge, UiCommand, UiEvent, UiEventSink};
 use daedalus_ui::input::{UiAction, translate_key};
 use daedalus_ui::layout::{HitTarget, LayoutInput, WorkspaceLayout, compute_layout, hit_test};
-use daedalus_ui::renderer::{GpuRenderer, picker_item_rect, picker_modal_rect, worktree_modal_rect};
+use daedalus_ui::renderer::{
+    GpuRenderer, picker_item_rect, picker_modal_rect, worktree_modal_rect,
+};
 use daedalus_ui::selection::{CellPos, Selection, extract_selected_text, select_word_at};
 use daedalus_ui::state::{AgentPreset, AppState};
 use tracing::{error, warn};
@@ -29,10 +31,7 @@ const FALLBACK_PANE_COLS: u16 = 120;
 const FALLBACK_PANE_ROWS: u16 = 36;
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "daedalus-ui",
-    about = "Daedalus native GPU terminal workbench"
-)]
+#[command(name = "daedalus-ui", about = "Daedalus native GPU terminal workbench")]
 struct Args {
     /// Unix socket path for `daedalusd`.
     #[arg(long, env = "DAEDALUS_SOCKET")]
@@ -198,8 +197,8 @@ impl DaedalusApp {
 
     fn ensure_clipboard(&mut self) -> Result<&mut arboard::Clipboard, String> {
         if self.clipboard.is_none() {
-            let cb = arboard::Clipboard::new()
-                .map_err(|err| format!("Clipboard unavailable: {err}"))?;
+            let cb =
+                arboard::Clipboard::new().map_err(|err| format!("Clipboard unavailable: {err}"))?;
             self.clipboard = Some(cb);
         }
         Ok(self.clipboard.as_mut().expect("clipboard initialized"))
@@ -565,14 +564,14 @@ impl DaedalusApp {
             HitTarget::PaneViewport { role, col, row } => {
                 self.state.focused_role = role;
                 let now = Instant::now();
-                let is_double_click = self
-                    .last_click
-                    .is_some_and(|(ts, prev_role, prev_col, prev_row)| {
-                        now.duration_since(ts) <= DOUBLE_CLICK_WINDOW
-                            && prev_role == role
-                            && prev_col == col
-                            && prev_row == row
-                    });
+                let is_double_click =
+                    self.last_click
+                        .is_some_and(|(ts, prev_role, prev_col, prev_row)| {
+                            now.duration_since(ts) <= DOUBLE_CLICK_WINDOW
+                                && prev_role == role
+                                && prev_col == col
+                                && prev_row == row
+                        });
 
                 if let Some(pane_id) = self.state.pane_id_for_role(role) {
                     if is_double_click {
@@ -588,10 +587,10 @@ impl DaedalusApp {
                         self.last_click = Some((now, role, col, row));
                         if let Some(pane) = self.state.panes.get_mut(&pane_id) {
                             pane.selection = None;
-                            self.drag_anchor = pane
-                                .visible_rows()
-                                .get(row as usize)
-                                .map(|grid_row| (role, pane_id, CellPos::new(col, grid_row.abs_row)));
+                            self.drag_anchor =
+                                pane.visible_rows().get(row as usize).map(|grid_row| {
+                                    (role, pane_id, CellPos::new(col, grid_row.abs_row))
+                                });
                         }
                     }
                 }
@@ -711,7 +710,10 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
 
         let attrs = Window::default_attributes()
             .with_title("Daedalus Workbench")
-            .with_inner_size(LogicalSize::new(INITIAL_WINDOW_WIDTH, INITIAL_WINDOW_HEIGHT));
+            .with_inner_size(LogicalSize::new(
+                INITIAL_WINDOW_WIDTH,
+                INITIAL_WINDOW_HEIGHT,
+            ));
 
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),

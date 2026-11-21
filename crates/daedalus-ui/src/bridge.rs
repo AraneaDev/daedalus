@@ -789,7 +789,11 @@ async fn populate_workspace_panes(
     let effective_agent = resolve_agent_preset(requested_agent, sink);
 
     let pane_specs = [
-        (PaneRole::Agent, effective_agent.command(), Some(effective_agent)),
+        (
+            PaneRole::Agent,
+            effective_agent.command(),
+            Some(effective_agent),
+        ),
         (PaneRole::Service, None, None),
         (PaneRole::Runner, None, None),
     ];
@@ -836,9 +840,7 @@ fn resolve_agent_preset(requested: AgentPreset, sink: &Arc<dyn UiEventSink>) -> 
         && find_binary_on_path(binary).is_none()
     {
         sink.emit(UiEvent::Toast {
-            message: format!(
-                "Agent CLI '{binary}' not found on $PATH; falling back to shell"
-            ),
+            message: format!("Agent CLI '{binary}' not found on $PATH; falling back to shell"),
             is_error: true,
         });
         return AgentPreset::Shell;

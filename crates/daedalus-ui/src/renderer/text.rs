@@ -33,8 +33,7 @@ const CHROME_BADGE_LINE_HEIGHT_LOGICAL: f32 = 12.0;
 const MODAL_TITLE_FONT_SIZE_LOGICAL: f32 = 13.5;
 const MODAL_TITLE_LINE_HEIGHT_LOGICAL: f32 = 18.0;
 
-const PREFERRED_MONO_FAMILIES: [&str; 3] =
-    ["JetBrains Mono", "Cascadia Mono", "DejaVu Sans Mono"];
+const PREFERRED_MONO_FAMILIES: [&str; 3] = ["JetBrains Mono", "Cascadia Mono", "DejaVu Sans Mono"];
 
 fn sanitize_scale(scale_factor: f32) -> f32 {
     if scale_factor.is_finite() && scale_factor > 0.0 {
@@ -227,11 +226,8 @@ impl TextRenderer {
             self.scale_factor = s;
             self.font_size = FONT_SIZE_LOGICAL * s;
             self.line_height = LINE_HEIGHT_LOGICAL * s;
-            let (cw, ch) = measure_cell_size(
-                &mut self.font_system,
-                self.mono_family_name.as_deref(),
-                s,
-            );
+            let (cw, ch) =
+                measure_cell_size(&mut self.font_system, self.mono_family_name.as_deref(), s);
             self.cell_w = cw;
             self.cell_h = ch;
             self.pane_buffers.clear();
@@ -495,22 +491,19 @@ impl TextRenderer {
         }
     }
 
-    fn build_chrome_items(
-        &mut self,
-        state: &AppState,
-        layout: &WorkspaceLayout,
-        theme: &Theme,
-    ) {
+    fn build_chrome_items(&mut self, state: &AppState, layout: &WorkspaceLayout, theme: &Theme) {
         let s = self.scale_factor;
 
         // Sidebar text
         if let Some(sidebar) = layout.sidebar {
             let m = LayoutMetrics::for_scale(s);
-            let header_rect = Rect::new(sidebar.x, sidebar.y, sidebar.width, m.sidebar_header_height);
+            let header_rect =
+                Rect::new(sidebar.x, sidebar.y, sidebar.width, m.sidebar_header_height);
             self.push_chrome_line(ChromeLineSpec {
                 text: "WORKSPACES",
                 left: header_rect.x + m.sidebar_pad + 4.0 * s,
-                top: header_rect.y + (header_rect.height - CHROME_SUB_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                top: header_rect.y
+                    + (header_rect.height - CHROME_SUB_LINE_HEIGHT_LOGICAL * s) * 0.5,
                 max_w: header_rect.width - 2.0 * m.sidebar_pad,
                 bounds: header_rect,
                 font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
@@ -608,7 +601,11 @@ impl TextRenderer {
             }
         });
 
-        let pill_reserve = if pill_text.is_some() { 54.0 * s } else { 8.0 * s };
+        let pill_reserve = if pill_text.is_some() {
+            54.0 * s
+        } else {
+            8.0 * s
+        };
         let name_max_w = (row_rect.right() - left_x - pill_reserve).max(1.0);
         let title_color = if is_active {
             theme.text_primary

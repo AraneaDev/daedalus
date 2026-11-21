@@ -802,10 +802,7 @@ async fn external_status_ingests_via_ndjson_socket_and_rpc() {
     let phrourion = seen_sources.get("phrourion").unwrap();
     assert_eq!(phrourion.level, StatusLevel::Warn);
     assert_eq!(phrourion.label, "3 dirty");
-    assert_eq!(
-        phrourion.detail.as_deref(),
-        Some("2 modified, 1 untracked")
-    );
+    assert_eq!(phrourion.detail.as_deref(), Some("2 modified, 1 untracked"));
 
     let cassandra = seen_sources.get("cassandra").unwrap();
     assert_eq!(cassandra.level, StatusLevel::Error);

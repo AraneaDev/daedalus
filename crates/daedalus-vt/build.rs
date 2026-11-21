@@ -7,7 +7,10 @@ fn main() {
 
         let include_paths: Vec<PathBuf> = if let Ok(dir) = std::env::var("GHOSTTY_VT_DIR") {
             let root = PathBuf::from(dir);
-            println!("cargo:rustc-link-search=native={}", root.join("lib").display());
+            println!(
+                "cargo:rustc-link-search=native={}",
+                root.join("lib").display()
+            );
             println!("cargo:rustc-link-lib=ghostty-vt");
             vec![root.join("include")]
         } else {

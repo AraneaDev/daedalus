@@ -3,15 +3,18 @@ mod client;
 use clap::{Parser, Subcommand, ValueEnum};
 use client::DaemonClient;
 use daedalus_proto::{
-    default_socket_path, wrap_bracketed_paste, ClientMessage, PaneId, PaneRole, ResponsePayload,
-    StatusLevel, WorkspaceId,
+    ClientMessage, PaneId, PaneRole, ResponsePayload, StatusLevel, WorkspaceId,
+    default_socket_path, wrap_bracketed_paste,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
-#[command(name = "daedalus-ctl", about = "CLI control and smoke client for daedalusd")]
+#[command(
+    name = "daedalus-ctl",
+    about = "CLI control and smoke client for daedalusd"
+)]
 struct Cli {
     #[arg(long, global = true, env = "DAEDALUS_SOCKET")]
     socket: Option<PathBuf>,
@@ -537,9 +540,14 @@ mod tests {
 
         let id = Uuid::new_v4();
         let id_str = id.to_string();
-        let ws_close =
-            Cli::try_parse_from(["daedalus-ctl", "workspace", "close", &id_str, "--compose-down"])
-                .expect("parse workspace close --compose-down");
+        let ws_close = Cli::try_parse_from([
+            "daedalus-ctl",
+            "workspace",
+            "close",
+            &id_str,
+            "--compose-down",
+        ])
+        .expect("parse workspace close --compose-down");
         assert!(matches!(
             ws_close.command,
             Commands::Workspace {

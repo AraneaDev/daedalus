@@ -294,11 +294,8 @@ mod tests {
     #[test]
     fn resolve_dim_scales_foreground_luminance_to_60_percent() {
         let base = Rgba::from_rgb_u8(200, 100, 50);
-        let (fg, bg) = resolve_cell_colors(
-            Color::Rgb(200, 100, 50),
-            Color::Default,
-            CellFlags::DIM,
-        );
+        let (fg, bg) =
+            resolve_cell_colors(Color::Rgb(200, 100, 50), Color::Default, CellFlags::DIM);
         assert_eq!(bg, None);
         assert_rgba_approx(
             fg,

@@ -204,7 +204,9 @@ mod tests {
             fail.command_finished,
             vec![(Some("cargo test".to_string()), 101, true)]
         );
-        let trace = tracker.last_failure_trace().expect("expected failure trace");
+        let trace = tracker
+            .last_failure_trace()
+            .expect("expected failure trace");
         assert_eq!(trace.exit_code, 101);
         assert_eq!(trace.command.as_deref(), Some("cargo test"));
         assert_eq!(trace.cwd, Some(PathBuf::from("/tmp/work")));
@@ -244,7 +246,9 @@ mod tests {
             ]
         );
         assert_eq!(tracker.status(), PaneStatus::Idle);
-        let trace = tracker.last_failure_trace().expect("expected failure trace");
+        let trace = tracker
+            .last_failure_trace()
+            .expect("expected failure trace");
         assert_eq!(trace.command.as_deref(), Some("false"));
         assert_eq!(trace.exit_code, 1);
         assert!(trace.output.contains("boom"));

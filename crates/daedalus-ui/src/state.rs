@@ -706,7 +706,10 @@ mod tests {
             },
             dirty_rows: vec![make_row(1, 11, "PATCHED!")],
         };
-        assert_eq!(state.apply_server_event(ServerEvent::GridDelta(delta)), None);
+        assert_eq!(
+            state.apply_server_event(ServerEvent::GridDelta(delta)),
+            None
+        );
 
         let pane = state.panes.get(&agent_id).unwrap();
         assert_eq!(pane.dirty_row_indices, vec![1]);
@@ -819,10 +822,7 @@ mod tests {
 
         // Scroll up 3 lines and load scrollback rows
         assert_eq!(pane.adjust_scroll_offset(3), 3);
-        pane.apply_scrollback(
-            5,
-            vec![make_row(0, 2, "hist-2"), make_row(1, 3, "hist-3")],
-        );
+        pane.apply_scrollback(5, vec![make_row(0, 2, "hist-2"), make_row(1, 3, "hist-3")]);
         assert_eq!(row_text(&pane.visible_rows()[0]), "hist-2");
         assert_eq!(row_text(&pane.visible_rows()[1]), "hist-3");
 
@@ -905,7 +905,10 @@ mod tests {
         assert_eq!(picker.selected_preset().short_name(), "claude");
         assert_eq!(picker.selected_preset().label(), "claude — Claude Code");
 
-        assert_eq!(AgentPreset::from_cli_name("CODEX"), Some(AgentPreset::Codex));
+        assert_eq!(
+            AgentPreset::from_cli_name("CODEX"),
+            Some(AgentPreset::Codex)
+        );
         assert_eq!(AgentPreset::from_cli_name("unknown"), None);
     }
 
@@ -914,8 +917,14 @@ mod tests {
         let mut state = AppState::new();
         assert_eq!(state.focused_role, PaneRole::Agent);
 
-        assert_eq!(state.focus_direction(FocusDirection::Right), PaneRole::Service);
-        assert_eq!(state.focus_direction(FocusDirection::Down), PaneRole::Runner);
+        assert_eq!(
+            state.focus_direction(FocusDirection::Right),
+            PaneRole::Service
+        );
+        assert_eq!(
+            state.focus_direction(FocusDirection::Down),
+            PaneRole::Runner
+        );
         assert_eq!(state.focus_direction(FocusDirection::Up), PaneRole::Service);
         assert_eq!(state.focus_direction(FocusDirection::Left), PaneRole::Agent);
         // Moving left from Agent is a no-op

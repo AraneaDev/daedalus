@@ -101,12 +101,7 @@ pub(super) fn sidebar_branch_badge_rect(row_rect: Rect, label: &str, scale_facto
     let left_x = row_rect.x + 22.0 * s;
     let max_w = (row_rect.right() - left_x - 8.0 * s).max(0.0);
     let est_w = ((label.chars().count() as f32) * 6.8 + 12.0) * s;
-    Rect::new(
-        left_x,
-        row_rect.y + 24.0 * s,
-        est_w.min(max_w),
-        15.0 * s,
-    )
+    Rect::new(left_x, row_rect.y + 24.0 * s, est_w.min(max_w), 15.0 * s)
 }
 
 pub(super) fn format_ports_summary(bound_ports: &[PortMapping]) -> (String, bool) {
@@ -195,7 +190,9 @@ fn push_rect_border(quads: &mut Vec<QuadInstance>, rect: Rect, thickness: f32, c
     }
     let t = thickness.min(rect.width * 0.5).min(rect.height * 0.5);
     // Top
-    quads.push(QuadInstance::from_xywh(rect.x, rect.y, rect.width, t, color));
+    quads.push(QuadInstance::from_xywh(
+        rect.x, rect.y, rect.width, t, color,
+    ));
     // Bottom
     quads.push(QuadInstance::from_xywh(
         rect.x,
@@ -417,14 +414,7 @@ pub fn collect_quads(
     // 3. Semantic panes (background, header, pills, merged cell bgs, selection, decorations, cursor, border).
     for pane_rect in &layout.panes {
         collect_pane_quads(
-            &mut quads,
-            pane_rect,
-            state,
-            theme,
-            s,
-            border_w,
-            cell_w,
-            cell_h,
+            &mut quads, pane_rect, state, theme, s, border_w, cell_w, cell_h,
         );
     }
 
@@ -1039,7 +1029,8 @@ mod tests {
         let (mut state, layout) = make_state_with_agent_row();
         let theme = Theme::dark();
 
-        let (quads, base_count) = collect_quads(&state, &layout, &theme, 1200.0, 800.0, 1.0, (8.0, 19.0));
+        let (quads, base_count) =
+            collect_quads(&state, &layout, &theme, 1200.0, 800.0, 1.0, (8.0, 19.0));
         assert_eq!(base_count as usize, quads.len());
 
         // Merged red background quad for cols 0..2 should have width 16.0 (2 * cell_w)
@@ -1187,7 +1178,8 @@ mod tests {
             ];
         }
 
-        let (quads, base_count) = collect_quads(&state, &layout, &theme, 1200.0, 800.0, 1.0, (8.0, 19.0));
+        let (quads, base_count) =
+            collect_quads(&state, &layout, &theme, 1200.0, 800.0, 1.0, (8.0, 19.0));
         assert_eq!(base_count as usize, quads.len());
 
         let sidebar = layout.sidebar.unwrap();
@@ -1239,13 +1231,17 @@ mod tests {
         assert!(input.x > modal.x && input.right() < modal.right());
         assert!(input.y > modal.y && input.bottom() < modal.bottom());
 
-        assert!(quads_with_modal[base_count_modal as usize..].iter().any(|q| {
-            q.color == theme.bg_window.to_array()
-                && (q.rect[0] - input.x).abs() < 1e-3
-                && (q.rect[1] - input.y).abs() < 1e-3
-                && (q.rect[2] - input.width).abs() < 1e-3
-                && (q.rect[3] - input.height).abs() < 1e-3
-        }));
+        assert!(
+            quads_with_modal[base_count_modal as usize..]
+                .iter()
+                .any(|q| {
+                    q.color == theme.bg_window.to_array()
+                        && (q.rect[0] - input.x).abs() < 1e-3
+                        && (q.rect[1] - input.y).abs() < 1e-3
+                        && (q.rect[2] - input.width).abs() < 1e-3
+                        && (q.rect[3] - input.height).abs() < 1e-3
+                })
+        );
 
         // Verify port & docker formatting helpers
         let ws = state.active_workspace().unwrap();

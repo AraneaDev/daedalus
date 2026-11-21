@@ -467,18 +467,15 @@ fn resolve_port_expr(expr: &str, env_lookup: &HashMap<String, String>) -> Option
     }
 
     if let Some(inner) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-        if let Some((var_name, default)) = inner.split_once(":-").or_else(|| inner.split_once('-')) {
+        if let Some((var_name, default)) = inner.split_once(":-").or_else(|| inner.split_once('-'))
+        {
             if let Some(val) = env_lookup.get(var_name.trim())
                 && let Ok(port) = val.trim().parse::<u16>()
                 && port > 0
             {
                 return Some(port);
             }
-            return default
-                .trim()
-                .parse::<u16>()
-                .ok()
-                .filter(|&p| p > 0);
+            return default.trim().parse::<u16>().ok().filter(|&p| p > 0);
         }
         return env_lookup
             .get(inner.trim())
@@ -881,7 +878,10 @@ LOCAL_NO_PORT_URL=http://localhost/health
         assert_eq!(plan.compose_project_name, None);
         assert_eq!(plan.compose_override_path, None);
 
-        assert_eq!(plan.injected_env.get("PORT").map(String::as_str), Some("3500"));
+        assert_eq!(
+            plan.injected_env.get("PORT").map(String::as_str),
+            Some("3500")
+        );
         // Caller env overrides remapped .env variable.
         assert_eq!(
             plan.injected_env.get("API_PORT").map(String::as_str),
@@ -912,8 +912,7 @@ LOCAL_NO_PORT_URL=http://localhost/health
         )
         .unwrap();
 
-        let plan =
-            prepare_workspace_isolation("primary", dir.path(), 0, &HashMap::new()).unwrap();
+        let plan = prepare_workspace_isolation("primary", dir.path(), 0, &HashMap::new()).unwrap();
 
         assert_eq!(plan.port_offset, 0);
         assert!(plan.remapped_ports.is_empty());
@@ -937,7 +936,10 @@ LOCAL_NO_PORT_URL=http://localhost/health
         assert_eq!(plan.slot_index, 1);
         assert_eq!(plan.port_offset, 200);
         assert_eq!(plan.remapped_ports.get(&3000), Some(&3200));
-        assert_eq!(plan.injected_env.get("PORT").map(String::as_str), Some("3200"));
+        assert_eq!(
+            plan.injected_env.get("PORT").map(String::as_str),
+            Some("3200")
+        );
     }
 
     #[test]
@@ -958,7 +960,10 @@ LOCAL_NO_PORT_URL=http://localhost/health
         assert_eq!(plan.slot_index, 2);
         assert_eq!(plan.port_offset, 300);
         assert_eq!(plan.remapped_ports.get(&3000), Some(&3300));
-        assert_eq!(plan.injected_env.get("PORT").map(String::as_str), Some("3300"));
+        assert_eq!(
+            plan.injected_env.get("PORT").map(String::as_str),
+            Some("3300")
+        );
     }
 
     #[test]
@@ -984,8 +989,7 @@ services:
         )
         .unwrap();
 
-        let plan =
-            prepare_workspace_isolation("My Repo!", dir.path(), 1, &HashMap::new()).unwrap();
+        let plan = prepare_workspace_isolation("My Repo!", dir.path(), 1, &HashMap::new()).unwrap();
 
         let override_path = plan
             .compose_override_path
@@ -1005,15 +1009,19 @@ services:
         );
         assert_eq!(
             plan.injected_env.get("COMPOSE_FILE").map(String::as_str),
-            Some(
-                format!("{}:{}", compose_path.display(), override_path.display()).as_str()
-            )
+            Some(format!("{}:{}", compose_path.display(), override_path.display()).as_str())
         );
 
         let yaml_text = std::fs::read_to_string(override_path).unwrap();
         assert!(yaml_text.contains("!override"), "yaml was:\n{yaml_text}");
-        assert!(yaml_text.contains("4300:3000/tcp"), "yaml was:\n{yaml_text}");
-        assert!(yaml_text.contains("127.0.0.1:8380:80"), "yaml was:\n{yaml_text}");
+        assert!(
+            yaml_text.contains("4300:3000/tcp"),
+            "yaml was:\n{yaml_text}"
+        );
+        assert!(
+            yaml_text.contains("127.0.0.1:8380:80"),
+            "yaml was:\n{yaml_text}"
+        );
         assert!(yaml_text.contains("9090"), "yaml was:\n{yaml_text}");
         assert!(
             yaml_text.contains("127.0.0.1:5732:5432/tcp"),
@@ -1052,7 +1060,10 @@ services:
         let yaml_text =
             std::fs::read_to_string(plan.compose_override_path.as_ref().unwrap()).unwrap();
         assert!(yaml_text.contains("4700:8080"), "yaml was:\n{yaml_text}");
-        assert!(yaml_text.contains("[::1]:6032:5432"), "yaml was:\n{yaml_text}");
+        assert!(
+            yaml_text.contains("[::1]:6032:5432"),
+            "yaml was:\n{yaml_text}"
+        );
     }
 
     #[test]
