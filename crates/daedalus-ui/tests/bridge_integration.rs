@@ -489,6 +489,7 @@ command = ["sh", "-c", "echo MANIFEST_RUNNER_NEEDLE; sleep 5"]
             pane_id: runner_id,
             query: "manifest_runner_needle".to_string(),
             case_sensitive: false,
+            generation: 1,
         });
         let wait_until = tokio::time::Instant::now() + Duration::from_millis(250);
         while tokio::time::Instant::now() < wait_until {

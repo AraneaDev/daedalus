@@ -159,6 +159,7 @@ pub struct SearchState {
     pub pane_id: PaneId,
     pub query: String,
     pub case_sensitive: bool,
+    pub generation: u64,
     pub total_scrollback: usize,
     pub matches: Vec<SearchMatch>,
     pub current_index: usize,
@@ -170,6 +171,7 @@ impl SearchState {
             pane_id,
             query: String::new(),
             case_sensitive: false,
+            generation: 0,
             total_scrollback: 0,
             matches: Vec::new(),
             current_index: 0,
@@ -179,6 +181,7 @@ impl SearchState {
     pub fn push_text(&mut self, text: &str) {
         if !text.is_empty() {
             self.query.push_str(text);
+            self.generation = self.generation.wrapping_add(1);
             self.matches.clear();
             self.current_index = 0;
         }
@@ -187,6 +190,7 @@ impl SearchState {
     pub fn pop_char(&mut self) -> bool {
         let popped = self.query.pop().is_some();
         if popped {
+            self.generation = self.generation.wrapping_add(1);
             self.matches.clear();
             self.current_index = 0;
         }
@@ -197,6 +201,21 @@ impl SearchState {
         self.total_scrollback = total_scrollback;
         self.matches = matches;
         self.current_index = 0;
+    }
+
+    /// Applies search results only if `generation` matches the current query generation
+    /// and the query is non-empty, ignoring stale out-of-order responses.
+    pub fn apply_results(
+        &mut self,
+        generation: u64,
+        total_scrollback: usize,
+        matches: Vec<SearchMatch>,
+    ) -> bool {
+        if self.generation != generation || self.query.is_empty() {
+            return false;
+        }
+        self.set_results(total_scrollback, matches);
+        true
     }
 
     pub fn active_match(&self) -> Option<SearchMatch> {
@@ -478,6 +497,24 @@ impl AppState {
 
     pub fn close_search(&mut self) {
         self.search = None;
+    }
+
+    /// Applies `SearchResults` to `self.search` only when `pane_id` and `generation` match
+    /// an active non-empty query.
+    pub fn apply_search_results(
+        &mut self,
+        pane_id: PaneId,
+        generation: u64,
+        total_scrollback: usize,
+        matches: Vec<SearchMatch>,
+    ) -> bool {
+        let Some(ref mut search) = self.search else {
+            return false;
+        };
+        if search.pane_id != pane_id {
+            return false;
+        }
+        search.apply_results(generation, total_scrollback, matches)
     }
 
     /// Returns the active workspace if it is dormant (`panes.is_empty()`) and not already
@@ -1333,5 +1370,55 @@ mod tests {
         state.register_pane(make_pane_summary(ws_id, PaneRole::Agent), None);
         state.clear_workspace_spawning(ws_id);
         assert!(state.active_dormant_workspace().is_none());
+    }
+
+    #[test]
+    fn stale_search_results_are_ignored_when_generation_or_pane_mismatches() {
+        let mut state = AppState::new();
+        let (ws, agent_id, service_id, _) = make_workspace_with_three_panes();
+        state.set_workspaces(vec![ws]);
+        state.toggle_search(agent_id);
+
+        let search = state.search.as_mut().unwrap();
+        assert_eq!(search.generation, 0);
+        search.push_text("err");
+        let gen_err = search.generation;
+        assert_eq!(gen_err, 1);
+
+        // User keeps typing before the response for "err" comes back
+        search.push_text("or");
+        let gen_error = search.generation;
+        assert_eq!(gen_error, 2);
+
+        let stale_match = vec![SearchMatch {
+            abs_row: 3,
+            start_col: 0,
+            end_col: 3,
+        }];
+        let fresh_match = vec![SearchMatch {
+            abs_row: 8,
+            start_col: 1,
+            end_col: 6,
+        }];
+
+        // Stale generation from "err" is dropped
+        assert!(!state.apply_search_results(agent_id, gen_err, 20, stale_match.clone()));
+        assert!(state.search.as_ref().unwrap().matches.is_empty());
+
+        // Results for a different pane are dropped
+        assert!(!state.apply_search_results(service_id, gen_error, 20, fresh_match.clone()));
+        assert!(state.search.as_ref().unwrap().matches.is_empty());
+
+        // Matching pane_id + current generation applies cleanly
+        assert!(state.apply_search_results(agent_id, gen_error, 20, fresh_match.clone()));
+        assert_eq!(state.search.as_ref().unwrap().matches, fresh_match);
+
+        // If user backspaces back to empty query, any in-flight response for earlier gen is dropped
+        for _ in 0..5 {
+            state.search.as_mut().unwrap().pop_char();
+        }
+        assert!(state.search.as_ref().unwrap().query.is_empty());
+        assert!(!state.apply_search_results(agent_id, gen_error, 20, fresh_match));
+        assert!(state.search.as_ref().unwrap().matches.is_empty());
     }
 }

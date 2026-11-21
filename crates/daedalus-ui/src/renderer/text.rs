@@ -114,7 +114,7 @@ pub fn truncate_left_with_ellipsis(input: &str, max_chars: usize) -> String {
         .char_indices()
         .nth(skip)
         .map_or(input.len(), |(idx, _)| idx);
-    let mut out = String::with_capacity(1 + (input.len() - byte_start));
+    let mut out = String::with_capacity('…'.len_utf8() + (input.len() - byte_start));
     out.push('…');
     out.push_str(&input[byte_start..]);
     out

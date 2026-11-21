@@ -86,6 +86,7 @@ pub enum UiCommand {
         pane_id: PaneId,
         query: String,
         case_sensitive: bool,
+        generation: u64,
     },
     EnsureWorkspacePanes {
         workspace_id: WorkspaceId,
@@ -125,6 +126,7 @@ pub enum UiEvent {
     },
     SearchResults {
         pane_id: PaneId,
+        generation: u64,
         total_scrollback: usize,
         matches: Vec<SearchMatch>,
     },
@@ -686,6 +688,7 @@ async fn handle_command(
             pane_id,
             query,
             case_sensitive,
+            generation,
         } => {
             match conn
                 .call(ClientMessage::SearchPane {
@@ -702,6 +705,7 @@ async fn handle_command(
                 } => {
                     sink.emit(UiEvent::SearchResults {
                         pane_id,
+                        generation,
                         total_scrollback,
                         matches,
                     });

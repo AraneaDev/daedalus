@@ -415,6 +415,7 @@ impl DaedalusApp {
             pane_id: search.pane_id,
             query: search.query.clone(),
             case_sensitive: search.case_sensitive,
+            generation: search.generation,
         });
     }
 
@@ -913,6 +914,7 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
                 return;
             }
         };
+        window.set_ime_allowed(true);
 
         let theme = Theme::from_preset(self.ui_config.theme);
         let renderer = match GpuRenderer::new(
@@ -1003,14 +1005,14 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
             }
             UiEvent::SearchResults {
                 pane_id,
+                generation,
                 total_scrollback,
                 matches,
             } => {
-                if let Some(ref mut search) = self.state.search
-                    && search.pane_id == pane_id
-                    && !search.query.is_empty()
+                if self
+                    .state
+                    .apply_search_results(pane_id, generation, total_scrollback, matches)
                 {
-                    search.set_results(total_scrollback, matches);
                     self.scroll_to_active_search_match();
                 }
             }
