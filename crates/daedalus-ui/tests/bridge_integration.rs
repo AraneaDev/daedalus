@@ -350,7 +350,7 @@ command = ["sh", "-c", "echo MANIFEST_RUNNER_NEEDLE; sleep 5"]
     #[cfg(windows)]
     let manifest_toml = r#"
 [runner]
-command = ["powershell.exe", "-NoProfile", "-Command", "Write-Output MANIFEST_RUNNER_NEEDLE; Start-Sleep -Seconds 5"]
+command = ["cmd.exe", "/C", "echo", "MANIFEST_RUNNER_NEEDLE", "&", "ping", "-n", "5", "127.0.0.1"]
 "#;
     std::fs::write(ws_dir.join(".daedalus.toml"), manifest_toml).unwrap();
 
@@ -496,6 +496,9 @@ command = ["powershell.exe", "-NoProfile", "-Command", "Write-Output MANIFEST_RU
     // Poll SearchPane until the manifest runner command output appears in the VT grid.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut found = false;
+    let mut seen_toasts = Vec::new();
+    let mut search_responses = 0usize;
+    let mut last_snapshot_lines = Vec::new();
     while tokio::time::Instant::now() < deadline && !found {
         bridge2.send(UiCommand::SearchPane {
             pane_id: runner_id,
@@ -512,9 +515,26 @@ command = ["powershell.exe", "-NoProfile", "-Command", "Write-Output MANIFEST_RU
             match tokio::time::timeout(remaining, evt_rx.recv()).await {
                 Ok(Some(UiEvent::SearchResults {
                     pane_id, matches, ..
-                })) if pane_id == runner_id && !matches.is_empty() => {
-                    found = true;
-                    break;
+                })) if pane_id == runner_id => {
+                    search_responses += 1;
+                    if !matches.is_empty() {
+                        found = true;
+                        break;
+                    }
+                }
+                Ok(Some(UiEvent::Toast { message, .. })) => {
+                    seen_toasts.push(message);
+                }
+                Ok(Some(UiEvent::ServerEvent(daedalus_proto::ServerEvent::GridDelta(delta))))
+                    if delta.pane_id == runner_id =>
+                {
+                    for row in delta.dirty_rows {
+                        let line: String = row.cells.into_iter().map(|c| c.text).collect();
+                        let trimmed = line.trim_end().to_string();
+                        if !trimmed.is_empty() {
+                            last_snapshot_lines.push(trimmed);
+                        }
+                    }
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => panic!("event channel closed"),
@@ -524,7 +544,7 @@ command = ["powershell.exe", "-NoProfile", "-Command", "Write-Output MANIFEST_RU
     }
     assert!(
         found,
-        "expected SearchPane to locate manifest runner output in restored pane"
+        "expected SearchPane to locate manifest runner output in restored pane (search_responses={search_responses}, toasts={seen_toasts:?}, lines={last_snapshot_lines:?})"
     );
 
     tokio::task::spawn_blocking(move || bridge2.shutdown())

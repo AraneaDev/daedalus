@@ -56,10 +56,17 @@ fn echo_worktree_env_command() -> Vec<String> {
     #[cfg(windows)]
     {
         vec![
-            "powershell.exe".to_string(),
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            "Write-Output \"PORT=$env:PORT PROJ=$env:COMPOSE_PROJECT_NAME DB=$env:DATABASE_URL\"; Start-Sleep -Seconds 3".to_string(),
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "echo".to_string(),
+            "PORT=%PORT%".to_string(),
+            "PROJ=%COMPOSE_PROJECT_NAME%".to_string(),
+            "DB=%DATABASE_URL%".to_string(),
+            "&".to_string(),
+            "ping".to_string(),
+            "-n".to_string(),
+            "4".to_string(),
+            "127.0.0.1".to_string(),
         ]
     }
 }
@@ -76,10 +83,15 @@ fn echo_restored_env_command() -> Vec<String> {
     #[cfg(windows)]
     {
         vec![
-            "powershell.exe".to_string(),
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            "Write-Output \"RESTORED=$env:RESTORED_ENV\"; Start-Sleep -Seconds 3".to_string(),
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "echo".to_string(),
+            "RESTORED=%RESTORED_ENV%".to_string(),
+            "&".to_string(),
+            "ping".to_string(),
+            "-n".to_string(),
+            "4".to_string(),
+            "127.0.0.1".to_string(),
         ]
     }
 }
