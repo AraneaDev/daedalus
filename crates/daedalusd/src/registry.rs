@@ -107,8 +107,9 @@ fn prepare_workspace_components(
         Some((status, branch)) => (Some(status), branch),
         None => (None, worktree::current_branch(root_dir)),
     };
-    let canonical_root_dir =
-        std::fs::canonicalize(root_dir).unwrap_or_else(|_| root_dir.to_path_buf());
+    let canonical_root_dir = daedalus_proto::strip_windows_verbatim_prefix(
+        std::fs::canonicalize(root_dir).unwrap_or_else(|_| root_dir.to_path_buf()),
+    );
     Ok(PreparedWorkspaceComponents {
         plan,
         git_branch,
@@ -727,10 +728,14 @@ impl Registry {
         match (workspace_id, root_dir) {
             (None, Some(dir)) => {
                 let dir_clone = dir.to_path_buf();
-                tokio::task::spawn_blocking(move || std::fs::canonicalize(&dir_clone).ok())
-                    .await
-                    .ok()
-                    .flatten()
+                tokio::task::spawn_blocking(move || {
+                    std::fs::canonicalize(&dir_clone)
+                        .ok()
+                        .map(daedalus_proto::strip_windows_verbatim_prefix)
+                })
+                .await
+                .ok()
+                .flatten()
             }
             _ => None,
         }

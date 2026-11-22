@@ -259,6 +259,20 @@ pub fn default_config_file_path() -> PathBuf {
     }
 }
 
+/// Strips Windows verbatim path prefixes (`\\?\UNC\` -> `\\` and `\\?\` -> ``) produced by
+/// `std::fs::canonicalize`, leaving non-verbatim and Unix paths unchanged.
+pub fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+    if let Some(raw) = path.to_str() {
+        if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1159,6 +1173,26 @@ mod tests {
                 git_status: None,
                 git_branch: None,
             }
+        );
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_normalizes_drive_and_unc_paths() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\tim\repo")),
+            PathBuf::from(r"C:\Users\tim\repo")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(PathBuf::from(r"C:\Users\tim\repo")),
+            PathBuf::from(r"C:\Users\tim\repo")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(PathBuf::from("/home/tim/repo")),
+            PathBuf::from("/home/tim/repo")
         );
     }
 }

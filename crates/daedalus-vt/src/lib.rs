@@ -119,6 +119,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_osc7_windows_drive_and_unix_uris() {
+        assert_eq!(
+            builtin::parse_osc7_file_uri("file://WINHOST/C:/Users/tim/project"),
+            Some(PathBuf::from("C:/Users/tim/project"))
+        );
+        assert_eq!(
+            builtin::parse_osc7_file_uri("file://WINHOST/C:"),
+            Some(PathBuf::from("C:"))
+        );
+        assert_eq!(
+            builtin::parse_osc7_file_uri("file://WINHOST/C%3A/Users/tim/my%20project"),
+            Some(PathBuf::from("C:/Users/tim/my project"))
+        );
+        assert_eq!(
+            builtin::parse_osc7_file_uri("file://host/home/tim"),
+            Some(PathBuf::from("/home/tim"))
+        );
+    }
+
+    #[test]
     fn truncates_plain_text_slice_to_64kib_tail() {
         let mut vt = BuiltinVt::new(VtConfig {
             cols: 100,

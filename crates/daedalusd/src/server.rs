@@ -15,6 +15,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 const CLIENT_OUTBOUND_CAPACITY: usize = 256;
@@ -134,18 +135,20 @@ impl DaemonServer {
         });
 
         tokio::pin!(shutdown);
+        let mut client_tasks = JoinSet::new();
         loop {
             tokio::select! {
                 accept_res = self.listener.accept() => {
                     match accept_res {
                         Ok(stream) => {
                             let reg = Arc::clone(&self.registry);
-                            tokio::spawn(handle_client(stream, reg));
+                            client_tasks.spawn(handle_client(stream, reg));
                         }
                         Err(e) => {
                             error!(error = %e, "accept failed");
                         }
                     }
+                    while client_tasks.try_join_next().is_some() {}
                 }
                 _ = &mut shutdown => {
                     info!("shutting down daedalusd");
@@ -155,6 +158,8 @@ impl DaemonServer {
         }
 
         let _ = shutdown_tx.send(true);
+        client_tasks.abort_all();
+        while client_tasks.join_next().await.is_some() {}
         let _ = monitor_handle.await;
         if let Some(handle) = hook_handle {
             let _ = handle.await;
@@ -192,45 +197,61 @@ impl SubscriptionFilter {
     }
 }
 
+async fn wait_for_done(done_rx: &mut watch::Receiver<bool>) {
+    while !*done_rx.borrow() {
+        if done_rx.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
 async fn handle_client(stream: IpcStream, registry: Arc<Registry>) {
     let (mut reader, mut writer) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMessage>(CLIENT_OUTBOUND_CAPACITY);
     let filter = Arc::new(RwLock::new(SubscriptionFilter::default()));
+    let (done_tx, mut done_rx) = watch::channel(false);
 
-    let writer_task = tokio::spawn(async move {
+    let writer_fut = async move {
         while let Some(msg) = out_rx.recv().await {
             if let Err(e) = write_frame(&mut writer, &msg).await {
                 debug!(error = %e, "client write failed");
                 break;
             }
         }
-    });
+    };
 
     let event_rx = registry.subscribe_events();
     let sub_out_tx = out_tx.clone();
     let sub_filter = Arc::clone(&filter);
-    let event_task = tokio::spawn(forward_subscriber_events(event_rx, sub_out_tx, sub_filter));
+    let event_fut = async move {
+        tokio::select! {
+            _ = forward_subscriber_events(event_rx, sub_out_tx, sub_filter) => {}
+            _ = wait_for_done(&mut done_rx) => {}
+        }
+    };
 
-    loop {
-        match read_frame::<_, Request>(&mut reader).await {
-            Ok(Some(req)) => {
-                let result = dispatch_request(&registry, &filter, req.payload).await;
-                let resp = ServerMessage::Response { id: req.id, result };
-                if out_tx.send(resp).await.is_err() {
+    let reader_fut = async move {
+        loop {
+            match read_frame::<_, Request>(&mut reader).await {
+                Ok(Some(req)) => {
+                    let result = dispatch_request(&registry, &filter, req.payload).await;
+                    let resp = ServerMessage::Response { id: req.id, result };
+                    if out_tx.send(resp).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(error = %e, "client protocol error; disconnecting");
                     break;
                 }
             }
-            Ok(None) => break,
-            Err(e) => {
-                warn!(error = %e, "client protocol error; disconnecting");
-                break;
-            }
         }
-    }
+        let _ = done_tx.send(true);
+        drop(out_tx);
+    };
 
-    event_task.abort();
-    drop(out_tx);
-    let _ = writer_task.await;
+    tokio::join!(reader_fut, writer_fut, event_fut);
 }
 
 async fn dispatch_request(

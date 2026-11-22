@@ -370,11 +370,26 @@ impl RpcConnection {
         }
     }
 
-    fn close(self) {
+    async fn close(self) {
         drop(self.write_tx);
         self.reader_task.abort();
         self.writer_task.abort();
+        let _ = self.reader_task.await;
+        let _ = self.writer_task.await;
     }
+}
+
+fn should_auto_spawn_daemon(
+    auto_spawn_daemon: bool,
+    spawn_attempted: bool,
+    socket_path: &Path,
+) -> bool {
+    auto_spawn_daemon
+        && !spawn_attempted
+        && matches!(
+            daedalus_proto::transport::parse_endpoint(socket_path),
+            daedalus_proto::transport::IpcEndpoint::Local(_)
+        )
 }
 
 async fn run_bridge(
@@ -396,7 +411,7 @@ async fn run_bridge(
                 match initialize_session(&conn, &config, &sink, &mut bootstrapped).await {
                     Ok(()) => {}
                     Err(RpcError::Disconnected) => {
-                        conn.close();
+                        conn.close().await;
                         sink.emit(UiEvent::Disconnected);
                         if !sleep_or_shutdown(RECONNECT_DELAY, &mut cmd_rx).await {
                             return;
@@ -409,7 +424,7 @@ async fn run_bridge(
                             message: format!("Daemon error: {err}"),
                             is_error: true,
                         });
-                        conn.close();
+                        conn.close().await;
                         sink.emit(UiEvent::Disconnected);
                         if !sleep_or_shutdown(RECONNECT_DELAY, &mut cmd_rx).await {
                             return;
@@ -419,7 +434,7 @@ async fn run_bridge(
                 }
 
                 let should_exit = session_loop(&mut conn, &sink, &mut cmd_rx).await;
-                conn.close();
+                conn.close().await;
                 if should_exit {
                     return;
                 }
@@ -435,7 +450,11 @@ async fn run_bridge(
                     error = %err,
                     "unable to connect to daedalusd"
                 );
-                if config.auto_spawn_daemon && !spawn_attempted {
+                if should_auto_spawn_daemon(
+                    config.auto_spawn_daemon,
+                    spawn_attempted,
+                    &config.socket_path,
+                ) {
                     spawn_attempted = true;
                     match spawn_daemon_detached(&config.socket_path) {
                         Ok(bin) => {
@@ -1427,7 +1446,7 @@ mod tests {
             .expect("call() deadlocked after disconnect");
         assert!(matches!(res, Err(RpcError::Disconnected)));
         assert!(conn.pending.lock().unwrap().is_empty());
-        conn.close();
+        conn.close().await;
 
         // Case 2: peer closes while `call()` is awaiting a response
         let (client_stream, mut server_stream) = ipc_pair().await;
@@ -1445,7 +1464,7 @@ mod tests {
         assert!(matches!(res, Err(RpcError::Disconnected)));
         peer_task.await.unwrap();
         assert!(conn.pending.lock().unwrap().is_empty());
-        conn.close();
+        conn.close().await;
     }
 
     #[test]
@@ -1513,5 +1532,34 @@ mod tests {
                 None,
             )
         );
+    }
+
+    #[test]
+    fn auto_spawn_skips_tcp_endpoints_and_allows_local_endpoints() {
+        assert!(!should_auto_spawn_daemon(
+            true,
+            false,
+            Path::new("tcp://127.0.0.1:7777")
+        ));
+        assert!(!should_auto_spawn_daemon(
+            false,
+            false,
+            Path::new("/tmp/daedalusd.sock")
+        ));
+        assert!(!should_auto_spawn_daemon(
+            true,
+            true,
+            Path::new("/tmp/daedalusd.sock")
+        ));
+        assert!(should_auto_spawn_daemon(
+            true,
+            false,
+            Path::new("/tmp/daedalusd.sock")
+        ));
+        assert!(should_auto_spawn_daemon(
+            true,
+            false,
+            Path::new(r"\\.\pipe\daedalus-alice-daedalusd")
+        ));
     }
 }

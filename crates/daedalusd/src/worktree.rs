@@ -97,24 +97,9 @@ pub fn sanitize_slug(branch: &str) -> Result<String, String> {
     Ok(slug.to_string())
 }
 
-fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
-    #[cfg(windows)]
-    {
-        if let Some(raw) = path.to_str() {
-            if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
-                return PathBuf::from(format!(r"\\{unc}"));
-            }
-            if let Some(stripped) = raw.strip_prefix(r"\\?\") {
-                return PathBuf::from(stripped);
-            }
-        }
-    }
-    path
-}
-
 fn canonicalize_path(path: &Path) -> PathBuf {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    strip_windows_verbatim_prefix(resolved)
+    daedalus_proto::strip_windows_verbatim_prefix(resolved)
 }
 
 fn spawn_reader<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<Vec<u8>> {

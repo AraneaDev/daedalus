@@ -286,7 +286,9 @@ fn resolve_dir(dir: Option<PathBuf>) -> Result<PathBuf, std::io::Error> {
     match dir {
         Some(d) if d.is_relative() => {
             let joined = std::env::current_dir()?.join(d);
-            Ok(std::fs::canonicalize(&joined).unwrap_or(joined))
+            Ok(daedalus_proto::strip_windows_verbatim_prefix(
+                std::fs::canonicalize(&joined).unwrap_or(joined),
+            ))
         }
         Some(d) => Ok(d),
         None => std::env::current_dir(),
@@ -1110,7 +1112,9 @@ mod tests {
             resolved.display()
         );
         let cwd = std::env::current_dir().unwrap();
-        let expected = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+        let expected = daedalus_proto::strip_windows_verbatim_prefix(
+            std::fs::canonicalize(&cwd).unwrap_or(cwd),
+        );
         assert_eq!(resolved, expected);
     }
 

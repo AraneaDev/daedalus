@@ -539,8 +539,33 @@ pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
 }
 
 #[cfg(windows)]
-pub fn collect_descendant_pids(_root_pid: u32) -> Vec<u32> {
-    Vec::new()
+pub(crate) fn collect_windows_ppid_edges() -> Vec<(u32, u32)> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        r#"Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }"#,
+    ]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let Some(output) = run_command_stdout_with_timeout(&mut cmd, Duration::from_secs(2), false)
+    else {
+        return Vec::new();
+    };
+    parse_ps_ppid_table(&output)
+}
+
+/// Collects all live descendant PIDs of `root_pid` using `Win32_Process`.
+#[cfg(windows)]
+pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
+    if root_pid == 0 {
+        return Vec::new();
+    }
+    let edges = collect_windows_ppid_edges();
+    descendants_from_ppid_edges(root_pid, &edges)
 }
 
 #[cfg(target_os = "linux")]

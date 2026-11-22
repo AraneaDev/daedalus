@@ -328,10 +328,21 @@ pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
     descendant_pids_with_comms(roots).0
 }
 
-/// Returns non-zero root PIDs for `netstat`-based port matching on Windows.
+/// Queries `Win32_Process` via PowerShell to collect `roots` and all live descendant PIDs.
 #[cfg(windows)]
 pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
-    roots.iter().copied().filter(|&pid| pid > 0).collect()
+    let mut collected: HashSet<u32> = roots.iter().copied().filter(|&pid| pid > 0).collect();
+    if collected.is_empty() {
+        return collected;
+    }
+
+    let edges = crate::supervisor::collect_windows_ppid_edges();
+    for &root in roots {
+        if root > 0 {
+            collected.extend(crate::supervisor::descendants_from_ppid_edges(root, &edges));
+        }
+    }
+    collected
 }
 
 #[cfg(target_os = "linux")]

@@ -288,10 +288,33 @@ impl IpcListener {
 
     #[cfg(windows)]
     async fn bind_local(path: PathBuf) -> std::io::Result<IpcListenerInner> {
+        const BIND_MAX_RETRIES: usize = 50;
+        const BIND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
         let pipe_name = windows_pipe_name_from_path(&path);
-        let server = tokio::net::windows::named_pipe::ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(&pipe_name)?;
+        let mut retries = 0usize;
+        let server = loop {
+            match tokio::net::windows::named_pipe::ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&pipe_name)
+            {
+                Ok(server) => break server,
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                    if IpcStream::is_endpoint_alive(&path).await {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            format!("daedalusd is already running on {}", path.display()),
+                        ));
+                    }
+                    if retries >= BIND_MAX_RETRIES {
+                        return Err(err);
+                    }
+                    retries += 1;
+                    tokio::time::sleep(BIND_RETRY_DELAY).await;
+                }
+                Err(err) => return Err(err),
+            }
+        };
         Ok(IpcListenerInner::NamedPipe {
             pipe_name,
             endpoint: path,

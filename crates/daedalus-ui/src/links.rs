@@ -291,6 +291,12 @@ fn parse_file_candidate(
     })
 }
 
+fn canonicalize_existing_file(path: &Path) -> PathBuf {
+    daedalus_proto::strip_windows_verbatim_prefix(
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+    )
+}
+
 fn resolve_existing_file(
     raw_path: &str,
     cwd: Option<&Path>,
@@ -302,15 +308,13 @@ fn resolve_existing_file(
 
     let path = Path::new(raw_path);
     if path.is_absolute() {
-        return path
-            .is_file()
-            .then(|| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+        return path.is_file().then(|| canonicalize_existing_file(path));
     }
 
     if let Some(cwd) = cwd {
         let joined = cwd.join(path);
         if joined.is_file() {
-            return Some(std::fs::canonicalize(&joined).unwrap_or(joined));
+            return Some(canonicalize_existing_file(&joined));
         }
     }
 
@@ -319,7 +323,7 @@ fn resolve_existing_file(
     {
         let joined = root.join(path);
         if joined.is_file() {
-            return Some(std::fs::canonicalize(&joined).unwrap_or(joined));
+            return Some(canonicalize_existing_file(&joined));
         }
     }
 
@@ -338,8 +342,8 @@ fn is_safe_http_url(url: &str) -> bool {
 }
 
 /// Splits an editor command template into argv tokens respecting single/double quotes and
-/// backslash escapes without invoking a shell.
-fn split_command_tokens(input: &str) -> Vec<String> {
+/// (on non-Windows targets) backslash escapes without invoking a shell.
+fn split_command_tokens_for_os(input: &str, is_windows: bool) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_token = false;
@@ -360,7 +364,7 @@ fn split_command_tokens(input: &str) -> Vec<String> {
                     quote = None;
                 } else if ch == '\\' {
                     if let Some(&next) = chars.peek()
-                        && matches!(next, '"' | '\\')
+                        && (next == '"' || (!is_windows && next == '\\'))
                     {
                         current.push(chars.next().unwrap());
                     } else {
@@ -375,7 +379,7 @@ fn split_command_tokens(input: &str) -> Vec<String> {
                     quote = Some(ch);
                     in_token = true;
                 }
-                '\\' => {
+                '\\' if !is_windows => {
                     in_token = true;
                     if let Some(next) = chars.next() {
                         current.push(next);
@@ -448,7 +452,7 @@ fn build_open_command_with_env(
                 return Some((system_opener.to_string(), vec![path_str]));
             };
 
-            let tokens = split_command_tokens(editor_cmd);
+            let tokens = split_command_tokens_for_os(editor_cmd, is_windows);
             let Some((program, rest)) = tokens.split_first() else {
                 return Some((system_opener.to_string(), vec![path_str]));
             };
@@ -479,11 +483,12 @@ fn build_open_command_with_env(
             }
 
             let mut args = rest.to_vec();
-            let basename = Path::new(program)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(program.as_str())
-                .to_ascii_lowercase();
+            let raw_name = if is_windows {
+                program.rsplit(['/', '\\']).next()
+            } else {
+                Path::new(program).file_name().and_then(|n| n.to_str())
+            };
+            let basename = raw_name.unwrap_or(program.as_str()).to_ascii_lowercase();
             let basename = basename
                 .strip_suffix(".exe")
                 .or_else(|| basename.strip_suffix(".cmd"))
@@ -638,7 +643,7 @@ mod tests {
         assert_eq!(
             detect_link_at(row1, col1, Some(&sub), Some(root.path())),
             Some(DetectedLink::File {
-                path: std::fs::canonicalize(&cwd_file).unwrap(),
+                path: canonicalize_existing_file(&cwd_file),
                 line: Some(42),
                 col: Some(13),
             })
@@ -650,7 +655,7 @@ mod tests {
         assert_eq!(
             detect_link_at(row2, col2, Some(&sub), Some(root.path())),
             Some(DetectedLink::File {
-                path: std::fs::canonicalize(&root_file).unwrap(),
+                path: canonicalize_existing_file(&root_file),
                 line: Some(10),
                 col: None,
             })
@@ -661,7 +666,7 @@ mod tests {
         assert_eq!(
             detect_link_at(row3, 3, Some(&sub), Some(root.path())),
             Some(DetectedLink::File {
-                path: std::fs::canonicalize(&cwd_file).unwrap(),
+                path: canonicalize_existing_file(&cwd_file),
                 line: Some(7),
                 col: None,
             })
@@ -911,6 +916,48 @@ mod tests {
                 "explorer.exe".to_string(),
                 vec!["/tmp/my project/main.rs".to_string()]
             ))
+        );
+    }
+
+    #[test]
+    fn windows_editor_command_preserves_backslashes() {
+        let link = DetectedLink::File {
+            path: PathBuf::from(r"C:\Users\tim\repo\main.rs"),
+            line: Some(18),
+            col: Some(3),
+        };
+
+        assert_eq!(
+            build_open_command_with_env(&link, Some(r"C:\tools\nvim.exe"), None, None, false, true,),
+            Some((
+                r"C:\tools\nvim.exe".to_string(),
+                vec!["+18".to_string(), r"C:\Users\tim\repo\main.rs".to_string()]
+            ))
+        );
+
+        assert_eq!(
+            split_command_tokens_for_os(
+                r#"C:\tools\nvim.exe --server \\.\pipe\nvim +{line} {path}"#,
+                true,
+            ),
+            vec![
+                r"C:\tools\nvim.exe".to_string(),
+                "--server".to_string(),
+                r"\\.\pipe\nvim".to_string(),
+                "+{line}".to_string(),
+                "{path}".to_string(),
+            ]
+        );
+
+        assert_eq!(
+            split_command_tokens_for_os(
+                r#""C:\Program Files\Neovim\bin\nvim.exe" "\\server\share\init.lua""#,
+                true,
+            ),
+            vec![
+                r"C:\Program Files\Neovim\bin\nvim.exe".to_string(),
+                r"\\server\share\init.lua".to_string(),
+            ]
         );
     }
 }

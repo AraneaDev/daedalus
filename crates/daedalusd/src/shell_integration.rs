@@ -187,6 +187,7 @@ if (-not $global:__daedalus_ps_initialized) {
         "${__daedalus_prompt_text}${__daedalus_esc}]133;B${__daedalus_bel}"
     }
 
+    Import-Module PSReadLine -ErrorAction SilentlyContinue
     if (Get-Module -Name PSReadLine) {
         Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
             param($key, $arg)
