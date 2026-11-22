@@ -64,9 +64,10 @@ jobs:
           dotnet tool install --tool-path "$env:RUNNER_TEMP/wix" wix --version 5.0.2
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force dist
-          $msi = "$pwd/dist/daedalus-$env:VERSION-x64.msi"
+          $msi = Join-Path (Resolve-Path dist).Path "daedalus-$env:VERSION-x64.msi"
           & "$env:RUNNER_TEMP/wix/wix.exe" build -arch x64 -d "Version=$env:VERSION" packaging/windows.wxs -o $msi
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (!(Test-Path -LiteralPath $msi -PathType Leaf)) { throw "Missing package: $msi" }
           foreach ($mode in '/i','/x') {
             $proc = Start-Process msiexec -ArgumentList "$mode `"$msi`" /qn /norestart" -Wait -PassThru
             if ($proc.ExitCode -ne 0) { throw "Installer exited with $($proc.ExitCode)" }
