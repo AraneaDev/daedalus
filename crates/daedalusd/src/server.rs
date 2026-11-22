@@ -4,6 +4,7 @@ use crate::registry::Registry;
 use crate::runtime_monitor;
 use crate::shell_integration::ShellIntegration;
 use crate::supervisor::Supervisor;
+use daedalus_proto::transport::{IpcListener, IpcStream};
 use daedalus_proto::{
     ClientMessage, PaneId, ProtoError, Request, ResponsePayload, ServerEvent, ServerMessage,
     default_events_socket_path, default_state_file_path, read_frame, write_frame,
@@ -11,18 +12,15 @@ use daedalus_proto::{
 use daedalus_vt::{VtConfig, create_vt_engine};
 use std::collections::HashSet;
 use std::future::Future;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 const CLIENT_OUTBOUND_CAPACITY: usize = 256;
 
 pub struct DaemonServer {
-    socket_path: PathBuf,
-    listener: UnixListener,
+    listener: IpcListener,
     registry: Arc<Registry>,
     external_hook: Option<ExternalHookServer>,
 }
@@ -71,28 +69,7 @@ impl DaemonServer {
         state_path: Option<PathBuf>,
         supervisor: Supervisor,
     ) -> std::io::Result<Self> {
-        if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let created = !parent.exists();
-            std::fs::create_dir_all(parent)?;
-            if created {
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-            }
-        }
         std::fs::create_dir_all(&runtime_dir)?;
-
-        if socket_path.exists() {
-            match UnixStream::connect(&socket_path).await {
-                Ok(_) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::AddrInUse,
-                        format!("daedalusd is already running on {}", socket_path.display()),
-                    ));
-                }
-                Err(_) => {
-                    let _ = std::fs::remove_file(&socket_path);
-                }
-            }
-        }
 
         let shell_integration = ShellIntegration::prepare(&runtime_dir)?;
         let (event_tx, _) = broadcast::channel(1024);
@@ -102,13 +79,13 @@ impl DaemonServer {
             event_tx,
             state_path.map(StateStore::new),
         ));
-        let listener = UnixListener::bind(&socket_path)?;
+        let listener = IpcListener::bind(&socket_path).await?;
         let external_hook = match events_socket_path {
             Some(events_path) => {
                 match ExternalHookServer::bind(events_path, Arc::clone(&registry)).await {
                     Ok(hook) => Some(hook),
                     Err(err) => {
-                        let _ = std::fs::remove_file(&socket_path);
+                        listener.cleanup();
                         return Err(err);
                     }
                 }
@@ -116,21 +93,25 @@ impl DaemonServer {
             None => None,
         };
         registry.restore_persisted_workspaces().await;
-        info!(socket = %socket_path.display(), "daedalusd listening");
+        let bound_endpoint = listener.local_endpoint();
+        info!(socket = %bound_endpoint.display(), "daedalusd listening");
 
         Ok(Self {
-            socket_path,
             listener,
             registry,
             external_hook,
         })
     }
 
+    pub fn socket_path(&self) -> PathBuf {
+        self.listener.local_endpoint()
+    }
+
     pub fn set_worktrees_dir(&self, dir: PathBuf) {
         self.registry.set_worktrees_dir(dir);
     }
 
-    pub async fn serve(self, shutdown: impl Future<Output = ()>) -> std::io::Result<()> {
+    pub async fn serve(mut self, shutdown: impl Future<Output = ()>) -> std::io::Result<()> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let monitor_handle =
             runtime_monitor::spawn_runtime_monitor(Arc::clone(&self.registry), shutdown_rx.clone());
@@ -157,7 +138,7 @@ impl DaemonServer {
             tokio::select! {
                 accept_res = self.listener.accept() => {
                     match accept_res {
-                        Ok((stream, _)) => {
+                        Ok(stream) => {
                             let reg = Arc::clone(&self.registry);
                             tokio::spawn(handle_client(stream, reg));
                         }
@@ -179,7 +160,7 @@ impl DaemonServer {
             let _ = handle.await;
         }
         self.registry.close_all().await;
-        let _ = std::fs::remove_file(&self.socket_path);
+        self.listener.cleanup();
         Ok(())
     }
 }
@@ -211,7 +192,7 @@ impl SubscriptionFilter {
     }
 }
 
-async fn handle_client(stream: UnixStream, registry: Arc<Registry>) {
+async fn handle_client(stream: IpcStream, registry: Arc<Registry>) {
     let (mut reader, mut writer) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMessage>(CLIENT_OUTBOUND_CAPACITY);
     let filter = Arc::new(RwLock::new(SubscriptionFilter::default()));
@@ -529,9 +510,11 @@ async fn forward_subscriber_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::supervisor::IsolationMode;
     use daedalus_proto::{CursorState, GridDelta};
     use std::time::Duration;
+    #[cfg(unix)]
     use tempfile::TempDir;
 
     fn dummy_delta(pane_id: PaneId, seq: u64) -> ServerEvent {
@@ -614,8 +597,11 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bind_preserves_existing_parent_permissions_and_sets_0700_on_created_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = TempDir::new().unwrap();
         let existing_parent = dir.path().join("existing");
         std::fs::create_dir(&existing_parent).unwrap();

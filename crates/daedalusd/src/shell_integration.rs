@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -147,6 +148,55 @@ if not set -q __daedalus_fish_initialized
 end
 "#;
 
+const POWERSHELL_INIT_SCRIPT: &str = r#"# Daedalus non-destructive PowerShell shell integration (OSC 7 + OSC 133)
+if (-not $global:__daedalus_ps_initialized) {
+    $global:__daedalus_ps_initialized = $true
+    $global:__daedalus_ps_first_prompt = $true
+    $global:__daedalus_ps_orig_prompt = $function:prompt
+
+    function global:prompt {
+        $__daedalus_ok = $?
+        $__daedalus_last_ec = $global:LASTEXITCODE
+        $__daedalus_esc = [char]0x1b
+        $__daedalus_bel = [char]0x07
+
+        if (-not $global:__daedalus_ps_first_prompt) {
+            $__daedalus_ec = if (-not $__daedalus_ok) {
+                if ($null -ne $__daedalus_last_ec -and $__daedalus_last_ec -ne 0) { $__daedalus_last_ec } else { 1 }
+            } else {
+                0
+            }
+            [Console]::Write("${__daedalus_esc}]133;D;${__daedalus_ec}${__daedalus_bel}")
+        }
+        $global:__daedalus_ps_first_prompt = $false
+
+        $__daedalus_host = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } elseif ($env:HOSTNAME) { $env:HOSTNAME } else { 'localhost' }
+        $__daedalus_raw_path = ($PWD.ProviderPath -replace '\\', '/').TrimStart('/')
+        $__daedalus_segments = $__daedalus_raw_path -split '/' | ForEach-Object {
+            if ($_ -match '^[A-Za-z]:$') { $_ } else { [System.Uri]::EscapeDataString($_) }
+        }
+        $__daedalus_encoded_path = '/' + ($__daedalus_segments -join '/')
+        [Console]::Write("${__daedalus_esc}]7;file://${__daedalus_host}${__daedalus_encoded_path}${__daedalus_bel}")
+        [Console]::Write("${__daedalus_esc}]133;A${__daedalus_bel}")
+
+        $__daedalus_prompt_text = if ($null -ne $global:__daedalus_ps_orig_prompt) {
+            & $global:__daedalus_ps_orig_prompt
+        } else {
+            "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
+        }
+        "${__daedalus_prompt_text}${__daedalus_esc}]133;B${__daedalus_bel}"
+    }
+
+    if (Get-Module -Name PSReadLine) {
+        Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
+            param($key, $arg)
+            [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine($key, $arg)
+            [Console]::Write("$([char]0x1b)]133;C$([char]0x07)")
+        }
+    }
+}
+"#;
+
 const DEFAULT_XDG_DATA_DIRS: &str = "/usr/local/share:/usr/share";
 
 fn build_fish_xdg_data_dirs(shell_dir: &Path, existing: Option<&str>) -> String {
@@ -157,11 +207,54 @@ fn build_fish_xdg_data_dirs(shell_dir: &Path, existing: Option<&str>) -> String 
     format!("{prefix}:{tail}")
 }
 
+#[cfg(any(windows, test))]
+fn resolve_windows_default_shell(
+    shell_env: Option<&str>,
+    comspec_env: Option<&str>,
+    path_env: Option<&std::ffi::OsStr>,
+) -> String {
+    if let Some(shell) = shell_env.filter(|s| !s.is_empty()) {
+        return shell.to_string();
+    }
+    if let Some(paths) = path_env {
+        for exe in ["pwsh.exe", "powershell.exe"] {
+            for dir in std::env::split_paths(paths) {
+                if dir.join(exe).is_file() {
+                    return exe.to_string();
+                }
+            }
+        }
+    }
+    comspec_env
+        .filter(|s| !s.is_empty())
+        .unwrap_or("powershell.exe")
+        .to_string()
+}
+
+fn default_shell_path() -> String {
+    #[cfg(windows)]
+    {
+        resolve_windows_default_shell(
+            std::env::var("SHELL").ok().as_deref(),
+            std::env::var("COMSPEC").ok().as_deref(),
+            std::env::var_os("PATH").as_deref(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/bash".to_string())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ShellIntegration {
     shell_dir: PathBuf,
     bash_rc: PathBuf,
     zsh_dir: PathBuf,
+    powershell_script: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,22 +270,31 @@ impl ShellIntegration {
         let zsh_dir = shell_dir.join("zsh");
         let fish_dir = shell_dir.join("fish");
         let fish_vendor_dir = fish_dir.join("vendor_conf.d");
+        let powershell_dir = shell_dir.join("powershell");
         fs::create_dir_all(&zsh_dir)?;
         fs::create_dir_all(&fish_vendor_dir)?;
-        fs::set_permissions(&shell_dir, fs::Permissions::from_mode(0o700))?;
-        fs::set_permissions(&zsh_dir, fs::Permissions::from_mode(0o700))?;
-        fs::set_permissions(&fish_dir, fs::Permissions::from_mode(0o700))?;
-        fs::set_permissions(&fish_vendor_dir, fs::Permissions::from_mode(0o700))?;
+        fs::create_dir_all(&powershell_dir)?;
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&shell_dir, fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(&zsh_dir, fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(&fish_dir, fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(&fish_vendor_dir, fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(&powershell_dir, fs::Permissions::from_mode(0o700))?;
+        }
 
         let bash_rc = shell_dir.join("bash-init.sh");
+        let powershell_script = powershell_dir.join("daedalus.ps1");
         fs::write(&bash_rc, BASH_INIT_SCRIPT)?;
         fs::write(zsh_dir.join(".zshrc"), ZSH_INIT_SCRIPT)?;
         fs::write(fish_vendor_dir.join("daedalus.fish"), FISH_INIT_SCRIPT)?;
+        fs::write(&powershell_script, POWERSHELL_INIT_SCRIPT)?;
 
         Ok(Self {
             shell_dir,
             bash_rc,
             zsh_dir,
+            powershell_script,
         })
     }
 
@@ -212,17 +314,17 @@ impl ShellIntegration {
         }
 
         let shell_path = shell_override
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| "/bin/bash".to_string());
+            .map(ToString::to_string)
+            .unwrap_or_else(default_shell_path);
 
-        let base_name = Path::new(&shell_path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("bash");
+        let base_name = shell_path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(shell_path.as_str())
+            .to_ascii_lowercase();
 
-        match base_name {
-            "bash" => ShellLaunchSpec {
+        match base_name.as_str() {
+            "bash" | "bash.exe" => ShellLaunchSpec {
                 program: shell_path,
                 args: vec![
                     "--rcfile".to_string(),
@@ -259,6 +361,24 @@ impl ShellIntegration {
                     program: shell_path,
                     args: vec!["-i".to_string()],
                     extra_env,
+                }
+            }
+            "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe" => {
+                let mut args = Vec::new();
+                if cfg!(windows) || base_name.ends_with(".exe") {
+                    args.push("-ExecutionPolicy".to_string());
+                    args.push("Bypass".to_string());
+                }
+                args.extend([
+                    "-NoLogo".to_string(),
+                    "-NoExit".to_string(),
+                    "-File".to_string(),
+                    self.powershell_script.to_string_lossy().into_owned(),
+                ]);
+                ShellLaunchSpec {
+                    program: shell_path,
+                    args,
+                    extra_env: HashMap::new(),
                 }
             }
             _ => ShellLaunchSpec {
@@ -342,6 +462,116 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prepares_powershell_script_and_builds_launch_specs_for_pwsh_and_powershell() {
+        let dir = TempDir::new().unwrap();
+        let integration = ShellIntegration::prepare(dir.path()).unwrap();
+
+        let expected_ps1 = dir
+            .path()
+            .join("shell")
+            .join("powershell")
+            .join("daedalus.ps1");
+        assert!(expected_ps1.is_file());
+        let ps1_contents = fs::read_to_string(&expected_ps1).unwrap();
+        assert!(ps1_contents.contains("133;A"));
+        assert!(ps1_contents.contains("133;B"));
+        assert!(ps1_contents.contains("133;C"));
+        assert!(ps1_contents.contains("133;D;"));
+        assert!(ps1_contents.contains("7;file://"));
+        assert!(ps1_contents.contains("PSReadLine"));
+
+        let pwsh_win =
+            integration.build_launch_spec(None, Some(r"C:\Program Files\PowerShell\7\pwsh.exe"));
+        assert_eq!(pwsh_win.program, r"C:\Program Files\PowerShell\7\pwsh.exe");
+        assert_eq!(
+            pwsh_win.args,
+            vec![
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-NoLogo".to_string(),
+                "-NoExit".to_string(),
+                "-File".to_string(),
+                expected_ps1.to_string_lossy().into_owned(),
+            ]
+        );
+        assert!(pwsh_win.extra_env.is_empty());
+
+        let powershell_exe = integration.build_launch_spec(None, Some("PowerShell.EXE"));
+        assert_eq!(powershell_exe.program, "PowerShell.EXE");
+        assert_eq!(
+            powershell_exe.args,
+            vec![
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-NoLogo".to_string(),
+                "-NoExit".to_string(),
+                "-File".to_string(),
+                expected_ps1.to_string_lossy().into_owned(),
+            ]
+        );
+
+        let pwsh_unix = integration.build_launch_spec(None, Some("/usr/bin/pwsh"));
+        assert_eq!(pwsh_unix.program, "/usr/bin/pwsh");
+        assert!(pwsh_unix.args.ends_with(&[
+            "-NoLogo".to_string(),
+            "-NoExit".to_string(),
+            "-File".to_string(),
+            expected_ps1.to_string_lossy().into_owned(),
+        ]));
+    }
+
+    #[test]
+    fn windows_default_shell_prefers_pwsh_then_powershell_then_comspec() {
+        let dir = TempDir::new().unwrap();
+        let empty_dir = dir.path().join("empty");
+        fs::create_dir_all(&empty_dir).unwrap();
+
+        assert_eq!(
+            resolve_windows_default_shell(
+                Some(r"C:\Program Files\Git\bin\bash.exe"),
+                Some(r"C:\Windows\System32\cmd.exe"),
+                Some(empty_dir.as_os_str()),
+            ),
+            r"C:\Program Files\Git\bin\bash.exe"
+        );
+        assert_eq!(
+            resolve_windows_default_shell(
+                None,
+                Some(r"C:\Windows\System32\cmd.exe"),
+                Some(empty_dir.as_os_str()),
+            ),
+            r"C:\Windows\System32\cmd.exe"
+        );
+        assert_eq!(
+            resolve_windows_default_shell(None, Some(""), Some(empty_dir.as_os_str())),
+            "powershell.exe"
+        );
+
+        let ps_dir = dir.path().join("ps");
+        fs::create_dir_all(&ps_dir).unwrap();
+        fs::write(ps_dir.join("powershell.exe"), b"").unwrap();
+        assert_eq!(
+            resolve_windows_default_shell(
+                None,
+                Some(r"C:\Windows\System32\cmd.exe"),
+                Some(ps_dir.as_os_str()),
+            ),
+            "powershell.exe"
+        );
+
+        fs::write(ps_dir.join("pwsh.exe"), b"").unwrap();
+        assert_eq!(
+            resolve_windows_default_shell(
+                None,
+                Some(r"C:\Windows\System32\cmd.exe"),
+                Some(ps_dir.as_os_str()),
+            ),
+            "pwsh.exe"
+        );
+    }
+
+    #[cfg(unix)]
     fn run_bash_with_bashrc(bashrc_contents: &str) -> Vec<daedalus_vt::SemanticEvent> {
         use crate::supervisor::{IsolationMode, Supervisor};
         use daedalus_proto::{PaneId, PaneRole, WorkspaceId};
@@ -428,6 +658,7 @@ mod tests {
         all_events
     }
 
+    #[cfg(unix)]
     #[test]
     fn bash_init_preserves_user_prompt_command_without_spurious_preexec() {
         use daedalus_vt::SemanticEvent;

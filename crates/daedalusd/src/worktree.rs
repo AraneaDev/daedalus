@@ -97,6 +97,26 @@ pub fn sanitize_slug(branch: &str) -> Result<String, String> {
     Ok(slug.to_string())
 }
 
+fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(raw) = path.to_str() {
+            if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+                return PathBuf::from(format!(r"\\{unc}"));
+            }
+            if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+                return PathBuf::from(stripped);
+            }
+        }
+    }
+    path
+}
+
+fn canonicalize_path(path: &Path) -> PathBuf {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    strip_windows_verbatim_prefix(resolved)
+}
+
 fn spawn_reader<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -324,11 +344,11 @@ pub fn create_worktree(
     }
 
     let repo_root_raw = PathBuf::from(toplevel_out.stdout.trim_end_matches(['\r', '\n']));
-    let repo_root = std::fs::canonicalize(&repo_root_raw).unwrap_or(repo_root_raw);
+    let repo_root = canonicalize_path(&repo_root_raw);
     let primary_root = discover_worktrees(&repo_root)
         .ok()
         .and_then(|mut worktrees| (!worktrees.is_empty()).then(|| worktrees.remove(0).path))
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .map(|p| canonicalize_path(&p))
         .unwrap_or_else(|| repo_root.clone());
     let repo_name = primary_root
         .file_name()
@@ -385,14 +405,11 @@ pub fn create_worktree(
         ));
     }
 
-    let canonical_target = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+    let canonical_target = canonicalize_path(&target);
     let worktrees = discover_worktrees(&repo_root)?;
     worktrees
         .into_iter()
-        .find(|wt| {
-            let wt_canon = std::fs::canonicalize(&wt.path).unwrap_or_else(|_| wt.path.clone());
-            wt_canon == canonical_target
-        })
+        .find(|wt| canonicalize_path(&wt.path) == canonical_target)
         .ok_or_else(|| {
             format!(
                 "created worktree at {} was not found in git worktree list",
@@ -485,10 +502,10 @@ pub fn validate_worktree_removal(path: &Path, force: bool) -> Result<PathBuf, Wo
     }
 
     let worktrees = discover_worktrees(path).map_err(WorktreeError::GitFailed)?;
-    let canon_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let matched = worktrees.iter().find(|wt| {
-        std::fs::canonicalize(&wt.path).unwrap_or_else(|_| wt.path.clone()) == canon_path
-    });
+    let canon_path = canonicalize_path(path);
+    let matched = worktrees
+        .iter()
+        .find(|wt| canonicalize_path(&wt.path) == canon_path);
     match matched {
         Some(wt) if wt.is_primary => {
             return Err(WorktreeError::PrimaryCheckout(path.to_path_buf()));
@@ -518,7 +535,7 @@ pub fn validate_worktree_removal(path: &Path, force: bool) -> Result<PathBuf, Wo
 /// Removes a linked secondary git worktree at `path`, refusing to remove a primary repo checkout.
 pub fn remove_worktree(path: &Path, force: bool) -> Result<(), WorktreeError> {
     let primary_repo = validate_worktree_removal(path, force)?;
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = canonicalize_path(path);
 
     let mut args = vec![OsStr::new("worktree"), OsStr::new("remove")];
     if force {
