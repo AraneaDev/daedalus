@@ -76,7 +76,7 @@ jobs:
           if [ -f CHANGELOG.md ]; then
             cp CHANGELOG.md "${STAGE_DIR}/"
           fi
-          tar -C dist -czf "dist/${ARCHIVE}.tar.gz" "${ARCHIVE}"
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/${ARCHIVE}.tar.gz" "${ARCHIVE}"
           (
             cd dist
             if command -v sha256sum >/dev/null 2>&1; then

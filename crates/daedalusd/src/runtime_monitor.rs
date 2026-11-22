@@ -447,6 +447,7 @@ pub fn connect_docker_client() -> Option<Docker> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     for path in discover_docker_socket_candidates(docker_host.as_deref(), home.as_deref()) {
         if path.exists()
+            && std::os::unix::net::UnixStream::connect(&path).is_ok()
             && let Some(path_str) = path.to_str()
             && let Ok(client) =
                 Docker::connect_with_unix(path_str, 120, bollard::API_DEFAULT_VERSION)
