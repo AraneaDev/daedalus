@@ -80,6 +80,7 @@ async fn daemon_bridge_bootstraps_three_panes_and_forwards_runner_failure_to_age
             socket_path: sock,
             initial_dir: dir.path().to_path_buf(),
             default_agent: AgentPreset::Shell,
+            auth_token: None,
             auto_spawn_daemon: false,
         },
         sink,
@@ -260,6 +261,7 @@ async fn daemon_bridge_handles_mid_session_disconnect_and_reconnects_cleanly() {
             socket_path: sock.clone(),
             initial_dir: dir.path().to_path_buf(),
             default_agent: AgentPreset::Shell,
+            auth_token: None,
             auto_spawn_daemon: false,
         },
         sink,
@@ -385,6 +387,7 @@ command = ["cmd.exe", "/C", "echo", "MANIFEST_RUNNER_NEEDLE", "&", "ping", "-n",
                 socket_path: sock.clone(),
                 initial_dir: ws_dir.clone(),
                 default_agent: AgentPreset::Shell,
+                auth_token: None,
                 auto_spawn_daemon: false,
             },
             sink,
@@ -437,6 +440,7 @@ command = ["cmd.exe", "/C", "echo", "MANIFEST_RUNNER_NEEDLE", "&", "ping", "-n",
             socket_path: sock,
             initial_dir: ws_dir,
             default_agent: AgentPreset::Shell,
+            auth_token: None,
             auto_spawn_daemon: false,
         },
         sink,
@@ -601,6 +605,7 @@ async fn daemon_bridge_delivers_agent_state_changed_and_closes_worktree_with_rem
             socket_path: sock.clone(),
             initial_dir: repo_dir.clone(),
             default_agent: AgentPreset::Shell,
+            auth_token: None,
             auto_spawn_daemon: false,
         },
         sink,
@@ -731,4 +736,90 @@ async fn daemon_bridge_delivers_agent_state_changed_and_closes_worktree_with_rem
         .await
         .expect("timed out waiting for DaemonServer shutdown")
         .expect("DaemonServer task panicked");
+}
+
+#[tokio::test]
+async fn authenticated_tcp_bridge_runs_workspace_action() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join(".daedalus.toml"),
+        r#"
+[[actions]]
+id = "mark"
+label = "Mark workspace"
+target = "runner"
+command = "mkdir action-result"
+"#,
+    )
+    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(
+        "tcp://127.0.0.1:0".into(),
+        dir.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap()
+    .with_auth_token(Some("bridge-test".into()));
+    let socket_path = server.socket_path();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let daemon = tokio::spawn(server.serve(async {
+        let _ = stopped.await;
+    }));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let bridge = DaemonBridge::start(
+        BridgeConfig {
+            socket_path,
+            initial_dir: dir.path().to_owned(),
+            default_agent: AgentPreset::Shell,
+            auto_spawn_daemon: false,
+            auth_token: Some("bridge-test".into()),
+        },
+        Arc::new(ChannelSink { tx }),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let workspace_id = loop {
+            if let UiEvent::WorkspaceCreated(ws) = rx.recv().await.unwrap() {
+                break ws.id;
+            }
+        };
+        bridge.send(UiCommand::RunWorkspaceAction {
+            workspace_id,
+            action_id: "mark".into(),
+        });
+        while !dir.path().join("action-result").is_dir() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("authenticated action did not write its result");
+    tokio::task::spawn_blocking(move || bridge.shutdown())
+        .await
+        .unwrap();
+    stop.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_unanswered_initialization_rpc() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let bridge = DaemonBridge::start(
+        BridgeConfig {
+            socket_path: format!("tcp://{}", listener.local_addr().unwrap()).into(),
+            initial_dir: ".".into(),
+            default_agent: AgentPreset::Shell,
+            auto_spawn_daemon: false,
+            auth_token: None,
+        },
+        Arc::new(ChannelSink { tx }),
+    );
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let request = read_frame::<_, Request>(&mut peer).await.unwrap().unwrap();
+    assert!(matches!(request.payload, ClientMessage::Ping));
+    let shutdown = tokio::task::spawn_blocking(move || bridge.shutdown());
+    let result = tokio::time::timeout(Duration::from_secs(2), shutdown).await;
+    drop(peer);
+    result
+        .expect("shutdown waited for the silent daemon")
+        .unwrap();
 }

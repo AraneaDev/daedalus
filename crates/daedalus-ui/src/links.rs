@@ -25,6 +25,14 @@ pub fn detect_link_at(
     cwd: Option<&Path>,
     root_dir: Option<&Path>,
 ) -> Option<DetectedLink> {
+    detect_at(row_text, col, Some((cwd, root_dir)))
+}
+
+fn detect_at(
+    row_text: &str,
+    col: usize,
+    file_context: Option<(Option<&Path>, Option<&Path>)>,
+) -> Option<DetectedLink> {
     let (click_byte, clicked_ch) = row_text.char_indices().nth(col)?;
     if clicked_ch.is_whitespace() {
         return None;
@@ -50,6 +58,7 @@ pub fn detect_link_at(
         return Some(DetectedLink::Url(url));
     }
 
+    let (cwd, root_dir) = file_context?;
     extract_file_at(token, rel_click, cwd, root_dir)
 }
 
@@ -59,6 +68,19 @@ pub fn detect_link_in_row(
     col: usize,
     cwd: Option<&Path>,
     root_dir: Option<&Path>,
+) -> Option<DetectedLink> {
+    row_link(row, col, Some((cwd, root_dir)))
+}
+
+/// Detects a web link in a remote pane without resolving paths on the client.
+pub fn detect_url_in_row(row: &GridRow, col: usize) -> Option<DetectedLink> {
+    row_link(row, col, None)
+}
+
+fn row_link(
+    row: &GridRow,
+    col: usize,
+    file_context: Option<(Option<&Path>, Option<&Path>)>,
 ) -> Option<DetectedLink> {
     if col >= row.cells.len() {
         return None;
@@ -90,7 +112,7 @@ pub fn detect_link_in_row(
     }
 
     let char_col = target_char_col?;
-    detect_link_at(&row_text, char_col, cwd, root_dir)
+    detect_at(&row_text, char_col, file_context)
 }
 
 fn is_url_stopper(ch: char) -> bool {
@@ -681,6 +703,17 @@ mod tests {
     }
 
     #[test]
+    fn remote_link_detection_ignores_existing_absolute_paths() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        assert!(matches!(
+            detect_link_at(path, 0, None, None),
+            Some(DetectedLink::File { .. })
+        ));
+        assert_eq!(detect_at(path, 0, None), None);
+    }
+
+    #[test]
     fn detects_link_in_grid_row_with_wide_chars() {
         let cells = vec![
             Cell {
@@ -756,6 +789,10 @@ mod tests {
             abs_row: 0,
             cells,
         };
+        assert_eq!(
+            detect_url_in_row(&row, 5),
+            detect_link_in_row(&row, 5, None, None),
+        );
         assert_eq!(
             detect_link_in_row(&row, 5, None, None),
             Some(DetectedLink::Url("https://a.com".to_string()))

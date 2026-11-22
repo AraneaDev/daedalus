@@ -71,6 +71,41 @@ impl AgentPreset {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ActionPaletteState {
+    pub open: bool,
+    pub selected_index: usize,
+}
+
+impl ActionPaletteState {
+    pub fn open(&mut self) {
+        self.open = true;
+        self.selected_index = 0;
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+    }
+
+    pub fn move_up(&mut self, len: usize) {
+        self.selected_index = if len == 0 {
+            0
+        } else if self.selected_index == 0 {
+            len - 1
+        } else {
+            (self.selected_index - 1).min(len - 1)
+        };
+    }
+
+    pub fn move_down(&mut self, len: usize) {
+        self.selected_index = if len == 0 {
+            0
+        } else {
+            (self.selected_index + 1) % len
+        };
+    }
+}
+
 /// State of the interactive Agent preset picker modal (`Ctrl+Shift+P`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PickerState {
@@ -510,6 +545,8 @@ pub struct AppState {
     pub focused_role: PaneRole,
     pub sidebar_visible: bool,
     pub zoomed: bool,
+    pub remote_host: Option<String>,
+    pub action_palette: ActionPaletteState,
     pub picker: PickerState,
     pub worktree_modal: WorktreeModalState,
     pub close_modal: CloseWorkspaceModalState,
@@ -535,6 +572,8 @@ impl AppState {
             focused_role: PaneRole::Agent,
             sidebar_visible: true,
             zoomed: false,
+            remote_host: None,
+            action_palette: ActionPaletteState::default(),
             picker: PickerState::default(),
             worktree_modal: WorktreeModalState::default(),
             close_modal: CloseWorkspaceModalState::default(),
@@ -554,6 +593,7 @@ impl AppState {
         {
             self.search = None;
         } else {
+            self.action_palette.close();
             self.picker.close();
             self.worktree_modal.close();
             self.close_modal.close();
@@ -604,11 +644,13 @@ impl AppState {
     pub fn open_picker_with(&mut self, preset: AgentPreset) {
         self.worktree_modal.close();
         self.close_modal.close();
+        self.action_palette.close();
         self.picker.open_with(preset);
     }
 
     /// Opens the Git worktree creator modal while ensuring other modals are closed.
     pub fn open_worktree_modal(&mut self) {
+        self.action_palette.close();
         self.picker.close();
         self.close_modal.close();
         self.worktree_modal.open();
@@ -633,6 +675,7 @@ impl AppState {
         else {
             return false;
         };
+        self.action_palette.close();
         self.picker.close();
         self.worktree_modal.close();
         self.close_search();
@@ -664,6 +707,7 @@ impl AppState {
         };
         let next_id = self.workspaces[next_idx].id;
         if self.active_workspace_id != Some(next_id) {
+            self.action_palette.close();
             self.active_workspace_id = Some(next_id);
             self.close_search();
         }
@@ -724,6 +768,21 @@ impl AppState {
     pub fn active_workspace(&self) -> Option<&WorkspaceInfo> {
         let id = self.active_workspace_id?;
         self.workspaces.iter().find(|ws| ws.id == id)
+    }
+
+    pub fn active_actions(&self) -> &[daedalus_proto::CustomAction] {
+        self.active_workspace()
+            .and_then(|ws| ws.manifest.as_ref())
+            .map(|m| m.actions.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub fn open_action_palette(&mut self) {
+        self.picker.close();
+        self.worktree_modal.close();
+        self.close_modal.close();
+        self.close_search();
+        self.action_palette.open();
     }
 
     pub fn active_workspace_mut(&mut self) -> Option<&mut WorkspaceInfo> {
@@ -800,6 +859,7 @@ impl AppState {
             .active_workspace_id
             .is_some_and(|id| self.workspaces.iter().any(|ws| ws.id == id));
         if !active_still_exists {
+            self.action_palette.close();
             self.active_workspace_id = self.workspaces.first().map(|ws| ws.id);
         }
     }
@@ -1266,6 +1326,21 @@ mod tests {
             state.panes.get(&runner_id).unwrap().summary.last_exit_code,
             Some(0)
         );
+    }
+
+    #[test]
+    fn action_palette_wraps_for_nonempty_and_empty_workspaces() {
+        let mut palette = ActionPaletteState::default();
+        palette.open();
+        palette.move_up(32);
+        assert_eq!(palette.selected_index, 31);
+        palette.move_down(32);
+        assert_eq!(palette.selected_index, 0);
+        palette.move_up(0);
+        palette.move_down(0);
+        assert_eq!(palette.selected_index, 0);
+        palette.close();
+        assert!(!palette.open);
     }
 
     #[test]

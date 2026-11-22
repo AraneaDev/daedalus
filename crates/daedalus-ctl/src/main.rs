@@ -21,7 +21,12 @@ const DEFAULT_DAEDALUSD_BIN: &str = "/usr/local/bin/daedalusd";
 struct Cli {
     #[arg(long, global = true, env = "DAEDALUS_SOCKET")]
     socket: Option<PathBuf>,
-    #[arg(long, global = true, env = "DAEDALUS_AUTH_TOKEN")]
+    #[arg(
+        long,
+        global = true,
+        env = "DAEDALUS_AUTH_TOKEN",
+        hide_env_values = true
+    )]
     auth_token: Option<String>,
     #[command(subcommand)]
     command: Commands,

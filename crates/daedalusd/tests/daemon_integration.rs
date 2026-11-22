@@ -2419,3 +2419,98 @@ command = "echo SVC_ACTION_OK"
     let _ = shutdown_tx.send(());
     srv_handle.await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_uses_env_token_without_passing_it_to_panes() {
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("control.sock");
+    let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_daedalusd"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--events-socket")
+        .arg(dir.path().join("events.sock"))
+        .arg("--runtime-dir")
+        .arg(dir.path().join("runtime"))
+        .arg("--state-file")
+        .arg(dir.path().join("state.json"))
+        .env("DAEDALUS_AUTH_TOKEN", "test-daemon-token")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut client = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(stream) = IpcStream::connect(&socket).await {
+                break stream;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("daemon startup timed out");
+    assert!(matches!(
+        send_rpc_result(&mut client, 1, ClientMessage::Ping).await,
+        Err(ProtoError::Unauthorized(_))
+    ));
+    assert_eq!(
+        send_rpc(
+            &mut client,
+            2,
+            ClientMessage::Authenticate {
+                token: "test-daemon-token".into()
+            }
+        )
+        .await,
+        ResponsePayload::Ok
+    );
+    let ResponsePayload::WorkspaceCreated(ws) = send_rpc(
+        &mut client,
+        3,
+        ClientMessage::CreateWorkspace {
+            name: "credential-test".into(),
+            root_dir: dir.path().into(),
+            env: HashMap::new(),
+        },
+    )
+    .await
+    else {
+        panic!("expected workspace");
+    };
+    let marker = dir.path().join("result");
+    let command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        r#"if test "${DAEDALUS_AUTH_TOKEN+x}" = x; then echo present; else echo absent; fi > "$1""#
+            .into(),
+        "sh".into(),
+        marker.to_str().unwrap().into(),
+    ];
+    send_rpc(
+        &mut client,
+        4,
+        ClientMessage::SpawnPane {
+            workspace_id: ws.id,
+            role: PaneRole::Runner,
+            command: Some(command),
+            shell: None,
+            cols: 80,
+            rows: 24,
+            env: HashMap::new(),
+        },
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&marker)
+                && !text.is_empty()
+            {
+                break text;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("pane did not write marker");
+    daemon.kill().await.unwrap();
+    assert_eq!(result.trim(), "absent");
+}

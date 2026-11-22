@@ -7,7 +7,7 @@ use daedalusd::supervisor::Supervisor;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     name = "daedalusd",
     about = "Daedalus persistent headless runtime daemon"
@@ -21,19 +21,28 @@ struct Args {
     events_socket: Option<PathBuf>,
     #[arg(long, env = "DAEDALUS_STATE_FILE")]
     state_file: Option<PathBuf>,
-    #[arg(long, env = "DAEDALUS_AUTH_TOKEN")]
+    #[arg(long, env = "DAEDALUS_AUTH_TOKEN", hide_env_values = true)]
     auth_token: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    // SAFETY: startup is still single-threaded. Remove the inherited credential before
+    // starting Tokio, tracing, or any subprocesses. Clap has already copied its value.
+    unsafe { std::env::remove_var("DAEDALUS_AUTH_TOKEN") };
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(args))
+}
+
+async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    let args = Args::parse();
     let socket = args.socket.unwrap_or_else(default_socket_path);
     let runtime_dir = args.runtime_dir.unwrap_or_else(default_runtime_dir);
     let events_socket = args
