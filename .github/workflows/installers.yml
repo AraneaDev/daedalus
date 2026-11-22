@@ -1,0 +1,104 @@
+name: Native installers
+
+on:
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - '.github/workflows/installers.yml'
+      - '.github/workflows/release-please.yml'
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+
+jobs:
+  installer:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Read package version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          version=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')
+          if [[ -n "$RELEASE_TAG" && "$RELEASE_TAG" != "v$version" ]]; then exit 1; fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config dpkg-dev libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - run: cargo build --release --locked --workspace
+      - name: Build and test Debian package
+        if: runner.os == 'Linux'
+        run: |
+          packaging/linux.sh "$VERSION"
+          sudo apt-get install -y ./dist/*.deb
+          /usr/bin/daedalus-ui --help >/dev/null
+          /usr/bin/daedalus-ctl --help >/dev/null
+          /usr/bin/daedalusd --help >/dev/null
+          sudo dpkg -r daedalus
+      - name: Build and test macOS package
+        if: runner.os == 'macOS'
+        run: |
+          packaging/macos.sh "$VERSION"
+          sudo installer -pkg dist/*.pkg -target /
+          /Applications/Daedalus.app/Contents/MacOS/daedalus-ui --help >/dev/null
+          /usr/local/bin/daedalus-ctl --help >/dev/null
+          /usr/local/bin/daedalusd --help >/dev/null
+      - name: Build and test Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dotnet tool install --tool-path "$env:RUNNER_TEMP/wix" wix --version 5.0.2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force dist
+          $msi = "$pwd/dist/daedalus-$env:VERSION-x64.msi"
+          & "$env:RUNNER_TEMP/wix/wix.exe" build -arch x64 -d "Version=$env:VERSION" packaging/windows.wxs -o $msi
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          foreach ($mode in '/i','/x') {
+            $proc = Start-Process msiexec -ArgumentList "$mode `"$msi`" /qn /norestart" -Wait -PassThru
+            if ($proc.ExitCode -ne 0) { throw "Installer exited with $($proc.ExitCode)" }
+            if ($mode -eq '/i') {
+              foreach ($bin in 'daedalus-ui','daedalus-ctl','daedalusd') {
+                & "$env:ProgramFiles/Daedalus/$bin.exe" --help
+                if ($LASTEXITCODE) { exit $LASTEXITCODE }
+              }
+            }
+          }
+      - name: Checksum installer
+        shell: bash
+        run: |
+          cd dist
+          for file in *.msi *.deb *.pkg; do
+            [[ -f "$file" ]] || continue
+            if command -v sha256sum >/dev/null; then sha256sum "$file"; else shasum -a 256 "$file"; fi > "$file.sha256"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daedalus-installer-${{ runner.os }}
+          path: |
+            dist/*.deb
+            dist/*.pkg
+            dist/*.msi
+            dist/*.sha256
+      - name: Publish verified installer and checksum
+        if: inputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          shopt -s nullglob
+          gh release upload "$RELEASE_TAG" dist/*.msi dist/*.deb dist/*.pkg dist/*.sha256 --clobber

@@ -137,3 +137,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
+
+  installers:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    uses: ./.github/workflows/installers.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
