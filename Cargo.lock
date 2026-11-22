@@ -637,6 +637,7 @@ dependencies = [
  "nix 0.32.0",
  "rmp-serde",
  "serde",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "uuid",
