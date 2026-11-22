@@ -275,7 +275,19 @@ pub fn parse_osc7_file_uri(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     let slash_idx = rest.find('/')?;
     let raw_path = &rest[slash_idx..];
-    Some(PathBuf::from(percent_decode(raw_path)))
+    let decoded = percent_decode(raw_path);
+    let bytes = decoded.as_bytes();
+    let normalized = if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && (bytes.len() == 3 || bytes[3] == b'/')
+    {
+        &decoded[1..]
+    } else {
+        decoded.as_str()
+    };
+    Some(PathBuf::from(normalized))
 }
 
 fn percent_decode(input: &str) -> String {

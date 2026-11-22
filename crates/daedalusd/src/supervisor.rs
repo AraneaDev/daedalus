@@ -1,6 +1,8 @@
 use crate::shell_integration::ShellLaunchSpec;
 use daedalus_proto::{PaneId, PaneRole, WorkspaceId};
+#[cfg(unix)]
 use nix::sys::signal::{Signal, killpg};
+#[cfg(unix)]
 use nix::unistd::Pid;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -13,6 +15,7 @@ use std::time::{Duration, Instant};
 pub enum IsolationMode {
     SystemdScope,
     PgidFallback,
+    WindowsProcessTree,
 }
 
 impl IsolationMode {
@@ -20,6 +23,7 @@ impl IsolationMode {
         match self {
             Self::SystemdScope => "systemd-scope",
             Self::PgidFallback => "pgid-fallback",
+            Self::WindowsProcessTree => "windows-process-tree",
         }
     }
 }
@@ -32,6 +36,7 @@ pub struct Supervisor {
 pub struct ProcessHandle {
     child: Box<dyn Child + Send + Sync>,
     pid: Option<u32>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     systemd_unit: Option<String>,
     torn_down: bool,
 }
@@ -57,9 +62,14 @@ pub fn detect_isolation_mode() -> IsolationMode {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn detect_isolation_mode() -> IsolationMode {
     IsolationMode::PgidFallback
+}
+
+#[cfg(windows)]
+pub fn detect_isolation_mode() -> IsolationMode {
+    IsolationMode::WindowsProcessTree
 }
 
 impl Supervisor {
@@ -117,7 +127,7 @@ impl Supervisor {
                 }
                 (cb, Some(format!("{unit}.scope")))
             }
-            IsolationMode::PgidFallback => {
+            IsolationMode::PgidFallback | IsolationMode::WindowsProcessTree => {
                 let mut cb = CommandBuilder::new(&launch.program);
                 for arg in &launch.args {
                     cb.arg(arg);
@@ -183,6 +193,7 @@ impl ProcessHandle {
         self.child.wait().ok().map(|s| s.exit_code() as i32)
     }
 
+    #[cfg(unix)]
     pub fn teardown(&mut self) {
         if self.torn_down {
             return;
@@ -210,16 +221,39 @@ impl ProcessHandle {
         self.reset_failed_unit();
     }
 
+    #[cfg(windows)]
+    pub fn teardown(&mut self) {
+        if self.torn_down {
+            return;
+        }
+        self.torn_down = true;
+
+        if self.try_wait_exit().is_some() {
+            return;
+        }
+
+        if let Some(pid) = self.pid {
+            let mut cmd = Command::new("taskkill");
+            cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+            let _ = run_command_with_timeout(&mut cmd, Duration::from_secs(3));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    #[cfg(unix)]
     fn has_live_processes(&self) -> bool {
         self.has_live_pgid_processes() || self.has_active_systemd_unit()
     }
 
+    #[cfg(unix)]
     fn has_active_systemd_unit(&self) -> bool {
         self.systemd_unit
             .as_deref()
             .is_some_and(|unit| run_systemctl_quiet(&["is-active", "--quiet", unit]))
     }
 
+    #[cfg(unix)]
     fn has_live_pgid_processes(&self) -> bool {
         let Some(pid) = self.pid else {
             return false;
@@ -240,6 +274,7 @@ impl ProcessHandle {
         }
     }
 
+    #[cfg(unix)]
     fn send_signal(&self, sig: Signal) {
         let sig_name = match sig {
             Signal::SIGTERM => "SIGTERM",
@@ -254,6 +289,7 @@ impl ProcessHandle {
         }
     }
 
+    #[cfg(unix)]
     fn reset_failed_unit(&self) {
         if let Some(unit) = &self.systemd_unit {
             let _ = run_systemctl_quiet(&["reset-failed", unit]);
@@ -261,7 +297,7 @@ impl ProcessHandle {
     }
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
 fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> bool {
     let Ok(mut child) = cmd
         .stdin(Stdio::null())
@@ -293,6 +329,7 @@ fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> bool {
     }
 }
 
+#[cfg(unix)]
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn run_command_stdout_with_timeout(
     cmd: &mut Command,
@@ -345,6 +382,53 @@ pub(crate) fn run_command_stdout_with_timeout(
     reader.join().ok().flatten()
 }
 
+#[cfg(windows)]
+pub(crate) fn run_command_stdout_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+    allow_nonzero_exit: bool,
+) -> Option<String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut buf).ok()?;
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    });
+
+    let deadline = Instant::now() + timeout;
+    let completed = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break allow_nonzero_exit || status.success(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+
+    if !completed {
+        return None;
+    }
+
+    reader.join().ok().flatten()
+}
+
+#[cfg(unix)]
 fn run_systemctl_quiet(args: &[&str]) -> bool {
     Command::new("systemctl")
         .arg("--user")
@@ -439,7 +523,7 @@ pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
 }
 
 /// Collects all live descendant PIDs of `root_pid` using `ps -axo pid=,ppid=`.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
     if root_pid == 0 {
         return Vec::new();
@@ -451,6 +535,36 @@ pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
         return Vec::new();
     };
     let edges = parse_ps_ppid_table(&output);
+    descendants_from_ppid_edges(root_pid, &edges)
+}
+
+#[cfg(windows)]
+pub(crate) fn collect_windows_ppid_edges() -> Vec<(u32, u32)> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        r#"Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }"#,
+    ]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let Some(output) = run_command_stdout_with_timeout(&mut cmd, Duration::from_secs(2), false)
+    else {
+        return Vec::new();
+    };
+    parse_ps_ppid_table(&output)
+}
+
+/// Collects all live descendant PIDs of `root_pid` using `Win32_Process`.
+#[cfg(windows)]
+pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
+    if root_pid == 0 {
+        return Vec::new();
+    }
+    let edges = collect_windows_ppid_edges();
     descendants_from_ppid_edges(root_pid, &edges)
 }
 
@@ -493,8 +607,11 @@ fn pgid_has_non_zombie_proc(pgid: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use nix::sys::signal::kill;
+    #[cfg(unix)]
     use std::io::BufRead;
+    #[cfg(unix)]
     use tempfile::TempDir;
 
     #[cfg(target_os = "linux")]
@@ -510,11 +627,12 @@ mod tests {
         true
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     fn is_process_alive(pid: i32) -> bool {
         kill(Pid::from_raw(pid), None).is_ok()
     }
 
+    #[cfg(unix)]
     fn assert_orphan_killed(script: &str) {
         let dir = TempDir::new().unwrap();
         let supervisor = Supervisor::with_mode(IsolationMode::PgidFallback);
@@ -567,16 +685,19 @@ mod tests {
         panic!("orphan child process {child_pid} survived teardown");
     }
 
+    #[cfg(unix)]
     #[test]
     fn teardown_kills_background_orphan_descendants() {
         assert_orphan_killed("sleep 60 & echo CHILD_PID=$!; wait");
     }
 
+    #[cfg(unix)]
     #[test]
     fn teardown_kills_sighup_immune_orphan_descendants() {
         assert_orphan_killed("(trap '' HUP; exec sleep 60) & echo CHILD_PID=$!; wait");
     }
 
+    #[cfg(unix)]
     #[test]
     fn command_probe_respects_timeout_and_kills_hanging_process() {
         let mut ok_cmd = Command::new("/bin/sh");
@@ -648,6 +769,7 @@ bad line
         assert!(descendants_from_ppid_edges(0, &edges).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn collect_descendant_pids_finds_live_child_process() {
         let mut child = Command::new("/bin/sh")
@@ -669,6 +791,7 @@ bad line
         let _ = child.wait();
     }
 
+    #[cfg(unix)]
     #[test]
     fn command_stdout_with_timeout_captures_output_and_kills_hanging_process() {
         let mut ok_cmd = Command::new("/bin/sh");
@@ -702,13 +825,33 @@ bad line
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn isolation_mode_as_str_matches_expected_names() {
+        assert_eq!(IsolationMode::SystemdScope.as_str(), "systemd-scope");
+        assert_eq!(IsolationMode::PgidFallback.as_str(), "pgid-fallback");
+        assert_eq!(
+            IsolationMode::WindowsProcessTree.as_str(),
+            "windows-process-tree"
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn detect_isolation_mode_uses_pgid_fallback_on_non_linux() {
         assert_eq!(detect_isolation_mode(), IsolationMode::PgidFallback);
         assert_eq!(
             Supervisor::detect().isolation_mode(),
             IsolationMode::PgidFallback
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detect_isolation_mode_uses_windows_process_tree_on_windows() {
+        assert_eq!(detect_isolation_mode(), IsolationMode::WindowsProcessTree);
+        assert_eq!(
+            Supervisor::detect().isolation_mode(),
+            IsolationMode::WindowsProcessTree
         );
     }
 }

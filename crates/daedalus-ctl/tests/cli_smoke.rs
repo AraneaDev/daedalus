@@ -1,3 +1,6 @@
+#[cfg(unix)]
+use daedalus_proto::transport::IpcStream;
+#[cfg(unix)]
 use daedalus_proto::{
     AgentState, ClientMessage, FailureTrace, Request, ResponsePayload, ServerMessage, WorkspaceId,
     WorkspaceInfo, read_frame, write_frame,
@@ -5,9 +8,19 @@ use daedalus_proto::{
 use daedalusd::server::DaemonServer;
 use daedalusd::supervisor::{IsolationMode, Supervisor};
 use tempfile::TempDir;
-use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::sync::oneshot;
+
+fn test_supervisor() -> Supervisor {
+    #[cfg(windows)]
+    {
+        Supervisor::with_mode(IsolationMode::WindowsProcessTree)
+    }
+    #[cfg(not(windows))]
+    {
+        Supervisor::with_mode(IsolationMode::PgidFallback)
+    }
+}
 
 #[tokio::test]
 async fn cli_smoke_ping_workspace_and_pane_lifecycle() {
@@ -15,13 +28,9 @@ async fn cli_smoke_ping_workspace_and_pane_lifecycle() {
     let sock = dir.path().join("daedalusd.sock");
     let runtime = dir.path().join("runtime");
 
-    let server = DaemonServer::bind_with_supervisor(
-        sock.clone(),
-        runtime,
-        Supervisor::with_mode(IsolationMode::PgidFallback),
-    )
-    .await
-    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let srv_handle = tokio::spawn(async move {
         let _ = server
@@ -58,6 +67,11 @@ async fn cli_smoke_ping_workspace_and_pane_lifecycle() {
     assert!(create.status.success());
     let ws_id = String::from_utf8_lossy(&create.stdout).trim().to_string();
 
+    #[cfg(unix)]
+    let shell_bin = "/bin/bash";
+    #[cfg(windows)]
+    let shell_bin = "cmd.exe";
+
     let spawn = Command::new(bin)
         .args([
             "--socket",
@@ -68,7 +82,7 @@ async fn cli_smoke_ping_workspace_and_pane_lifecycle() {
             "--role",
             "agent",
             "--shell",
-            "/bin/bash",
+            shell_bin,
         ])
         .output()
         .await
@@ -76,22 +90,25 @@ async fn cli_smoke_ping_workspace_and_pane_lifecycle() {
     assert!(spawn.status.success());
     let pane_id = String::from_utf8_lossy(&spawn.stdout).trim().to_string();
 
-    let send = Command::new(bin)
-        .args([
-            "--socket",
-            sock.to_str().unwrap(),
-            "pane",
-            "send",
-            &pane_id,
-            "echo SMOKE_OK",
-            "--newline",
-        ])
-        .output()
-        .await
-        .unwrap();
-    assert!(send.status.success());
+    #[cfg(unix)]
+    {
+        let send = Command::new(bin)
+            .args([
+                "--socket",
+                sock.to_str().unwrap(),
+                "pane",
+                "send",
+                &pane_id,
+                "echo SMOKE_OK",
+                "--newline",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(send.status.success());
 
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
 
     let snap = Command::new(bin)
         .args([
@@ -105,6 +122,7 @@ async fn cli_smoke_ping_workspace_and_pane_lifecycle() {
         .await
         .unwrap();
     assert!(snap.status.success());
+    #[cfg(unix)]
     assert!(String::from_utf8_lossy(&snap.stdout).contains("SMOKE_OK"));
 
     let status_pub = Command::new(bin)
@@ -206,13 +224,9 @@ async fn cli_smoke_worktree_create_list_and_compose_down() {
     run_git(&repo, &["add", "README.md"]).await;
     run_git(&repo, &["commit", "-m", "initial"]).await;
 
-    let server = DaemonServer::bind_with_supervisor(
-        sock.clone(),
-        runtime,
-        Supervisor::with_mode(IsolationMode::PgidFallback),
-    )
-    .await
-    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
     server.set_worktrees_dir(worktrees_dir);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -333,8 +347,9 @@ async fn cli_smoke_worktree_create_list_and_compose_down() {
     srv_handle.await.unwrap();
 }
 
+#[cfg(unix)]
 async fn list_workspaces_rpc(sock: &std::path::Path) -> Vec<WorkspaceInfo> {
-    let mut stream = UnixStream::connect(sock).await.unwrap();
+    let mut stream = IpcStream::connect(sock).await.unwrap();
     let req = Request {
         id: 1,
         payload: ClientMessage::ListWorkspaces,
@@ -351,6 +366,7 @@ async fn list_workspaces_rpc(sock: &std::path::Path) -> Vec<WorkspaceInfo> {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cli_smoke_v0_0_3_agent_state_failure_trace_status_presets_and_worktree_cleanup() {
     let dir = TempDir::new().unwrap();
@@ -369,13 +385,9 @@ async fn cli_smoke_v0_0_3_agent_state_failure_trace_status_presets_and_worktree_
     run_git(&repo, &["add", "README.md"]).await;
     run_git(&repo, &["commit", "-m", "initial"]).await;
 
-    let server = DaemonServer::bind_with_supervisor(
-        sock.clone(),
-        runtime,
-        Supervisor::with_mode(IsolationMode::PgidFallback),
-    )
-    .await
-    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
     server.set_worktrees_dir(worktrees_dir.clone());
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

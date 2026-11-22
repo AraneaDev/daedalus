@@ -1,13 +1,11 @@
 use crate::registry::Registry;
+use daedalus_proto::transport::{IpcListener, IpcStream};
 use daedalus_proto::{AgentState, PaneId, StatusLevel, WorkspaceId};
 use serde::Deserialize;
 use std::future::Future;
-use std::io::ErrorKind;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
@@ -37,59 +35,30 @@ struct HookEventIngest {
     state: Option<String>,
 }
 
-/// NDJSON Unix domain socket listener that ingests external status updates (e.g. from
+/// NDJSON IPC listener that ingests external status updates (e.g. from
 /// `phrourion` or `cassandra`) into [`Registry`].
 pub struct ExternalHookServer {
-    socket_path: PathBuf,
-    listener: UnixListener,
+    listener: IpcListener,
     registry: Arc<Registry>,
 }
 
 impl ExternalHookServer {
-    /// Binds an NDJSON Unix socket at `socket_path`, cleaning up any stale socket file first.
+    /// Binds an NDJSON IPC listener at `socket_path`, cleaning up any stale socket file first.
     pub async fn bind(socket_path: PathBuf, registry: Arc<Registry>) -> std::io::Result<Self> {
-        if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let created = !parent.exists();
-            std::fs::create_dir_all(parent)?;
-            if created {
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-            }
-        }
+        let listener = IpcListener::bind(&socket_path).await?;
+        let bound_endpoint = listener.local_endpoint();
+        info!(socket = %bound_endpoint.display(), "external status hook listening");
 
-        if socket_path.exists() {
-            match UnixStream::connect(&socket_path).await {
-                Ok(_) => {
-                    return Err(std::io::Error::new(
-                        ErrorKind::AddrInUse,
-                        format!(
-                            "external events socket is already active at {}",
-                            socket_path.display()
-                        ),
-                    ));
-                }
-                Err(_) => {
-                    let _ = std::fs::remove_file(&socket_path);
-                }
-            }
-        }
-
-        let listener = UnixListener::bind(&socket_path)?;
-        info!(socket = %socket_path.display(), "external status hook listening");
-
-        Ok(Self {
-            socket_path,
-            listener,
-            registry,
-        })
+        Ok(Self { listener, registry })
     }
 
-    /// Returns the filesystem path of the bound Unix socket.
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
+    /// Returns the bound endpoint path (`tcp://host:port` for TCP listeners).
+    pub fn socket_path(&self) -> PathBuf {
+        self.listener.local_endpoint()
     }
 
-    /// Serves incoming NDJSON status connections until `shutdown` resolves, then removes the socket.
-    pub async fn serve(self, shutdown: impl Future<Output = ()>) -> std::io::Result<()> {
+    /// Serves incoming NDJSON status connections until `shutdown` resolves, then cleans up.
+    pub async fn serve(mut self, shutdown: impl Future<Output = ()>) -> std::io::Result<()> {
         tokio::pin!(shutdown);
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut connections = JoinSet::new();
@@ -98,7 +67,7 @@ impl ExternalHookServer {
             tokio::select! {
                 accept_res = self.listener.accept() => {
                     match accept_res {
-                        Ok((stream, _)) => {
+                        Ok(stream) => {
                             let reg = Arc::clone(&self.registry);
                             let stop = stop_rx.clone();
                             connections.spawn(handle_hook_client(stream, reg, stop));
@@ -110,7 +79,7 @@ impl ExternalHookServer {
                     while connections.try_join_next().is_some() {}
                 }
                 _ = &mut shutdown => {
-                    debug!(socket = %self.socket_path.display(), "shutting down external status hook");
+                    debug!(socket = %self.listener.local_endpoint().display(), "shutting down external status hook");
                     break;
                 }
             }
@@ -119,13 +88,13 @@ impl ExternalHookServer {
         let _ = stop_tx.send(true);
         connections.abort_all();
         while connections.join_next().await.is_some() {}
-        let _ = std::fs::remove_file(&self.socket_path);
+        self.listener.cleanup();
         Ok(())
     }
 }
 
 async fn handle_hook_client(
-    stream: UnixStream,
+    stream: IpcStream,
     registry: Arc<Registry>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -286,20 +255,27 @@ mod tests {
     use crate::supervisor::{IsolationMode, Supervisor};
     use daedalus_proto::ServerEvent;
     use std::collections::HashMap;
+    use std::path::Path;
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::io::AsyncWriteExt;
     use tokio::sync::{broadcast, oneshot};
 
     fn test_registry(runtime_dir: &Path) -> Arc<Registry> {
+        #[cfg(windows)]
+        let supervisor = Supervisor::with_mode(IsolationMode::WindowsProcessTree);
+        #[cfg(not(windows))]
         let supervisor = Supervisor::with_mode(IsolationMode::PgidFallback);
         let shell_integration = ShellIntegration::prepare(runtime_dir).unwrap();
         let (event_tx, _) = broadcast::channel(64);
         Arc::new(Registry::new(supervisor, shell_integration, event_tx))
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn cleans_stale_socket_rejects_active_and_removes_on_shutdown() {
+        use std::io::ErrorKind;
+
         let dir = TempDir::new().unwrap();
         let reg = test_registry(dir.path());
         let sock = dir.path().join("nested").join("events.sock");
@@ -311,7 +287,7 @@ mod tests {
         let hook = ExternalHookServer::bind(sock.clone(), Arc::clone(&reg))
             .await
             .unwrap();
-        assert_eq!(hook.socket_path(), sock.as_path());
+        assert_eq!(hook.socket_path(), sock);
 
         // Active listener must reject a second bind with AddrInUse
         let err = ExternalHookServer::bind(sock.clone(), Arc::clone(&reg))
@@ -363,7 +339,7 @@ mod tests {
             .unwrap();
         });
 
-        let mut client = UnixStream::connect(&sock).await.unwrap();
+        let mut client = IpcStream::connect(&sock).await.unwrap();
         // 1. Invalid JSON line
         client.write_all(b"{not json\n").await.unwrap();
         // 2. Oversized line (> 64 KiB)
@@ -372,15 +348,23 @@ mod tests {
         client.write_all(&huge).await.unwrap();
         // 3. Valid line omitting level (defaults to info)
         let valid_1 = format!(
-            "{{\"root_dir\":\"{}\",\"source\":\"phrourion\",\"label\":\"clean\"}}\n",
-            ws_dir.display()
+            "{}\n",
+            serde_json::json!({
+                "root_dir": ws_dir,
+                "source": "phrourion",
+                "label": "clean"
+            })
         );
         client.write_all(valid_1.as_bytes()).await.unwrap();
         // 4. Valid line with explicit level and no trailing newline until EOF
-        let valid_2 = format!(
-            "{{\"workspace_id\":\"{}\",\"source\":\"cassandra\",\"level\":\"error\",\"label\":\"retry 2/5\",\"detail\":\"timeout\"}}",
-            ws.id
-        );
+        let valid_2 = serde_json::json!({
+            "workspace_id": ws.id,
+            "source": "cassandra",
+            "level": "error",
+            "label": "retry 2/5",
+            "detail": "timeout"
+        })
+        .to_string();
         client.write_all(valid_2.as_bytes()).await.unwrap();
         client.shutdown().await.unwrap();
         drop(client);

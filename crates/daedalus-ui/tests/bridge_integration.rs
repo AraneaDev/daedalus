@@ -1,18 +1,32 @@
+#[cfg(unix)]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use daedalus_proto::transport::IpcStream;
 use daedalus_proto::{
-    AgentState, ClientMessage, GridSnapshot, PaneId, PaneRole, Request, ResponsePayload,
-    ServerEvent, ServerMessage, read_frame, write_frame,
+    AgentState, ClientMessage, PaneRole, Request, ResponsePayload, ServerMessage, read_frame,
+    write_frame,
 };
+#[cfg(unix)]
+use daedalus_proto::{GridSnapshot, PaneId, ServerEvent};
 use daedalus_ui::bridge::{BridgeConfig, DaemonBridge, UiCommand, UiEvent, UiEventSink};
 use daedalus_ui::state::AgentPreset;
 use daedalusd::server::DaemonServer;
 use daedalusd::supervisor::{IsolationMode, Supervisor};
 use tempfile::TempDir;
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
+
+fn test_supervisor() -> Supervisor {
+    #[cfg(windows)]
+    {
+        Supervisor::with_mode(IsolationMode::WindowsProcessTree)
+    }
+    #[cfg(not(windows))]
+    {
+        Supervisor::with_mode(IsolationMode::PgidFallback)
+    }
+}
 
 struct ChannelSink {
     tx: mpsc::UnboundedSender<UiEvent>,
@@ -24,6 +38,7 @@ impl UiEventSink for ChannelSink {
     }
 }
 
+#[cfg(unix)]
 fn snapshot_text(snapshot: &GridSnapshot) -> String {
     snapshot
         .rows_data
@@ -38,19 +53,16 @@ fn snapshot_text(snapshot: &GridSnapshot) -> String {
         .join("\n")
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn daemon_bridge_bootstraps_three_panes_and_forwards_runner_failure_to_agent() {
     let dir = TempDir::new().unwrap();
     let sock = dir.path().join("daedalusd.sock");
     let runtime = dir.path().join("runtime");
 
-    let server = DaemonServer::bind_with_supervisor(
-        sock.clone(),
-        runtime,
-        Supervisor::with_mode(IsolationMode::PgidFallback),
-    )
-    .await
-    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
     server.set_worktrees_dir(dir.path().join("worktrees"));
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let srv_handle = tokio::spawn(async move {
@@ -226,13 +238,9 @@ async fn daemon_bridge_handles_mid_session_disconnect_and_reconnects_cleanly() {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let server1 = DaemonServer::bind_with_supervisor(
-                sock1,
-                runtime1,
-                Supervisor::with_mode(IsolationMode::PgidFallback),
-            )
-            .await
-            .unwrap();
+            let server1 = DaemonServer::bind_with_supervisor(sock1, runtime1, test_supervisor())
+                .await
+                .unwrap();
             let _ = ready1_tx.send(());
             let _ = server1
                 .serve(async {
@@ -292,13 +300,9 @@ async fn daemon_bridge_handles_mid_session_disconnect_and_reconnects_cleanly() {
     .expect("timed out waiting for UiEvent::Disconnected");
 
     // Start daemon 2 on the same socket and verify DaemonBridge reconnects and reloads workspaces.
-    let server2 = DaemonServer::bind_with_supervisor(
-        sock.clone(),
-        runtime,
-        Supervisor::with_mode(IsolationMode::PgidFallback),
-    )
-    .await
-    .unwrap();
+    let server2 = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
     let (shutdown2_tx, shutdown2_rx) = oneshot::channel::<()>();
     let srv2_handle = tokio::spawn(async move {
         let _ = server2
@@ -338,14 +342,17 @@ async fn daemon_bridge_activates_dormant_workspace_with_manifest_and_searches_sc
     let dir = TempDir::new().unwrap();
     let ws_dir = dir.path().join("project");
     std::fs::create_dir_all(&ws_dir).unwrap();
-    std::fs::write(
-        ws_dir.join(".daedalus.toml"),
-        r#"
+    #[cfg(unix)]
+    let manifest_toml = r#"
 [runner]
 command = ["sh", "-c", "echo MANIFEST_RUNNER_NEEDLE; sleep 5"]
-"#,
-    )
-    .unwrap();
+"#;
+    #[cfg(windows)]
+    let manifest_toml = r#"
+[runner]
+command = ["cmd.exe", "/C", "echo", "MANIFEST_RUNNER_NEEDLE", "&", "ping", "-n", "5", "127.0.0.1"]
+"#;
+    std::fs::write(ws_dir.join(".daedalus.toml"), manifest_toml).unwrap();
 
     let sock = dir.path().join("daedalusd.sock");
     let runtime = dir.path().join("runtime");
@@ -358,7 +365,7 @@ command = ["sh", "-c", "echo MANIFEST_RUNNER_NEEDLE; sleep 5"]
             runtime.clone(),
             None,
             Some(state_file.clone()),
-            Supervisor::with_mode(IsolationMode::PgidFallback),
+            test_supervisor(),
         )
         .await
         .unwrap();
@@ -410,7 +417,7 @@ command = ["sh", "-c", "echo MANIFEST_RUNNER_NEEDLE; sleep 5"]
         runtime,
         None,
         Some(state_file),
-        Supervisor::with_mode(IsolationMode::PgidFallback),
+        test_supervisor(),
     )
     .await
     .unwrap();
@@ -489,6 +496,9 @@ command = ["sh", "-c", "echo MANIFEST_RUNNER_NEEDLE; sleep 5"]
     // Poll SearchPane until the manifest runner command output appears in the VT grid.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut found = false;
+    let mut seen_toasts = Vec::new();
+    let mut search_responses = 0usize;
+    let mut last_snapshot_lines = Vec::new();
     while tokio::time::Instant::now() < deadline && !found {
         bridge2.send(UiCommand::SearchPane {
             pane_id: runner_id,
@@ -505,9 +515,26 @@ command = ["sh", "-c", "echo MANIFEST_RUNNER_NEEDLE; sleep 5"]
             match tokio::time::timeout(remaining, evt_rx.recv()).await {
                 Ok(Some(UiEvent::SearchResults {
                     pane_id, matches, ..
-                })) if pane_id == runner_id && !matches.is_empty() => {
-                    found = true;
-                    break;
+                })) if pane_id == runner_id => {
+                    search_responses += 1;
+                    if !matches.is_empty() {
+                        found = true;
+                        break;
+                    }
+                }
+                Ok(Some(UiEvent::Toast { message, .. })) => {
+                    seen_toasts.push(message);
+                }
+                Ok(Some(UiEvent::ServerEvent(daedalus_proto::ServerEvent::GridDelta(delta))))
+                    if delta.pane_id == runner_id =>
+                {
+                    for row in delta.dirty_rows {
+                        let line: String = row.cells.into_iter().map(|c| c.text).collect();
+                        let trimmed = line.trim_end().to_string();
+                        if !trimmed.is_empty() {
+                            last_snapshot_lines.push(trimmed);
+                        }
+                    }
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => panic!("event channel closed"),
@@ -517,7 +544,7 @@ command = ["sh", "-c", "echo MANIFEST_RUNNER_NEEDLE; sleep 5"]
     }
     assert!(
         found,
-        "expected SearchPane to locate manifest runner output in restored pane"
+        "expected SearchPane to locate manifest runner output in restored pane (search_responses={search_responses}, toasts={seen_toasts:?}, lines={last_snapshot_lines:?})"
     );
 
     tokio::task::spawn_blocking(move || bridge2.shutdown())
@@ -554,13 +581,9 @@ async fn daemon_bridge_delivers_agent_state_changed_and_closes_worktree_with_rem
     let sock = dir.path().join("daedalusd.sock");
     let runtime = dir.path().join("runtime");
 
-    let server = DaemonServer::bind_with_supervisor(
-        sock.clone(),
-        runtime,
-        Supervisor::with_mode(IsolationMode::PgidFallback),
-    )
-    .await
-    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
     server.set_worktrees_dir(dir.path().join("worktrees"));
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let srv_handle = tokio::spawn(async move {
@@ -607,7 +630,7 @@ async fn daemon_bridge_delivers_agent_state_changed_and_closes_worktree_with_rem
     let agent_id = agent_pane_id.unwrap();
 
     // Trigger SetAgentState over a separate daemon connection and verify UiEvent::AgentStateChanged arrives.
-    let mut ctl_stream = UnixStream::connect(&sock).await.unwrap();
+    let mut ctl_stream = IpcStream::connect(&sock).await.unwrap();
     let req = Request {
         id: 1,
         payload: ClientMessage::SetAgentState {

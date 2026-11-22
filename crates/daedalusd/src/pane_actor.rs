@@ -300,10 +300,17 @@ async fn run_pane_actor(
     let mut seq: u64 = 0;
     let mut has_pending_delta = false;
     let mut pty_open = true;
+    let mut exited_emitted = false;
     let mut delta_tick = tokio::time::interval(Duration::from_millis(16));
     delta_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut agent_tick = tokio::time::interval(Duration::from_millis(250));
     agent_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    #[cfg(windows)]
+    let mut exit_tick = {
+        let mut t = tokio::time::interval(Duration::from_millis(50));
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        t
+    };
 
     let emit_agent_state = |state: Option<AgentState>| {
         if let Some(state) = state {
@@ -321,6 +328,15 @@ async fn run_pane_actor(
                 match maybe_out {
                     Some(PtyOutput::Bytes(bytes)) => {
                         let outcome = tracker.feed(&bytes);
+                        let reply_bytes =
+                            terminal_query_replies(&bytes, tracker.engine().snapshot(pane_id, seq).cursor);
+                        if !reply_bytes.is_empty() {
+                            let (reply_tx, _reply_rx) = oneshot::channel();
+                            let _ = write_tx.try_send(WriteRequest {
+                                data: reply_bytes,
+                                reply: reply_tx,
+                            });
+                        }
                         has_pending_delta = true;
                         for (status, cwd) in outcome.status_changed {
                             let _ = event_tx.send(ServerEvent::PaneStatusChanged {
@@ -350,21 +366,24 @@ async fn run_pane_actor(
                                 let _ = event_tx.send(ServerEvent::GridDelta(delta));
                             }
                         }
-                        let mut exit_code = proc_handle.try_wait_exit();
-                        if exit_code.is_none() {
-                            for _ in 0..20 {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
-                                exit_code = proc_handle.try_wait_exit();
-                                if exit_code.is_some() {
-                                    break;
+                        if !exited_emitted {
+                            let mut exit_code = proc_handle.try_wait_exit();
+                            if exit_code.is_none() {
+                                for _ in 0..20 {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                    exit_code = proc_handle.try_wait_exit();
+                                    if exit_code.is_some() {
+                                        break;
+                                    }
                                 }
                             }
+                            tracker.mark_exited(exit_code);
+                            if let Some(det) = detector.as_mut() {
+                                emit_agent_state(det.observe_exit(exit_code));
+                            }
+                            let _ = event_tx.send(ServerEvent::PaneExited { pane_id, exit_code });
+                            exited_emitted = true;
                         }
-                        tracker.mark_exited(exit_code);
-                        if let Some(det) = detector.as_mut() {
-                            emit_agent_state(det.observe_exit(exit_code));
-                        }
-                        let _ = event_tx.send(ServerEvent::PaneExited { pane_id, exit_code });
                     }
                 }
             }
@@ -378,6 +397,39 @@ async fn run_pane_actor(
             _ = agent_tick.tick(), if detector.is_some() => {
                 if let Some(det) = detector.as_mut() {
                     emit_agent_state(det.observe_tick(Instant::now()));
+                }
+            }
+            _ = async {
+                #[cfg(windows)]
+                {
+                    exit_tick.tick().await;
+                }
+                #[cfg(not(windows))]
+                {
+                    std::future::pending::<()>().await;
+                }
+            }, if !exited_emitted => {
+                if let Some(code) = proc_handle.try_wait_exit() {
+                    while let Ok(PtyOutput::Bytes(bytes)) = pty_rx.try_recv() {
+                        let _ = tracker.feed(&bytes);
+                        has_pending_delta = true;
+                    }
+                    if has_pending_delta {
+                        has_pending_delta = false;
+                        seq += 1;
+                        if let Some(delta) = tracker.engine_mut().take_dirty_delta(pane_id, seq) {
+                            let _ = event_tx.send(ServerEvent::GridDelta(delta));
+                        }
+                    }
+                    tracker.mark_exited(Some(code));
+                    if let Some(det) = detector.as_mut() {
+                        emit_agent_state(det.observe_exit(Some(code)));
+                    }
+                    let _ = event_tx.send(ServerEvent::PaneExited {
+                        pane_id,
+                        exit_code: Some(code),
+                    });
+                    exited_emitted = true;
                 }
             }
             maybe_cmd = cmd_rx.recv() => {
@@ -502,4 +554,50 @@ async fn teardown_pane(
         let _ = writer_handle.join();
     })
     .await;
+}
+
+/// Builds terminal responses for synchronous VT queries that Windows ConPTY,
+/// PowerShell PSReadLine, and modern shells/TUIs expect back on PTY stdin:
+/// - `CSI 6 n` (DSR cursor position report) -> `CSI <row>;<col> R`
+/// - `CSI c` / `CSI 0 c` (DA1 primary device attributes) -> `CSI ? 1 ; 2 c`
+fn terminal_query_replies(bytes: &[u8], cursor: daedalus_proto::CursorState) -> Vec<u8> {
+    let mut replies = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"\x1b[6n") {
+            let row = cursor.row.saturating_add(1);
+            let col = cursor.col.saturating_add(1);
+            replies.extend_from_slice(format!("\x1b[{row};{col}R").as_bytes());
+            i += 4;
+        } else if bytes[i..].starts_with(b"\x1b[0c") {
+            replies.extend_from_slice(b"\x1b[?1;2c");
+            i += 4;
+        } else if bytes[i..].starts_with(b"\x1b[c") {
+            replies.extend_from_slice(b"\x1b[?1;2c");
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    replies
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daedalus_proto::CursorState;
+
+    #[test]
+    fn responds_to_dsr_cursor_position_and_da1_queries() {
+        let cursor = CursorState {
+            col: 4,
+            row: 2,
+            visible: true,
+        };
+        assert_eq!(
+            terminal_query_replies(b"hello\x1b[6nworld\x1b[0c\x1b[c", cursor),
+            b"\x1b[3;5R\x1b[?1;2c\x1b[?1;2c"
+        );
+        assert!(terminal_query_replies(b"plain text", cursor).is_empty());
+    }
 }

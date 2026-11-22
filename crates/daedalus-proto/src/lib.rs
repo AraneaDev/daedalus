@@ -1,5 +1,6 @@
 pub mod codec;
 pub mod rpc;
+pub mod transport;
 pub mod types;
 
 pub use codec::{CodecError, MAX_FRAME_SIZE, read_frame, write_frame};
@@ -15,10 +16,43 @@ use std::path::{Path, PathBuf};
 
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 96;
 
+#[cfg(any(not(unix), test))]
+fn sanitize_user_tag(raw: Option<&str>) -> String {
+    let Some(raw) = raw else {
+        return "user".to_string();
+    };
+    let sanitized: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "user".to_string()
+    } else {
+        sanitized
+    }
+}
+
+#[cfg(unix)]
+fn current_user_tag() -> String {
+    nix::unistd::Uid::current().as_raw().to_string()
+}
+
+#[cfg(not(unix))]
+fn current_user_tag() -> String {
+    sanitize_user_tag(std::env::var("USERNAME").ok().as_deref())
+}
+
 fn resolve_runtime_dir_with_limit(
     xdg: Option<&str>,
     temp_dir: &Path,
-    uid: u32,
+    user_tag: impl std::fmt::Display,
     max_socket_bytes: usize,
 ) -> PathBuf {
     if let Some(xdg) = xdg
@@ -26,7 +60,7 @@ fn resolve_runtime_dir_with_limit(
     {
         return PathBuf::from(xdg).join("daedalus");
     }
-    let dir_name = format!("daedalus-{uid}");
+    let dir_name = format!("daedalus-{user_tag}");
     let candidate = temp_dir.join(&dir_name);
     if candidate.join("daedalusd.sock").as_os_str().len() > max_socket_bytes {
         PathBuf::from("/tmp").join(dir_name)
@@ -39,7 +73,7 @@ fn resolve_runtime_dir(xdg: Option<&str>) -> PathBuf {
     resolve_runtime_dir_with_limit(
         xdg,
         &std::env::temp_dir(),
-        nix::unistd::Uid::current().as_raw(),
+        current_user_tag(),
         MAX_UNIX_SOCKET_PATH_BYTES,
     )
 }
@@ -49,14 +83,26 @@ pub fn default_runtime_dir() -> PathBuf {
 }
 
 pub fn default_socket_path() -> PathBuf {
-    if let Ok(sock) = std::env::var("DAEDALUS_SOCKET")
-        && !sock.is_empty()
+    #[cfg(windows)]
     {
-        return PathBuf::from(sock);
+        resolve_windows_socket_path(
+            std::env::var("DAEDALUS_SOCKET").ok().as_deref(),
+            &current_user_tag(),
+            "daedalusd",
+        )
     }
-    default_runtime_dir().join("daedalusd.sock")
+    #[cfg(not(windows))]
+    {
+        if let Ok(sock) = std::env::var("DAEDALUS_SOCKET")
+            && !sock.is_empty()
+        {
+            return PathBuf::from(sock);
+        }
+        default_runtime_dir().join("daedalusd.sock")
+    }
 }
 
+#[cfg(any(unix, test))]
 fn resolve_events_socket_path(env_override: Option<&str>, xdg: Option<&str>) -> PathBuf {
     if let Some(sock) = env_override
         && !sock.is_empty()
@@ -66,11 +112,36 @@ fn resolve_events_socket_path(env_override: Option<&str>, xdg: Option<&str>) -> 
     resolve_runtime_dir(xdg).join("events.sock")
 }
 
+#[cfg(any(windows, test))]
+fn resolve_windows_socket_path(
+    env_override: Option<&str>,
+    user_tag: &str,
+    pipe_suffix: &str,
+) -> PathBuf {
+    if let Some(sock) = env_override
+        && !sock.is_empty()
+    {
+        return PathBuf::from(sock);
+    }
+    PathBuf::from(format!(r"\\.\pipe\daedalus-{user_tag}-{pipe_suffix}"))
+}
+
 pub fn default_events_socket_path() -> PathBuf {
-    resolve_events_socket_path(
-        std::env::var("DAEDALUS_EVENTS_SOCKET").ok().as_deref(),
-        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
-    )
+    #[cfg(windows)]
+    {
+        resolve_windows_socket_path(
+            std::env::var("DAEDALUS_EVENTS_SOCKET").ok().as_deref(),
+            &current_user_tag(),
+            "events",
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        resolve_events_socket_path(
+            std::env::var("DAEDALUS_EVENTS_SOCKET").ok().as_deref(),
+            std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+        )
+    }
 }
 
 fn resolve_user_file_path(
@@ -100,7 +171,7 @@ fn resolve_user_file_path(
         return path.join("daedalus").join(filename);
     }
     std::env::temp_dir()
-        .join(format!("daedalus-{}", nix::unistd::Uid::current()))
+        .join(format!("daedalus-{}", current_user_tag()))
         .join(filename)
 }
 
@@ -118,12 +189,32 @@ fn resolve_state_file_path(
     )
 }
 
+#[cfg(any(windows, test))]
+fn resolve_windows_state_file_path(
+    env_override: Option<&str>,
+    local_app_data: Option<&str>,
+    user_profile: Option<&str>,
+) -> PathBuf {
+    resolve_state_file_path(env_override, local_app_data, user_profile)
+}
+
 pub fn default_state_file_path() -> PathBuf {
-    resolve_state_file_path(
-        std::env::var("DAEDALUS_STATE_FILE").ok().as_deref(),
-        std::env::var("XDG_STATE_HOME").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
-    )
+    #[cfg(windows)]
+    {
+        resolve_windows_state_file_path(
+            std::env::var("DAEDALUS_STATE_FILE").ok().as_deref(),
+            std::env::var("LOCALAPPDATA").ok().as_deref(),
+            std::env::var("USERPROFILE").ok().as_deref(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        resolve_state_file_path(
+            std::env::var("DAEDALUS_STATE_FILE").ok().as_deref(),
+            std::env::var("XDG_STATE_HOME").ok().as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        )
+    }
 }
 
 fn resolve_config_file_path(
@@ -140,12 +231,46 @@ fn resolve_config_file_path(
     )
 }
 
+#[cfg(any(windows, test))]
+fn resolve_windows_config_file_path(
+    env_override: Option<&str>,
+    app_data: Option<&str>,
+    user_profile: Option<&str>,
+) -> PathBuf {
+    resolve_config_file_path(env_override, app_data, user_profile)
+}
+
 pub fn default_config_file_path() -> PathBuf {
-    resolve_config_file_path(
-        std::env::var("DAEDALUS_CONFIG").ok().as_deref(),
-        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
-    )
+    #[cfg(windows)]
+    {
+        resolve_windows_config_file_path(
+            std::env::var("DAEDALUS_CONFIG").ok().as_deref(),
+            std::env::var("APPDATA").ok().as_deref(),
+            std::env::var("USERPROFILE").ok().as_deref(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        resolve_config_file_path(
+            std::env::var("DAEDALUS_CONFIG").ok().as_deref(),
+            std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        )
+    }
+}
+
+/// Strips Windows verbatim path prefixes (`\\?\UNC\` -> `\\` and `\\?\` -> ``) produced by
+/// `std::fs::canonicalize`, leaving non-verbatim and Unix paths unchanged.
+pub fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+    if let Some(raw) = path.to_str() {
+        if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    path
 }
 
 #[cfg(test)]
@@ -248,7 +373,7 @@ mod tests {
             resolve_runtime_dir(Some("/run/user/1234")),
             PathBuf::from("/run/user/1234/daedalus")
         );
-        let uid = nix::unistd::Uid::current().as_raw();
+        let uid = current_user_tag();
         let candidate = std::env::temp_dir().join(format!("daedalus-{uid}"));
         let expected_fallback =
             if candidate.join("daedalusd.sock").as_os_str().len() > MAX_UNIX_SOCKET_PATH_BYTES {
@@ -643,8 +768,7 @@ mod tests {
             PathBuf::from("/home/alice/.config/daedalus/config.toml")
         );
 
-        let fallback_prefix =
-            std::env::temp_dir().join(format!("daedalus-{}", nix::unistd::Uid::current()));
+        let fallback_prefix = std::env::temp_dir().join(format!("daedalus-{}", current_user_tag()));
         assert_eq!(
             resolve_state_file_path(None, None, None),
             fallback_prefix.join("state.json")
@@ -652,6 +776,82 @@ mod tests {
         assert_eq!(
             resolve_config_file_path(None, None, Some("")),
             fallback_prefix.join("config.toml")
+        );
+    }
+
+    #[test]
+    fn sanitizes_windows_user_tags() {
+        assert_eq!(sanitize_user_tag(Some("Alice")), "Alice");
+        assert_eq!(sanitize_user_tag(Some("Alice Smith")), "Alice_Smith");
+        assert_eq!(sanitize_user_tag(Some("tim-1_2")), "tim-1_2");
+        assert_eq!(sanitize_user_tag(Some("  ")), "user");
+        assert_eq!(sanitize_user_tag(None), "user");
+    }
+
+    #[test]
+    fn resolves_windows_socket_and_user_paths() {
+        assert_eq!(
+            resolve_windows_socket_path(None, "Alice", "daedalusd"),
+            PathBuf::from(r"\\.\pipe\daedalus-Alice-daedalusd")
+        );
+        assert_eq!(
+            resolve_windows_socket_path(Some(""), "Alice", "events"),
+            PathBuf::from(r"\\.\pipe\daedalus-Alice-events")
+        );
+        assert_eq!(
+            resolve_windows_socket_path(Some("tcp://127.0.0.1:7777"), "Alice", "daedalusd"),
+            PathBuf::from("tcp://127.0.0.1:7777")
+        );
+        assert_eq!(
+            resolve_windows_socket_path(Some(r"\\.\pipe\custom"), "Alice", "events"),
+            PathBuf::from(r"\\.\pipe\custom")
+        );
+
+        let app_data = r"C:\Users\Alice\AppData\Roaming";
+        let local_app_data = r"C:\Users\Alice\AppData\Local";
+        let user_profile = r"C:\Users\Alice";
+
+        assert_eq!(
+            resolve_windows_config_file_path(
+                Some(r"D:\custom\config.toml"),
+                Some(app_data),
+                Some(user_profile),
+            ),
+            PathBuf::from(r"D:\custom\config.toml")
+        );
+        assert_eq!(
+            resolve_windows_config_file_path(Some(""), Some(app_data), Some(user_profile)),
+            PathBuf::from(app_data).join("daedalus").join("config.toml")
+        );
+        assert_eq!(
+            resolve_windows_config_file_path(None, None, Some(user_profile)),
+            PathBuf::from(user_profile)
+                .join(".config")
+                .join("daedalus")
+                .join("config.toml")
+        );
+
+        assert_eq!(
+            resolve_windows_state_file_path(
+                Some(r"D:\custom\state.json"),
+                Some(local_app_data),
+                Some(user_profile),
+            ),
+            PathBuf::from(r"D:\custom\state.json")
+        );
+        assert_eq!(
+            resolve_windows_state_file_path(Some(""), Some(local_app_data), Some(user_profile)),
+            PathBuf::from(local_app_data)
+                .join("daedalus")
+                .join("state.json")
+        );
+        assert_eq!(
+            resolve_windows_state_file_path(None, Some(""), Some(user_profile)),
+            PathBuf::from(user_profile)
+                .join(".local")
+                .join("state")
+                .join("daedalus")
+                .join("state.json")
         );
     }
 
@@ -973,6 +1173,26 @@ mod tests {
                 git_status: None,
                 git_branch: None,
             }
+        );
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_normalizes_drive_and_unc_paths() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\tim\repo")),
+            PathBuf::from(r"C:\Users\tim\repo")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(PathBuf::from(r"C:\Users\tim\repo")),
+            PathBuf::from(r"C:\Users\tim\repo")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(PathBuf::from("/home/tim/repo")),
+            PathBuf::from("/home/tim/repo")
         );
     }
 }

@@ -107,8 +107,9 @@ fn prepare_workspace_components(
         Some((status, branch)) => (Some(status), branch),
         None => (None, worktree::current_branch(root_dir)),
     };
-    let canonical_root_dir =
-        std::fs::canonicalize(root_dir).unwrap_or_else(|_| root_dir.to_path_buf());
+    let canonical_root_dir = daedalus_proto::strip_windows_verbatim_prefix(
+        std::fs::canonicalize(root_dir).unwrap_or_else(|_| root_dir.to_path_buf()),
+    );
     Ok(PreparedWorkspaceComponents {
         plan,
         git_branch,
@@ -727,10 +728,14 @@ impl Registry {
         match (workspace_id, root_dir) {
             (None, Some(dir)) => {
                 let dir_clone = dir.to_path_buf();
-                tokio::task::spawn_blocking(move || std::fs::canonicalize(&dir_clone).ok())
-                    .await
-                    .ok()
-                    .flatten()
+                tokio::task::spawn_blocking(move || {
+                    std::fs::canonicalize(&dir_clone)
+                        .ok()
+                        .map(daedalus_proto::strip_windows_verbatim_prefix)
+                })
+                .await
+                .ok()
+                .flatten()
             }
             _ => None,
         }
@@ -1076,8 +1081,70 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    fn test_supervisor() -> Supervisor {
+        #[cfg(windows)]
+        {
+            Supervisor::with_mode(IsolationMode::WindowsProcessTree)
+        }
+        #[cfg(not(windows))]
+        {
+            Supervisor::with_mode(IsolationMode::PgidFallback)
+        }
+    }
+
+    fn interactive_shell_command() -> Vec<String> {
+        #[cfg(unix)]
+        {
+            vec!["/bin/sh".to_string()]
+        }
+        #[cfg(windows)]
+        {
+            vec!["cmd.exe".to_string(), "/Q".to_string()]
+        }
+    }
+
+    fn exit_code_command(code: i32) -> Vec<String> {
+        #[cfg(unix)]
+        {
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("exit {code}"),
+            ]
+        }
+        #[cfg(windows)]
+        {
+            vec![
+                "cmd.exe".to_string(),
+                "/C".to_string(),
+                "exit".to_string(),
+                code.to_string(),
+            ]
+        }
+    }
+
+    fn sleep_5s_command() -> Vec<String> {
+        #[cfg(unix)]
+        {
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 5".to_string(),
+            ]
+        }
+        #[cfg(windows)]
+        {
+            vec![
+                "ping.exe".to_string(),
+                "-n".to_string(),
+                "6".to_string(),
+                "127.0.0.1".to_string(),
+            ]
+        }
+    }
+
     fn test_registry(runtime_dir: &std::path::Path) -> Registry {
-        let supervisor = Supervisor::with_mode(IsolationMode::PgidFallback);
+        let supervisor = test_supervisor();
         let shell_integration = ShellIntegration::prepare(runtime_dir).unwrap();
         let (event_tx, _) = broadcast::channel(256);
         Registry::new(supervisor, shell_integration, event_tx)
@@ -1371,7 +1438,7 @@ mod tests {
             .spawn_pane(
                 ws.id,
                 PaneRole::Runner,
-                Some(vec!["/bin/sh".to_string()]),
+                Some(interactive_shell_command()),
                 None,
                 80,
                 24,
@@ -1388,10 +1455,11 @@ mod tests {
         assert!(!targets[0].root_pids.is_empty());
 
         let handle = registry.get_pane(summary.id).await.unwrap();
-        handle
-            .send_input(b"echo DAEDALUS_PANE_OK\n".to_vec())
-            .await
-            .unwrap();
+        #[cfg(windows)]
+        let input_bytes = b"echo DAEDALUS_PANE_OK\r\n".to_vec();
+        #[cfg(not(windows))]
+        let input_bytes = b"echo DAEDALUS_PANE_OK\n".to_vec();
+        handle.send_input(input_bytes).await.unwrap();
 
         let mut saw_output = false;
         for _ in 0..40 {
@@ -1438,11 +1506,7 @@ mod tests {
             .spawn_pane(
                 ws.id,
                 PaneRole::Service,
-                Some(vec![
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    "exit 42".to_string(),
-                ]),
+                Some(exit_code_command(42)),
                 None,
                 80,
                 24,
@@ -1485,11 +1549,7 @@ mod tests {
             let spawn_fut = reg_spawn.spawn_pane(
                 ws.id,
                 PaneRole::Service,
-                Some(vec![
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    "sleep 5".to_string(),
-                ]),
+                Some(sleep_5s_command()),
                 None,
                 80,
                 24,
@@ -1613,7 +1673,7 @@ SHARED_KEY = "from_manifest"
         .unwrap();
 
         let reg1 = Registry::new_with_state_store(
-            Supervisor::with_mode(IsolationMode::PgidFallback),
+            test_supervisor(),
             ShellIntegration::prepare(dir.path()).unwrap(),
             broadcast::channel(64).0,
             Some(StateStore::new(state_path.clone())),
@@ -1641,7 +1701,7 @@ SHARED_KEY = "from_manifest"
         std::fs::remove_dir_all(&drop_dir).unwrap();
 
         let reg2 = Registry::new_with_state_store(
-            Supervisor::with_mode(IsolationMode::PgidFallback),
+            test_supervisor(),
             ShellIntegration::prepare(dir.path()).unwrap(),
             broadcast::channel(64).0,
             Some(StateStore::new(state_path.clone())),

@@ -2,6 +2,7 @@ use daedalus_proto::WorkspaceId;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,8 +76,10 @@ impl StateStore {
 
     pub fn save(&self, state: &PersistedState) -> io::Result<()> {
         if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            #[cfg_attr(not(unix), allow(unused_variables))]
             let created = !parent.exists();
             fs::create_dir_all(parent)?;
+            #[cfg(unix)]
             if created {
                 fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
             }
@@ -101,13 +104,14 @@ impl StateStore {
             _ => PathBuf::from(tmp_name),
         };
 
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp_path)?;
+        let mut open_opts = OpenOptions::new();
+        open_opts.write(true).create_new(true);
+        #[cfg(unix)]
+        open_opts.mode(0o600);
+        let mut file = open_opts.open(&tmp_path)?;
 
         let write_res = (|| -> io::Result<()> {
+            #[cfg(unix)]
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
             file.write_all(&bytes)?;
             file.sync_all()?;
@@ -140,6 +144,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let existing_parent = dir.path().join("existing");
         fs::create_dir(&existing_parent).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&existing_parent, fs::Permissions::from_mode(0o755)).unwrap();
 
         let state_path_existing = existing_parent.join("state.json");
@@ -156,18 +161,21 @@ mod tests {
         };
         store1.save(&state).unwrap();
 
-        assert_eq!(
-            fs::metadata(&existing_parent).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
-        assert_eq!(
-            fs::metadata(&state_path_existing)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::metadata(&existing_parent).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert_eq!(
+                fs::metadata(&state_path_existing)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         assert_eq!(store1.load().unwrap(), state);
 
         // No stray .tmp files left behind
@@ -183,18 +191,22 @@ mod tests {
         let state_path_created = created_parent.join("state.json");
         let store2 = StateStore::new(state_path_created.clone());
         store2.save(&state).unwrap();
-        assert_eq!(
-            fs::metadata(&created_parent).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
-            fs::metadata(&state_path_created)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+        assert_eq!(store2.load().unwrap(), state);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::metadata(&created_parent).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&state_path_created)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

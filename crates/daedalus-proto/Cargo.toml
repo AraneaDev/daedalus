@@ -6,12 +6,15 @@ license.workspace = true
 
 [dependencies]
 bitflags.workspace = true
-nix.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
 uuid.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time"] }

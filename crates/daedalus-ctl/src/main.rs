@@ -286,7 +286,9 @@ fn resolve_dir(dir: Option<PathBuf>) -> Result<PathBuf, std::io::Error> {
     match dir {
         Some(d) if d.is_relative() => {
             let joined = std::env::current_dir()?.join(d);
-            Ok(std::fs::canonicalize(&joined).unwrap_or(joined))
+            Ok(daedalus_proto::strip_windows_verbatim_prefix(
+                std::fs::canonicalize(&joined).unwrap_or(joined),
+            ))
         }
         Some(d) => Ok(d),
         None => std::env::current_dir(),
@@ -355,8 +357,10 @@ fn render_launchd_plist(label: &str, binary: &Path, socket: &Path, log_dir: &Pat
     let label_xml = escape_xml(label);
     let binary_xml = escape_xml(&binary.to_string_lossy());
     let socket_xml = escape_xml(&socket.to_string_lossy());
-    let stdout_xml = escape_xml(&log_dir.join("daedalusd.out.log").to_string_lossy());
-    let stderr_xml = escape_xml(&log_dir.join("daedalusd.err.log").to_string_lossy());
+    let log_dir_str = log_dir.to_string_lossy();
+    let log_prefix = log_dir_str.trim_end_matches(['/', '\\']);
+    let stdout_xml = escape_xml(&format!("{log_prefix}/daedalusd.out.log"));
+    let stderr_xml = escape_xml(&format!("{log_prefix}/daedalusd.err.log"));
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1110,7 +1114,9 @@ mod tests {
             resolved.display()
         );
         let cwd = std::env::current_dir().unwrap();
-        let expected = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+        let expected = daedalus_proto::strip_windows_verbatim_prefix(
+            std::fs::canonicalize(&cwd).unwrap_or(cwd),
+        );
         assert_eq!(resolved, expected);
     }
 

@@ -1,3 +1,4 @@
+use daedalus_proto::transport::IpcStream;
 use daedalus_proto::{
     AgentState, ClientMessage, PaneRole, ProtoError, Request, ResponsePayload, ServerEvent,
     ServerMessage, StatusLevel, read_frame, write_frame,
@@ -5,16 +6,98 @@ use daedalus_proto::{
 use daedalusd::server::DaemonServer;
 use daedalusd::supervisor::{IsolationMode, Supervisor};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 
+fn test_supervisor() -> Supervisor {
+    #[cfg(windows)]
+    {
+        Supervisor::with_mode(IsolationMode::WindowsProcessTree)
+    }
+    #[cfg(not(windows))]
+    {
+        Supervisor::with_mode(IsolationMode::PgidFallback)
+    }
+}
+
+fn sleep_command() -> Vec<String> {
+    #[cfg(unix)]
+    {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 10".to_string(),
+        ]
+    }
+    #[cfg(windows)]
+    {
+        vec![
+            "ping.exe".to_string(),
+            "-n".to_string(),
+            "11".to_string(),
+            "127.0.0.1".to_string(),
+        ]
+    }
+}
+
+fn echo_worktree_env_command() -> Vec<String> {
+    #[cfg(unix)]
+    {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo PORT=$PORT PROJ=$COMPOSE_PROJECT_NAME DB=$DATABASE_URL; sleep 2".to_string(),
+        ]
+    }
+    #[cfg(windows)]
+    {
+        vec![
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "echo".to_string(),
+            "PORT=%PORT%".to_string(),
+            "PROJ=%COMPOSE_PROJECT_NAME%".to_string(),
+            "DB=%DATABASE_URL%".to_string(),
+            "&".to_string(),
+            "ping".to_string(),
+            "-n".to_string(),
+            "4".to_string(),
+            "127.0.0.1".to_string(),
+        ]
+    }
+}
+
+fn echo_restored_env_command() -> Vec<String> {
+    #[cfg(unix)]
+    {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo RESTORED=$RESTORED_ENV; sleep 2".to_string(),
+        ]
+    }
+    #[cfg(windows)]
+    {
+        vec![
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "echo".to_string(),
+            "RESTORED=%RESTORED_ENV%".to_string(),
+            "&".to_string(),
+            "ping".to_string(),
+            "-n".to_string(),
+            "4".to_string(),
+            "127.0.0.1".to_string(),
+        ]
+    }
+}
+
 async fn send_rpc_result(
-    stream: &mut UnixStream,
+    stream: &mut IpcStream,
     id: u64,
     payload: ClientMessage,
 ) -> Result<ResponsePayload, ProtoError> {
@@ -32,12 +115,13 @@ async fn send_rpc_result(
     }
 }
 
-async fn send_rpc(stream: &mut UnixStream, id: u64, payload: ClientMessage) -> ResponsePayload {
+async fn send_rpc(stream: &mut IpcStream, id: u64, payload: ClientMessage) -> ResponsePayload {
     send_rpc_result(stream, id, payload).await.unwrap()
 }
 
+#[cfg(unix)]
 async fn wait_for_command_finished(
-    stream: &mut UnixStream,
+    stream: &mut IpcStream,
     expected_code: i32,
 ) -> (Option<String>, i32, bool) {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -58,19 +142,16 @@ async fn wait_for_command_finished(
     .expect("timed out waiting for CommandFinished")
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn bash_osc133_captures_failure_trace_and_survives_client_reconnect() {
     let dir = TempDir::new().unwrap();
     let sock = dir.path().join("daedalusd.sock");
     let runtime = dir.path().join("runtime");
 
-    let server = DaemonServer::bind_with_supervisor(
-        sock.clone(),
-        runtime,
-        Supervisor::with_mode(IsolationMode::PgidFallback),
-    )
-    .await
-    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let srv_handle = tokio::spawn(async move {
         let _ = server
@@ -81,7 +162,7 @@ async fn bash_osc133_captures_failure_trace_and_survives_client_reconnect() {
     });
 
     // Client 1: create workspace, spawn bash runner pane, subscribe
-    let mut c1 = UnixStream::connect(&sock).await.unwrap();
+    let mut c1 = IpcStream::connect(&sock).await.unwrap();
     let ws = match send_rpc(
         &mut c1,
         1,
@@ -158,7 +239,7 @@ async fn bash_osc133_captures_failure_trace_and_survives_client_reconnect() {
 
     // Disconnect client 1 and reconnect with client 2
     drop(c1);
-    let mut c2 = UnixStream::connect(&sock).await.unwrap();
+    let mut c2 = IpcStream::connect(&sock).await.unwrap();
 
     let trace = match send_rpc(
         &mut c2,
@@ -194,6 +275,7 @@ async fn bash_osc133_captures_failure_trace_and_survives_client_reconnect() {
     srv_handle.await.unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn zsh_osc133_captures_failure_trace_when_zsh_installed() {
     let zsh_path = match std::process::Command::new("which").arg("zsh").output() {
@@ -205,13 +287,9 @@ async fn zsh_osc133_captures_failure_trace_when_zsh_installed() {
     let sock = dir.path().join("daedalusd.sock");
     let runtime = dir.path().join("runtime");
 
-    let server = DaemonServer::bind_with_supervisor(
-        sock.clone(),
-        runtime,
-        Supervisor::with_mode(IsolationMode::PgidFallback),
-    )
-    .await
-    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let srv_handle = tokio::spawn(async move {
         let _ = server
@@ -221,7 +299,7 @@ async fn zsh_osc133_captures_failure_trace_when_zsh_installed() {
             .await;
     });
 
-    let mut client = UnixStream::connect(&sock).await.unwrap();
+    let mut client = IpcStream::connect(&sock).await.unwrap();
     let ws = match send_rpc(
         &mut client,
         1,
@@ -308,19 +386,16 @@ async fn zsh_osc133_captures_failure_trace_when_zsh_installed() {
     srv_handle.await.unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn get_scrollback_returns_lines_scrolled_above_viewport() {
     let dir = TempDir::new().unwrap();
     let sock = dir.path().join("daedalusd.sock");
     let runtime = dir.path().join("runtime");
 
-    let server = DaemonServer::bind_with_supervisor(
-        sock.clone(),
-        runtime,
-        Supervisor::with_mode(IsolationMode::PgidFallback),
-    )
-    .await
-    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let srv_handle = tokio::spawn(async move {
         let _ = server
@@ -330,7 +405,7 @@ async fn get_scrollback_returns_lines_scrolled_above_viewport() {
             .await;
     });
 
-    let mut client = UnixStream::connect(&sock).await.unwrap();
+    let mut client = IpcStream::connect(&sock).await.unwrap();
     let ws = match send_rpc(
         &mut client,
         1,
@@ -598,13 +673,9 @@ async fn create_worktree_workspace_isolates_ports_and_injects_env() {
         ],
     );
 
-    let server = DaemonServer::bind_with_supervisor(
-        sock.clone(),
-        runtime,
-        Supervisor::with_mode(IsolationMode::PgidFallback),
-    )
-    .await
-    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
     server.set_worktrees_dir(worktrees_dir);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -616,7 +687,7 @@ async fn create_worktree_workspace_isolates_ports_and_injects_env() {
             .await;
     });
 
-    let mut client = UnixStream::connect(&sock).await.unwrap();
+    let mut client = IpcStream::connect(&sock).await.unwrap();
 
     // Open primary workspace (slot 0, port_offset 0)
     let primary_ws = match send_rpc(
@@ -707,11 +778,7 @@ async fn create_worktree_workspace_isolates_ports_and_injects_env() {
         ClientMessage::SpawnPane {
             workspace_id: wt_ws.id,
             role: PaneRole::Service,
-            command: Some(vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "echo PORT=$PORT PROJ=$COMPOSE_PROJECT_NAME DB=$DATABASE_URL; sleep 2".to_string(),
-            ]),
+            command: Some(echo_worktree_env_command()),
             shell: None,
             cols: 160,
             rows: 12,
@@ -802,7 +869,7 @@ async fn external_status_ingests_via_ndjson_socket_and_rpc() {
         sock.clone(),
         runtime,
         Some(events_sock.clone()),
-        Supervisor::with_mode(IsolationMode::PgidFallback),
+        test_supervisor(),
     )
     .await
     .unwrap();
@@ -815,7 +882,7 @@ async fn external_status_ingests_via_ndjson_socket_and_rpc() {
             .await;
     });
 
-    let mut client = UnixStream::connect(&sock).await.unwrap();
+    let mut client = IpcStream::connect(&sock).await.unwrap();
     let ws = match send_rpc(
         &mut client,
         1,
@@ -832,7 +899,7 @@ async fn external_status_ingests_via_ndjson_socket_and_rpc() {
     };
 
     // Subscribe on a dedicated listener stream so send_rpc on `client` cannot swallow events
-    let mut sub_client = UnixStream::connect(&sock).await.unwrap();
+    let mut sub_client = IpcStream::connect(&sock).await.unwrap();
     send_rpc(
         &mut sub_client,
         2,
@@ -841,10 +908,16 @@ async fn external_status_ingests_via_ndjson_socket_and_rpc() {
     .await;
 
     // 1. Write 1-line JSON status for phrourion to events.sock
-    let mut hook_stream = UnixStream::connect(&events_sock).await.unwrap();
+    let mut hook_stream = IpcStream::connect(&events_sock).await.unwrap();
     let ndjson = format!(
-        "{{\"source\":\"phrourion\",\"root_dir\":\"{}\",\"level\":\"warn\",\"label\":\"3 dirty\",\"detail\":\"2 modified, 1 untracked\"}}\n",
-        ws_dir.display()
+        "{}\n",
+        serde_json::json!({
+            "source": "phrourion",
+            "root_dir": ws_dir,
+            "level": "warn",
+            "label": "3 dirty",
+            "detail": "2 modified, 1 untracked"
+        })
     );
     hook_stream.write_all(ndjson.as_bytes()).await.unwrap();
     hook_stream.shutdown().await.unwrap();
@@ -919,6 +992,7 @@ async fn external_status_ingests_via_ndjson_socket_and_rpc() {
 
     let _ = shutdown_tx.send(());
     srv_handle.await.unwrap();
+    #[cfg(unix)]
     assert!(
         !events_sock.exists(),
         "events.sock should be removed on daemon shutdown"
@@ -948,7 +1022,7 @@ async fn persistence_restores_dormant_workspaces_across_daemon_restart_and_skips
         runtime.clone(),
         None,
         Some(state_path.clone()),
-        Supervisor::with_mode(IsolationMode::PgidFallback),
+        test_supervisor(),
     )
     .await
     .unwrap();
@@ -961,7 +1035,7 @@ async fn persistence_restores_dormant_workspaces_across_daemon_restart_and_skips
             .await;
     });
 
-    let mut c1 = UnixStream::connect(&sock).await.unwrap();
+    let mut c1 = IpcStream::connect(&sock).await.unwrap();
     let ws_keep = match send_rpc(
         &mut c1,
         1,
@@ -1006,7 +1080,7 @@ async fn persistence_restores_dormant_workspaces_across_daemon_restart_and_skips
         runtime,
         None,
         Some(state_path.clone()),
-        Supervisor::with_mode(IsolationMode::PgidFallback),
+        test_supervisor(),
     )
     .await
     .unwrap();
@@ -1019,7 +1093,7 @@ async fn persistence_restores_dormant_workspaces_across_daemon_restart_and_skips
             .await;
     });
 
-    let mut c2 = UnixStream::connect(&sock).await.unwrap();
+    let mut c2 = IpcStream::connect(&sock).await.unwrap();
     let listed = match send_rpc(&mut c2, 1, ClientMessage::ListWorkspaces).await {
         ResponsePayload::Workspaces(list) => list,
         other => panic!("unexpected: {other:?}"),
@@ -1052,11 +1126,7 @@ async fn persistence_restores_dormant_workspaces_across_daemon_restart_and_skips
         ClientMessage::SpawnPane {
             workspace_id: ws_keep.id,
             role: PaneRole::Runner,
-            command: Some(vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "echo RESTORED=$RESTORED_ENV; sleep 2".to_string(),
-            ]),
+            command: Some(echo_restored_env_command()),
             shell: None,
             cols: 80,
             rows: 8,
@@ -1148,13 +1218,9 @@ CALLER_OVERRIDES = "from_toml"
     std::fs::create_dir_all(&malformed_dir).unwrap();
     std::fs::write(malformed_dir.join(".daedalus.toml"), "[agent\nbroken =").unwrap();
 
-    let server = DaemonServer::bind_with_supervisor(
-        sock.clone(),
-        runtime,
-        Supervisor::with_mode(IsolationMode::PgidFallback),
-    )
-    .await
-    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let srv_handle = tokio::spawn(async move {
         let _ = server
@@ -1164,7 +1230,7 @@ CALLER_OVERRIDES = "from_toml"
             .await;
     });
 
-    let mut client = UnixStream::connect(&sock).await.unwrap();
+    let mut client = IpcStream::connect(&sock).await.unwrap();
     let ws0 = match send_rpc(
         &mut client,
         1,
@@ -1256,6 +1322,7 @@ CALLER_OVERRIDES = "from_toml"
     srv_handle.await.unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn fish_osc133_captures_failure_trace_when_fish_installed() {
     let fish_path = match std::process::Command::new("which").arg("fish").output() {
@@ -1267,13 +1334,9 @@ async fn fish_osc133_captures_failure_trace_when_fish_installed() {
     let sock = dir.path().join("daedalusd.sock");
     let runtime = dir.path().join("runtime");
 
-    let server = DaemonServer::bind_with_supervisor(
-        sock.clone(),
-        runtime,
-        Supervisor::with_mode(IsolationMode::PgidFallback),
-    )
-    .await
-    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let srv_handle = tokio::spawn(async move {
         let _ = server
@@ -1283,7 +1346,7 @@ async fn fish_osc133_captures_failure_trace_when_fish_installed() {
             .await;
     });
 
-    let mut client = UnixStream::connect(&sock).await.unwrap();
+    let mut client = IpcStream::connect(&sock).await.unwrap();
     let ws = match send_rpc(
         &mut client,
         1,
@@ -1383,7 +1446,7 @@ async fn set_agent_state_and_hook_events_broadcast_and_clear_status() {
         sock.clone(),
         runtime,
         Some(events_sock.clone()),
-        Supervisor::with_mode(IsolationMode::PgidFallback),
+        test_supervisor(),
     )
     .await
     .unwrap();
@@ -1396,7 +1459,7 @@ async fn set_agent_state_and_hook_events_broadcast_and_clear_status() {
             .await;
     });
 
-    let mut client = UnixStream::connect(&sock).await.unwrap();
+    let mut client = IpcStream::connect(&sock).await.unwrap();
     let ws = match send_rpc(
         &mut client,
         1,
@@ -1418,11 +1481,7 @@ async fn set_agent_state_and_hook_events_broadcast_and_clear_status() {
         ClientMessage::SpawnPane {
             workspace_id: ws.id,
             role: PaneRole::Agent,
-            command: Some(vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "sleep 10".to_string(),
-            ]),
+            command: Some(sleep_command()),
             shell: None,
             cols: 80,
             rows: 24,
@@ -1442,11 +1501,7 @@ async fn set_agent_state_and_hook_events_broadcast_and_clear_status() {
         ClientMessage::SpawnPane {
             workspace_id: ws.id,
             role: PaneRole::Runner,
-            command: Some(vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "sleep 10".to_string(),
-            ]),
+            command: Some(sleep_command()),
             shell: None,
             cols: 80,
             rows: 24,
@@ -1475,7 +1530,7 @@ async fn set_agent_state_and_hook_events_broadcast_and_clear_status() {
     .unwrap_err();
     assert!(matches!(non_agent_err, ProtoError::InvalidRequest(_)));
 
-    let mut sub_client = UnixStream::connect(&sock).await.unwrap();
+    let mut sub_client = IpcStream::connect(&sock).await.unwrap();
     send_rpc(
         &mut sub_client,
         10,
@@ -1518,14 +1573,26 @@ async fn set_agent_state_and_hook_events_broadcast_and_clear_status() {
     .expect("timed out waiting for AgentStateChanged from RPC");
 
     // 2. events.sock agent_state + status + clear_status ingestion
-    let mut hook_stream = UnixStream::connect(&events_sock).await.unwrap();
+    let mut hook_stream = IpcStream::connect(&events_sock).await.unwrap();
     let payload = format!(
-        "{{\"kind\":\"agent_state\",\"root_dir\":\"{}\",\"state\":\"thinking\"}}\n\
-         {{\"kind\":\"status\",\"root_dir\":\"{}\",\"source\":\"phrourion\",\"level\":\"warn\",\"label\":\"2 dirty\"}}\n\
-         {{\"kind\":\"clear_status\",\"workspace_id\":\"{}\",\"source\":\"phrourion\"}}\n",
-        ws_dir.display(),
-        ws_dir.display(),
-        ws.id,
+        "{}\n{}\n{}\n",
+        serde_json::json!({
+            "kind": "agent_state",
+            "root_dir": ws_dir,
+            "state": "thinking"
+        }),
+        serde_json::json!({
+            "kind": "status",
+            "root_dir": ws_dir,
+            "source": "phrourion",
+            "level": "warn",
+            "label": "2 dirty"
+        }),
+        serde_json::json!({
+            "kind": "clear_status",
+            "workspace_id": ws.id,
+            "source": "phrourion"
+        }),
     );
     hook_stream.write_all(payload.as_bytes()).await.unwrap();
     hook_stream.shutdown().await.unwrap();
@@ -1633,6 +1700,7 @@ async fn set_agent_state_and_hook_events_broadcast_and_clear_status() {
     srv_handle.await.unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn get_failure_trace_includes_git_branch_and_diff_stat_for_dirty_repo() {
     let dir = TempDir::new().unwrap();
@@ -1660,13 +1728,9 @@ async fn get_failure_trace_includes_git_branch_and_diff_stat_for_dirty_repo() {
     std::fs::write(repo_dir.join("README.md"), "# initial\nmodified line\n").unwrap();
     std::fs::write(repo_dir.join("notes.txt"), "untracked\n").unwrap();
 
-    let server = DaemonServer::bind_with_supervisor(
-        sock.clone(),
-        runtime,
-        Supervisor::with_mode(IsolationMode::PgidFallback),
-    )
-    .await
-    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let srv_handle = tokio::spawn(async move {
         let _ = server
@@ -1676,7 +1740,7 @@ async fn get_failure_trace_includes_git_branch_and_diff_stat_for_dirty_repo() {
             .await;
     });
 
-    let mut client = UnixStream::connect(&sock).await.unwrap();
+    let mut client = IpcStream::connect(&sock).await.unwrap();
     let ws = match send_rpc(
         &mut client,
         1,
@@ -1782,13 +1846,9 @@ async fn close_workspace_removes_linked_worktree_and_refuses_primary_checkout() 
         ],
     );
 
-    let server = DaemonServer::bind_with_supervisor(
-        sock.clone(),
-        runtime,
-        Supervisor::with_mode(IsolationMode::PgidFallback),
-    )
-    .await
-    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
     server.set_worktrees_dir(worktrees_dir);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -1800,7 +1860,7 @@ async fn close_workspace_removes_linked_worktree_and_refuses_primary_checkout() 
             .await;
     });
 
-    let mut client = UnixStream::connect(&sock).await.unwrap();
+    let mut client = IpcStream::connect(&sock).await.unwrap();
 
     let primary_ws = match send_rpc(
         &mut client,
@@ -1916,6 +1976,91 @@ async fn close_workspace_removes_linked_worktree_and_refuses_primary_checkout() 
     )
     .await;
     assert!(repo_dir.is_dir());
+
+    let _ = shutdown_tx.send(());
+    srv_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn tcp_wsl2_bridge_rpc_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let runtime = dir.path().join("runtime");
+    let ws_dir = dir.path().join("bridge-ws");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+
+    let supervisor = test_supervisor();
+    let expected_mode = supervisor.isolation_mode().as_str().to_string();
+
+    let server =
+        DaemonServer::bind_with_supervisor(PathBuf::from("tcp://127.0.0.1:0"), runtime, supervisor)
+            .await
+            .unwrap();
+    let endpoint = server.socket_path();
+    let endpoint_str = endpoint.to_string_lossy();
+    assert!(
+        endpoint_str.starts_with("tcp://127.0.0.1:"),
+        "expected resolved tcp://127.0.0.1:<port>, got {endpoint_str}"
+    );
+    assert_ne!(endpoint_str, "tcp://127.0.0.1:0");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let mut client = IpcStream::connect(&endpoint).await.unwrap();
+    match send_rpc(&mut client, 1, ClientMessage::Ping).await {
+        ResponsePayload::Pong {
+            version,
+            vt_backend,
+            isolation_mode,
+        } => {
+            assert_eq!(version, env!("CARGO_PKG_VERSION"));
+            assert!(!vt_backend.is_empty());
+            assert_eq!(isolation_mode, expected_mode);
+        }
+        other => panic!("expected Pong, got {other:?}"),
+    }
+
+    let created = match send_rpc(
+        &mut client,
+        2,
+        ClientMessage::CreateWorkspace {
+            name: "wsl2-bridge".to_string(),
+            root_dir: ws_dir,
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::WorkspaceCreated(ws) => ws,
+        other => panic!("expected WorkspaceCreated, got {other:?}"),
+    };
+    assert_eq!(created.name, "wsl2-bridge");
+
+    let listed = match send_rpc(&mut client, 3, ClientMessage::ListWorkspaces).await {
+        ResponsePayload::Workspaces(list) => list,
+        other => panic!("expected Workspaces, got {other:?}"),
+    };
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, created.id);
+
+    let ok = send_rpc(
+        &mut client,
+        4,
+        ClientMessage::CloseWorkspace {
+            id: created.id,
+            compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
+        },
+    )
+    .await;
+    assert_eq!(ok, ResponsePayload::Ok);
 
     let _ = shutdown_tx.send(());
     srv_handle.await.unwrap();

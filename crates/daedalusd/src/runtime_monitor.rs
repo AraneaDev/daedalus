@@ -4,7 +4,9 @@ use bollard::Docker;
 use bollard::models::ContainerSummary;
 use bollard::query_parameters::ListContainersOptions;
 use daedalus_proto::{ContainerHealth, GitWorkspaceStatus, PortMapping, PortSource, WorkspaceId};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+#[cfg(unix)]
+use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -176,6 +178,61 @@ pub fn parse_lsof_listen_output(output: &str) -> Vec<(u32, u16, Option<String>)>
     out
 }
 
+/// Parses Windows `netstat -ano -p TCP` output and returns deduplicated [`PortMapping`] entries
+/// for `LISTENING` sockets whose PID is present in `pid_filter`.
+pub fn parse_windows_netstat_output(output: &str, pid_filter: &HashSet<u32>) -> Vec<PortMapping> {
+    if pid_filter.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ports = BTreeSet::new();
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut cols = line.split_whitespace();
+        let (Some(proto), Some(local_addr), Some(_foreign_addr), Some(state), Some(pid_str), None) = (
+            cols.next(),
+            cols.next(),
+            cols.next(),
+            cols.next(),
+            cols.next(),
+            cols.next(),
+        ) else {
+            continue;
+        };
+        if !proto.eq_ignore_ascii_case("TCP") || !state.eq_ignore_ascii_case("LISTENING") {
+            continue;
+        }
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 || !pid_filter.contains(&pid) {
+            continue;
+        }
+        let Some((_, port_str)) = local_addr.rsplit_once(':') else {
+            continue;
+        };
+        let Ok(port) = port_str.parse::<u16>() else {
+            continue;
+        };
+        if port > 0 {
+            ports.insert(port);
+        }
+    }
+
+    ports
+        .into_iter()
+        .map(|host_port| PortMapping {
+            host_port,
+            container_port: None,
+            service: None,
+            source: PortSource::LocalProcess,
+        })
+        .collect()
+}
+
 /// Walks `/proc/<pid>/stat` to collect `roots` and all live descendant PIDs.
 #[cfg(target_os = "linux")]
 pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
@@ -223,7 +280,7 @@ pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
     collected
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn descendant_pids_with_comms(roots: &[u32]) -> (HashSet<u32>, HashMap<u32, String>) {
     if roots.is_empty() {
         return (HashSet::new(), HashMap::new());
@@ -266,9 +323,26 @@ fn descendant_pids_with_comms(roots: &[u32]) -> (HashSet<u32>, HashMap<u32, Stri
 }
 
 /// Walks `ps` output to collect `roots` and all live descendant PIDs.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
     descendant_pids_with_comms(roots).0
+}
+
+/// Queries `Win32_Process` via PowerShell to collect `roots` and all live descendant PIDs.
+#[cfg(windows)]
+pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
+    let mut collected: HashSet<u32> = roots.iter().copied().filter(|&pid| pid > 0).collect();
+    if collected.is_empty() {
+        return collected;
+    }
+
+    let edges = crate::supervisor::collect_windows_ppid_edges();
+    for &root in roots {
+        if root > 0 {
+            collected.extend(crate::supervisor::descendants_from_ppid_edges(root, &edges));
+        }
+    }
+    collected
 }
 
 #[cfg(target_os = "linux")]
@@ -355,7 +429,7 @@ pub fn discover_local_ports_for_roots(root_pids: &[u32]) -> Vec<PortMapping> {
 
 /// Discovers local TCP listening ports bound by processes in the subtrees rooted at `root_pids`
 /// using `ps` and `lsof`.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn discover_local_ports_for_roots(root_pids: &[u32]) -> Vec<PortMapping> {
     if root_pids.is_empty() {
         return Vec::new();
@@ -416,6 +490,24 @@ pub fn discover_local_ports_for_roots(root_pids: &[u32]) -> Vec<PortMapping> {
         .collect()
 }
 
+/// Discovers local TCP listening ports bound by `root_pids` via `netstat -ano -p TCP`.
+#[cfg(windows)]
+pub fn discover_local_ports_for_roots(root_pids: &[u32]) -> Vec<PortMapping> {
+    let pid_filter = collect_descendant_pids(root_pids);
+    if pid_filter.is_empty() {
+        return Vec::new();
+    }
+
+    let mut cmd = std::process::Command::new("netstat");
+    cmd.args(["-ano", "-p", "TCP"]);
+    let Some(output) =
+        crate::supervisor::run_command_stdout_with_timeout(&mut cmd, Duration::from_secs(2), false)
+    else {
+        return Vec::new();
+    };
+    parse_windows_netstat_output(&output, &pid_filter)
+}
+
 /// Returns ordered candidate Docker Unix socket paths when `DOCKER_HOST` is unset.
 pub fn discover_docker_socket_candidates(
     docker_host: Option<&str>,
@@ -439,20 +531,23 @@ pub fn discover_docker_socket_candidates(
 /// Connects to Docker respecting `DOCKER_HOST` first, then probing OrbStack, Docker Desktop,
 /// Colima, and `/var/run/docker.sock`, falling back to `Docker::connect_with_local_defaults()`.
 pub fn connect_docker_client() -> Option<Docker> {
-    let docker_host = std::env::var("DOCKER_HOST").ok();
-    if docker_host.as_deref().is_some_and(|h| !h.is_empty()) {
-        return Docker::connect_with_local_defaults().ok();
-    }
+    #[cfg(unix)]
+    {
+        let docker_host = std::env::var("DOCKER_HOST").ok();
+        if docker_host.as_deref().is_some_and(|h| !h.is_empty()) {
+            return Docker::connect_with_local_defaults().ok();
+        }
 
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    for path in discover_docker_socket_candidates(docker_host.as_deref(), home.as_deref()) {
-        if path.exists()
-            && std::os::unix::net::UnixStream::connect(&path).is_ok()
-            && let Some(path_str) = path.to_str()
-            && let Ok(client) =
-                Docker::connect_with_unix(path_str, 120, bollard::API_DEFAULT_VERSION)
-        {
-            return Some(client);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        for path in discover_docker_socket_candidates(docker_host.as_deref(), home.as_deref()) {
+            if path.exists()
+                && std::os::unix::net::UnixStream::connect(&path).is_ok()
+                && let Some(path_str) = path.to_str()
+                && let Ok(client) =
+                    Docker::connect_with_unix(path_str, 120, bollard::API_DEFAULT_VERSION)
+            {
+                return Some(client);
+            }
         }
     }
 
@@ -725,6 +820,7 @@ mod tests {
     use super::*;
     use bollard::models::{ContainerSummaryStateEnum, PortSummary, PortSummaryTypeEnum};
     use std::net::TcpListener;
+    #[cfg(unix)]
     use std::process::{Command, Stdio};
 
     #[test]
@@ -772,11 +868,13 @@ mod tests {
             .unwrap_or_else(|| panic!("expected port {bound_port} in {ports:?}"));
         assert_eq!(found.container_port, None);
         assert_eq!(found.source, PortSource::LocalProcess);
+        #[cfg(unix)]
         assert!(found.service.is_some());
 
         drop(listener);
     }
 
+    #[cfg(unix)]
     #[test]
     fn collect_descendant_pids_includes_root_and_live_children() {
         let mut child = Command::new("/bin/sh")
@@ -972,5 +1070,48 @@ n127.0.0.1:9000
             discover_docker_socket_candidates(None, None),
             vec![PathBuf::from("/var/run/docker.sock")]
         );
+    }
+
+    #[test]
+    fn parse_windows_netstat_output_filters_listening_tcp_and_pids() {
+        let sample = "\
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:5432           0.0.0.0:0              LISTENING       1234
+  TCP    127.0.0.1:3000         0.0.0.0:0              LISTENING       1234
+  TCP    [::1]:8080             [::]:0                 LISTENING       5678
+  TCP    [::]:8080              [::]:0                 LISTENING       5678
+  TCP    127.0.0.1:3000         127.0.0.1:51234        ESTABLISHED     1234
+  TCP    0.0.0.0:9999           0.0.0.0:0              LISTENING       9999
+  UDP    0.0.0.0:5353           *:*                                    1234
+  TCP    0.0.0.0:0              0.0.0.0:0              LISTENING       1234
+  malformed line
+";
+        let pid_filter = HashSet::from([1234, 5678]);
+        assert_eq!(
+            parse_windows_netstat_output(sample, &pid_filter),
+            vec![
+                PortMapping {
+                    host_port: 3000,
+                    container_port: None,
+                    service: None,
+                    source: PortSource::LocalProcess,
+                },
+                PortMapping {
+                    host_port: 5432,
+                    container_port: None,
+                    service: None,
+                    source: PortSource::LocalProcess,
+                },
+                PortMapping {
+                    host_port: 8080,
+                    container_port: None,
+                    service: None,
+                    source: PortSource::LocalProcess,
+                },
+            ]
+        );
+        assert!(parse_windows_netstat_output(sample, &HashSet::new()).is_empty());
     }
 }
