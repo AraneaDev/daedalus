@@ -497,17 +497,22 @@ mod tests {
     use std::io::BufRead;
     use tempfile::TempDir;
 
+    #[cfg(target_os = "linux")]
     fn is_process_alive(pid: i32) -> bool {
         if kill(Pid::from_raw(pid), None).is_err() {
             return false;
         }
-        #[cfg(target_os = "linux")]
         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
             && let Some((state, _)) = parse_proc_stat(&stat)
         {
             return !matches!(state, 'Z' | 'X');
         }
         true
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn is_process_alive(pid: i32) -> bool {
+        kill(Pid::from_raw(pid), None).is_ok()
     }
 
     fn assert_orphan_killed(script: &str) {
