@@ -35,6 +35,9 @@ pub enum ClientMessage {
         env: HashMap<String, String>,
     },
     ListWorkspaces,
+    ResolveWorkspaceDirectory {
+        root_dir: PathBuf,
+    },
     CloseWorkspace {
         id: WorkspaceId,
         #[serde(default)]
@@ -71,6 +74,14 @@ pub enum ClientMessage {
         cols: u16,
         rows: u16,
         env: HashMap<String, String>,
+    },
+    /// Replaces the expected Agent pane after the new process starts.
+    ReplaceAgentPane {
+        workspace_id: WorkspaceId,
+        old_pane_id: Option<PaneId>,
+        command: Option<Vec<String>>,
+        cols: u16,
+        rows: u16,
     },
     ClosePane {
         pane_id: PaneId,
@@ -129,6 +140,7 @@ pub enum ResponsePayload {
         isolation_mode: String,
     },
     WorkspaceCreated(WorkspaceInfo),
+    WorkspaceResolved(WorkspaceInfo),
     Workspaces(Vec<WorkspaceInfo>),
     Worktrees(Vec<GitWorktreeInfo>),
     PaneSpawned(PaneSummary),

@@ -1,23 +1,23 @@
+mod persistence;
+mod status;
+
 use crate::isolation;
 use crate::manifest;
 use crate::pane_actor::PaneHandle;
-use crate::persistence::{PersistedState, PersistedWorkspace, STATE_VERSION, StateStore};
+use crate::persistence::{PersistedWorkspace, StateStore};
 use crate::runtime_monitor::WorkspaceMonitorTarget;
 use crate::shell_integration::ShellIntegration;
 use crate::supervisor::{IsolationMode, Supervisor};
 use crate::worktree::{self, WorktreeError};
 use daedalus_proto::{
     AgentState, ContainerHealth, ExternalStatus, FailureTrace, GitWorkspaceStatus, GitWorktreeInfo,
-    PaneId, PaneRole, PaneSummary, PortMapping, ProtoError, ServerEvent, StatusLevel, WorkspaceId,
+    PaneId, PaneRole, PaneSummary, PortMapping, ProtoError, ServerEvent, WorkspaceId,
     WorkspaceInfo, WorkspaceManifest,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, broadcast};
-use tracing::{info, warn};
-
-const MAX_EXTERNAL_STATUSES: usize = 16;
+use tracing::warn;
 
 struct WorkspaceRecord {
     id: WorkspaceId,
@@ -32,6 +32,7 @@ struct WorkspaceRecord {
     injected_env: HashMap<String, String>,
     reserved_ports: HashSet<u16>,
     pane_ids: Vec<PaneId>,
+    lifecycle: std::sync::Arc<Mutex<()>>,
     bound_ports: Vec<PortMapping>,
     containers: Vec<ContainerHealth>,
     external_statuses: Vec<ExternalStatus>,
@@ -56,6 +57,18 @@ impl WorkspaceRecord {
             external_statuses: self.external_statuses.clone(),
             manifest: self.manifest.clone(),
         }
+    }
+
+    fn snapshot_handles(
+        &self,
+        panes: &HashMap<PaneId, PaneHandle>,
+    ) -> (WorkspaceInfo, Vec<PaneHandle>) {
+        let handles = self
+            .pane_ids
+            .iter()
+            .filter_map(|id| panes.get(id).cloned())
+            .collect();
+        (self.to_info(Vec::new()), handles)
     }
 
     fn to_persisted(&self) -> PersistedWorkspace {
@@ -139,6 +152,7 @@ fn build_workspace_record(
         injected_env: prepared.plan.injected_env,
         reserved_ports,
         pane_ids: Vec::new(),
+        lifecycle: Default::default(),
         bound_ports: Vec::new(),
         containers: Vec::new(),
         external_statuses: Vec::new(),
@@ -152,6 +166,7 @@ pub struct Registry {
     event_tx: broadcast::Sender<ServerEvent>,
     state_store: Option<StateStore>,
     persist_lock: Mutex<()>,
+    unresolved_legacy_roots: RwLock<Vec<PersistedWorkspace>>,
     create_lock: Mutex<()>,
     worktrees_dir: std::sync::RwLock<Option<PathBuf>>,
     workspaces: RwLock<HashMap<WorkspaceId, WorkspaceRecord>>,
@@ -179,166 +194,12 @@ impl Registry {
             event_tx,
             state_store,
             persist_lock: Mutex::new(()),
+            unresolved_legacy_roots: RwLock::new(Vec::new()),
             create_lock: Mutex::new(()),
             worktrees_dir: std::sync::RwLock::new(None),
             workspaces: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
         }
-    }
-
-    async fn persist_state(&self) {
-        let Some(store) = self.state_store.clone() else {
-            return;
-        };
-        let _persist_guard = self.persist_lock.lock().await;
-        let mut workspaces: Vec<PersistedWorkspace> = {
-            let ws_map = self.workspaces.read().await;
-            ws_map.values().map(WorkspaceRecord::to_persisted).collect()
-        };
-        workspaces.sort_by_key(|ws| ws.slot_index);
-        let state = PersistedState {
-            version: STATE_VERSION,
-            workspaces,
-        };
-        match tokio::task::spawn_blocking(move || store.save(&state)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                warn!(error = %err, "failed to persist daemon workspace state");
-            }
-            Err(err) => {
-                warn!(error = %err, "state persistence task panicked");
-            }
-        }
-    }
-
-    /// Restores persisted workspaces from `state.json` as dormant workspaces (`panes: []`),
-    /// skipping entries whose `root_dir` no longer exists and refreshing isolation, git branch,
-    /// and `.daedalus.toml` manifest.
-    pub async fn restore_persisted_workspaces(&self) -> usize {
-        let Some(store) = self.state_store.clone() else {
-            return 0;
-        };
-
-        let _create_guard = self.create_lock.lock().await;
-        let load_path = store.path().to_path_buf();
-        let mut persisted_state = match tokio::task::spawn_blocking(move || store.load()).await {
-            Ok(Ok(state)) => state,
-            Ok(Err(err)) => {
-                warn!(path = %load_path.display(), error = %err, "failed to load persisted state; starting empty");
-                return 0;
-            }
-            Err(err) => {
-                warn!(path = %load_path.display(), error = %err, "state restore task panicked; starting empty");
-                return 0;
-            }
-        };
-
-        if persisted_state.workspaces.is_empty() {
-            return 0;
-        }
-
-        persisted_state.workspaces.sort_by_key(|ws| ws.slot_index);
-
-        let (mut used_slots, mut reserved_ports, mut existing_ids) = {
-            let ws_map = self.workspaces.read().await;
-            let used_slots: HashSet<u16> = ws_map.values().map(|ws| ws.slot_index).collect();
-            let reserved_ports: HashSet<u16> = ws_map
-                .values()
-                .flat_map(|ws| ws.reserved_ports.iter().copied())
-                .collect();
-            let existing_ids: HashSet<WorkspaceId> = ws_map.keys().copied().collect();
-            (used_slots, reserved_ports, existing_ids)
-        };
-
-        let mut restored_records = Vec::new();
-        let mut needs_resave = false;
-
-        for entry in persisted_state.workspaces {
-            if existing_ids.contains(&entry.id) {
-                needs_resave = true;
-                continue;
-            }
-            if !entry.root_dir.is_dir() {
-                info!(
-                    workspace_id = %entry.id,
-                    root_dir = %entry.root_dir.display(),
-                    "skipping persisted workspace whose root_dir no longer exists"
-                );
-                needs_resave = true;
-                continue;
-            }
-
-            let slot_index = if !used_slots.contains(&entry.slot_index) {
-                entry.slot_index
-            } else if let Some(slot) = (0..=u16::MAX).find(|s| !used_slots.contains(s)) {
-                needs_resave = true;
-                slot
-            } else {
-                warn!(workspace_id = %entry.id, "no workspace slots available during restore");
-                needs_resave = true;
-                continue;
-            };
-
-            let name_clone = entry.name.clone();
-            let root_clone = entry.root_dir.clone();
-            let reserved_clone = reserved_ports.clone();
-            let prepared_res = tokio::task::spawn_blocking(move || {
-                prepare_workspace_components(
-                    &name_clone,
-                    &root_clone,
-                    slot_index,
-                    HashMap::new(),
-                    &reserved_clone,
-                )
-            })
-            .await;
-
-            let prepared = match prepared_res {
-                Ok(Ok(p)) => p,
-                Ok(Err(err)) => {
-                    warn!(
-                        workspace_id = %entry.id,
-                        root_dir = %entry.root_dir.display(),
-                        error = %err,
-                        "failed to prepare isolation for persisted workspace; skipping"
-                    );
-                    needs_resave = true;
-                    continue;
-                }
-                Err(err) => {
-                    warn!(workspace_id = %entry.id, error = %err, "workspace restore task panicked");
-                    needs_resave = true;
-                    continue;
-                }
-            };
-
-            let record = build_workspace_record(entry.id, entry.name, entry.root_dir, prepared);
-            used_slots.insert(record.slot_index);
-            reserved_ports.extend(record.reserved_ports.iter().copied());
-            existing_ids.insert(record.id);
-            restored_records.push(record);
-        }
-
-        let restored_count = restored_records.len();
-        if restored_count > 0 {
-            let mut ws_map = self.workspaces.write().await;
-            for record in restored_records {
-                ws_map.insert(record.id, record);
-            }
-        }
-        drop(_create_guard);
-
-        if needs_resave {
-            self.persist_state().await;
-        }
-        if restored_count > 0 {
-            info!(
-                count = restored_count,
-                "restored dormant workspaces from state.json"
-            );
-        }
-
-        restored_count
     }
 
     pub fn set_worktrees_dir(&self, dir: PathBuf) {
@@ -370,6 +231,8 @@ impl Registry {
         root_dir: PathBuf,
         env: HashMap<String, String>,
     ) -> Result<WorkspaceInfo, ProtoError> {
+        let root_dir =
+            std::path::absolute(root_dir).map_err(|err| ProtoError::IoError(err.to_string()))?;
         if !root_dir.is_dir() {
             return Err(ProtoError::InvalidRequest(format!(
                 "root_dir does not exist or is not a directory: {}",
@@ -467,31 +330,64 @@ impl Registry {
             let pane_map = self.panes.read().await;
             ws_map
                 .values()
-                .map(|ws| {
-                    let handles = ws
-                        .pane_ids
-                        .iter()
-                        .filter_map(|pid| pane_map.get(pid).cloned())
-                        .collect();
-                    (ws.to_info(Vec::new()), handles)
-                })
+                .map(|ws| ws.snapshot_handles(&pane_map))
                 .collect()
         };
 
         snapshot.sort_by_key(|(info, _)| info.slot_index);
 
         let mut out = Vec::with_capacity(snapshot.len());
-        for (mut info, handles) in snapshot {
-            let mut panes = Vec::new();
-            for handle in handles {
-                if let Ok(summary) = handle.summary().await {
-                    panes.push(summary);
-                }
-            }
-            info.panes = panes;
-            out.push(info);
+        for (info, handles) in snapshot {
+            out.push(Self::with_pane_summaries(info, handles).await);
         }
         out
+    }
+
+    pub async fn workspace_for_directory(
+        &self,
+        root_dir: PathBuf,
+    ) -> Result<WorkspaceInfo, ProtoError> {
+        let canonical = Self::canonicalize_target(None, Some(&root_dir)).await;
+        let (info, handles) = {
+            let workspaces = self.workspaces.read().await;
+            let id = Self::resolve_workspace_in_map(
+                &workspaces,
+                None,
+                Some(&root_dir),
+                canonical.as_deref(),
+            )?;
+            let ws = &workspaces[&id];
+            let panes = self.panes.read().await;
+            ws.snapshot_handles(&panes)
+        };
+        Ok(Self::with_pane_summaries(info, handles).await)
+    }
+
+    async fn with_pane_summaries(
+        mut info: WorkspaceInfo,
+        handles: Vec<PaneHandle>,
+    ) -> WorkspaceInfo {
+        for handle in handles {
+            if let Ok(summary) = handle.summary().await {
+                info.panes.push(summary);
+            }
+        }
+        info
+    }
+
+    async fn lock_workspace_lifecycle(
+        &self,
+        id: WorkspaceId,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ProtoError> {
+        let lifecycle = self
+            .workspaces
+            .read()
+            .await
+            .get(&id)
+            .ok_or(ProtoError::WorkspaceNotFound(id))?
+            .lifecycle
+            .clone();
+        Ok(lifecycle.lock_owned().await)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -504,6 +400,77 @@ impl Registry {
         cols: u16,
         rows: u16,
         pane_env: HashMap<String, String>,
+    ) -> Result<PaneSummary, ProtoError> {
+        let _lifecycle = self.lock_workspace_lifecycle(workspace_id).await?;
+        self.install_pane(
+            workspace_id,
+            role,
+            command,
+            shell,
+            cols,
+            rows,
+            pane_env,
+            None,
+        )
+        .await
+    }
+
+    pub async fn replace_agent_pane(
+        &self,
+        workspace_id: WorkspaceId,
+        old_pane_id: Option<PaneId>,
+        command: Option<Vec<String>>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<PaneSummary, ProtoError> {
+        let _lifecycle = self.lock_workspace_lifecycle(workspace_id).await?;
+        {
+            let workspaces = self.workspaces.read().await;
+            let ws = workspaces
+                .get(&workspace_id)
+                .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
+            let panes = self.panes.read().await;
+            let mut agents = ws
+                .pane_ids
+                .iter()
+                .filter(|id| panes.get(id).is_some_and(|p| p.role() == PaneRole::Agent));
+            match old_pane_id {
+                Some(id) if !agents.any(|agent_id| *agent_id == id) => {
+                    return Err(ProtoError::PaneNotFound(id));
+                }
+                None if agents.next().is_some() => {
+                    return Err(ProtoError::InvalidRequest(
+                        "workspace already has an Agent pane".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        self.install_pane(
+            workspace_id,
+            PaneRole::Agent,
+            command,
+            None,
+            cols,
+            rows,
+            HashMap::new(),
+            old_pane_id,
+        )
+        .await
+    }
+
+    /// The caller holds the workspace lifecycle lock until installation completes.
+    #[allow(clippy::too_many_arguments)]
+    async fn install_pane(
+        &self,
+        workspace_id: WorkspaceId,
+        role: PaneRole,
+        command: Option<Vec<String>>,
+        shell: Option<String>,
+        cols: u16,
+        rows: u16,
+        pane_env: HashMap<String, String>,
+        old_pane_id: Option<PaneId>,
     ) -> Result<PaneSummary, ProtoError> {
         let (root_dir, mut merged_env) = {
             let ws_map = self.workspaces.read().await;
@@ -551,20 +518,22 @@ impl Registry {
             }
         };
 
-        let inserted = {
-            let mut ws_map = self.workspaces.write().await;
-            if let Some(ws) = ws_map.get_mut(&workspace_id) {
-                ws.pane_ids.push(pane_id);
-                self.panes.write().await.insert(pane_id, handle.clone());
-                true
-            } else {
-                false
-            }
+        let previous = {
+            let mut workspaces = self.workspaces.write().await;
+            let ws = workspaces
+                .get_mut(&workspace_id)
+                .expect("workspace lifecycle lock held");
+            let mut panes = self.panes.write().await;
+            let previous = old_pane_id.and_then(|old| {
+                ws.pane_ids.retain(|id| *id != old);
+                panes.remove(&old)
+            });
+            ws.pane_ids.push(pane_id);
+            panes.insert(pane_id, handle);
+            previous
         };
-
-        if !inserted {
-            handle.close().await;
-            return Err(ProtoError::WorkspaceNotFound(workspace_id));
+        if let Some(previous) = previous {
+            previous.close().await;
         }
 
         Ok(summary)
@@ -580,6 +549,8 @@ impl Registry {
     }
 
     pub async fn close_pane(&self, pane_id: PaneId) -> Result<(), ProtoError> {
+        let workspace_id = self.get_pane(pane_id).await?.workspace_id();
+        let _lifecycle = self.lock_workspace_lifecycle(workspace_id).await?;
         let handle = self
             .panes
             .write()
@@ -623,51 +594,43 @@ impl Registry {
         force_remove_worktree: bool,
         persist: bool,
     ) -> Result<(), ProtoError> {
-        if remove_worktree {
-            let root_dir = self
-                .workspaces
-                .read()
-                .await
+        let _lifecycle = self.lock_workspace_lifecycle(workspace_id).await?;
+        let (root_dir, project) = {
+            let workspaces = self.workspaces.read().await;
+            let ws = workspaces
                 .get(&workspace_id)
-                .map(|ws| ws.root_dir.clone())
                 .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
-
-            let validation = tokio::task::spawn_blocking(move || {
-                worktree::validate_worktree_removal(&root_dir, force_remove_worktree)
+            (ws.root_dir.clone(), ws.compose_project_name.clone())
+        };
+        if remove_worktree {
+            let path = root_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                worktree::validate_worktree_removal(&path, force_remove_worktree)
             })
             .await
-            .map_err(|e| ProtoError::Internal(format!("worktree validation task failed: {e}")))?;
-
-            if let Err(err) = validation {
-                return Err(map_worktree_error(err));
-            }
+            .map_err(|e| ProtoError::Internal(format!("worktree validation task failed: {e}")))?
+            .map_err(map_worktree_error)?;
         }
 
-        let ws = self
-            .workspaces
-            .write()
-            .await
-            .remove(&workspace_id)
-            .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
-        let mut handles = Vec::new();
-        {
-            let mut pane_map = self.panes.write().await;
-            for pid in ws.pane_ids {
-                if let Some(h) = pane_map.remove(&pid) {
-                    handles.push(h);
-                }
-            }
-        }
+        // Keep the workspace and its slot reserved until cleanup succeeds. If Git fails,
+        // clients can inspect the remaining record and retry with the same workspace ID.
+        let handles: Vec<_> = {
+            let mut workspaces = self.workspaces.write().await;
+            let ws = workspaces
+                .get_mut(&workspace_id)
+                .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
+            let mut panes = self.panes.write().await;
+            ws.pane_ids
+                .drain(..)
+                .filter_map(|id| panes.remove(&id))
+                .collect()
+        };
         for handle in handles {
             handle.close().await;
         }
 
-        if persist {
-            self.persist_state().await;
-        }
-
-        if compose_down && let Some(project) = ws.compose_project_name {
-            let root_dir = ws.root_dir.clone();
+        if compose_down && let Some(project) = project {
+            let root_dir = root_dir.clone();
             let project_for_task = project.clone();
             let res = tokio::task::spawn_blocking(move || {
                 isolation::run_compose_down(&root_dir, &project_for_task)
@@ -695,7 +658,6 @@ impl Registry {
         }
 
         if remove_worktree {
-            let root_dir = ws.root_dir;
             let removal = tokio::task::spawn_blocking(move || {
                 worktree::remove_worktree(&root_dir, force_remove_worktree)
             })
@@ -707,6 +669,10 @@ impl Registry {
             }
         }
 
+        self.workspaces.write().await.remove(&workspace_id);
+        if persist {
+            self.persist_state().await;
+        }
         Ok(())
     }
 
@@ -892,137 +858,6 @@ impl Registry {
         Ok(Some(trace))
     }
 
-    pub async fn publish_external_status(
-        &self,
-        workspace_id: Option<WorkspaceId>,
-        root_dir: Option<PathBuf>,
-        source: String,
-        level: StatusLevel,
-        label: String,
-        detail: Option<String>,
-    ) -> Result<ExternalStatus, ProtoError> {
-        if source.trim().is_empty() {
-            return Err(ProtoError::InvalidRequest(
-                "external status source cannot be empty".to_string(),
-            ));
-        }
-        if label.trim().is_empty() {
-            return Err(ProtoError::InvalidRequest(
-                "external status label cannot be empty".to_string(),
-            ));
-        }
-        if workspace_id.is_none() && root_dir.is_none() {
-            return Err(ProtoError::InvalidRequest(
-                "either workspace_id or root_dir must be provided".to_string(),
-            ));
-        }
-
-        let canonical_target = Self::canonicalize_target(workspace_id, root_dir.as_deref()).await;
-
-        let updated_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
-
-        let status = ExternalStatus {
-            source,
-            level,
-            label,
-            detail,
-            updated_at_ms,
-        };
-
-        let target_id = {
-            let mut ws_map = self.workspaces.write().await;
-            let resolved_id = Self::resolve_workspace_in_map(
-                &ws_map,
-                workspace_id,
-                root_dir.as_deref(),
-                canonical_target.as_deref(),
-            )?;
-
-            let ws = ws_map
-                .get_mut(&resolved_id)
-                .ok_or(ProtoError::WorkspaceNotFound(resolved_id))?;
-
-            if let Some(pos) = ws
-                .external_statuses
-                .iter()
-                .position(|existing| existing.source == status.source)
-            {
-                ws.external_statuses.remove(pos);
-            } else if ws.external_statuses.len() >= MAX_EXTERNAL_STATUSES {
-                ws.external_statuses.remove(0);
-            }
-            ws.external_statuses.push(status.clone());
-            resolved_id
-        };
-
-        let _ = self.event_tx.send(ServerEvent::ExternalStatusUpdated {
-            workspace_id: target_id,
-            status: status.clone(),
-        });
-
-        Ok(status)
-    }
-
-    pub async fn clear_external_status(
-        &self,
-        workspace_id: Option<WorkspaceId>,
-        root_dir: Option<PathBuf>,
-        source: String,
-    ) -> Result<(), ProtoError> {
-        if source.trim().is_empty() {
-            return Err(ProtoError::InvalidRequest(
-                "external status source cannot be empty".to_string(),
-            ));
-        }
-        if workspace_id.is_none() && root_dir.is_none() {
-            return Err(ProtoError::InvalidRequest(
-                "either workspace_id or root_dir must be provided".to_string(),
-            ));
-        }
-
-        let canonical_target = Self::canonicalize_target(workspace_id, root_dir.as_deref()).await;
-        let updated_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
-
-        let cleared_ws_id = {
-            let mut ws_map = self.workspaces.write().await;
-            let resolved_id = Self::resolve_workspace_in_map(
-                &ws_map,
-                workspace_id,
-                root_dir.as_deref(),
-                canonical_target.as_deref(),
-            )?;
-            let ws = ws_map
-                .get_mut(&resolved_id)
-                .ok_or(ProtoError::WorkspaceNotFound(resolved_id))?;
-
-            let before = ws.external_statuses.len();
-            ws.external_statuses
-                .retain(|existing| existing.source != source);
-            (ws.external_statuses.len() != before).then_some(resolved_id)
-        };
-
-        if let Some(target_id) = cleared_ws_id {
-            let _ = self.event_tx.send(ServerEvent::ExternalStatusUpdated {
-                workspace_id: target_id,
-                status: ExternalStatus {
-                    source,
-                    level: StatusLevel::Info,
-                    label: String::new(),
-                    detail: None,
-                    updated_at_ms,
-                },
-            });
-        }
-
-        Ok(())
-    }
-
     pub async fn monitor_targets(&self) -> Vec<WorkspaceMonitorTarget> {
         let ws_map = self.workspaces.read().await;
         let pane_map = self.panes.read().await;
@@ -1089,6 +924,7 @@ fn map_worktree_error(err: WorktreeError) -> ProtoError {
     match err {
         WorktreeError::PrimaryCheckout(_)
         | WorktreeError::NotAWorktree(_)
+        | WorktreeError::LockedWorktree(_)
         | WorktreeError::DirtyWorktree(_) => ProtoError::InvalidRequest(err.to_string()),
         WorktreeError::GitFailed(_) => ProtoError::Internal(err.to_string()),
     }
@@ -1099,37 +935,32 @@ fn find_longest_prefix_workspace(
     target_dir: &Path,
     canonical_target: Option<&Path>,
 ) -> Option<WorkspaceId> {
-    let mut best: Option<(usize, u16, WorkspaceId)> = None;
-    for ws in ws_map.values() {
-        let match_len = if target_dir.starts_with(&ws.root_dir) {
-            Some(ws.root_dir.components().count())
-        } else if let Some(canon_target) = canonical_target
-            && canon_target.starts_with(&ws.canonical_root_dir)
-        {
-            Some(ws.canonical_root_dir.components().count())
-        } else {
-            None
-        };
-
-        if let Some(len) = match_len {
-            let replace = match best {
-                None => true,
-                Some((best_len, best_slot, _)) => {
-                    len > best_len || (len == best_len && ws.slot_index < best_slot)
-                }
+    ws_map
+        .values()
+        .filter_map(|ws| {
+            // Compare both paths in the same namespace. A raw prefix can point to a
+            // different workspace when the target contains a symlink or `..`.
+            let (target, root) = match canonical_target {
+                Some(target) => (target, &ws.canonical_root_dir),
+                None => (target_dir, &ws.root_dir),
             };
-            if replace {
-                best = Some((len, ws.slot_index, ws.id));
-            }
-        }
-    }
-    best.map(|(_, _, id)| id)
+            target.starts_with(root).then(|| {
+                (
+                    root.components().count(),
+                    std::cmp::Reverse(ws.slot_index),
+                    ws.id,
+                )
+            })
+        })
+        .max_by_key(|(depth, slot, _)| (*depth, *slot))
+        .map(|(_, _, id)| id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use daedalus_proto::PortSource;
+    use daedalus_proto::StatusLevel;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -1478,6 +1309,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_replacement_retains_previous_on_failure_and_rejects_stale_clients() {
+        let dir = TempDir::new().unwrap();
+        let reg = test_registry(dir.path());
+        let ws = reg
+            .create_workspace("main".into(), dir.path().to_owned(), HashMap::new())
+            .await
+            .unwrap();
+        let original = reg
+            .replace_agent_pane(ws.id, None, Some(interactive_shell_command()), 80, 24)
+            .await
+            .unwrap();
+        let failed = reg
+            .replace_agent_pane(
+                ws.id,
+                Some(original.id),
+                Some(vec!["absent-agent-8bd055".into()]),
+                80,
+                24,
+            )
+            .await;
+        assert!(matches!(failed, Err(ProtoError::SpawnFailed(_))));
+        assert!(reg.get_pane(original.id).await.is_ok());
+        let (first, second) = tokio::join!(
+            reg.replace_agent_pane(
+                ws.id,
+                Some(original.id),
+                Some(interactive_shell_command()),
+                80,
+                24
+            ),
+            reg.replace_agent_pane(
+                ws.id,
+                Some(original.id),
+                Some(interactive_shell_command()),
+                80,
+                24
+            ),
+        );
+        let winner = match (first, second) {
+            (Ok(pane), Err(ProtoError::PaneNotFound(id)))
+            | (Err(ProtoError::PaneNotFound(id)), Ok(pane))
+                if id == original.id =>
+            {
+                pane
+            }
+            outcomes => panic!("unexpected replacements: {outcomes:?}"),
+        };
+        assert_eq!(reg.list_workspaces().await[0].panes[0].id, winner.id);
+        assert_eq!(reg.list_workspaces().await[0].panes.len(), 1);
+        reg.close_all().await;
+    }
+
+    #[tokio::test]
     async fn pane_spawn_send_input_snapshot_resize_and_workspace_close() {
         let dir = TempDir::new().unwrap();
         let registry = test_registry(dir.path());
@@ -1708,6 +1592,35 @@ SHARED_KEY = "from_manifest"
             .unwrap();
         assert_eq!(ws2.slot_index, 2);
         assert_eq!(ws2.port_offset, 300);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_legacy_roots_survive_new_state_writes_without_becoming_active() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::new(dir.path().join("state.json"));
+        let unresolved = PersistedWorkspace {
+            id: WorkspaceId::new(),
+            name: "legacy".into(),
+            root_dir: ".".into(),
+            slot_index: 0,
+            agent_preset: None,
+        };
+        let mut state = crate::persistence::PersistedState::default();
+        state.workspaces.push(unresolved.clone());
+        store.save(&state).unwrap();
+        let registry = Registry::new_with_state_store(
+            test_supervisor(),
+            ShellIntegration::prepare(dir.path()).unwrap(),
+            broadcast::channel(8).0,
+            Some(store.clone()),
+        );
+        assert_eq!(registry.restore_persisted_workspaces().await, 0);
+        registry
+            .create_workspace("new".into(), dir.path().into(), HashMap::new())
+            .await
+            .unwrap();
+        assert!(store.load().unwrap().workspaces.contains(&unresolved));
+        assert_eq!(registry.list_workspaces().await.len(), 1);
     }
 
     #[tokio::test]

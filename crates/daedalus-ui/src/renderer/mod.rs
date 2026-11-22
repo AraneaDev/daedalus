@@ -559,168 +559,8 @@ pub fn collect_quads(
     let (cell_w, cell_h) = cell_size;
     let mut quads = Vec::with_capacity(256);
 
-    // 1. Sidebar background, workspace cards, status dots, and "+ New Workspace" button.
     if let Some(sidebar) = layout.sidebar {
-        quads.push(QuadInstance::new(sidebar, theme.bg_sidebar));
-        // Right divider border
-        quads.push(QuadInstance::from_xywh(
-            sidebar.right() - border_w,
-            sidebar.y,
-            border_w,
-            sidebar.height,
-            theme.border_unfocused,
-        ));
-
-        for (idx, ws) in state.workspaces.iter().enumerate() {
-            let row_rect = sidebar_workspace_rect(sidebar, idx, s);
-            if row_rect.y > sidebar.bottom() {
-                break;
-            }
-            let is_active = state.active_workspace_id == Some(ws.id);
-            if is_active {
-                quads.push(QuadInstance::new(row_rect, theme.bg_header));
-                // Left accent stripe
-                quads.push(QuadInstance::from_xywh(
-                    row_rect.x,
-                    row_rect.y,
-                    3.0 * s,
-                    row_rect.height,
-                    theme.border_focused,
-                ));
-            } else {
-                quads.push(QuadInstance::new(row_rect, theme.bg_pane.with_alpha(0.55)));
-            }
-
-            // Agent status dot (highlighted in amber/error when agent_state demands attention)
-            let agent_status = ws
-                .panes
-                .iter()
-                .rev()
-                .find(|p| p.role == PaneRole::Agent)
-                .map_or(PaneStatus::Exited { code: None }, |p| p.status);
-            let agent_state = state.workspace_agent_state(ws);
-            let dot_color = match agent_state {
-                Some(AgentState::WaitingForApproval) => theme.status_busy,
-                Some(AgentState::Error) => theme.status_err,
-                _ => status_dot_color(agent_status, theme),
-            };
-            let dot_size = 7.0 * s;
-            quads.push(QuadInstance::from_xywh(
-                row_rect.x + 9.0 * s,
-                row_rect.y + 11.0 * s,
-                dot_size,
-                dot_size,
-                dot_color,
-            ));
-
-            // Sidebar workspace `×` close button
-            let close_rect = sidebar_workspace_close_rect(row_rect, s);
-            quads.push(QuadInstance::new(
-                close_rect,
-                theme.bg_window.with_alpha(0.55),
-            ));
-            push_rect_border(
-                &mut quads,
-                close_rect,
-                border_w,
-                theme.border_unfocused.with_alpha(0.75),
-            );
-
-            // Runner status pill backdrop (shifted left of `×` button)
-            if let Some(runner) = ws.panes.iter().rev().find(|p| p.role == PaneRole::Runner) {
-                let pill_bg = if runner.has_failure_trace {
-                    Some(theme.status_err.with_alpha(0.22))
-                } else if runner.last_exit_code == Some(0) {
-                    Some(theme.status_ok.with_alpha(0.18))
-                } else {
-                    None
-                };
-                if let Some(bg) = pill_bg {
-                    quads.push(QuadInstance::from_xywh(
-                        row_rect.right() - 70.0 * s,
-                        row_rect.y + 5.0 * s,
-                        46.0 * s,
-                        18.0 * s,
-                        bg,
-                    ));
-                }
-            }
-
-            // Compact Agent state badge on Line 2 right side
-            let agent_pill_reserve = if let Some(ast) = agent_state {
-                let (label, color) = agent_state_badge(ast, theme);
-                let pill_rect = sidebar_agent_state_pill_rect(row_rect, label, s);
-                let (fill_alpha, border_alpha) = if ast == AgentState::WaitingForApproval {
-                    (0.28, 0.90)
-                } else {
-                    (0.18, 0.60)
-                };
-                quads.push(QuadInstance::new(pill_rect, color.with_alpha(fill_alpha)));
-                push_rect_border(
-                    &mut quads,
-                    pill_rect,
-                    border_w,
-                    color.with_alpha(border_alpha),
-                );
-                pill_rect.width + 6.0 * s
-            } else {
-                0.0
-            };
-
-            // Git branch / worktree slot badge backdrop
-            if let Some((branch_label, is_wt)) = workspace_branch_badge(ws) {
-                let badge_rect = sidebar_branch_badge_rect_with_reserve(
-                    row_rect,
-                    &branch_label,
-                    agent_pill_reserve,
-                    s,
-                );
-                let bg = if is_wt {
-                    theme.border_focused.with_alpha(0.18)
-                } else {
-                    theme.bg_window.with_alpha(0.75)
-                };
-                quads.push(QuadInstance::new(badge_rect, bg));
-            }
-
-            // Docker container health pill backdrop
-            if let Some((_, is_healthy)) = format_docker_health(&ws.containers) {
-                let docker_rect = sidebar_docker_pill_rect(row_rect, s);
-                let bg = if is_healthy {
-                    theme.status_ok.with_alpha(0.15)
-                } else {
-                    theme.status_err.with_alpha(0.24)
-                };
-                quads.push(QuadInstance::new(docker_rect, bg));
-            }
-
-            // Up to 2 external status badges
-            let ext_statuses = visible_external_statuses(ws);
-            for (badge_idx, ext) in ext_statuses.iter().enumerate() {
-                let badge_rect =
-                    sidebar_external_badge_rect(row_rect, badge_idx, ext_statuses.len(), s);
-                let color = external_status_color(ext.level, theme);
-                quads.push(QuadInstance::new(badge_rect, color.with_alpha(0.18)));
-                push_rect_border(&mut quads, badge_rect, border_w, color.with_alpha(0.55));
-            }
-        }
-
-        let new_btn = sidebar_new_workspace_rect(sidebar, state.workspaces.len(), s);
-        if new_btn.y < sidebar.bottom() {
-            quads.push(QuadInstance::new(new_btn, theme.bg_header));
-            push_rect_border(&mut quads, new_btn, border_w, theme.border_unfocused);
-        }
-
-        let new_wt_btn = sidebar_new_worktree_rect(sidebar, state.workspaces.len(), s);
-        if new_wt_btn.y < sidebar.bottom() {
-            quads.push(QuadInstance::new(new_wt_btn, theme.bg_header));
-            push_rect_border(
-                &mut quads,
-                new_wt_btn,
-                border_w,
-                theme.border_focused.with_alpha(0.60),
-            );
-        }
+        collect_sidebar_quads(&mut quads, state, sidebar, theme, s, border_w);
     }
 
     // 2. Top disconnect / toast banner.
@@ -745,17 +585,221 @@ pub fn collect_quads(
 
     let base_quad_count = quads.len() as u32;
 
-    // 4. Centered Agent preset picker modal overlay (rendered after base text).
-    if state.picker.open || state.action_palette.open {
-        // Dimmed backdrop scrim
+    collect_overlay_quads(
+        &mut quads,
+        state,
+        layout,
+        theme,
+        (screen_w, screen_h),
+        s,
+        border_w,
+    );
+    (quads, base_quad_count)
+}
+
+fn collect_sidebar_quads(
+    quads: &mut Vec<QuadInstance>,
+    state: &AppState,
+    sidebar: Rect,
+    theme: &Theme,
+    s: f32,
+    border_w: f32,
+) {
+    quads.push(QuadInstance::new(sidebar, theme.bg_sidebar));
+    // Right divider border
+    quads.push(QuadInstance::from_xywh(
+        sidebar.right() - border_w,
+        sidebar.y,
+        border_w,
+        sidebar.height,
+        theme.border_unfocused,
+    ));
+
+    for (idx, ws) in state.workspaces.iter().enumerate() {
+        let row_rect = sidebar_workspace_rect(sidebar, idx, s);
+        if row_rect.y > sidebar.bottom() {
+            break;
+        }
+        let is_active = state.active_workspace_id == Some(ws.id);
+        if is_active {
+            quads.push(QuadInstance::new(row_rect, theme.bg_header));
+            // Left accent stripe
+            quads.push(QuadInstance::from_xywh(
+                row_rect.x,
+                row_rect.y,
+                3.0 * s,
+                row_rect.height,
+                theme.border_focused,
+            ));
+        } else {
+            quads.push(QuadInstance::new(row_rect, theme.bg_pane.with_alpha(0.55)));
+        }
+
+        // Agent status dot (highlighted in amber/error when agent_state demands attention)
+        let agent_status = ws
+            .panes
+            .iter()
+            .rev()
+            .find(|p| p.role == PaneRole::Agent)
+            .map_or(PaneStatus::Exited { code: None }, |p| p.status);
+        let agent_state = state.workspace_agent_state(ws);
+        let dot_color = match agent_state {
+            Some(AgentState::WaitingForApproval) => theme.status_busy,
+            Some(AgentState::Error) => theme.status_err,
+            _ => status_dot_color(agent_status, theme),
+        };
+        let dot_size = 7.0 * s;
         quads.push(QuadInstance::from_xywh(
-            0.0,
-            0.0,
-            screen_w,
-            screen_h,
-            Rgba::new(0.0, 0.0, 0.0, 0.55),
+            row_rect.x + 9.0 * s,
+            row_rect.y + 11.0 * s,
+            dot_size,
+            dot_size,
+            dot_color,
         ));
 
+        // Sidebar workspace `×` close button
+        let close_rect = sidebar_workspace_close_rect(row_rect, s);
+        quads.push(QuadInstance::new(
+            close_rect,
+            theme.bg_window.with_alpha(0.55),
+        ));
+        push_rect_border(
+            quads,
+            close_rect,
+            border_w,
+            theme.border_unfocused.with_alpha(0.75),
+        );
+
+        // Runner status pill backdrop (shifted left of `×` button)
+        if let Some(runner) = ws.panes.iter().rev().find(|p| p.role == PaneRole::Runner) {
+            let pill_bg = if runner.has_failure_trace {
+                Some(theme.status_err.with_alpha(0.22))
+            } else if runner.last_exit_code == Some(0) {
+                Some(theme.status_ok.with_alpha(0.18))
+            } else {
+                None
+            };
+            if let Some(bg) = pill_bg {
+                quads.push(QuadInstance::from_xywh(
+                    row_rect.right() - 70.0 * s,
+                    row_rect.y + 5.0 * s,
+                    46.0 * s,
+                    18.0 * s,
+                    bg,
+                ));
+            }
+        }
+
+        // Compact Agent state badge on Line 2 right side
+        let agent_pill_reserve = if let Some(ast) = agent_state {
+            let (label, color) = agent_state_badge(ast, theme);
+            let pill_rect = sidebar_agent_state_pill_rect(row_rect, label, s);
+            let (fill_alpha, border_alpha) = if ast == AgentState::WaitingForApproval {
+                (0.28, 0.90)
+            } else {
+                (0.18, 0.60)
+            };
+            quads.push(QuadInstance::new(pill_rect, color.with_alpha(fill_alpha)));
+            push_rect_border(quads, pill_rect, border_w, color.with_alpha(border_alpha));
+            pill_rect.width + 6.0 * s
+        } else {
+            0.0
+        };
+
+        // Git branch / worktree slot badge backdrop
+        if let Some((branch_label, is_wt)) = workspace_branch_badge(ws) {
+            let badge_rect = sidebar_branch_badge_rect_with_reserve(
+                row_rect,
+                &branch_label,
+                agent_pill_reserve,
+                s,
+            );
+            let bg = if is_wt {
+                theme.border_focused.with_alpha(0.18)
+            } else {
+                theme.bg_window.with_alpha(0.75)
+            };
+            quads.push(QuadInstance::new(badge_rect, bg));
+        }
+
+        // Docker container health pill backdrop
+        if let Some((_, is_healthy)) = format_docker_health(&ws.containers) {
+            let docker_rect = sidebar_docker_pill_rect(row_rect, s);
+            let bg = if is_healthy {
+                theme.status_ok.with_alpha(0.15)
+            } else {
+                theme.status_err.with_alpha(0.24)
+            };
+            quads.push(QuadInstance::new(docker_rect, bg));
+        }
+
+        // Up to 2 external status badges
+        let ext_statuses = visible_external_statuses(ws);
+        for (badge_idx, ext) in ext_statuses.iter().enumerate() {
+            let badge_rect =
+                sidebar_external_badge_rect(row_rect, badge_idx, ext_statuses.len(), s);
+            let color = external_status_color(ext.level, theme);
+            quads.push(QuadInstance::new(badge_rect, color.with_alpha(0.18)));
+            push_rect_border(quads, badge_rect, border_w, color.with_alpha(0.55));
+        }
+    }
+
+    let new_btn = sidebar_new_workspace_rect(sidebar, state.workspaces.len(), s);
+    if new_btn.y < sidebar.bottom() {
+        quads.push(QuadInstance::new(new_btn, theme.bg_header));
+        push_rect_border(quads, new_btn, border_w, theme.border_unfocused);
+    }
+
+    let new_wt_btn = sidebar_new_worktree_rect(sidebar, state.workspaces.len(), s);
+    if new_wt_btn.y < sidebar.bottom() {
+        quads.push(QuadInstance::new(new_wt_btn, theme.bg_header));
+        push_rect_border(
+            quads,
+            new_wt_btn,
+            border_w,
+            theme.border_focused.with_alpha(0.60),
+        );
+    }
+}
+
+fn push_modal_frame(
+    quads: &mut Vec<QuadInstance>,
+    modal: Rect,
+    screen: (f32, f32),
+    theme: &Theme,
+    border_w: f32,
+    divider_y: f32,
+) {
+    quads.push(QuadInstance::from_xywh(
+        0.0,
+        0.0,
+        screen.0,
+        screen.1,
+        Rgba::new(0.0, 0.0, 0.0, 0.55),
+    ));
+    quads.push(QuadInstance::new(modal, theme.picker_bg));
+    push_rect_border(quads, modal, border_w, theme.border_focused);
+    quads.push(QuadInstance::from_xywh(
+        modal.x + border_w,
+        modal.y + divider_y,
+        (modal.width - 2.0 * border_w).max(0.0),
+        border_w,
+        theme.border_unfocused,
+    ));
+}
+
+fn collect_overlay_quads(
+    quads: &mut Vec<QuadInstance>,
+    state: &AppState,
+    layout: &WorkspaceLayout,
+    theme: &Theme,
+    screen: (f32, f32),
+    s: f32,
+    border_w: f32,
+) {
+    let (screen_w, screen_h) = screen;
+    // 4. Centered Agent preset picker modal overlay (rendered after base text).
+    if state.picker.open || state.action_palette.open {
         let (modal, selected) = if state.action_palette.open {
             let idx = state.action_palette.selected_index;
             let (modal, visible) =
@@ -767,17 +811,14 @@ pub fn collect_quads(
                 Some(state.picker.selected_index),
             )
         };
-        quads.push(QuadInstance::new(modal, theme.picker_bg));
-        push_rect_border(&mut quads, modal, border_w, theme.border_focused);
-
-        // Header divider
-        quads.push(QuadInstance::from_xywh(
-            modal.x + border_w,
-            modal.y + (PICKER_HEADER_LOGICAL_HEIGHT - 4.0) * s,
-            (modal.width - 2.0 * border_w).max(0.0),
+        push_modal_frame(
+            quads,
+            modal,
+            screen,
+            theme,
             border_w,
-            theme.border_unfocused,
-        ));
+            (PICKER_HEADER_LOGICAL_HEIGHT - 4.0) * s,
+        );
 
         // Selected row highlight
         if let Some(selected) = selected {
@@ -787,61 +828,37 @@ pub fn collect_quads(
                 theme.border_focused.with_alpha(0.26),
             ));
             push_rect_border(
-                &mut quads,
+                quads,
                 selected_rect,
                 border_w,
                 theme.border_focused.with_alpha(0.75),
             );
         }
     } else if state.worktree_modal.open {
-        // Dimmed backdrop scrim
-        quads.push(QuadInstance::from_xywh(
-            0.0,
-            0.0,
-            screen_w,
-            screen_h,
-            Rgba::new(0.0, 0.0, 0.0, 0.55),
-        ));
-
         let modal = worktree_modal_rect(screen_w, screen_h, s);
-        quads.push(QuadInstance::new(modal, theme.picker_bg));
-        push_rect_border(&mut quads, modal, border_w, theme.border_focused);
-
-        // Header divider
-        quads.push(QuadInstance::from_xywh(
-            modal.x + border_w,
-            modal.y + (WORKTREE_HEADER_LOGICAL_HEIGHT - 2.0) * s,
-            (modal.width - 2.0 * border_w).max(0.0),
+        push_modal_frame(
+            quads,
+            modal,
+            screen,
+            theme,
             border_w,
-            theme.border_unfocused,
-        ));
+            (WORKTREE_HEADER_LOGICAL_HEIGHT - 2.0) * s,
+        );
 
         // Branch input box
         let input_rect = worktree_input_rect(modal, s);
         quads.push(QuadInstance::new(input_rect, theme.bg_window));
-        push_rect_border(&mut quads, input_rect, border_w, theme.border_focused);
+        push_rect_border(quads, input_rect, border_w, theme.border_focused);
     } else if state.close_modal.open {
-        // Dimmed backdrop scrim
-        quads.push(QuadInstance::from_xywh(
-            0.0,
-            0.0,
-            screen_w,
-            screen_h,
-            Rgba::new(0.0, 0.0, 0.0, 0.55),
-        ));
-
         let modal = close_workspace_modal_rect(screen_w, screen_h, s);
-        quads.push(QuadInstance::new(modal, theme.picker_bg));
-        push_rect_border(&mut quads, modal, border_w, theme.border_focused);
-
-        // Header divider
-        quads.push(QuadInstance::from_xywh(
-            modal.x + border_w,
-            modal.y + (CLOSE_MODAL_HEADER_LOGICAL_HEIGHT - 2.0) * s,
-            (modal.width - 2.0 * border_w).max(0.0),
+        push_modal_frame(
+            quads,
+            modal,
+            screen,
+            theme,
             border_w,
-            theme.border_unfocused,
-        ));
+            (CLOSE_MODAL_HEADER_LOGICAL_HEIGHT - 2.0) * s,
+        );
 
         // Dirty worktree warning banner
         if state.close_modal.is_dirty {
@@ -851,7 +868,7 @@ pub fn collect_quads(
                 theme.status_busy.with_alpha(0.18),
             ));
             push_rect_border(
-                &mut quads,
+                quads,
                 warn_rect,
                 border_w,
                 theme.status_busy.with_alpha(0.75),
@@ -871,7 +888,7 @@ pub fn collect_quads(
                 theme.border_unfocused
             };
             quads.push(QuadInstance::new(rect, fill));
-            push_rect_border(&mut quads, rect, border_w, border);
+            push_rect_border(quads, rect, border_w, border);
         };
 
         let compose_rect = close_modal_compose_rect(modal, &state.close_modal, s);
@@ -900,7 +917,7 @@ pub fn collect_quads(
         // Cancel & Confirm buttons
         let cancel_rect = close_modal_cancel_rect(modal, s);
         quads.push(QuadInstance::new(cancel_rect, theme.bg_header));
-        push_rect_border(&mut quads, cancel_rect, border_w, theme.border_unfocused);
+        push_rect_border(quads, cancel_rect, border_w, theme.border_unfocused);
 
         let confirm_rect = close_modal_confirm_rect(modal, s);
         let confirm_accent = if state.close_modal.remove_worktree {
@@ -913,7 +930,7 @@ pub fn collect_quads(
             confirm_accent.with_alpha(0.24),
         ));
         push_rect_border(
-            &mut quads,
+            quads,
             confirm_rect,
             border_w,
             confirm_accent.with_alpha(0.85),
@@ -927,10 +944,8 @@ pub fn collect_quads(
     {
         let bar = search_bar_rect(pane_rect, s);
         quads.push(QuadInstance::new(bar, theme.picker_bg));
-        push_rect_border(&mut quads, bar, border_w, theme.border_focused);
+        push_rect_border(quads, bar, border_w, theme.border_focused);
     }
-
-    (quads, base_quad_count)
 }
 
 #[allow(clippy::too_many_arguments)]

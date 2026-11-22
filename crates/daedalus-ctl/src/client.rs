@@ -68,7 +68,13 @@ impl DaemonClient {
                 }
                 Some(ServerMessage::Event(_)) => continue,
                 Some(other) => return Err(format!("unexpected message: {other:?}").into()),
-                None => return Err("daemon closed connection".into()),
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "daemon closed connection",
+                    )
+                    .into());
+                }
             }
         }
     }

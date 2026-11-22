@@ -1846,21 +1846,31 @@ async fn close_workspace_removes_linked_worktree_and_refuses_primary_checkout() 
         ],
     );
 
-    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+    let state_path = dir.path().join("state.json");
+    let start = async || {
+        let server = DaemonServer::bind_with_options(
+            sock.clone(),
+            runtime.clone(),
+            None,
+            Some(state_path.clone()),
+            test_supervisor(),
+        )
         .await
         .unwrap();
-    server.set_worktrees_dir(worktrees_dir);
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let srv_handle = tokio::spawn(async move {
-        let _ = server
-            .serve(async {
-                let _ = shutdown_rx.await;
-            })
-            .await;
-    });
-
-    let mut client = IpcStream::connect(&sock).await.unwrap();
+        server.set_worktrees_dir(worktrees_dir.clone());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let srv_handle = tokio::spawn(async move {
+            server
+                .serve(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        let client = IpcStream::connect(&sock).await.unwrap();
+        (shutdown_tx, srv_handle, client)
+    };
+    let (shutdown_tx, srv_handle, mut client) = start().await;
 
     let primary_ws = match send_rpc(
         &mut client,
@@ -1916,6 +1926,49 @@ async fn close_workspace_removes_linked_worktree_and_refuses_primary_checkout() 
     assert!(matches!(primary_err, ProtoError::InvalidRequest(_)));
     assert!(repo_dir.is_dir());
 
+    let target = wt_ws.root_dir.to_str().unwrap();
+    let ResponsePayload::PaneSpawned(pane) = send_rpc(
+        &mut client,
+        40,
+        ClientMessage::SpawnPane {
+            workspace_id: wt_ws.id,
+            role: PaneRole::Runner,
+            command: Some(sleep_command()),
+            shell: None,
+            cols: 80,
+            rows: 24,
+            env: HashMap::new(),
+        },
+    )
+    .await
+    else {
+        panic!("expected pane");
+    };
+    run_git(&repo_dir, &["worktree", "lock", target]);
+    let locked = send_rpc_result(
+        &mut client,
+        41,
+        ClientMessage::CloseWorkspace {
+            id: wt_ws.id,
+            compose_down: false,
+            remove_worktree: true,
+            force_remove_worktree: true,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(locked, ProtoError::InvalidRequest(msg) if msg.contains("locked")));
+    assert!(matches!(
+        send_rpc(
+            &mut client,
+            42,
+            ClientMessage::GetSnapshot { pane_id: pane.id }
+        )
+        .await,
+        ResponsePayload::Snapshot(_)
+    ));
+    run_git(&repo_dir, &["worktree", "unlock", target]);
+
     // Dirty linked worktree without force must fail and preserve the workspace
     std::fs::write(wt_ws.root_dir.join("dirty.txt"), "unsaved\n").unwrap();
     let dirty_err = send_rpc_result(
@@ -1932,6 +1985,61 @@ async fn close_workspace_removes_linked_worktree_and_refuses_primary_checkout() 
     .unwrap_err();
     assert!(matches!(dirty_err, ProtoError::InvalidRequest(_)));
     assert!(wt_ws.root_dir.is_dir());
+
+    // A clean initialized submodule passes the dirty/locked checks, but Git requires
+    // --force for removal. The failed close must keep a retryable workspace record.
+    std::fs::remove_file(wt_ws.root_dir.join("dirty.txt")).unwrap();
+    run_git(
+        &wt_ws.root_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            repo_dir.to_str().unwrap(),
+            "nested",
+        ],
+    );
+    run_git(
+        &wt_ws.root_dir,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "add submodule",
+        ],
+    );
+    let late = send_rpc_result(
+        &mut client,
+        43,
+        ClientMessage::CloseWorkspace {
+            id: wt_ws.id,
+            compose_down: false,
+            remove_worktree: true,
+            force_remove_worktree: false,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(late, ProtoError::Internal(msg) if msg.contains("git worktree remove failed"))
+    );
+    let ResponsePayload::Workspaces(after_failure) =
+        send_rpc(&mut client, 44, ClientMessage::ListWorkspaces).await
+    else {
+        panic!("expected workspace list");
+    };
+    let retained = after_failure.iter().find(|ws| ws.id == wt_ws.id).unwrap();
+    assert!(retained.panes.is_empty());
+    assert_eq!(retained.slot_index, wt_ws.slot_index);
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    srv_handle.await.unwrap();
+    let (shutdown_tx, srv_handle, mut client) = start().await;
 
     // With force = true, linked worktree is removed cleanly
     let ok = send_rpc(
@@ -2513,4 +2621,75 @@ async fn daemon_uses_env_token_without_passing_it_to_panes() {
     .expect("pane did not write marker");
     daemon.kill().await.unwrap();
     assert_eq!(result.trim(), "absent");
+}
+
+#[tokio::test]
+async fn relative_workspace_root_survives_restart_from_a_different_directory() {
+    let dir = TempDir::new().unwrap();
+    let mut original = None;
+    for (index, preset) in ["codex", "claude"].iter().enumerate() {
+        let cwd = dir.path().join(preset);
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(
+            cwd.join(".daedalus.toml"),
+            format!("[agent]\npreset = '{preset}'\n"),
+        )
+        .unwrap();
+        let socket = dir.path().join(format!("daemon-{index}.sock"));
+        let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_daedalusd"))
+            .current_dir(&cwd)
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--runtime-dir")
+            .arg(dir.path().join("runtime"))
+            .arg("--events-socket")
+            .arg(dir.path().join(format!("events-{index}.sock")))
+            .arg("--state-file")
+            .arg(dir.path().join("state.json"))
+            .env_remove("DAEDALUS_AUTH_TOKEN")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut client = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(stream) = IpcStream::connect(&socket).await {
+                    break stream;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("daemon startup timed out");
+        if index == 0 {
+            let ResponsePayload::WorkspaceCreated(ws) = send_rpc(
+                &mut client,
+                1,
+                ClientMessage::CreateWorkspace {
+                    name: "relative".into(),
+                    root_dir: ".".into(),
+                    env: HashMap::new(),
+                },
+            )
+            .await
+            else {
+                panic!("expected created workspace")
+            };
+            assert!(ws.root_dir.is_absolute());
+            original = Some(ws.id);
+        } else {
+            let ResponsePayload::Workspaces(list) =
+                send_rpc(&mut client, 1, ClientMessage::ListWorkspaces).await
+            else {
+                panic!("expected restored workspace");
+            };
+            assert_eq!(list.len(), 1);
+            assert_eq!(Some(list[0].id), original);
+            assert_eq!(
+                list[0].manifest.as_ref().unwrap().agent_preset.as_deref(),
+                Some("codex")
+            );
+        }
+        drop(client);
+        daemon.kill().await.unwrap();
+    }
 }

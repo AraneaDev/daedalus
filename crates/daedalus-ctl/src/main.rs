@@ -1,10 +1,11 @@
 mod client;
+mod commands;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use client::DaemonClient;
 use daedalus_proto::{
     AgentState, ClientMessage, PaneId, PaneRole, ResponsePayload, StatusLevel, WorkspaceId,
-    WorkspaceInfo, default_socket_path, strip_windows_verbatim_prefix, wrap_bracketed_paste,
+    default_socket_path,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -336,57 +337,6 @@ fn resolve_target_root_dir(
     }
 }
 
-fn canonicalize_lossy(path: &Path) -> PathBuf {
-    strip_windows_verbatim_prefix(
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
-    )
-}
-
-fn resolve_workspace_for_target(
-    workspaces: &[WorkspaceInfo],
-    workspace: Option<Uuid>,
-    dir: Option<PathBuf>,
-) -> Result<WorkspaceInfo, Box<dyn std::error::Error>> {
-    if let Some(id) = workspace {
-        return workspaces
-            .iter()
-            .find(|ws| ws.id == WorkspaceId(id))
-            .cloned()
-            .ok_or_else(|| format!("workspace not found: {id}").into());
-    }
-
-    let target_dir = resolve_dir(dir)?;
-    let canon_target = canonicalize_lossy(&target_dir);
-    let mut best: Option<(usize, u16, &WorkspaceInfo)> = None;
-    for ws in workspaces {
-        let match_len = if target_dir.starts_with(&ws.root_dir) {
-            Some(ws.root_dir.components().count())
-        } else {
-            let canon_root = canonicalize_lossy(&ws.root_dir);
-            if canon_target.starts_with(&canon_root) {
-                Some(canon_root.components().count())
-            } else {
-                None
-            }
-        };
-
-        if let Some(len) = match_len {
-            let replace = match best {
-                None => true,
-                Some((best_len, best_slot, _)) => {
-                    len > best_len || (len == best_len && ws.slot_index < best_slot)
-                }
-            };
-            if replace {
-                best = Some((len, ws.slot_index, ws));
-            }
-        }
-    }
-
-    best.map(|(_, _, ws)| ws.clone())
-        .ok_or_else(|| format!("no workspace matches directory: {}", target_dir.display()).into())
-}
-
 fn unexpected_response(payload: ResponsePayload) -> Box<dyn std::error::Error> {
     format!("unexpected response payload: {payload:?}").into()
 }
@@ -660,180 +610,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("cleared");
             }
         },
-        Commands::Pane { action } => match action {
-            PaneAction::Spawn {
-                workspace_id,
-                role,
-                shell,
-                cols,
-                rows,
-                env,
-                command,
-            } => {
-                let env_map = parse_env_pairs(&env)?;
-                let cmd = if command.is_empty() {
-                    None
-                } else {
-                    Some(command)
-                };
-                match client
-                    .request(ClientMessage::SpawnPane {
-                        workspace_id: WorkspaceId(workspace_id),
-                        role: role.into(),
-                        command: cmd,
-                        shell,
-                        cols,
-                        rows,
-                        env: env_map,
-                    })
-                    .await?
-                {
-                    ResponsePayload::PaneSpawned(pane) => println!("{}", pane.id),
-                    other => return Err(unexpected_response(other)),
-                }
-            }
-            PaneAction::Close { pane_id } => {
-                expect_ok(
-                    client
-                        .request(ClientMessage::ClosePane {
-                            pane_id: PaneId(pane_id),
-                        })
-                        .await?,
-                )?;
-                println!("closed {pane_id}");
-            }
-            PaneAction::Send {
-                pane_id,
-                text,
-                newline,
-                bracketed_paste,
-            } => {
-                let mut bytes = if bracketed_paste {
-                    wrap_bracketed_paste(text.as_bytes())
-                } else {
-                    text.into_bytes()
-                };
-                if newline {
-                    bytes.push(b'\n');
-                }
-                expect_ok(
-                    client
-                        .request(ClientMessage::SendInput {
-                            pane_id: PaneId(pane_id),
-                            data: bytes,
-                        })
-                        .await?,
-                )?;
-            }
-            PaneAction::Resize {
-                pane_id,
-                cols,
-                rows,
-            } => {
-                expect_ok(
-                    client
-                        .request(ClientMessage::ResizePane {
-                            pane_id: PaneId(pane_id),
-                            cols,
-                            rows,
-                        })
-                        .await?,
-                )?;
-            }
-            PaneAction::Snapshot { pane_id } => {
-                match client
-                    .request(ClientMessage::GetSnapshot {
-                        pane_id: PaneId(pane_id),
-                    })
-                    .await?
-                {
-                    ResponsePayload::Snapshot(snap) => {
-                        for row in snap.rows_data {
-                            let line: String = row.cells.iter().map(|c| c.text.as_str()).collect();
-                            println!("{}", line.trim_end());
-                        }
-                    }
-                    other => return Err(unexpected_response(other)),
-                }
-            }
-            PaneAction::Trace { pane_id } => {
-                match client
-                    .request(ClientMessage::GetFailureTrace {
-                        pane_id: PaneId(pane_id),
-                    })
-                    .await?
-                {
-                    ResponsePayload::FailureTrace(trace) => match trace {
-                        Some(t) => {
-                            println!(
-                                "exit_code={} command={}",
-                                t.exit_code,
-                                t.command.as_deref().unwrap_or("<unknown>")
-                            );
-                            println!("{}", t.output);
-                        }
-                        None => println!("no failure trace"),
-                    },
-                    other => return Err(unexpected_response(other)),
-                }
-            }
-        },
-        Commands::Action { action } => match action {
-            CustomActionCommand::List {
-                workspace,
-                dir,
-                json,
-            } => {
-                let workspaces = match client.request(ClientMessage::ListWorkspaces).await? {
-                    ResponsePayload::Workspaces(list) => list,
-                    other => return Err(unexpected_response(other)),
-                };
-                let ws = resolve_workspace_for_target(&workspaces, workspace, dir)?;
-                let actions = ws.manifest.map(|m| m.actions).unwrap_or_default();
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&actions)?);
-                } else if actions.is_empty() {
-                    println!("no actions configured");
-                } else {
-                    for a in actions {
-                        if let Some(shortcut) = &a.shortcut {
-                            println!(
-                                "{}\t{}\t{}\t[{}]\t{}",
-                                a.id, a.target, a.label, shortcut, a.command
-                            );
-                        } else {
-                            println!("{}\t{}\t{}\t{}", a.id, a.target, a.label, a.command);
-                        }
-                    }
-                }
-            }
-            CustomActionCommand::Run {
-                action_id,
-                workspace,
-                dir,
-            } => {
-                let workspace_id = match workspace {
-                    Some(id) => WorkspaceId(id),
-                    None => {
-                        let workspaces = match client.request(ClientMessage::ListWorkspaces).await?
-                        {
-                            ResponsePayload::Workspaces(list) => list,
-                            other => return Err(unexpected_response(other)),
-                        };
-                        resolve_workspace_for_target(&workspaces, None, dir)?.id
-                    }
-                };
-                expect_ok(
-                    client
-                        .request(ClientMessage::RunWorkspaceAction {
-                            workspace_id,
-                            action_id: action_id.clone(),
-                        })
-                        .await?,
-                )?;
-                println!("ran action {action_id}");
-            }
-        },
+        Commands::Pane { action } => commands::pane::execute(&mut client, action).await?,
+        Commands::Action { action } => {
+            commands::action::execute(
+                &mut client,
+                action,
+                socket.to_string_lossy().starts_with("ssh://"),
+            )
+            .await?
+        }
         Commands::AgentState { action } => match action {
             AgentStateAction::Set {
                 state,
