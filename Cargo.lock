@@ -618,7 +618,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "daedalus-ctl"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "clap",
  "daedalus-proto",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "daedalus-proto"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "bitflags 2.13.2",
  "nix 0.32.0",
@@ -645,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "daedalus-ui"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "arboard",
  "bytemuck",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "daedalus-vt"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "bindgen",
  "daedalus-proto",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "daedalusd"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "bollard",
  "clap",
