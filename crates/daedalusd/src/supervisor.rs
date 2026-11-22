@@ -3,12 +3,11 @@ use daedalus_proto::{PaneId, PaneRole, WorkspaceId};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use tracing::warn;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationMode {
@@ -44,23 +43,29 @@ pub struct SpawnedPty {
     pub handle: ProcessHandle,
 }
 
+#[cfg(target_os = "linux")]
+pub fn detect_isolation_mode() -> IsolationMode {
+    let mut cmd = Command::new("systemd-run");
+    cmd.args(["--user", "--scope", "--quiet", "--", "true"]);
+    if run_command_with_timeout(&mut cmd, Duration::from_secs(2)) {
+        IsolationMode::SystemdScope
+    } else {
+        tracing::warn!(
+            "systemd user session unavailable or timed out; falling back to setsid + process-group (killpg) isolation"
+        );
+        IsolationMode::PgidFallback
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn detect_isolation_mode() -> IsolationMode {
+    IsolationMode::PgidFallback
+}
+
 impl Supervisor {
     pub fn detect() -> Self {
-        let mut cmd = Command::new("systemd-run");
-        cmd.args(["--user", "--scope", "--quiet", "--", "true"]);
-        let ok = run_command_with_timeout(&mut cmd, Duration::from_secs(2));
-
-        if ok {
-            Self {
-                mode: IsolationMode::SystemdScope,
-            }
-        } else {
-            warn!(
-                "systemd user session unavailable or timed out; falling back to setsid + process-group (killpg) isolation"
-            );
-            Self {
-                mode: IsolationMode::PgidFallback,
-            }
+        Self {
+            mode: detect_isolation_mode(),
         }
     }
 
@@ -223,9 +228,16 @@ impl ProcessHandle {
         if killpg(Pid::from_raw(pgid), None).is_err() {
             return false;
         }
-        // In container environments where PID 1 does not reap reparented zombies,
-        // killpg(..., None) still succeeds if only zombies remain in the group.
-        pgid_has_non_zombie_proc(pgid)
+        #[cfg(target_os = "linux")]
+        {
+            // In container environments where PID 1 does not reap reparented zombies,
+            // killpg(..., None) still succeeds if only zombies remain in the group.
+            pgid_has_non_zombie_proc(pgid)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
     }
 
     fn send_signal(&self, sig: Signal) {
@@ -249,6 +261,7 @@ impl ProcessHandle {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> bool {
     let Ok(mut child) = cmd
         .stdin(Stdio::null())
@@ -280,6 +293,58 @@ fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> bool {
     }
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn run_command_stdout_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+    allow_nonzero_exit: bool,
+) -> Option<String> {
+    use std::os::unix::process::CommandExt;
+
+    let mut child = cmd
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let pgid = Pid::from_raw(child.id() as i32);
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut buf).ok()?;
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    });
+
+    let deadline = Instant::now() + timeout;
+    let completed = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break allow_nonzero_exit || status.success(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = killpg(pgid, Signal::SIGKILL);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = killpg(pgid, Signal::SIGKILL);
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+
+    if !completed {
+        return None;
+    }
+
+    reader.join().ok().flatten()
+}
+
 fn run_systemctl_quiet(args: &[&str]) -> bool {
     Command::new("systemctl")
         .arg("--user")
@@ -291,6 +356,105 @@ fn run_systemctl_quiet(args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// Parses `ps -axo pid=,ppid=` output into `(pid, ppid)` pairs, ignoring headers and malformed lines.
+pub fn parse_ps_ppid_table(output: &str) -> Vec<(u32, u32)> {
+    let mut edges = Vec::new();
+    for line in output.lines() {
+        let mut cols = line.split_whitespace();
+        let (Some(pid_str), Some(ppid_str), None) = (cols.next(), cols.next(), cols.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid_str.parse::<u32>(), ppid_str.parse::<u32>()) else {
+            continue;
+        };
+        if pid == 0 {
+            continue;
+        }
+        edges.push((pid, ppid));
+    }
+    edges
+}
+
+/// Computes all descendant PIDs of `root` from `(pid, ppid)` edges.
+pub fn descendants_from_ppid_edges(root: u32, edges: &[(u32, u32)]) -> Vec<u32> {
+    if root == 0 {
+        return Vec::new();
+    }
+
+    let mut children_by_ppid: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(pid, ppid) in edges {
+        if pid > 0 {
+            children_by_ppid.entry(ppid).or_default().push(pid);
+        }
+    }
+    for children in children_by_ppid.values_mut() {
+        children.sort_unstable();
+        children.dedup();
+    }
+
+    let mut visited = HashSet::from([root]);
+    let mut queue = VecDeque::from([root]);
+    let mut descendants = Vec::new();
+
+    while let Some(pid) = queue.pop_front() {
+        if let Some(children) = children_by_ppid.get(&pid) {
+            for &child in children {
+                if visited.insert(child) {
+                    descendants.push(child);
+                    queue.push_back(child);
+                }
+            }
+        }
+    }
+
+    descendants
+}
+
+/// Collects all live descendant PIDs of `root_pid`.
+#[cfg(target_os = "linux")]
+pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
+    if root_pid == 0 {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut edges = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if let Some(edge) = crate::runtime_monitor::parse_proc_stat_pid_ppid(&stat) {
+            edges.push(edge);
+        }
+    }
+    descendants_from_ppid_edges(root_pid, &edges)
+}
+
+/// Collects all live descendant PIDs of `root_pid` using `ps -axo pid=,ppid=`.
+#[cfg(not(target_os = "linux"))]
+pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
+    if root_pid == 0 {
+        return Vec::new();
+    }
+    let mut cmd = Command::new("ps");
+    cmd.args(["-axo", "pid=,ppid="]);
+    let Some(output) = run_command_stdout_with_timeout(&mut cmd, Duration::from_secs(2), false)
+    else {
+        return Vec::new();
+    };
+    let edges = parse_ps_ppid_table(&output);
+    descendants_from_ppid_edges(root_pid, &edges)
+}
+
+#[cfg(target_os = "linux")]
 fn parse_proc_stat(stat: &str) -> Option<(char, i32)> {
     let after_comm = stat.rfind(')')?;
     let mut parts = stat[after_comm + 1..].split_whitespace();
@@ -300,6 +464,7 @@ fn parse_proc_stat(stat: &str) -> Option<(char, i32)> {
     Some((state, pgrp))
 }
 
+#[cfg(target_os = "linux")]
 fn pgid_has_non_zombie_proc(pgid: i32) -> bool {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return true;
@@ -332,6 +497,7 @@ mod tests {
     use std::io::BufRead;
     use tempfile::TempDir;
 
+    #[cfg(target_os = "linux")]
     fn is_process_alive(pid: i32) -> bool {
         if kill(Pid::from_raw(pid), None).is_err() {
             return false;
@@ -342,6 +508,11 @@ mod tests {
             return !matches!(state, 'Z' | 'X');
         }
         true
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn is_process_alive(pid: i32) -> bool {
+        kill(Pid::from_raw(pid), None).is_ok()
     }
 
     fn assert_orphan_killed(script: &str) {
@@ -433,6 +604,111 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "timeout helper took too long: {:?}",
             start.elapsed()
+        );
+    }
+
+    #[test]
+    fn parse_ps_ppid_table_ignores_headers_and_malformed_lines() {
+        let sample = "\
+  PID  PPID
+    0     0
+    1     0
+  100     1
+  205   100
+bad line
+  300   abc
+  400
+  500   205   extra
+  600   205
+";
+        assert_eq!(
+            parse_ps_ppid_table(sample),
+            vec![(1, 0), (100, 1), (205, 100), (600, 205)]
+        );
+    }
+
+    #[test]
+    fn descendants_from_ppid_edges_collects_subtree_and_handles_cycles() {
+        let edges = vec![
+            (10, 1),
+            (20, 10),
+            (30, 10),
+            (40, 20),
+            (50, 40),
+            (60, 1),
+            // Self-loop and cycle should not loop infinitely or re-include root
+            (10, 20),
+            (70, 70),
+        ];
+        assert_eq!(
+            descendants_from_ppid_edges(10, &edges),
+            vec![20, 30, 40, 50]
+        );
+        assert!(descendants_from_ppid_edges(999, &edges).is_empty());
+        assert!(descendants_from_ppid_edges(0, &edges).is_empty());
+    }
+
+    #[test]
+    fn collect_descendant_pids_finds_live_child_process() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child");
+
+        let child_pid = child.id();
+        let descendants = collect_descendant_pids(std::process::id());
+        assert!(
+            descendants.contains(&child_pid),
+            "expected {child_pid} in {descendants:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn command_stdout_with_timeout_captures_output_and_kills_hanging_process() {
+        let mut ok_cmd = Command::new("/bin/sh");
+        ok_cmd.args(["-c", "printf 'hello\\n'"]);
+        assert_eq!(
+            run_command_stdout_with_timeout(&mut ok_cmd, Duration::from_secs(2), false),
+            Some("hello\n".to_string())
+        );
+
+        let mut nonzero_cmd = Command::new("/bin/sh");
+        nonzero_cmd.args(["-c", "printf 'partial'; exit 1"]);
+        assert_eq!(
+            run_command_stdout_with_timeout(&mut nonzero_cmd, Duration::from_secs(2), false),
+            None
+        );
+
+        let mut allowed_nonzero_cmd = Command::new("/bin/sh");
+        allowed_nonzero_cmd.args(["-c", "printf 'partial'; exit 1"]);
+        assert_eq!(
+            run_command_stdout_with_timeout(&mut allowed_nonzero_cmd, Duration::from_secs(2), true),
+            Some("partial".to_string())
+        );
+
+        let start = Instant::now();
+        let mut hang_cmd = Command::new("/bin/sh");
+        hang_cmd.args(["-c", "sleep 10"]);
+        assert_eq!(
+            run_command_stdout_with_timeout(&mut hang_cmd, Duration::from_millis(150), true),
+            None
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn detect_isolation_mode_uses_pgid_fallback_on_non_linux() {
+        assert_eq!(detect_isolation_mode(), IsolationMode::PgidFallback);
+        assert_eq!(
+            Supervisor::detect().isolation_mode(),
+            IsolationMode::PgidFallback
         );
     }
 }

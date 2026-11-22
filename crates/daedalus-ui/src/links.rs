@@ -403,18 +403,25 @@ fn split_command_tokens(input: &str) -> Vec<String> {
     tokens
 }
 
+/// Returns the platform's default system opener binary (`open` on macOS, `xdg-open` on Linux).
+pub fn default_system_opener(is_macos: bool) -> &'static str {
+    if is_macos { "open" } else { "xdg-open" }
+}
+
 fn build_open_command_with_env(
     link: &DetectedLink,
     editor: Option<&str>,
     visual_env: Option<&str>,
     editor_env: Option<&str>,
+    is_macos: bool,
 ) -> Option<(String, Vec<String>)> {
+    let system_opener = default_system_opener(is_macos);
     match link {
         DetectedLink::Url(url) => {
             if !is_safe_http_url(url) {
                 return None;
             }
-            Some(("xdg-open".to_string(), vec![url.clone()]))
+            Some((system_opener.to_string(), vec![url.clone()]))
         }
         DetectedLink::File { path, line, col } => {
             let path_str = path.to_string_lossy().into_owned();
@@ -425,12 +432,12 @@ fn build_open_command_with_env(
                 .find(|s| !s.is_empty());
 
             let Some(editor_cmd) = chosen_editor else {
-                return Some(("xdg-open".to_string(), vec![path_str]));
+                return Some((system_opener.to_string(), vec![path_str]));
             };
 
             let tokens = split_command_tokens(editor_cmd);
             let Some((program, rest)) = tokens.split_first() else {
-                return Some(("xdg-open".to_string(), vec![path_str]));
+                return Some((system_opener.to_string(), vec![path_str]));
             };
 
             let has_placeholders = rest
@@ -507,18 +514,25 @@ fn build_open_command_with_env(
 
 /// Builds the `(program, argv)` invocation for opening `link` without invoking a shell.
 ///
-/// Uses `editor`, falling back to `$VISUAL`, `$EDITOR`, and finally `xdg-open`.
+/// Uses `editor`, falling back to `$VISUAL`, `$EDITOR`, and finally the platform opener
+/// (`open` on macOS, `xdg-open` on Linux).
 pub fn build_open_command(
     link: &DetectedLink,
     editor: Option<&str>,
 ) -> Option<(String, Vec<String>)> {
     let visual_env = std::env::var("VISUAL").ok();
     let editor_env = std::env::var("EDITOR").ok();
-    build_open_command_with_env(link, editor, visual_env.as_deref(), editor_env.as_deref())
+    build_open_command_with_env(
+        link,
+        editor,
+        visual_env.as_deref(),
+        editor_env.as_deref(),
+        cfg!(target_os = "macos"),
+    )
 }
 
-/// Spawns the external opener (`xdg-open` or configured editor) for `link` directly via
-/// `Command::new(program).args(args)` without shell interpolation.
+/// Spawns the external opener (`open` on macOS, `xdg-open` on Linux, or configured editor)
+/// for `link` directly via `Command::new(program).args(args)` without shell interpolation.
 pub fn open_link(link: &DetectedLink, editor: Option<&str>) -> std::io::Result<()> {
     let Some((program, args)) = build_open_command(link, editor) else {
         return Err(std::io::Error::new(
@@ -727,19 +741,43 @@ mod tests {
     fn build_open_command_handles_urls_and_rejects_unsafe_schemes() {
         let ok = DetectedLink::Url("https://example.com/a?x=1&y=$(whoami);id".to_string());
         assert_eq!(
-            build_open_command_with_env(&ok, None, None, None),
+            build_open_command_with_env(&ok, None, None, None, false),
             Some((
                 "xdg-open".to_string(),
                 vec!["https://example.com/a?x=1&y=$(whoami);id".to_string()]
             ))
         );
+        assert_eq!(
+            build_open_command_with_env(&ok, None, None, None, true),
+            Some((
+                "open".to_string(),
+                vec!["https://example.com/a?x=1&y=$(whoami);id".to_string()]
+            ))
+        );
+        assert_eq!(
+            build_open_command(&ok, None),
+            Some((
+                default_system_opener(cfg!(target_os = "macos")).to_string(),
+                vec!["https://example.com/a?x=1&y=$(whoami);id".to_string()]
+            ))
+        );
 
         let bad = DetectedLink::Url("javascript:alert(1)".to_string());
-        assert_eq!(build_open_command_with_env(&bad, None, None, None), None);
+        assert_eq!(
+            build_open_command_with_env(&bad, None, None, None, false),
+            None
+        );
+        assert_eq!(
+            build_open_command_with_env(&bad, None, None, None, true),
+            None
+        );
     }
 
     #[test]
-    fn build_open_command_substitutes_placeholders_and_falls_back_to_env_or_xdg_open() {
+    fn build_open_command_substitutes_placeholders_and_falls_back_to_env_or_system_opener() {
+        assert_eq!(default_system_opener(false), "xdg-open");
+        assert_eq!(default_system_opener(true), "open");
+
         let link = DetectedLink::File {
             path: PathBuf::from("/tmp/my project/main.rs"),
             line: Some(42),
@@ -748,7 +786,13 @@ mod tests {
 
         // Explicit template with placeholders
         assert_eq!(
-            build_open_command_with_env(&link, Some("code --goto {path}:{line}:{col}"), None, None),
+            build_open_command_with_env(
+                &link,
+                Some("code --goto {path}:{line}:{col}"),
+                None,
+                None,
+                false
+            ),
             Some((
                 "code".to_string(),
                 vec![
@@ -764,7 +808,8 @@ mod tests {
                 &link,
                 Some("\"/opt/my editor/nvim\" +{line} {path}"),
                 None,
-                None
+                None,
+                true
             ),
             Some((
                 "/opt/my editor/nvim".to_string(),
@@ -774,7 +819,7 @@ mod tests {
 
         // $VISUAL fallback without placeholders (nvim -> +line path)
         assert_eq!(
-            build_open_command_with_env(&link, None, Some("nvim"), Some("nano")),
+            build_open_command_with_env(&link, None, Some("nvim"), Some("nano"), false),
             Some((
                 "nvim".to_string(),
                 vec!["+42".to_string(), "/tmp/my project/main.rs".to_string()]
@@ -783,7 +828,7 @@ mod tests {
 
         // $EDITOR fallback without placeholders (code -> --goto path:line:col)
         assert_eq!(
-            build_open_command_with_env(&link, None, None, Some("code")),
+            build_open_command_with_env(&link, None, None, Some("code"), true),
             Some((
                 "code".to_string(),
                 vec![
@@ -793,11 +838,18 @@ mod tests {
             ))
         );
 
-        // No editor configured -> xdg-open fallback
+        // No editor configured -> platform opener fallback (xdg-open on Linux, open on macOS)
         assert_eq!(
-            build_open_command_with_env(&link, None, None, None),
+            build_open_command_with_env(&link, None, None, None, false),
             Some((
                 "xdg-open".to_string(),
+                vec!["/tmp/my project/main.rs".to_string()]
+            ))
+        );
+        assert_eq!(
+            build_open_command_with_env(&link, None, None, None, true),
+            Some((
+                "open".to_string(),
                 vec!["/tmp/my project/main.rs".to_string()]
             ))
         );

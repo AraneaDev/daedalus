@@ -71,27 +71,54 @@ pub fn translate_key(
     close_modal_open: bool,
     search_open: bool,
 ) -> UiAction {
+    translate_key_for_platform(
+        key,
+        text,
+        mods,
+        picker_open,
+        worktree_modal_open,
+        close_modal_open,
+        search_open,
+        cfg!(target_os = "macos"),
+    )
+}
+
+/// Platform-parameterized variant of [`translate_key`].
+#[allow(clippy::too_many_arguments)]
+pub fn translate_key_for_platform(
+    key: &Key,
+    text: Option<&str>,
+    mods: ModifiersState,
+    picker_open: bool,
+    worktree_modal_open: bool,
+    close_modal_open: bool,
+    search_open: bool,
+    is_macos: bool,
+) -> UiAction {
     if picker_open {
-        return translate_picker_key(key, mods);
+        return translate_picker_key(key, mods, is_macos);
     }
     if worktree_modal_open {
-        return translate_worktree_modal_key(key, text, mods);
+        return translate_worktree_modal_key(key, text, mods, is_macos);
     }
     if close_modal_open {
         return translate_close_modal_key(key, mods);
     }
     if search_open {
-        return translate_search_key(key, text, mods);
-    }
-
-    // Never leak OS / window-manager Super shortcuts into the terminal.
-    if mods.super_key() {
-        return UiAction::Ignore;
+        return translate_search_key(key, text, mods, is_macos);
     }
 
     let ctrl = mods.control_key();
     let shift = mods.shift_key();
     let alt = mods.alt_key();
+
+    if mods.super_key() {
+        if is_macos && !ctrl && !alt {
+            return translate_macos_cmd(key, shift);
+        }
+        // Never leak OS / window-manager Super shortcuts into the terminal.
+        return UiAction::Ignore;
+    }
 
     // Workbench chords
     if alt
@@ -111,25 +138,8 @@ pub fn translate_key(
         if matches!(key, Key::Named(NamedKey::Tab)) {
             return UiAction::SwitchWorkspacePrev;
         }
-        if let Key::Character(ch) = key {
-            return match ch.to_ascii_lowercase().as_str() {
-                "h" => UiAction::FocusDir(FocusDirection::Left),
-                "j" => UiAction::FocusDir(FocusDirection::Down),
-                "k" => UiAction::FocusDir(FocusDirection::Up),
-                "l" => UiAction::FocusDir(FocusDirection::Right),
-                "z" => UiAction::ToggleZoom,
-                "b" => UiAction::ToggleSidebar,
-                "p" => UiAction::ToggleAgentPicker,
-                "w" => UiAction::ToggleWorktreeModal,
-                "d" => UiAction::OpenCloseWorkspaceModal,
-                "f" => UiAction::ToggleSearch,
-                "n" => UiAction::NewWorkspace,
-                "c" => UiAction::CopySelection,
-                "v" => UiAction::PasteClipboard,
-                "e" => UiAction::ForwardFailureToAgent,
-                "=" | "+" => UiAction::FontZoomIn,
-                _ => UiAction::Ignore,
-            };
+        if !is_macos && let Key::Character(ch) = key {
+            return translate_primary_shift_char(ch);
         }
         return UiAction::Ignore;
     }
@@ -147,20 +157,25 @@ pub fn translate_key(
         }
     }
 
-    // Ctrl+<key> (without Shift/Alt) -> workspace cycling, font zoom chords, or single ASCII control byte
+    // Ctrl+<key> (without Shift/Alt) -> workspace cycling, font zoom chords (Linux), or single ASCII control byte
     if ctrl && !shift && !alt {
         return match key {
             Key::Named(NamedKey::Tab) => UiAction::SwitchWorkspaceNext,
             Key::Named(NamedKey::Space) => UiAction::SendBytes(vec![0x00]),
-            Key::Character(ch) => match ch.as_str() {
-                "=" | "+" => UiAction::FontZoomIn,
-                "-" => UiAction::FontZoomOut,
-                "0" => UiAction::FontZoomReset,
-                other => match encode_ctrl_char(other) {
+            Key::Character(ch) => {
+                if !is_macos {
+                    match ch.as_str() {
+                        "=" | "+" => return UiAction::FontZoomIn,
+                        "-" => return UiAction::FontZoomOut,
+                        "0" => return UiAction::FontZoomReset,
+                        _ => {}
+                    }
+                }
+                match encode_ctrl_char(ch) {
                     Some(byte) => UiAction::SendBytes(vec![byte]),
                     None => UiAction::Ignore,
-                },
-            },
+                }
+            }
             _ => UiAction::Ignore,
         };
     }
@@ -229,14 +244,76 @@ pub fn translate_key(
     UiAction::Ignore
 }
 
-fn translate_picker_key(key: &Key, mods: ModifiersState) -> UiAction {
-    if mods.control_key()
+fn translate_primary_shift_char(ch: &str) -> UiAction {
+    match ch.to_ascii_lowercase().as_str() {
+        "h" => UiAction::FocusDir(FocusDirection::Left),
+        "j" => UiAction::FocusDir(FocusDirection::Down),
+        "k" => UiAction::FocusDir(FocusDirection::Up),
+        "l" => UiAction::FocusDir(FocusDirection::Right),
+        "z" => UiAction::ToggleZoom,
+        "b" => UiAction::ToggleSidebar,
+        "p" => UiAction::ToggleAgentPicker,
+        "w" => UiAction::ToggleWorktreeModal,
+        "d" => UiAction::OpenCloseWorkspaceModal,
+        "f" => UiAction::ToggleSearch,
+        "n" => UiAction::NewWorkspace,
+        "c" => UiAction::CopySelection,
+        "v" => UiAction::PasteClipboard,
+        "e" => UiAction::ForwardFailureToAgent,
+        "=" | "+" => UiAction::FontZoomIn,
+        _ => UiAction::Ignore,
+    }
+}
+
+fn translate_macos_cmd(key: &Key, shift: bool) -> UiAction {
+    let Key::Character(ch) = key else {
+        return UiAction::Ignore;
+    };
+    if shift {
+        return translate_primary_shift_char(ch);
+    }
+    match ch.to_ascii_lowercase().as_str() {
+        "c" => UiAction::CopySelection,
+        "v" => UiAction::PasteClipboard,
+        "f" => UiAction::ToggleSearch,
+        "=" | "+" => UiAction::FontZoomIn,
+        "-" => UiAction::FontZoomOut,
+        "0" => UiAction::FontZoomReset,
+        "1" => UiAction::FocusRole(PaneRole::Agent),
+        "2" => UiAction::FocusRole(PaneRole::Service),
+        "3" => UiAction::FocusRole(PaneRole::Runner),
+        _ => UiAction::Ignore,
+    }
+}
+
+fn is_primary_shift_char(key: &Key, mods: ModifiersState, target: &str, is_macos: bool) -> bool {
+    let primary_only = if is_macos {
+        mods.super_key() && !mods.control_key()
+    } else {
+        mods.control_key() && !mods.super_key()
+    };
+    primary_only
         && mods.shift_key()
         && !mods.alt_key()
-        && !mods.super_key()
-        && let Key::Character(ch) = key
-        && ch.eq_ignore_ascii_case("p")
-    {
+        && matches!(key, Key::Character(ch) if ch.eq_ignore_ascii_case(target))
+}
+
+fn is_search_toggle_chord(key: &Key, mods: ModifiersState, is_macos: bool) -> bool {
+    let Key::Character(ch) = key else {
+        return false;
+    };
+    if !ch.eq_ignore_ascii_case("f") || mods.alt_key() {
+        return false;
+    }
+    if is_macos {
+        mods.super_key() && !mods.control_key()
+    } else {
+        mods.control_key() && mods.shift_key() && !mods.super_key()
+    }
+}
+
+fn translate_picker_key(key: &Key, mods: ModifiersState, is_macos: bool) -> UiAction {
+    if is_primary_shift_char(key, mods, "p", is_macos) {
         return UiAction::ToggleAgentPicker;
     }
 
@@ -258,14 +335,13 @@ fn translate_picker_key(key: &Key, mods: ModifiersState) -> UiAction {
     }
 }
 
-fn translate_worktree_modal_key(key: &Key, text: Option<&str>, mods: ModifiersState) -> UiAction {
-    if mods.control_key()
-        && mods.shift_key()
-        && !mods.alt_key()
-        && !mods.super_key()
-        && let Key::Character(ch) = key
-        && ch.eq_ignore_ascii_case("w")
-    {
+fn translate_worktree_modal_key(
+    key: &Key,
+    text: Option<&str>,
+    mods: ModifiersState,
+    is_macos: bool,
+) -> UiAction {
+    if is_primary_shift_char(key, mods, "w", is_macos) {
         return UiAction::ToggleWorktreeModal;
     }
 
@@ -313,14 +389,13 @@ fn translate_close_modal_key(key: &Key, mods: ModifiersState) -> UiAction {
     }
 }
 
-fn translate_search_key(key: &Key, text: Option<&str>, mods: ModifiersState) -> UiAction {
-    if mods.control_key()
-        && mods.shift_key()
-        && !mods.alt_key()
-        && !mods.super_key()
-        && let Key::Character(ch) = key
-        && ch.eq_ignore_ascii_case("f")
-    {
+fn translate_search_key(
+    key: &Key,
+    text: Option<&str>,
+    mods: ModifiersState,
+    is_macos: bool,
+) -> UiAction {
+    if is_search_toggle_chord(key, mods, is_macos) {
         return UiAction::ToggleSearch;
     }
 
@@ -438,7 +513,11 @@ mod tests {
     }
 
     fn t(key: &Key, text: Option<&str>, mods: ModifiersState) -> UiAction {
-        translate_key(key, text, mods, false, false, false, false)
+        translate_key_for_platform(key, text, mods, false, false, false, false, false)
+    }
+
+    fn t_macos(key: &Key, text: Option<&str>, mods: ModifiersState) -> UiAction {
+        translate_key_for_platform(key, text, mods, false, false, false, false, true)
     }
 
     #[test]
@@ -625,11 +704,32 @@ mod tests {
         );
     }
 
+    fn t_linux_mode(
+        key: &Key,
+        text: Option<&str>,
+        mods: ModifiersState,
+        picker_open: bool,
+        worktree_modal_open: bool,
+        close_modal_open: bool,
+        search_open: bool,
+    ) -> UiAction {
+        translate_key_for_platform(
+            key,
+            text,
+            mods,
+            picker_open,
+            worktree_modal_open,
+            close_modal_open,
+            search_open,
+            false,
+        )
+    }
+
     #[test]
     fn picker_modal_captures_navigation_and_swallows_other_keys() {
         let none = ModifiersState::empty();
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::ArrowUp),
                 None,
                 none,
@@ -641,11 +741,11 @@ mod tests {
             UiAction::PickerUp
         );
         assert_eq!(
-            translate_key(&char_key("k"), Some("k"), none, true, false, false, false),
+            t_linux_mode(&char_key("k"), Some("k"), none, true, false, false, false),
             UiAction::PickerUp
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("K"),
                 Some("K"),
                 ModifiersState::SHIFT,
@@ -657,7 +757,7 @@ mod tests {
             UiAction::PickerUp
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::ArrowDown),
                 None,
                 none,
@@ -669,11 +769,11 @@ mod tests {
             UiAction::PickerDown
         );
         assert_eq!(
-            translate_key(&char_key("j"), Some("j"), none, true, false, false, false),
+            t_linux_mode(&char_key("j"), Some("j"), none, true, false, false, false),
             UiAction::PickerDown
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("J"),
                 Some("J"),
                 ModifiersState::SHIFT,
@@ -685,7 +785,7 @@ mod tests {
             UiAction::PickerDown
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::Enter),
                 Some("\r"),
                 none,
@@ -697,7 +797,7 @@ mod tests {
             UiAction::PickerConfirm
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::Escape),
                 Some("\x1b"),
                 none,
@@ -711,11 +811,11 @@ mod tests {
 
         // Normal text and workbench chords are swallowed while picker is open
         assert_eq!(
-            translate_key(&char_key("a"), Some("a"), none, true, false, false, false),
+            t_linux_mode(&char_key("a"), Some("a"), none, true, false, false, false),
             UiAction::Ignore
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("1"),
                 None,
                 ModifiersState::ALT,
@@ -727,7 +827,7 @@ mod tests {
             UiAction::Ignore
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("Z"),
                 Some("Z"),
                 ModifiersState::CONTROL | ModifiersState::SHIFT,
@@ -739,7 +839,7 @@ mod tests {
             UiAction::Ignore
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("k"),
                 None,
                 ModifiersState::CONTROL,
@@ -756,15 +856,15 @@ mod tests {
     fn ctrl_shift_p_toggles_picker_closed_when_already_open() {
         let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
         assert_eq!(
-            translate_key(&char_key("P"), Some("P"), cs, true, false, false, false),
+            t_linux_mode(&char_key("P"), Some("P"), cs, true, false, false, false),
             UiAction::ToggleAgentPicker
         );
         assert_eq!(
-            translate_key(&char_key("p"), Some("p"), cs, true, false, false, false),
+            t_linux_mode(&char_key("p"), Some("p"), cs, true, false, false, false),
             UiAction::ToggleAgentPicker
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("P"),
                 None,
                 cs | ModifiersState::ALT,
@@ -776,7 +876,7 @@ mod tests {
             UiAction::Ignore
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("p"),
                 None,
                 ModifiersState::CONTROL,
@@ -795,15 +895,15 @@ mod tests {
         let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
 
         assert_eq!(
-            translate_key(&char_key("f"), Some("f"), none, false, true, false, false),
+            t_linux_mode(&char_key("f"), Some("f"), none, false, true, false, false),
             UiAction::WorktreeModalText("f".to_string())
         );
         assert_eq!(
-            translate_key(&char_key("/"), Some("/"), none, false, true, false, false),
+            t_linux_mode(&char_key("/"), Some("/"), none, false, true, false, false),
             UiAction::WorktreeModalText("/".to_string())
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("A"),
                 Some("A"),
                 ModifiersState::SHIFT,
@@ -816,7 +916,7 @@ mod tests {
         );
         // Full multi-char IME / dead-key composition string, stripping whitespace & control chars
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("é"),
                 Some("feat/日本語\n "),
                 none,
@@ -828,7 +928,7 @@ mod tests {
             UiAction::WorktreeModalText("feat/日本語".to_string())
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::Backspace),
                 None,
                 none,
@@ -840,7 +940,7 @@ mod tests {
             UiAction::WorktreeModalBackspace
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::Enter),
                 Some("\r"),
                 none,
@@ -852,7 +952,7 @@ mod tests {
             UiAction::WorktreeModalConfirm
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::Escape),
                 Some("\x1b"),
                 none,
@@ -864,13 +964,13 @@ mod tests {
             UiAction::WorktreeModalCancel
         );
         assert_eq!(
-            translate_key(&char_key("W"), Some("W"), cs, false, true, false, false),
+            t_linux_mode(&char_key("W"), Some("W"), cs, false, true, false, false),
             UiAction::ToggleWorktreeModal
         );
 
         // Space, control, and alt chords are swallowed while worktree modal is open
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::Space),
                 Some(" "),
                 none,
@@ -882,7 +982,7 @@ mod tests {
             UiAction::Ignore
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("c"),
                 None,
                 ModifiersState::CONTROL,
@@ -894,7 +994,7 @@ mod tests {
             UiAction::Ignore
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("1"),
                 None,
                 ModifiersState::ALT,
@@ -911,11 +1011,11 @@ mod tests {
     fn close_modal_captures_toggles_confirm_cancel_and_swallows_others() {
         let none = ModifiersState::empty();
         assert_eq!(
-            translate_key(&char_key("c"), Some("c"), none, false, false, true, false),
+            t_linux_mode(&char_key("c"), Some("c"), none, false, false, true, false),
             UiAction::CloseModalToggleCompose
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("C"),
                 Some("C"),
                 ModifiersState::SHIFT,
@@ -927,15 +1027,15 @@ mod tests {
             UiAction::CloseModalToggleCompose
         );
         assert_eq!(
-            translate_key(&char_key("w"), Some("w"), none, false, false, true, false),
+            t_linux_mode(&char_key("w"), Some("w"), none, false, false, true, false),
             UiAction::CloseModalToggleWorktree
         );
         assert_eq!(
-            translate_key(&char_key("f"), Some("f"), none, false, false, true, false),
+            t_linux_mode(&char_key("f"), Some("f"), none, false, false, true, false),
             UiAction::CloseModalToggleForce
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::Enter),
                 Some("\r"),
                 none,
@@ -947,7 +1047,7 @@ mod tests {
             UiAction::CloseModalConfirm
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::Escape),
                 Some("\x1b"),
                 none,
@@ -961,11 +1061,11 @@ mod tests {
 
         // Other keys & modifier chords are swallowed while close modal is open
         assert_eq!(
-            translate_key(&char_key("a"), Some("a"), none, false, false, true, false),
+            t_linux_mode(&char_key("a"), Some("a"), none, false, false, true, false),
             UiAction::Ignore
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("c"),
                 None,
                 ModifiersState::CONTROL,
@@ -977,7 +1077,7 @@ mod tests {
             UiAction::Ignore
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::Tab),
                 None,
                 ModifiersState::CONTROL,
@@ -997,11 +1097,11 @@ mod tests {
         let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
 
         assert_eq!(
-            translate_key(&char_key("e"), Some("e"), none, false, false, false, true),
+            t_linux_mode(&char_key("e"), Some("e"), none, false, false, false, true),
             UiAction::SearchText("e".to_string())
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::Space),
                 Some(" "),
                 none,
@@ -1014,7 +1114,7 @@ mod tests {
         );
         // Multi-char IME composition preserves spaces and filters control chars
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("x"),
                 Some("foo bar\x07"),
                 none,
@@ -1026,7 +1126,7 @@ mod tests {
             UiAction::SearchText("foo bar".to_string())
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::Backspace),
                 None,
                 none,
@@ -1038,7 +1138,7 @@ mod tests {
             UiAction::SearchBackspace
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::Enter),
                 Some("\r"),
                 none,
@@ -1050,7 +1150,7 @@ mod tests {
             UiAction::SearchNext
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::Enter),
                 Some("\r"),
                 shift,
@@ -1062,7 +1162,7 @@ mod tests {
             UiAction::SearchPrev
         );
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &named_key(NamedKey::Escape),
                 Some("\x1b"),
                 none,
@@ -1074,12 +1174,12 @@ mod tests {
             UiAction::SearchCancel
         );
         assert_eq!(
-            translate_key(&char_key("F"), Some("F"), cs, false, false, false, true),
+            t_linux_mode(&char_key("F"), Some("F"), cs, false, false, false, true),
             UiAction::ToggleSearch
         );
         // Ctrl+other is swallowed rather than typed
         assert_eq!(
-            translate_key(
+            t_linux_mode(
                 &char_key("c"),
                 None,
                 ModifiersState::CONTROL,
@@ -1089,6 +1189,211 @@ mod tests {
                 true
             ),
             UiAction::Ignore
+        );
+    }
+
+    #[test]
+    fn macos_cmd_chords_and_terminal_ctrl_bytes() {
+        let cmd = ModifiersState::SUPER;
+        let cmd_shift = ModifiersState::SUPER | ModifiersState::SHIFT;
+        let ctrl = ModifiersState::CONTROL;
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let alt = ModifiersState::ALT;
+
+        // Cmd clipboard, search, zoom, role focus
+        assert_eq!(
+            t_macos(&char_key("c"), Some("c"), cmd),
+            UiAction::CopySelection
+        );
+        assert_eq!(
+            t_macos(&char_key("C"), Some("C"), cmd_shift),
+            UiAction::CopySelection
+        );
+        assert_eq!(
+            t_macos(&char_key("v"), Some("v"), cmd),
+            UiAction::PasteClipboard
+        );
+        assert_eq!(
+            t_macos(&char_key("V"), Some("V"), cmd_shift),
+            UiAction::PasteClipboard
+        );
+        assert_eq!(
+            t_macos(&char_key("f"), Some("f"), cmd),
+            UiAction::ToggleSearch
+        );
+        assert_eq!(
+            t_macos(&char_key("F"), Some("F"), cmd_shift),
+            UiAction::ToggleSearch
+        );
+        assert_eq!(t_macos(&char_key("="), None, cmd), UiAction::FontZoomIn);
+        assert_eq!(
+            t_macos(&char_key("+"), Some("+"), cmd),
+            UiAction::FontZoomIn
+        );
+        assert_eq!(
+            t_macos(&char_key("+"), Some("+"), cmd_shift),
+            UiAction::FontZoomIn
+        );
+        assert_eq!(t_macos(&char_key("-"), None, cmd), UiAction::FontZoomOut);
+        assert_eq!(t_macos(&char_key("0"), None, cmd), UiAction::FontZoomReset);
+        assert_eq!(
+            t_macos(&char_key("1"), None, cmd),
+            UiAction::FocusRole(PaneRole::Agent)
+        );
+        assert_eq!(
+            t_macos(&char_key("2"), None, cmd),
+            UiAction::FocusRole(PaneRole::Service)
+        );
+        assert_eq!(
+            t_macos(&char_key("3"), None, cmd),
+            UiAction::FocusRole(PaneRole::Runner)
+        );
+
+        // Alt+1/2/3 also stays functional on macOS
+        assert_eq!(
+            t_macos(&char_key("1"), None, alt),
+            UiAction::FocusRole(PaneRole::Agent)
+        );
+        assert_eq!(
+            t_macos(&char_key("2"), None, alt),
+            UiAction::FocusRole(PaneRole::Service)
+        );
+        assert_eq!(
+            t_macos(&char_key("3"), None, alt),
+            UiAction::FocusRole(PaneRole::Runner)
+        );
+
+        // Cmd+Shift workbench actions
+        assert_eq!(
+            t_macos(&char_key("P"), Some("P"), cmd_shift),
+            UiAction::ToggleAgentPicker
+        );
+        assert_eq!(
+            t_macos(&char_key("E"), Some("E"), cmd_shift),
+            UiAction::ForwardFailureToAgent
+        );
+        assert_eq!(
+            t_macos(&char_key("W"), Some("W"), cmd_shift),
+            UiAction::ToggleWorktreeModal
+        );
+        assert_eq!(
+            t_macos(&char_key("D"), Some("D"), cmd_shift),
+            UiAction::OpenCloseWorkspaceModal
+        );
+        assert_eq!(
+            t_macos(&char_key("B"), Some("B"), cmd_shift),
+            UiAction::ToggleSidebar
+        );
+        assert_eq!(
+            t_macos(&char_key("Z"), Some("Z"), cmd_shift),
+            UiAction::ToggleZoom
+        );
+
+        // Ctrl+Tab / Ctrl+Shift+Tab cycle workspaces on macOS
+        assert_eq!(
+            t_macos(&named_key(NamedKey::Tab), None, ctrl),
+            UiAction::SwitchWorkspaceNext
+        );
+        assert_eq!(
+            t_macos(&named_key(NamedKey::Tab), None, ctrl_shift),
+            UiAction::SwitchWorkspacePrev
+        );
+
+        // Crucially, Ctrl+<letter> without Cmd still sends raw PTY control bytes on macOS
+        assert_eq!(
+            t_macos(&char_key("c"), Some("\x03"), ctrl),
+            UiAction::SendBytes(vec![0x03])
+        );
+        assert_eq!(
+            t_macos(&char_key("d"), None, ctrl),
+            UiAction::SendBytes(vec![0x04])
+        );
+        assert_eq!(
+            t_macos(&char_key("z"), None, ctrl),
+            UiAction::SendBytes(vec![0x1a])
+        );
+
+        // Unbound Cmd combinations are ignored rather than leaked to PTY
+        assert_eq!(t_macos(&char_key("q"), Some("q"), cmd), UiAction::Ignore);
+        assert_eq!(t_macos(&char_key("l"), Some("l"), cmd), UiAction::Ignore);
+        assert_eq!(
+            t_macos(&char_key("Q"), Some("Q"), cmd_shift),
+            UiAction::Ignore
+        );
+        assert_eq!(t_macos(&char_key("c"), None, cmd | ctrl), UiAction::Ignore);
+        assert_eq!(t_macos(&char_key("c"), None, cmd | alt), UiAction::Ignore);
+        assert_eq!(
+            t_macos(&char_key("C"), Some("C"), ctrl_shift),
+            UiAction::Ignore
+        );
+
+        // Modal toggle chords also respect macOS Cmd shortcuts
+        assert_eq!(
+            translate_key_for_platform(
+                &char_key("p"),
+                Some("p"),
+                cmd_shift,
+                true,
+                false,
+                false,
+                false,
+                true
+            ),
+            UiAction::ToggleAgentPicker
+        );
+        assert_eq!(
+            translate_key_for_platform(
+                &char_key("w"),
+                Some("w"),
+                cmd_shift,
+                false,
+                true,
+                false,
+                false,
+                true
+            ),
+            UiAction::ToggleWorktreeModal
+        );
+        assert_eq!(
+            translate_key_for_platform(
+                &char_key("f"),
+                Some("f"),
+                cmd,
+                false,
+                false,
+                false,
+                true,
+                true
+            ),
+            UiAction::ToggleSearch
+        );
+        assert_eq!(
+            translate_key_for_platform(
+                &char_key("F"),
+                Some("F"),
+                cmd_shift,
+                false,
+                false,
+                false,
+                true,
+                true
+            ),
+            UiAction::ToggleSearch
+        );
+
+        // Platform wrapper matches cfg!(target_os = "macos")
+        assert_eq!(
+            translate_key(&char_key("c"), Some("c"), cmd, false, false, false, false),
+            translate_key_for_platform(
+                &char_key("c"),
+                Some("c"),
+                cmd,
+                false,
+                false,
+                false,
+                false,
+                cfg!(target_os = "macos"),
+            )
         );
     }
 

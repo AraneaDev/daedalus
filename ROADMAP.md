@@ -27,7 +27,7 @@
 
 ---
 
-## v0.0.3 — Deeper Agent & Worktree Workflows
+## v0.0.3 — Deeper Agent & Worktree Workflows (Shipped)
 
 - **First-Class `agy`, `claude`, and `codex` Enhancements:**
   - Agent state detection (thinking, waiting for approval, idle) surfaced in sidebar & pane headers.

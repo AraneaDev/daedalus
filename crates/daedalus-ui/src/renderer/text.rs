@@ -1058,7 +1058,14 @@ impl TextRenderer {
                         .unwrap_or("preset");
                     (format!("Preset: {preset_name}"), theme.border_focused)
                 }
-                PaneRole::Runner => ("Send Error → Agent ^⇧E".to_string(), theme.status_err),
+                PaneRole::Runner => (
+                    if cfg!(target_os = "macos") {
+                        "Send Error → Agent ⌘⇧E".to_string()
+                    } else {
+                        "Send Error → Agent ^⇧E".to_string()
+                    },
+                    theme.status_err,
+                ),
                 PaneRole::Service => (String::new(), theme.text_primary),
             };
             if !pill_label.is_empty() {

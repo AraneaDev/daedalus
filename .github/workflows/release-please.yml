@@ -21,6 +21,9 @@ concurrency:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - uses: googleapis/release-please-action@v5
         id: release
@@ -28,36 +31,43 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  package:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
       - uses: actions/checkout@v7
-        if: ${{ steps.release.outputs.release_created }}
         with:
-          ref: ${{ steps.release.outputs.tag_name }}
+          ref: ${{ needs.release-please.outputs.tag_name }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-        if: ${{ steps.release.outputs.release_created }}
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-        if: ${{ steps.release.outputs.release_created }}
       - name: Install Linux GUI build headers
-        if: ${{ steps.release.outputs.release_created }}
+        if: ${{ matrix.os == 'ubuntu-latest' }}
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - run: cargo fmt --all -- --check
-        if: ${{ steps.release.outputs.release_created }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
-        if: ${{ steps.release.outputs.release_created }}
       - run: cargo test --workspace
-        if: ${{ steps.release.outputs.release_created }}
       - name: Build release binaries
-        if: ${{ steps.release.outputs.release_created }}
         run: cargo build --release --workspace --locked
-      - name: Package Linux release tarball
-        if: ${{ steps.release.outputs.release_created }}
+      - name: Package release tarball
         env:
-          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          ARCHIVE="daedalus-${TAG_NAME}-x86_64-unknown-linux-gnu"
+          ARCHIVE="daedalus-${TAG_NAME}-${TARGET}"
           STAGE_DIR="dist/${ARCHIVE}"
           rm -rf dist
           mkdir -p "${STAGE_DIR}"
@@ -66,14 +76,21 @@ jobs:
           if [ -f CHANGELOG.md ]; then
             cp CHANGELOG.md "${STAGE_DIR}/"
           fi
-          tar -C dist -czf "dist/${ARCHIVE}.tar.gz" "${ARCHIVE}"
-          (cd dist && sha256sum "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256")
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/${ARCHIVE}.tar.gz" "${ARCHIVE}"
+          (
+            cd dist
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
+            else
+              shasum -a 256 "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
+            fi
+          )
       - name: Upload release assets
-        if: ${{ steps.release.outputs.release_created }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          ARCHIVE="daedalus-${TAG_NAME}-x86_64-unknown-linux-gnu"
+          ARCHIVE="daedalus-${TAG_NAME}-${TARGET}"
           gh release upload "${TAG_NAME}" "dist/${ARCHIVE}.tar.gz" "dist/${ARCHIVE}.tar.gz.sha256" --clobber

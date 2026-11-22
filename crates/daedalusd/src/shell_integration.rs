@@ -58,7 +58,20 @@ if [[ "$PS1" != *"133;A"* ]]; then
 fi
 
 if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
-    PROMPT_COMMAND=("__daedalus_precmd_start" "${PROMPT_COMMAND[@]}" "__daedalus_precmd_end")
+    if (( ${BASH_VERSINFO[0]:-0} > 5 || (${BASH_VERSINFO[0]:-0} == 5 && ${BASH_VERSINFO[1]:-0} >= 1) )); then
+        PROMPT_COMMAND=("__daedalus_precmd_start" "${PROMPT_COMMAND[@]}" "__daedalus_precmd_end")
+    else
+        __daedalus_joined_pc="__daedalus_precmd_start"
+        for __daedalus_pc_item in "${PROMPT_COMMAND[@]}"; do
+            if [ -n "${__daedalus_pc_item}" ]; then
+                __daedalus_joined_pc+=$'\n'"${__daedalus_pc_item}"
+            fi
+        done
+        __daedalus_joined_pc+=$'\n__daedalus_precmd_end'
+        unset PROMPT_COMMAND
+        PROMPT_COMMAND="${__daedalus_joined_pc}"
+        unset __daedalus_joined_pc __daedalus_pc_item
+    fi
 elif [ -n "${PROMPT_COMMAND:-}" ]; then
     PROMPT_COMMAND=$'__daedalus_precmd_start\n'"${PROMPT_COMMAND}"$'\n__daedalus_precmd_end'
 else
