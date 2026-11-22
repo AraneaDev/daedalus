@@ -120,8 +120,19 @@ impl Supervisor {
                     &format!("--unit={unit}"),
                     &format!("--working-directory={}", cwd.display()),
                     "--",
-                    &launch.program,
                 ]);
+                #[cfg(target_os = "linux")]
+                {
+                    let search_path = launch
+                        .extra_env
+                        .get("PATH")
+                        .or_else(|| env.get("PATH"))
+                        .map(std::ffi::OsStr::new)
+                        .or_else(|| cb.get_env("PATH"));
+                    cb.arg(resolve_scope_executable(&launch.program, cwd, search_path)?);
+                }
+                #[cfg(not(target_os = "linux"))]
+                cb.arg(&launch.program);
                 for arg in &launch.args {
                     cb.arg(arg);
                 }
@@ -175,6 +186,36 @@ impl Supervisor {
             },
         })
     }
+}
+
+// portable-pty starts systemd-run here, so resolve its child on the daemon
+// before acknowledging the spawn. Relative PATH entries belong to the workspace.
+#[cfg(target_os = "linux")]
+fn resolve_scope_executable(
+    program: &str,
+    cwd: &Path,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Result<std::path::PathBuf, String> {
+    use nix::unistd::{AccessFlags, access};
+    let cwd = std::path::absolute(cwd).map_err(|error| error.to_string())?;
+    let executable = |path: &Path| path.is_file() && access(path, AccessFlags::X_OK).is_ok();
+    if program.contains('/') {
+        let path = cwd.join(program);
+        if executable(&path) {
+            return Ok(path);
+        }
+    } else if let Some(search_path) = search_path {
+        for dir in std::env::split_paths(search_path) {
+            let path = cwd.join(dir).join(program);
+            if executable(&path) {
+                return Ok(path);
+            }
+        }
+    }
+    Err(format!(
+        "program '{program}' not found or not executable in {}",
+        cwd.display()
+    ))
 }
 
 impl ProcessHandle {
@@ -613,6 +654,30 @@ mod tests {
     use std::io::BufRead;
     #[cfg(unix)]
     use tempfile::TempDir;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_resolves_program_using_workspace_path_and_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let program = bin.join("workspace-agent");
+        let path = std::ffi::OsStr::new("bin");
+        assert!(resolve_scope_executable("workspace-agent", dir.path(), Some(path)).is_err());
+        std::fs::write(&program, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(resolve_scope_executable("workspace-agent", dir.path(), Some(path)).is_err());
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve_scope_executable("workspace-agent", dir.path(), Some(path)).unwrap(),
+            program
+        );
+        assert_eq!(
+            resolve_scope_executable("./bin/workspace-agent", dir.path(), None).unwrap(),
+            program
+        );
+    }
 
     #[cfg(target_os = "linux")]
     fn is_process_alive(pid: i32) -> bool {

@@ -315,6 +315,9 @@ async fn dispatch_request(
         } => Ok(ResponsePayload::WorkspaceCreated(
             registry.create_workspace(name, root_dir, env).await?,
         )),
+        ClientMessage::ResolveWorkspaceDirectory { root_dir } => Ok(
+            ResponsePayload::WorkspaceResolved(registry.workspace_for_directory(root_dir).await?),
+        ),
         ClientMessage::ListWorkspaces => Ok(ResponsePayload::Workspaces(
             registry.list_workspaces().await,
         )),
@@ -387,6 +390,17 @@ async fn dispatch_request(
         } => Ok(ResponsePayload::PaneSpawned(
             registry
                 .spawn_pane(workspace_id, role, command, shell, cols, rows, env)
+                .await?,
+        )),
+        ClientMessage::ReplaceAgentPane {
+            workspace_id,
+            old_pane_id,
+            command,
+            cols,
+            rows,
+        } => Ok(ResponsePayload::PaneSpawned(
+            registry
+                .replace_agent_pane(workspace_id, old_pane_id, command, cols, rows)
                 .await?,
         )),
         ClientMessage::ClosePane { pane_id } => {

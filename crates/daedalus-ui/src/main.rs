@@ -1146,6 +1146,10 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
                 self.state.spawning_workspaces.clear();
                 self.schedule_resize_flush();
             }
+            UiEvent::WorkspaceCloseFailed(workspaces) => {
+                self.state.set_workspaces(workspaces);
+                self.schedule_resize_flush();
+            }
             UiEvent::WorkspacesLoaded(workspaces) => {
                 self.state.set_workspaces(workspaces);
                 self.ensure_active_workspace_panes();

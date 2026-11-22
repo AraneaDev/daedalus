@@ -702,6 +702,27 @@ async fn daemon_bridge_delivers_agent_state_changed_and_closes_worktree_with_rem
         "expected worktree directory to exist before close"
     );
 
+    let dirty_file = wt_ws.root_dir.join("unsaved.txt");
+    std::fs::write(&dirty_file, "keep this file").unwrap();
+    bridge.send(UiCommand::CloseWorkspace {
+        id: wt_ws.id,
+        compose_down: false,
+        remove_worktree: true,
+        force_remove_worktree: false,
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let UiEvent::WorkspaceCloseFailed(workspaces) = evt_rx.recv().await.unwrap() {
+                let retained = workspaces.iter().find(|ws| ws.id == wt_ws.id).unwrap();
+                assert_eq!(retained.panes.len(), 3);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("failed close should refresh workspace and panes");
+    std::fs::remove_file(dirty_file).unwrap();
+
     bridge.send(UiCommand::CloseWorkspace {
         id: wt_ws.id,
         compose_down: false,

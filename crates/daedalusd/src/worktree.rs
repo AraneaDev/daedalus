@@ -18,6 +18,8 @@ pub enum WorktreeError {
     NotAWorktree(PathBuf),
     #[error("worktree has uncommitted changes (use force to remove): {0}")]
     DirtyWorktree(PathBuf),
+    #[error("worktree is locked (unlock it before removing): {0}")]
+    LockedWorktree(PathBuf),
     #[error("git command failed: {0}")]
     GitFailed(String),
 }
@@ -185,13 +187,19 @@ fn run_git_with_timeout_for(
     })
 }
 
-fn parse_worktree_porcelain(output: &str) -> Vec<GitWorktreeInfo> {
+struct WorktreeEntry {
+    info: GitWorktreeInfo,
+    locked: bool,
+}
+
+fn parse_worktree_porcelain(output: &str) -> Vec<WorktreeEntry> {
     #[derive(Default)]
     struct Stanza {
         path: Option<PathBuf>,
         head: String,
         branch: Option<String>,
         is_detached: bool,
+        locked: bool,
     }
 
     let mut stanzas = Vec::new();
@@ -204,6 +212,7 @@ fn parse_worktree_porcelain(output: &str) -> Vec<GitWorktreeInfo> {
                 head: std::mem::take(&mut current.head),
                 branch: current.branch.take(),
                 is_detached: std::mem::take(&mut current.is_detached),
+                locked: std::mem::take(&mut current.locked),
             });
         } else {
             *current = Stanza::default();
@@ -228,6 +237,8 @@ fn parse_worktree_porcelain(output: &str) -> Vec<GitWorktreeInfo> {
             current.branch = Some(name.to_string());
         } else if line == "detached" {
             current.is_detached = true;
+        } else if line == "locked" || line.starts_with("locked ") {
+            current.locked = true;
         }
     }
     flush(&mut stanzas, &mut current);
@@ -236,12 +247,15 @@ fn parse_worktree_porcelain(output: &str) -> Vec<GitWorktreeInfo> {
         .into_iter()
         .enumerate()
         .filter_map(|(idx, s)| {
-            Some(GitWorktreeInfo {
-                path: s.path?,
-                branch: s.branch,
-                head: s.head,
-                is_primary: idx == 0,
-                is_detached: s.is_detached,
+            Some(WorktreeEntry {
+                locked: s.locked,
+                info: GitWorktreeInfo {
+                    path: s.path?,
+                    branch: s.branch,
+                    head: s.head,
+                    is_primary: idx == 0,
+                    is_detached: s.is_detached,
+                },
             })
         })
         .collect()
@@ -251,6 +265,13 @@ fn parse_worktree_porcelain(output: &str) -> Vec<GitWorktreeInfo> {
 ///
 /// Returns `Ok(Vec::new())` if `repo_dir` is not inside a Git repository.
 pub fn discover_worktrees(repo_dir: &Path) -> Result<Vec<GitWorktreeInfo>, String> {
+    Ok(list_worktrees(repo_dir)?
+        .into_iter()
+        .map(|entry| entry.info)
+        .collect())
+}
+
+fn list_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeEntry>, String> {
     if !repo_dir.is_dir() {
         return Err(format!(
             "repository path is not a directory: {}",
@@ -486,15 +507,16 @@ pub fn validate_worktree_removal(path: &Path, force: bool) -> Result<PathBuf, Wo
         return Err(WorktreeError::NotAWorktree(path.to_path_buf()));
     }
 
-    let worktrees = discover_worktrees(path).map_err(WorktreeError::GitFailed)?;
+    let worktrees = list_worktrees(path).map_err(WorktreeError::GitFailed)?;
     let canon_path = canonicalize_path(path);
     let matched = worktrees
         .iter()
-        .find(|wt| canonicalize_path(&wt.path) == canon_path);
+        .find(|wt| canonicalize_path(&wt.info.path) == canon_path);
     match matched {
-        Some(wt) if wt.is_primary => {
+        Some(wt) if wt.info.is_primary => {
             return Err(WorktreeError::PrimaryCheckout(path.to_path_buf()));
         }
+        Some(wt) if wt.locked => return Err(WorktreeError::LockedWorktree(path.to_owned())),
         Some(_) => {}
         None => {
             return Err(WorktreeError::NotAWorktree(path.to_path_buf()));
@@ -503,8 +525,8 @@ pub fn validate_worktree_removal(path: &Path, force: bool) -> Result<PathBuf, Wo
 
     let primary_repo = worktrees
         .iter()
-        .find(|wt| wt.is_primary)
-        .map(|wt| wt.path.clone())
+        .find(|wt| wt.info.is_primary)
+        .map(|wt| wt.info.path.clone())
         .ok_or_else(|| WorktreeError::NotAWorktree(path.to_path_buf()))?;
 
     if !force
@@ -721,7 +743,9 @@ worktree /worktrees/app/detached dir\r\n\
 HEAD 3333333333333333333333333333333333333333\r\n\
 detached\r\n";
 
-        let parsed = parse_worktree_porcelain(porcelain);
+        let entries = parse_worktree_porcelain(porcelain);
+        assert!(entries[1].locked);
+        let parsed: Vec<_> = entries.into_iter().map(|entry| entry.info).collect();
         assert_eq!(parsed.len(), 3);
         assert_eq!(
             parsed[0],
