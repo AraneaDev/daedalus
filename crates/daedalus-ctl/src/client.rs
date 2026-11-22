@@ -1,17 +1,17 @@
+use daedalus_proto::transport::IpcStream;
 use daedalus_proto::{
     ClientMessage, Request, ResponsePayload, ServerEvent, ServerMessage, read_frame, write_frame,
 };
 use std::path::Path;
-use tokio::net::UnixStream;
 
 pub struct DaemonClient {
-    stream: UnixStream,
+    stream: IpcStream,
     next_id: u64,
 }
 
 impl DaemonClient {
     pub async fn connect(socket: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let stream = UnixStream::connect(socket).await?;
+        let stream = IpcStream::connect(socket).await?;
         Ok(Self { stream, next_id: 1 })
     }
 

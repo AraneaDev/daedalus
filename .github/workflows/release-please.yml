@@ -43,6 +43,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -62,6 +64,7 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --workspace --locked
       - name: Package release tarball
+        if: ${{ matrix.os != 'windows-latest' }}
         env:
           TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
           TARGET: ${{ matrix.target }}
@@ -85,7 +88,33 @@ jobs:
               shasum -a 256 "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
             fi
           )
+      - name: Package release zip (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: pwsh
+        env:
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "daedalus-$env:TAG_NAME-$env:TARGET"
+          $stageDir = "dist/$archive"
+          if (Test-Path dist) {
+            Remove-Item -Recurse -Force dist
+          }
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+          Copy-Item target/release/daedalusd.exe, target/release/daedalus-ui.exe, target/release/daedalus-ctl.exe -Destination $stageDir
+          Copy-Item README.md, LICENSE -Destination $stageDir
+          if (Test-Path CHANGELOG.md) {
+            Copy-Item CHANGELOG.md -Destination $stageDir
+          }
+          $zipFile = "$archive.zip"
+          $zipPath = Join-Path "dist" $zipFile
+          Compress-Archive -Path $stageDir -DestinationPath $zipPath -Force
+          $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $shaPath = Join-Path (Resolve-Path "dist").Path "$zipFile.sha256"
+          [System.IO.File]::WriteAllText($shaPath, "$hash  $zipFile`n")
       - name: Upload release assets
+        if: ${{ matrix.os != 'windows-latest' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
@@ -94,3 +123,17 @@ jobs:
           set -euo pipefail
           ARCHIVE="daedalus-${TAG_NAME}-${TARGET}"
           gh release upload "${TAG_NAME}" "dist/${ARCHIVE}.tar.gz" "dist/${ARCHIVE}.tar.gz.sha256" --clobber
+      - name: Upload release assets (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "daedalus-$env:TAG_NAME-$env:TARGET"
+          gh release upload $env:TAG_NAME "dist/$archive.zip" "dist/$archive.zip.sha256" --clobber
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }

@@ -403,9 +403,21 @@ fn split_command_tokens(input: &str) -> Vec<String> {
     tokens
 }
 
+/// Returns the platform's default system opener binary
+/// (`open` on macOS, `explorer.exe` on Windows, `xdg-open` on Linux).
+pub fn default_system_opener_for_os(is_macos: bool, is_windows: bool) -> &'static str {
+    if is_macos {
+        "open"
+    } else if is_windows {
+        "explorer.exe"
+    } else {
+        "xdg-open"
+    }
+}
+
 /// Returns the platform's default system opener binary (`open` on macOS, `xdg-open` on Linux).
 pub fn default_system_opener(is_macos: bool) -> &'static str {
-    if is_macos { "open" } else { "xdg-open" }
+    default_system_opener_for_os(is_macos, false)
 }
 
 fn build_open_command_with_env(
@@ -414,8 +426,9 @@ fn build_open_command_with_env(
     visual_env: Option<&str>,
     editor_env: Option<&str>,
     is_macos: bool,
+    is_windows: bool,
 ) -> Option<(String, Vec<String>)> {
-    let system_opener = default_system_opener(is_macos);
+    let system_opener = default_system_opener_for_os(is_macos, is_windows);
     match link {
         DetectedLink::Url(url) => {
             if !is_safe_http_url(url) {
@@ -471,8 +484,13 @@ fn build_open_command_with_env(
                 .and_then(|n| n.to_str())
                 .unwrap_or(program.as_str())
                 .to_ascii_lowercase();
+            let basename = basename
+                .strip_suffix(".exe")
+                .or_else(|| basename.strip_suffix(".cmd"))
+                .or_else(|| basename.strip_suffix(".bat"))
+                .unwrap_or(&basename);
 
-            match basename.as_str() {
+            match basename {
                 "code" | "code-insiders" | "codium" | "cursor" | "windsurf" => {
                     if let Some(l) = line {
                         args.push("--goto".to_string());
@@ -515,7 +533,7 @@ fn build_open_command_with_env(
 /// Builds the `(program, argv)` invocation for opening `link` without invoking a shell.
 ///
 /// Uses `editor`, falling back to `$VISUAL`, `$EDITOR`, and finally the platform opener
-/// (`open` on macOS, `xdg-open` on Linux).
+/// (`open` on macOS, `explorer.exe` on Windows, `xdg-open` on Linux).
 pub fn build_open_command(
     link: &DetectedLink,
     editor: Option<&str>,
@@ -528,11 +546,13 @@ pub fn build_open_command(
         visual_env.as_deref(),
         editor_env.as_deref(),
         cfg!(target_os = "macos"),
+        cfg!(target_os = "windows"),
     )
 }
 
-/// Spawns the external opener (`open` on macOS, `xdg-open` on Linux, or configured editor)
-/// for `link` directly via `Command::new(program).args(args)` without shell interpolation.
+/// Spawns the external opener (`open` on macOS, `explorer.exe` on Windows, `xdg-open` on Linux,
+/// or configured editor) for `link` directly via `Command::new(program).args(args)` without shell
+/// interpolation.
 pub fn open_link(link: &DetectedLink, editor: Option<&str>) -> std::io::Result<()> {
     let Some((program, args)) = build_open_command(link, editor) else {
         return Err(std::io::Error::new(
@@ -741,34 +761,49 @@ mod tests {
     fn build_open_command_handles_urls_and_rejects_unsafe_schemes() {
         let ok = DetectedLink::Url("https://example.com/a?x=1&y=$(whoami);id".to_string());
         assert_eq!(
-            build_open_command_with_env(&ok, None, None, None, false),
+            build_open_command_with_env(&ok, None, None, None, false, false),
             Some((
                 "xdg-open".to_string(),
                 vec!["https://example.com/a?x=1&y=$(whoami);id".to_string()]
             ))
         );
         assert_eq!(
-            build_open_command_with_env(&ok, None, None, None, true),
+            build_open_command_with_env(&ok, None, None, None, true, false),
             Some((
                 "open".to_string(),
                 vec!["https://example.com/a?x=1&y=$(whoami);id".to_string()]
             ))
         );
         assert_eq!(
+            build_open_command_with_env(&ok, None, None, None, false, true),
+            Some((
+                "explorer.exe".to_string(),
+                vec!["https://example.com/a?x=1&y=$(whoami);id".to_string()]
+            ))
+        );
+        assert_eq!(
             build_open_command(&ok, None),
             Some((
-                default_system_opener(cfg!(target_os = "macos")).to_string(),
+                default_system_opener_for_os(
+                    cfg!(target_os = "macos"),
+                    cfg!(target_os = "windows")
+                )
+                .to_string(),
                 vec!["https://example.com/a?x=1&y=$(whoami);id".to_string()]
             ))
         );
 
         let bad = DetectedLink::Url("javascript:alert(1)".to_string());
         assert_eq!(
-            build_open_command_with_env(&bad, None, None, None, false),
+            build_open_command_with_env(&bad, None, None, None, false, false),
             None
         );
         assert_eq!(
-            build_open_command_with_env(&bad, None, None, None, true),
+            build_open_command_with_env(&bad, None, None, None, true, false),
+            None
+        );
+        assert_eq!(
+            build_open_command_with_env(&bad, None, None, None, false, true),
             None
         );
     }
@@ -777,6 +812,9 @@ mod tests {
     fn build_open_command_substitutes_placeholders_and_falls_back_to_env_or_system_opener() {
         assert_eq!(default_system_opener(false), "xdg-open");
         assert_eq!(default_system_opener(true), "open");
+        assert_eq!(default_system_opener_for_os(false, false), "xdg-open");
+        assert_eq!(default_system_opener_for_os(true, false), "open");
+        assert_eq!(default_system_opener_for_os(false, true), "explorer.exe");
 
         let link = DetectedLink::File {
             path: PathBuf::from("/tmp/my project/main.rs"),
@@ -791,6 +829,7 @@ mod tests {
                 Some("code --goto {path}:{line}:{col}"),
                 None,
                 None,
+                false,
                 false
             ),
             Some((
@@ -809,7 +848,8 @@ mod tests {
                 Some("\"/opt/my editor/nvim\" +{line} {path}"),
                 None,
                 None,
-                true
+                true,
+                false
             ),
             Some((
                 "/opt/my editor/nvim".to_string(),
@@ -819,7 +859,7 @@ mod tests {
 
         // $VISUAL fallback without placeholders (nvim -> +line path)
         assert_eq!(
-            build_open_command_with_env(&link, None, Some("nvim"), Some("nano"), false),
+            build_open_command_with_env(&link, None, Some("nvim"), Some("nano"), false, false),
             Some((
                 "nvim".to_string(),
                 vec!["+42".to_string(), "/tmp/my project/main.rs".to_string()]
@@ -828,7 +868,7 @@ mod tests {
 
         // $EDITOR fallback without placeholders (code -> --goto path:line:col)
         assert_eq!(
-            build_open_command_with_env(&link, None, None, Some("code"), true),
+            build_open_command_with_env(&link, None, None, Some("code"), true, false),
             Some((
                 "code".to_string(),
                 vec![
@@ -838,18 +878,37 @@ mod tests {
             ))
         );
 
-        // No editor configured -> platform opener fallback (xdg-open on Linux, open on macOS)
+        // Windows `.cmd` / `.exe` editor wrapper suffix still matches editor presets
         assert_eq!(
-            build_open_command_with_env(&link, None, None, None, false),
+            build_open_command_with_env(&link, None, None, Some("code.cmd"), false, true),
+            Some((
+                "code.cmd".to_string(),
+                vec![
+                    "--goto".to_string(),
+                    "/tmp/my project/main.rs:42:7".to_string()
+                ]
+            ))
+        );
+
+        // No editor configured -> platform opener fallback
+        assert_eq!(
+            build_open_command_with_env(&link, None, None, None, false, false),
             Some((
                 "xdg-open".to_string(),
                 vec!["/tmp/my project/main.rs".to_string()]
             ))
         );
         assert_eq!(
-            build_open_command_with_env(&link, None, None, None, true),
+            build_open_command_with_env(&link, None, None, None, true, false),
             Some((
                 "open".to_string(),
+                vec!["/tmp/my project/main.rs".to_string()]
+            ))
+        );
+        assert_eq!(
+            build_open_command_with_env(&link, None, None, None, false, true),
+            Some((
+                "explorer.exe".to_string(),
                 vec!["/tmp/my project/main.rs".to_string()]
             ))
         );

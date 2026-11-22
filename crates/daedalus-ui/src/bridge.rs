@@ -1,6 +1,10 @@
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,13 +12,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use daedalus_proto::transport::IpcStream;
 use daedalus_proto::{
     AgentState, ClientMessage, ContainerHealth, GitWorkspaceStatus, GridRow, GridSnapshot, PaneId,
     PaneRole, PaneSummary, PortMapping, ProtoError, Request, ResponsePayload, SearchMatch,
     ServerEvent, ServerMessage, WorkspaceId, WorkspaceInfo, WorkspaceManifest, read_frame,
     write_frame,
 };
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tracing::{debug, info, warn};
@@ -222,7 +226,7 @@ struct RpcConnection {
 }
 
 impl RpcConnection {
-    fn new(stream: UnixStream, sink: Arc<dyn UiEventSink>) -> Self {
+    fn new(stream: IpcStream, sink: Arc<dyn UiEventSink>) -> Self {
         let (mut reader, mut writer) = stream.into_split();
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Request>();
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -383,7 +387,7 @@ async fn run_bridge(
     let mut spawn_attempted = false;
 
     loop {
-        match UnixStream::connect(&config.socket_path).await {
+        match IpcStream::connect(&config.socket_path).await {
             Ok(stream) => {
                 backoff = INITIAL_BACKOFF;
                 spawn_attempted = false;
@@ -1074,7 +1078,7 @@ fn resolve_pane_launch_specs(
             .or_else(|| cmd.first().and_then(|b| AgentPreset::from_cli_name(b)))
             .unwrap_or(base_preset);
         if let Some(bin) = cmd.first()
-            && (!bin.contains('/') || Path::new(bin).is_absolute())
+            && (!is_explicit_path(bin) || Path::new(bin).is_absolute())
             && !has_binary(bin)
         {
             warnings.push(format!(
@@ -1086,7 +1090,7 @@ fn resolve_pane_launch_specs(
         }
     } else if let Some(cmd) = base_preset.command() {
         if let Some(bin) = cmd.first()
-            && (!bin.contains('/') || Path::new(bin).is_absolute())
+            && (!is_explicit_path(bin) || Path::new(bin).is_absolute())
             && !has_binary(bin)
         {
             warnings.push(format!(
@@ -1125,16 +1129,32 @@ fn workspace_name_from_dir(dir: &Path) -> String {
         .to_string()
 }
 
+fn is_explicit_path(binary: &str) -> bool {
+    binary.contains('/') || (cfg!(windows) && binary.contains('\\'))
+}
+
+fn daemon_binary_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "daedalusd.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "daedalusd"
+    }
+}
+
 fn resolve_daemon_binary(current_exe: Option<&Path>) -> PathBuf {
+    let bin_name = daemon_binary_name();
     if let Some(exe) = current_exe
         && let Some(parent) = exe.parent()
     {
-        let sibling = parent.join("daedalusd");
+        let sibling = parent.join(bin_name);
         if is_executable_file(&sibling) {
             return sibling;
         }
     }
-    PathBuf::from("daedalusd")
+    PathBuf::from(bin_name)
 }
 
 fn spawn_daemon_detached(socket_path: &Path) -> std::io::Result<PathBuf> {
@@ -1148,23 +1168,71 @@ fn spawn_daemon_detached(socket_path: &Path) -> std::io::Result<PathBuf> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    // SAFETY: `setsid()` is async-signal-safe per POSIX and detaches `daedalusd`
-    // into its own session so it outlives the UI process cleanly.
-    unsafe {
-        cmd.pre_exec(|| {
-            nix::unistd::setsid()
-                .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
-            Ok(())
-        });
+    #[cfg(unix)]
+    {
+        // SAFETY: `setsid()` is async-signal-safe per POSIX and detaches `daedalusd`
+        // into its own session so it outlives the UI process cleanly.
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::unistd::setsid()
+                    .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
 
     let _child = cmd.spawn()?;
     Ok(bin)
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_pathext_candidates(pathext: Option<&str>) -> Vec<String> {
+    const DEFAULT_PATHEXT: &[&str] = &[".exe", ".cmd", ".bat", ".com"];
+    let mut exts: Vec<String> = pathext
+        .unwrap_or_default()
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if s.starts_with('.') {
+                s.to_ascii_lowercase()
+            } else {
+                format!(".{}", s.to_ascii_lowercase())
+            }
+        })
+        .collect();
+    if exts.is_empty() {
+        exts = DEFAULT_PATHEXT.iter().map(|s| (*s).to_string()).collect();
+    } else {
+        for default_ext in DEFAULT_PATHEXT {
+            if !exts.iter().any(|ext| ext.eq_ignore_ascii_case(default_ext)) {
+                exts.push((*default_ext).to_string());
+            }
+        }
+    }
+    exts
+}
+
 fn find_binary_on_path(binary: &str) -> Option<PathBuf> {
-    if binary.contains('/') {
+    if is_explicit_path(binary) {
         let path = PathBuf::from(binary);
+        #[cfg(windows)]
+        if path.extension().is_none() {
+            let pathext = std::env::var("PATHEXT").ok();
+            for ext in windows_pathext_candidates(pathext.as_deref()) {
+                let with_ext = PathBuf::from(format!("{binary}{ext}"));
+                if is_executable_file(&with_ext) {
+                    return Some(with_ext);
+                }
+            }
+        }
         return is_executable_file(&path).then_some(path);
     }
     let path_var = std::env::var_os("PATH")?;
@@ -1173,24 +1241,60 @@ fn find_binary_on_path(binary: &str) -> Option<PathBuf> {
 }
 
 fn find_binary_in_paths(binary: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
-    for dir in dirs {
-        let candidate = dir.join(binary);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
+    #[cfg(windows)]
+    {
+        let has_extension = Path::new(binary).extension().is_some();
+        let pathext = (!has_extension).then(|| std::env::var("PATHEXT").ok());
+        let exts = pathext
+            .as_ref()
+            .map(|val| windows_pathext_candidates(val.as_deref()));
+
+        for dir in dirs {
+            if has_extension {
+                let candidate = dir.join(binary);
+                if is_executable_file(&candidate) {
+                    return Some(candidate);
+                }
+            } else if let Some(ref exts) = exts {
+                for ext in exts {
+                    let candidate = dir.join(format!("{binary}{ext}"));
+                    if is_executable_file(&candidate) {
+                        return Some(candidate);
+                    }
+                }
+            }
         }
+        None
     }
-    None
+
+    #[cfg(not(windows))]
+    {
+        for dir in dirs {
+            let candidate = dir.join(binary);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
 }
 
+#[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
         .unwrap_or(false)
 }
 
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use daedalus_proto::transport::IpcListener;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1204,6 +1308,23 @@ mod tests {
         assert_eq!(workspace_name_from_dir(Path::new("")), "workspace");
     }
 
+    #[test]
+    fn windows_pathext_candidates_normalize_and_append_defaults() {
+        assert_eq!(
+            windows_pathext_candidates(None),
+            vec![".exe", ".cmd", ".bat", ".com"]
+        );
+        assert_eq!(
+            windows_pathext_candidates(Some(".COM;.EXE")),
+            vec![".com", ".exe", ".cmd", ".bat"]
+        );
+        assert_eq!(
+            windows_pathext_candidates(Some("EXE; cmd")),
+            vec![".exe", ".cmd", ".bat", ".com"]
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn find_binary_in_paths_checks_executable_bit() {
         let dir = TempDir::new().unwrap();
@@ -1225,21 +1346,52 @@ mod tests {
         assert_eq!(find_binary_in_paths("my-agent", &dirs), Some(exec));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn find_binary_in_paths_probes_pathext_extensions() {
+        let dir = TempDir::new().unwrap();
+        let plain = dir.path().join("plain-file");
+        fs::write(&plain, "not an exe").unwrap();
+
+        let exe = dir.path().join("my-agent.exe");
+        fs::write(&exe, "").unwrap();
+
+        let cmd = dir.path().join("my-tool.cmd");
+        fs::write(&cmd, "@echo off\r\n").unwrap();
+
+        let sub = dir.path().join("subdir");
+        fs::create_dir(&sub).unwrap();
+
+        let dirs = vec![dir.path().to_path_buf()];
+        assert_eq!(find_binary_in_paths("plain-file", &dirs), None);
+        assert_eq!(find_binary_in_paths("subdir", &dirs), None);
+        assert_eq!(find_binary_in_paths("missing", &dirs), None);
+        assert_eq!(find_binary_in_paths("my-agent", &dirs), Some(exe.clone()));
+        assert_eq!(find_binary_in_paths("my-agent.exe", &dirs), Some(exe));
+        assert_eq!(find_binary_in_paths("my-tool", &dirs), Some(cmd));
+    }
+
     #[test]
     fn resolve_daemon_binary_prefers_sibling_executable() {
         let dir = TempDir::new().unwrap();
-        let fake_ui = dir.path().join("daedalus-ui");
+        let ui_name = if cfg!(windows) {
+            "daedalus-ui.exe"
+        } else {
+            "daedalus-ui"
+        };
+        let fake_ui = dir.path().join(ui_name);
         fs::write(&fake_ui, "").unwrap();
 
         // Without sibling daedalusd -> falls back to PATH lookup name
         assert_eq!(
             resolve_daemon_binary(Some(&fake_ui)),
-            PathBuf::from("daedalusd")
+            PathBuf::from(daemon_binary_name())
         );
 
         // With executable sibling daedalusd -> returns sibling path
-        let sibling = dir.path().join("daedalusd");
+        let sibling = dir.path().join(daemon_binary_name());
         fs::write(&sibling, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&sibling, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(resolve_daemon_binary(Some(&fake_ui)), sibling);
     }
@@ -1249,10 +1401,20 @@ mod tests {
         fn emit(&self, _event: UiEvent) {}
     }
 
+    async fn ipc_pair() -> (IpcStream, IpcStream) {
+        let mut listener = IpcListener::bind(Path::new("tcp://127.0.0.1:0"))
+            .await
+            .unwrap();
+        let endpoint = listener.local_endpoint();
+        let (client_res, server_res) =
+            tokio::join!(IpcStream::connect(&endpoint), listener.accept());
+        (client_res.unwrap(), server_res.unwrap())
+    }
+
     #[tokio::test]
     async fn rpc_call_fails_immediately_when_disconnected_before_or_during_call() {
         // Case 1: peer closes before `call()` is invoked
-        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let (client_stream, server_stream) = ipc_pair().await;
         let mut conn = RpcConnection::new(client_stream, Arc::new(NoopSink));
         drop(server_stream);
 
@@ -1268,7 +1430,7 @@ mod tests {
         conn.close();
 
         // Case 2: peer closes while `call()` is awaiting a response
-        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let (client_stream, mut server_stream) = ipc_pair().await;
         let conn = RpcConnection::new(client_stream, Arc::new(NoopSink));
 
         let peer_task = tokio::spawn(async move {

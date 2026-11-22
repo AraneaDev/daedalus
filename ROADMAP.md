@@ -39,7 +39,7 @@
 
 ---
 
-## v0.0.4 — macOS Native Support (Apple Silicon & Intel)
+## v0.0.4 — macOS Native Support (Apple Silicon & Intel) (Shipped)
 
 Because `daedalus-ui` already uses `winit` + `wgpu` (Metal backend) + `glyphon` + `arboard`, most of the macOS port lives in `daedalusd`:
 
