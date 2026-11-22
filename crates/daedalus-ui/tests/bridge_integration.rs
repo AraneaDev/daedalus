@@ -350,7 +350,7 @@ command = ["sh", "-c", "echo MANIFEST_RUNNER_NEEDLE; sleep 5"]
     #[cfg(windows)]
     let manifest_toml = r#"
 [runner]
-command = ["cmd.exe", "/C", "echo MANIFEST_RUNNER_NEEDLE & ping -n 6 127.0.0.1 >nul"]
+command = ["cmd.exe", "/C", "echo", "MANIFEST_RUNNER_NEEDLE"]
 "#;
     std::fs::write(ws_dir.join(".daedalus.toml"), manifest_toml).unwrap();
 

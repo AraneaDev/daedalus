@@ -36,9 +36,10 @@ fn sleep_command() -> Vec<String> {
     #[cfg(windows)]
     {
         vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "ping -n 11 127.0.0.1 >nul".to_string(),
+            "ping.exe".to_string(),
+            "-n".to_string(),
+            "11".to_string(),
+            "127.0.0.1".to_string(),
         ]
     }
 }
@@ -57,7 +58,10 @@ fn echo_worktree_env_command() -> Vec<String> {
         vec![
             "cmd.exe".to_string(),
             "/C".to_string(),
-            "echo PORT=%PORT% PROJ=%COMPOSE_PROJECT_NAME% DB=%DATABASE_URL% & ping -n 3 127.0.0.1 >nul".to_string(),
+            "echo".to_string(),
+            "PORT=%PORT%".to_string(),
+            "PROJ=%COMPOSE_PROJECT_NAME%".to_string(),
+            "DB=%DATABASE_URL%".to_string(),
         ]
     }
 }
@@ -76,7 +80,8 @@ fn echo_restored_env_command() -> Vec<String> {
         vec![
             "cmd.exe".to_string(),
             "/C".to_string(),
-            "echo RESTORED=%RESTORED_ENV% & ping -n 3 127.0.0.1 >nul".to_string(),
+            "echo".to_string(),
+            "RESTORED=%RESTORED_ENV%".to_string(),
         ]
     }
 }

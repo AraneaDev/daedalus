@@ -1117,7 +1117,8 @@ mod tests {
             vec![
                 "cmd.exe".to_string(),
                 "/C".to_string(),
-                format!("exit {code}"),
+                "exit".to_string(),
+                code.to_string(),
             ]
         }
     }
@@ -1134,9 +1135,10 @@ mod tests {
         #[cfg(windows)]
         {
             vec![
-                "cmd.exe".to_string(),
-                "/C".to_string(),
-                "ping -n 6 127.0.0.1 >nul".to_string(),
+                "ping.exe".to_string(),
+                "-n".to_string(),
+                "6".to_string(),
+                "127.0.0.1".to_string(),
             ]
         }
     }
