@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.8](https://github.com/AraneaDev/daedalus/compare/v0.0.7...v0.0.8) (2026-11-22)
+
+
+### Bug Fixes
+
+* preserve workspace and agent state across lifecycle operations ([#28](https://github.com/AraneaDev/daedalus/issues/28)) ([6aaf604](https://github.com/AraneaDev/daedalus/commit/6aaf604fee611e5c15939b79c30fa109d16eaa31))
+
 ## [0.0.7](https://github.com/AraneaDev/daedalus/compare/v0.0.6...v0.0.7) (2026-11-22)
 
 
