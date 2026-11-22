@@ -313,7 +313,7 @@ pub(crate) fn run_command_stdout_with_timeout(
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut stdout, &mut buf).ok()?;
-        String::from_utf8(buf).ok()
+        Some(String::from_utf8_lossy(&buf).into_owned())
     });
 
     let deadline = Instant::now() + timeout;

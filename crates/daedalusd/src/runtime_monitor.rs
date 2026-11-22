@@ -66,6 +66,7 @@ pub fn parse_proc_net_tcp(content: &str) -> Vec<(u64, u16)> {
     out
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn parse_proc_stat_pid_ppid(stat: &str) -> Option<(u32, u32)> {
     let first_paren = stat.find('(')?;
     let last_paren = stat.rfind(')')?;
