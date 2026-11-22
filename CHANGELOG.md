@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.4](https://github.com/AraneaDev/daedalus/compare/v0.0.3...v0.0.4) (2026-11-22)
+
+
+### Features
+
+* add macOS native support and Apple Silicon release packaging (v0.0.4) ([#20](https://github.com/AraneaDev/daedalus/issues/20)) ([6983d51](https://github.com/AraneaDev/daedalus/commit/6983d5119be687e33b9cb247def52480acb5ecd7))
+
 ## [0.0.3](https://github.com/AraneaDev/daedalus/compare/v0.0.2...v0.0.3) (2026-11-21)
 
 
