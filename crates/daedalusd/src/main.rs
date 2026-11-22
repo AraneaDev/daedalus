@@ -21,6 +21,8 @@ struct Args {
     events_socket: Option<PathBuf>,
     #[arg(long, env = "DAEDALUS_STATE_FILE")]
     state_file: Option<PathBuf>,
+    #[arg(long, env = "DAEDALUS_AUTH_TOKEN")]
+    auth_token: Option<String>,
 }
 
 #[tokio::main]
@@ -42,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .state_file
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(default_state_file_path);
+    let auth_token = args.auth_token.filter(|t| !t.is_empty());
 
     let server = DaemonServer::bind_with_options(
         socket,
@@ -50,7 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(state_file),
         Supervisor::detect(),
     )
-    .await?;
+    .await?
+    .with_auth_token(auth_token);
     server
         .serve(async {
             let ctrl_c = tokio::signal::ctrl_c();

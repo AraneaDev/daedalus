@@ -2065,3 +2065,357 @@ async fn tcp_wsl2_bridge_rpc_round_trip() {
     let _ = shutdown_tx.send(());
     srv_handle.await.unwrap();
 }
+
+#[tokio::test]
+async fn auth_token_rejects_unauthenticated_and_allows_authenticated_clients() {
+    let dir = TempDir::new().unwrap();
+    let runtime = dir.path().join("runtime");
+
+    let server = DaemonServer::bind_with_supervisor(
+        PathBuf::from("tcp://127.0.0.1:0"),
+        runtime,
+        test_supervisor(),
+    )
+    .await
+    .unwrap()
+    .with_auth_token(Some("super-secret-token".to_string()));
+    let endpoint = server.socket_path();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let mut c1 = IpcStream::connect(&endpoint).await.unwrap();
+    assert!(matches!(
+        send_rpc_result(&mut c1, 1, ClientMessage::Ping).await,
+        Err(ProtoError::Unauthorized(_))
+    ));
+    assert!(matches!(
+        send_rpc_result(&mut c1, 2, ClientMessage::ListWorkspaces).await,
+        Err(ProtoError::Unauthorized(_))
+    ));
+    assert!(matches!(
+        send_rpc_result(
+            &mut c1,
+            3,
+            ClientMessage::Authenticate {
+                token: "wrong-token".to_string(),
+            },
+        )
+        .await,
+        Err(ProtoError::Unauthorized(_))
+    ));
+    assert!(matches!(
+        send_rpc_result(&mut c1, 4, ClientMessage::Ping).await,
+        Err(ProtoError::Unauthorized(_))
+    ));
+
+    let auth_ok = send_rpc(
+        &mut c1,
+        5,
+        ClientMessage::Authenticate {
+            token: "super-secret-token".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(auth_ok, ResponsePayload::Ok);
+
+    assert!(matches!(
+        send_rpc(&mut c1, 6, ClientMessage::Ping).await,
+        ResponsePayload::Pong { .. }
+    ));
+    assert!(matches!(
+        send_rpc(&mut c1, 7, ClientMessage::ListWorkspaces).await,
+        ResponsePayload::Workspaces(_)
+    ));
+
+    // Auth state is per-connection: a second client must also authenticate.
+    let mut c2 = IpcStream::connect(&endpoint).await.unwrap();
+    assert!(matches!(
+        send_rpc_result(&mut c2, 1, ClientMessage::Ping).await,
+        Err(ProtoError::Unauthorized(_))
+    ));
+    assert_eq!(
+        send_rpc(
+            &mut c2,
+            2,
+            ClientMessage::Authenticate {
+                token: "super-secret-token".to_string(),
+            },
+        )
+        .await,
+        ResponsePayload::Ok
+    );
+    assert!(matches!(
+        send_rpc(&mut c2, 3, ClientMessage::Ping).await,
+        ResponsePayload::Pong { .. }
+    ));
+
+    let _ = shutdown_tx.send(());
+    srv_handle.await.unwrap();
+}
+
+fn interactive_shell_for_action_test() -> Vec<String> {
+    #[cfg(unix)]
+    {
+        vec!["/bin/sh".to_string()]
+    }
+    #[cfg(windows)]
+    {
+        vec!["cmd.exe".to_string(), "/Q".to_string()]
+    }
+}
+
+#[tokio::test]
+async fn run_workspace_action_sends_command_to_target_pane() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daedalusd.sock");
+    let runtime = dir.path().join("runtime");
+    let ws_dir = dir.path().join("ws");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    std::fs::write(
+        ws_dir.join(".daedalus.toml"),
+        r#"
+[[actions]]
+id = "runner-echo"
+label = "Runner Echo"
+target = "runner"
+command = "echo RUNNER_ACTION_OK"
+
+[[actions]]
+id = "agent-prompt"
+label = "Agent Prompt"
+target = "agent"
+command = "AGENT_ACTION_OK"
+
+[[actions]]
+id = "service-cmd"
+label = "Service Cmd"
+target = "service"
+command = "echo SVC_ACTION_OK"
+"#,
+    )
+    .unwrap();
+
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let mut client = IpcStream::connect(&sock).await.unwrap();
+    let ws = match send_rpc(
+        &mut client,
+        1,
+        ClientMessage::CreateWorkspace {
+            name: "actions-ws".to_string(),
+            root_dir: ws_dir,
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::WorkspaceCreated(ws) => ws,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    let manifest = ws.manifest.expect("manifest should be loaded");
+    assert_eq!(manifest.actions.len(), 3);
+
+    // Unknown action returns InvalidRequest
+    let unknown_err = send_rpc_result(
+        &mut client,
+        2,
+        ClientMessage::RunWorkspaceAction {
+            workspace_id: ws.id,
+            action_id: "missing-action".to_string(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(unknown_err, ProtoError::InvalidRequest(_)));
+
+    // Missing target pane returns InvalidRequest
+    let missing_pane_err = send_rpc_result(
+        &mut client,
+        3,
+        ClientMessage::RunWorkspaceAction {
+            workspace_id: ws.id,
+            action_id: "service-cmd".to_string(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(missing_pane_err, ProtoError::InvalidRequest(_)));
+
+    let runner_pane = match send_rpc(
+        &mut client,
+        4,
+        ClientMessage::SpawnPane {
+            workspace_id: ws.id,
+            role: PaneRole::Runner,
+            command: Some(interactive_shell_for_action_test()),
+            shell: None,
+            cols: 120,
+            rows: 20,
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::PaneSpawned(p) => p,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        send_rpc(
+            &mut client,
+            5,
+            ClientMessage::RunWorkspaceAction {
+                workspace_id: ws.id,
+                action_id: "runner-echo".to_string(),
+            },
+        )
+        .await,
+        ResponsePayload::Ok
+    );
+
+    let runner_text = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snap = match send_rpc(
+                &mut client,
+                6,
+                ClientMessage::GetSnapshot {
+                    pane_id: runner_pane.id,
+                },
+            )
+            .await
+            {
+                ResponsePayload::Snapshot(s) => s,
+                other => panic!("unexpected response: {other:?}"),
+            };
+            let text: String = snap
+                .rows_data
+                .iter()
+                .map(|r| {
+                    r.cells
+                        .iter()
+                        .map(|c| c.text.as_str())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.contains("RUNNER_ACTION_OK") {
+                return text;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for RUNNER_ACTION_OK in runner pane snapshot");
+    assert!(runner_text.contains("RUNNER_ACTION_OK"));
+
+    #[cfg(unix)]
+    {
+        let agent_pane = match send_rpc(
+            &mut client,
+            7,
+            ClientMessage::SpawnPane {
+                workspace_id: ws.id,
+                role: PaneRole::Agent,
+                command: Some(vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "stty -echo; cat -v".to_string(),
+                ]),
+                shell: None,
+                cols: 120,
+                rows: 20,
+                env: HashMap::new(),
+            },
+        )
+        .await
+        {
+            ResponsePayload::PaneSpawned(p) => p,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            send_rpc(
+                &mut client,
+                8,
+                ClientMessage::RunWorkspaceAction {
+                    workspace_id: ws.id,
+                    action_id: "agent-prompt".to_string(),
+                },
+            )
+            .await,
+            ResponsePayload::Ok
+        );
+
+        let agent_text = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snap = match send_rpc(
+                    &mut client,
+                    9,
+                    ClientMessage::GetSnapshot {
+                        pane_id: agent_pane.id,
+                    },
+                )
+                .await
+                {
+                    ResponsePayload::Snapshot(s) => s,
+                    other => panic!("unexpected response: {other:?}"),
+                };
+                let text: String = snap
+                    .rows_data
+                    .iter()
+                    .map(|r| {
+                        r.cells
+                            .iter()
+                            .map(|c| c.text.as_str())
+                            .collect::<String>()
+                            .trim_end()
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.contains("^[[200~AGENT_ACTION_OK^[[201~") {
+                    return text;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for bracketed paste AGENT_ACTION_OK in agent pane snapshot");
+        assert!(agent_text.contains("^[[200~AGENT_ACTION_OK^[[201~"));
+    }
+
+    send_rpc(
+        &mut client,
+        10,
+        ClientMessage::CloseWorkspace {
+            id: ws.id,
+            compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
+        },
+    )
+    .await;
+    let _ = shutdown_tx.send(());
+    srv_handle.await.unwrap();
+}
