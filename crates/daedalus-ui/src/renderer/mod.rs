@@ -53,8 +53,31 @@ fn sanitize_scale(scale_factor: f32) -> f32 {
 
 /// Computes the centered physical-pixel rectangle of the Agent preset picker modal.
 pub fn picker_modal_rect(window_w: f32, window_h: f32, scale_factor: f32) -> Rect {
+    picker_rect_for_rows(window_w, window_h, scale_factor, AgentPreset::ALL.len())
+}
+
+pub fn action_palette_layout(
+    window_w: f32,
+    window_h: f32,
+    scale_factor: f32,
+    count: usize,
+    selected: usize,
+) -> (Rect, std::ops::Range<usize>) {
     let s = sanitize_scale(scale_factor);
-    let item_count = AgentPreset::ALL.len() as f32;
+    let row_height = PICKER_ITEM_LOGICAL_HEIGHT + PICKER_ITEM_LOGICAL_GAP;
+    let available = window_h / s - 24.0 - PICKER_HEADER_LOGICAL_HEIGHT - PICKER_PAD_LOGICAL
+        + PICKER_ITEM_LOGICAL_GAP;
+    let rows = ((available / row_height) as usize).max(1).min(count.max(1));
+    let start = (selected.min(count.saturating_sub(1)) + 1).saturating_sub(rows);
+    (
+        picker_rect_for_rows(window_w, window_h, s, rows),
+        start..(start + rows).min(count),
+    )
+}
+
+fn picker_rect_for_rows(window_w: f32, window_h: f32, scale_factor: f32, rows: usize) -> Rect {
+    let s = sanitize_scale(scale_factor);
+    let item_count = rows as f32;
     let modal_w = (PICKER_MODAL_LOGICAL_WIDTH * s).min((window_w - 24.0 * s).max(120.0));
     let modal_h = (PICKER_HEADER_LOGICAL_HEIGHT
         + item_count * PICKER_ITEM_LOGICAL_HEIGHT
@@ -723,7 +746,7 @@ pub fn collect_quads(
     let base_quad_count = quads.len() as u32;
 
     // 4. Centered Agent preset picker modal overlay (rendered after base text).
-    if state.picker.open {
+    if state.picker.open || state.action_palette.open {
         // Dimmed backdrop scrim
         quads.push(QuadInstance::from_xywh(
             0.0,
@@ -733,7 +756,17 @@ pub fn collect_quads(
             Rgba::new(0.0, 0.0, 0.0, 0.55),
         ));
 
-        let modal = picker_modal_rect(screen_w, screen_h, s);
+        let (modal, selected) = if state.action_palette.open {
+            let idx = state.action_palette.selected_index;
+            let (modal, visible) =
+                action_palette_layout(screen_w, screen_h, s, state.active_actions().len(), idx);
+            (modal, visible.contains(&idx).then(|| idx - visible.start))
+        } else {
+            (
+                picker_modal_rect(screen_w, screen_h, s),
+                Some(state.picker.selected_index),
+            )
+        };
         quads.push(QuadInstance::new(modal, theme.picker_bg));
         push_rect_border(&mut quads, modal, border_w, theme.border_focused);
 
@@ -747,17 +780,19 @@ pub fn collect_quads(
         ));
 
         // Selected row highlight
-        let selected_rect = picker_item_rect(modal, state.picker.selected_index, s);
-        quads.push(QuadInstance::new(
-            selected_rect,
-            theme.border_focused.with_alpha(0.26),
-        ));
-        push_rect_border(
-            &mut quads,
-            selected_rect,
-            border_w,
-            theme.border_focused.with_alpha(0.75),
-        );
+        if let Some(selected) = selected {
+            let selected_rect = picker_item_rect(modal, selected, s);
+            quads.push(QuadInstance::new(
+                selected_rect,
+                theme.border_focused.with_alpha(0.26),
+            ));
+            push_rect_border(
+                &mut quads,
+                selected_rect,
+                border_w,
+                theme.border_focused.with_alpha(0.75),
+            );
+        }
     } else if state.worktree_modal.open {
         // Dimmed backdrop scrim
         quads.push(QuadInstance::from_xywh(
@@ -1422,6 +1457,7 @@ impl GpuRenderer {
 
             // Overlay pass (same render pass): active modal or search bar above base text
             if total_quad_count > base_quad_count
+                || state.action_palette.open
                 || state.picker.open
                 || state.worktree_modal.open
                 || state.close_modal.open
@@ -1580,6 +1616,16 @@ mod tests {
             collect_quads(&state, &layout, &theme, 1200.0, 800.0, 1.0, (8.0, 19.0));
         assert_eq!(base_count_modal, base_count);
         assert!(quads_with_modal.len() > base_count_modal as usize);
+    }
+
+    #[test]
+    fn action_palette_scrolls_last_action_into_view_at_high_dpi() {
+        let (modal, visible) = action_palette_layout(1280.0, 720.0, 2.0, 32, 31);
+        assert!(visible.start > 0);
+        assert_eq!(visible.end, 32);
+        assert!(picker_item_rect(modal, visible.len() - 1, 2.0).bottom() <= modal.bottom());
+        assert!(modal.bottom() <= 720.0);
+        assert!(action_palette_layout(1280.0, 720.0, 2.0, 0, 0).1.is_empty());
     }
 
     #[test]

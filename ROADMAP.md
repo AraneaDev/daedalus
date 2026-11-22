@@ -52,7 +52,7 @@ Because `daedalus-ui` already uses `winit` + `wgpu` (Metal backend) + `glyphon` 
 
 ---
 
-## v0.0.5 — Windows Native Support (ConPTY, Named Pipes & WSL2 Bridge)
+## v0.0.5 — Windows Native Support (ConPTY, Named Pipes & WSL2 Bridge) (Shipped)
 
 - **Cross-Platform IPC (`daedalus-proto`):** Abstract transport over Unix Domain Sockets (Linux/macOS/Windows `AF_UNIX`) and Windows Named Pipes (`\\.\pipe\daedalus`).
 - **Windows Daemon (`daedalusd`):**

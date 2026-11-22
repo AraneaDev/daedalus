@@ -190,6 +190,16 @@ pub struct ExternalStatus {
     pub updated_at_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomAction {
+    pub id: String,
+    pub label: String,
+    pub target: PaneRole,
+    pub command: String,
+    #[serde(default)]
+    pub shortcut: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkspaceManifest {
     #[serde(default)]
@@ -200,6 +210,8 @@ pub struct WorkspaceManifest {
     pub service_command: Option<Vec<String>>,
     #[serde(default)]
     pub runner_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub actions: Vec<CustomAction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

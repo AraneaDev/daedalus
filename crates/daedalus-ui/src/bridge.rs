@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use daedalus_proto::remote::{SshTarget, SshTunnel};
 use daedalus_proto::transport::IpcStream;
 use daedalus_proto::{
     AgentState, ClientMessage, ContainerHealth, GitWorkspaceStatus, GridRow, GridSnapshot, PaneId,
@@ -39,12 +40,28 @@ pub trait UiEventSink: Send + Sync + 'static {
 }
 
 /// Configuration for `DaemonBridge`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BridgeConfig {
     pub socket_path: PathBuf,
+    pub auth_token: Option<String>,
     pub initial_dir: PathBuf,
     pub default_agent: AgentPreset,
     pub auto_spawn_daemon: bool,
+}
+
+impl std::fmt::Debug for BridgeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeConfig")
+            .field("socket_path", &self.socket_path)
+            .field("initial_dir", &self.initial_dir)
+            .field("default_agent", &self.default_agent)
+            .field("auto_spawn_daemon", &self.auto_spawn_daemon)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 /// Commands sent from the UI thread to `DaemonBridge`.
@@ -72,6 +89,10 @@ pub enum UiCommand {
         preset: AgentPreset,
         cols: u16,
         rows: u16,
+    },
+    RunWorkspaceAction {
+        workspace_id: WorkspaceId,
+        action_id: String,
     },
     SendInput {
         pane_id: PaneId,
@@ -160,6 +181,7 @@ pub enum UiEvent {
 /// Background async bridge between the UI thread and `daedalusd`.
 pub struct DaemonBridge {
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
+    shutdown_tx: watch::Sender<()>,
     thread_handle: Option<JoinHandle<()>>,
 }
 
@@ -167,6 +189,7 @@ impl DaemonBridge {
     /// Spawns a dedicated 2-worker Tokio runtime thread and begins connecting to `daedalusd`.
     pub fn start(config: BridgeConfig, sink: Arc<dyn UiEventSink>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(());
         let thread_handle = std::thread::Builder::new()
             .name("daedalus-bridge".to_string())
             .spawn(move || {
@@ -175,33 +198,41 @@ impl DaemonBridge {
                     .enable_all()
                     .build()
                     .expect("failed to build Tokio runtime for DaemonBridge");
-                runtime.block_on(run_bridge(config, sink, cmd_rx));
+                runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx.changed() => {}
+                        _ = run_bridge(config, sink, cmd_rx) => {}
+                    }
+                });
             })
             .expect("failed to spawn DaemonBridge thread");
 
         Self {
             cmd_tx,
+            shutdown_tx,
             thread_handle: Some(thread_handle),
         }
     }
 
     /// Enqueues a command for the background bridge runtime.
     pub fn send(&self, cmd: UiCommand) {
-        let _ = self.cmd_tx.send(cmd);
+        if matches!(cmd, UiCommand::Shutdown) {
+            let _ = self.shutdown_tx.send(());
+        } else {
+            let _ = self.cmd_tx.send(cmd);
+        }
     }
 
     /// Requests a clean shutdown and waits for the background runtime thread to exit.
-    pub fn shutdown(mut self) {
-        let _ = self.cmd_tx.send(UiCommand::Shutdown);
-        if let Some(handle) = self.thread_handle.take() {
-            let _ = handle.join();
-        }
+    pub fn shutdown(self) {
+        drop(self);
     }
 }
 
 impl Drop for DaemonBridge {
     fn drop(&mut self) {
-        let _ = self.cmd_tx.send(UiCommand::Shutdown);
+        let _ = self.shutdown_tx.send(());
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
         }
@@ -385,11 +416,28 @@ fn should_auto_spawn_daemon(
     socket_path: &Path,
 ) -> bool {
     auto_spawn_daemon
+        && ssh_uri(socket_path).is_none()
         && !spawn_attempted
         && matches!(
             daedalus_proto::transport::parse_endpoint(socket_path),
             daedalus_proto::transport::IpcEndpoint::Local(_)
         )
+}
+
+fn ssh_uri(endpoint: &Path) -> Option<&str> {
+    endpoint.to_str().filter(|raw| raw.starts_with("ssh://"))
+}
+
+async fn connect_endpoint(endpoint: &Path) -> std::io::Result<(IpcStream, Option<SshTunnel>)> {
+    if let Some(uri) = ssh_uri(endpoint) {
+        let target = SshTarget::parse(uri)
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+        let tunnel = SshTunnel::start(target).await?;
+        let stream = IpcStream::connect(tunnel.local_endpoint()).await?;
+        Ok((stream, Some(tunnel)))
+    } else {
+        Ok((IpcStream::connect(endpoint).await?, None))
+    }
 }
 
 async fn run_bridge(
@@ -402,8 +450,8 @@ async fn run_bridge(
     let mut spawn_attempted = false;
 
     loop {
-        match IpcStream::connect(&config.socket_path).await {
-            Ok(stream) => {
+        match connect_endpoint(&config.socket_path).await {
+            Ok((stream, _tunnel)) => {
                 backoff = INITIAL_BACKOFF;
                 spawn_attempted = false;
                 let mut conn = RpcConnection::new(stream, Arc::clone(&sink));
@@ -456,7 +504,7 @@ async fn run_bridge(
                     &config.socket_path,
                 ) {
                     spawn_attempted = true;
-                    match spawn_daemon_detached(&config.socket_path) {
+                    match spawn_daemon_detached(&config.socket_path, config.auth_token.as_deref()) {
                         Ok(bin) => {
                             info!(
                                 binary = %bin.display(),
@@ -512,6 +560,18 @@ async fn initialize_session(
     sink: &Arc<dyn UiEventSink>,
     bootstrapped: &mut bool,
 ) -> Result<(), RpcError> {
+    if let Some(token) = config.auth_token.as_ref().filter(|token| !token.is_empty()) {
+        let response = conn
+            .call(ClientMessage::Authenticate {
+                token: token.clone(),
+            })
+            .await?;
+        if !matches!(response, ResponsePayload::Ok) {
+            return Err(RpcError::Proto(ProtoError::InvalidRequest(
+                "unexpected authentication response".into(),
+            )));
+        }
+    }
     let _ = conn.call(ClientMessage::Ping).await?;
     let _ = conn
         .call(ClientMessage::Subscribe { pane_ids: None })
@@ -708,6 +768,16 @@ async fn handle_command(
                 message: format!("Switched Agent pane to {}", preset.short_name()),
                 is_error: false,
             });
+        }
+        UiCommand::RunWorkspaceAction {
+            workspace_id,
+            action_id,
+        } => {
+            conn.call(ClientMessage::RunWorkspaceAction {
+                workspace_id,
+                action_id,
+            })
+            .await?;
         }
         UiCommand::SendInput { pane_id, data } => {
             let _ = conn
@@ -1176,11 +1246,14 @@ fn resolve_daemon_binary(current_exe: Option<&Path>) -> PathBuf {
     PathBuf::from(bin_name)
 }
 
-fn spawn_daemon_detached(socket_path: &Path) -> std::io::Result<PathBuf> {
+fn spawn_daemon_detached(socket_path: &Path, auth_token: Option<&str>) -> std::io::Result<PathBuf> {
     let exe = std::env::current_exe().ok();
     let bin = resolve_daemon_binary(exe.as_deref());
 
     let mut cmd = Command::new(&bin);
+    if let Some(token) = auth_token {
+        cmd.env("DAEDALUS_AUTH_TOKEN", token);
+    }
     cmd.arg("--socket")
         .arg(socket_path)
         .stdin(Stdio::null())
@@ -1478,6 +1551,7 @@ mod tests {
                 "up".to_string(),
             ]),
             runner_command: Some(vec!["cargo".to_string(), "test".to_string()]),
+            actions: Vec::new(),
         };
 
         let (specs, warnings) =
@@ -1535,7 +1609,12 @@ mod tests {
     }
 
     #[test]
-    fn auto_spawn_skips_tcp_endpoints_and_allows_local_endpoints() {
+    fn auto_spawn_only_for_local_endpoints() {
+        assert!(!should_auto_spawn_daemon(
+            true,
+            false,
+            Path::new("ssh://host")
+        ));
         assert!(!should_auto_spawn_daemon(
             true,
             false,

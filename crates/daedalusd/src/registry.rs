@@ -812,6 +812,58 @@ impl Registry {
         handle.set_agent_state(state).await
     }
 
+    /// Executes a custom action from the workspace's `.daedalus.toml` `[[actions]]` manifest
+    /// by sending its command to the first pane matching `action.target`.
+    pub async fn run_workspace_action(
+        &self,
+        workspace_id: WorkspaceId,
+        action_id: &str,
+    ) -> Result<(), ProtoError> {
+        let (action, pane_handle) = {
+            let ws_map = self.workspaces.read().await;
+            let pane_map = self.panes.read().await;
+            let ws = ws_map
+                .get(&workspace_id)
+                .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
+            let action = ws
+                .manifest
+                .as_ref()
+                .and_then(|m| m.actions.iter().find(|a| a.id == action_id))
+                .cloned()
+                .ok_or_else(|| {
+                    ProtoError::InvalidRequest(format!("unknown action '{action_id}'"))
+                })?;
+            let handle = ws
+                .pane_ids
+                .iter()
+                .filter_map(|pid| pane_map.get(pid))
+                .find(|h| h.role() == action.target)
+                .cloned()
+                .ok_or_else(|| {
+                    ProtoError::InvalidRequest(format!("no {} pane in workspace", action.target))
+                })?;
+            (action, handle)
+        };
+
+        let data = match action.target {
+            PaneRole::Agent => {
+                let mut bytes = daedalus_proto::wrap_bracketed_paste(action.command.as_bytes());
+                bytes.push(b'\r');
+                bytes
+            }
+            PaneRole::Service | PaneRole::Runner => {
+                let mut bytes = action.command.into_bytes();
+                #[cfg(windows)]
+                bytes.extend_from_slice(b"\r\n");
+                #[cfg(not(windows))]
+                bytes.push(b'\n');
+                bytes
+            }
+        };
+
+        pane_handle.send_input(data).await
+    }
+
     pub async fn get_failure_trace(
         &self,
         pane_id: PaneId,

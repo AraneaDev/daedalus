@@ -1,11 +1,12 @@
-use daedalus_proto::WorkspaceManifest;
+use daedalus_proto::{CustomAction, PaneRole, WorkspaceManifest};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
 use tracing::warn;
 
 pub const MANIFEST_FILENAME: &str = ".daedalus.toml";
+pub const MAX_MANIFEST_ACTIONS: usize = 32;
 
 /// Parsed project manifest loaded from `<root_dir>/.daedalus.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -27,6 +28,22 @@ struct RawManifest {
     ports: Option<RawPortsSection>,
     #[serde(default)]
     env: HashMap<String, String>,
+    #[serde(default)]
+    actions: Vec<RawActionEntry>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawActionEntry {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    shortcut: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -59,6 +76,52 @@ fn normalize_preset(preset: Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn parse_action_target(raw: &str) -> Option<PaneRole> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "agent" => Some(PaneRole::Agent),
+        "service" => Some(PaneRole::Service),
+        "runner" => Some(PaneRole::Runner),
+        _ => None,
+    }
+}
+
+fn normalize_actions(raw_actions: Vec<RawActionEntry>) -> Vec<CustomAction> {
+    let mut out = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    for raw in raw_actions {
+        if out.len() >= MAX_MANIFEST_ACTIONS {
+            break;
+        }
+        let id = raw.id.trim().to_string();
+        let label = raw.label.trim().to_string();
+        let command = raw.command.trim().to_string();
+        if id.is_empty() || label.is_empty() || command.is_empty() {
+            continue;
+        }
+        let Some(target) = parse_action_target(&raw.target) else {
+            continue;
+        };
+        if !seen_ids.insert(id.clone()) {
+            continue;
+        }
+        let shortcut = raw
+            .shortcut
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        out.push(CustomAction {
+            id,
+            label,
+            target,
+            command,
+            shortcut,
+        });
+    }
+
+    out
+}
+
 /// Parses `.daedalus.toml` contents into a [`LoadedManifest`].
 pub fn parse_project_manifest(contents: &str) -> Result<LoadedManifest, toml::de::Error> {
     let raw: RawManifest = toml::from_str(contents)?;
@@ -66,6 +129,7 @@ pub fn parse_project_manifest(contents: &str) -> Result<LoadedManifest, toml::de
     let service = raw.service.unwrap_or_default();
     let runner = raw.runner.unwrap_or_default();
     let ports = raw.ports.unwrap_or_default();
+    let actions = normalize_actions(raw.actions);
 
     Ok(LoadedManifest {
         workspace_manifest: WorkspaceManifest {
@@ -73,6 +137,7 @@ pub fn parse_project_manifest(contents: &str) -> Result<LoadedManifest, toml::de
             agent_command: normalize_command(agent.command),
             service_command: normalize_command(service.command),
             runner_command: normalize_command(runner.command),
+            actions,
         },
         extra_ports: ports.extra.into_iter().filter(|&p| p > 0).collect(),
         env: raw.env,
@@ -158,6 +223,7 @@ API_BASE = "http://localhost:8080"
                     "test".to_string(),
                     "--workspace".to_string(),
                 ]),
+                actions: Vec::new(),
             }
         );
         assert_eq!(loaded.extra_ports, vec![8080, 9000]);
@@ -212,5 +278,136 @@ extra = [0, 7070]
         assert_eq!(loaded.workspace_manifest, WorkspaceManifest::default());
         assert_eq!(loaded.extra_ports, vec![7070]);
         assert!(loaded.env.is_empty());
+    }
+
+    #[test]
+    fn parses_valid_actions_and_trims_fields() {
+        let loaded = parse_project_manifest(
+            r#"
+[[actions]]
+id = "  test-all  "
+label = "  Run Tests  "
+target = " Runner "
+command = "  cargo test --workspace  "
+shortcut = "  Ctrl+T  "
+
+[[actions]]
+id = "restart-svc"
+label = "Restart Service"
+target = "service"
+command = "docker compose restart"
+
+[[actions]]
+id = "ask-agent"
+label = "Summarize"
+target = "AGENT"
+command = "/summarize"
+shortcut = "   "
+"#,
+        )
+        .expect("manifest with actions should parse");
+
+        assert_eq!(
+            loaded.workspace_manifest.actions,
+            vec![
+                CustomAction {
+                    id: "test-all".to_string(),
+                    label: "Run Tests".to_string(),
+                    target: PaneRole::Runner,
+                    command: "cargo test --workspace".to_string(),
+                    shortcut: Some("Ctrl+T".to_string()),
+                },
+                CustomAction {
+                    id: "restart-svc".to_string(),
+                    label: "Restart Service".to_string(),
+                    target: PaneRole::Service,
+                    command: "docker compose restart".to_string(),
+                    shortcut: None,
+                },
+                CustomAction {
+                    id: "ask-agent".to_string(),
+                    label: "Summarize".to_string(),
+                    target: PaneRole::Agent,
+                    command: "/summarize".to_string(),
+                    shortcut: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn deduplicates_action_ids_and_skips_invalid_entries() {
+        let loaded = parse_project_manifest(
+            r#"
+[[actions]]
+id = ""
+label = "Missing ID"
+target = "runner"
+command = "echo nope"
+
+[[actions]]
+id = "blank-label"
+label = "   "
+target = "runner"
+command = "echo nope"
+
+[[actions]]
+id = "blank-cmd"
+label = "Blank Command"
+target = "runner"
+command = ""
+
+[[actions]]
+id = "bad-target"
+label = "Unknown Target"
+target = "shell"
+command = "echo nope"
+
+[[actions]]
+id = "dup"
+label = "First"
+target = "runner"
+command = "echo first"
+
+[[actions]]
+id = "dup"
+label = "Second"
+target = "service"
+command = "echo second"
+"#,
+        )
+        .expect("manifest should skip invalid actions without failing");
+
+        assert_eq!(
+            loaded.workspace_manifest.actions,
+            vec![CustomAction {
+                id: "dup".to_string(),
+                label: "First".to_string(),
+                target: PaneRole::Runner,
+                command: "echo first".to_string(),
+                shortcut: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn caps_actions_at_max_manifest_actions() {
+        let mut toml_str = String::new();
+        for i in 0..(MAX_MANIFEST_ACTIONS + 8) {
+            toml_str.push_str(&format!(
+                "[[actions]]\nid = \"act-{i}\"\nlabel = \"Action {i}\"\ntarget = \"runner\"\ncommand = \"echo {i}\"\n\n"
+            ));
+        }
+
+        let loaded = parse_project_manifest(&toml_str).expect("manifest should parse");
+        assert_eq!(
+            loaded.workspace_manifest.actions.len(),
+            MAX_MANIFEST_ACTIONS
+        );
+        assert_eq!(loaded.workspace_manifest.actions[0].id, "act-0");
+        assert_eq!(
+            loaded.workspace_manifest.actions[MAX_MANIFEST_ACTIONS - 1].id,
+            format!("act-{}", MAX_MANIFEST_ACTIONS - 1)
+        );
     }
 }

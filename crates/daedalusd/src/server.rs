@@ -24,6 +24,7 @@ pub struct DaemonServer {
     listener: IpcListener,
     registry: Arc<Registry>,
     external_hook: Option<ExternalHookServer>,
+    auth_token: Option<String>,
 }
 
 impl DaemonServer {
@@ -101,7 +102,13 @@ impl DaemonServer {
             listener,
             registry,
             external_hook,
+            auth_token: None,
         })
+    }
+
+    pub fn with_auth_token(mut self, token: Option<String>) -> Self {
+        self.auth_token = token.filter(|t| !t.is_empty());
+        self
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -142,7 +149,8 @@ impl DaemonServer {
                     match accept_res {
                         Ok(stream) => {
                             let reg = Arc::clone(&self.registry);
-                            client_tasks.spawn(handle_client(stream, reg));
+                            let auth_token = self.auth_token.clone();
+                            client_tasks.spawn(handle_client(stream, reg, auth_token));
                         }
                         Err(e) => {
                             error!(error = %e, "accept failed");
@@ -205,7 +213,18 @@ async fn wait_for_done(done_rx: &mut watch::Receiver<bool>) {
     }
 }
 
-async fn handle_client(stream: IpcStream, registry: Arc<Registry>) {
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let max_len = a.len().max(b.len());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..max_len {
+        let byte_a = a.get(i).copied().unwrap_or(0);
+        let byte_b = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(byte_a ^ byte_b);
+    }
+    diff == 0
+}
+
+async fn handle_client(stream: IpcStream, registry: Arc<Registry>, auth_token: Option<String>) {
     let (mut reader, mut writer) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMessage>(CLIENT_OUTBOUND_CAPACITY);
     let filter = Arc::new(RwLock::new(SubscriptionFilter::default()));
@@ -231,10 +250,28 @@ async fn handle_client(stream: IpcStream, registry: Arc<Registry>) {
     };
 
     let reader_fut = async move {
+        let mut authenticated = auth_token.is_none();
         loop {
             match read_frame::<_, Request>(&mut reader).await {
                 Ok(Some(req)) => {
-                    let result = dispatch_request(&registry, &filter, req.payload).await;
+                    let result = match req.payload {
+                        ClientMessage::Authenticate { token } => match &auth_token {
+                            None => Ok(ResponsePayload::Ok),
+                            Some(expected)
+                                if constant_time_eq(token.as_bytes(), expected.as_bytes()) =>
+                            {
+                                authenticated = true;
+                                Ok(ResponsePayload::Ok)
+                            }
+                            Some(_) => Err(ProtoError::Unauthorized(
+                                "invalid authentication token".to_string(),
+                            )),
+                        },
+                        _ if !authenticated => Err(ProtoError::Unauthorized(
+                            "authentication required".to_string(),
+                        )),
+                        other => dispatch_request(&registry, &filter, other).await,
+                    };
                     let resp = ServerMessage::Response { id: req.id, result };
                     if out_tx.send(resp).await.is_err() {
                         break;
@@ -270,6 +307,7 @@ async fn dispatch_request(
                 isolation_mode: registry.isolation_mode().as_str().to_string(),
             })
         }
+        ClientMessage::Authenticate { .. } => Ok(ResponsePayload::Ok),
         ClientMessage::CreateWorkspace {
             name,
             root_dir,
@@ -415,6 +453,15 @@ async fn dispatch_request(
             let mut f = filter.write().await;
             f.active = false;
             f.pane_ids = None;
+            Ok(ResponsePayload::Ok)
+        }
+        ClientMessage::RunWorkspaceAction {
+            workspace_id,
+            action_id,
+        } => {
+            registry
+                .run_workspace_action(workspace_id, &action_id)
+                .await?;
             Ok(ResponsePayload::Ok)
         }
     }
@@ -663,5 +710,15 @@ mod tests {
             & 0o777;
         assert_eq!(mode2, 0o700);
         drop(srv2);
+    }
+
+    #[test]
+    fn constant_time_eq_checks_bytes_and_lengths() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"secret-token-123", b"secret-token-123"));
+        assert!(!constant_time_eq(b"secret-token-123", b"secret-token-124"));
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+        assert!(!constant_time_eq(b"secret-longer", b"secret"));
+        assert!(!constant_time_eq(b"", b"nonempty"));
     }
 }

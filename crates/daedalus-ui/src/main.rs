@@ -8,12 +8,12 @@ use daedalus_ui::bridge::{BridgeConfig, DaemonBridge, UiCommand, UiEvent, UiEven
 use daedalus_ui::config::UiConfig;
 use daedalus_ui::input::{UiAction, filter_modal_text, translate_key};
 use daedalus_ui::layout::{HitTarget, LayoutInput, WorkspaceLayout, compute_layout, hit_test};
-use daedalus_ui::links::{detect_link_in_row, open_link};
+use daedalus_ui::links::{detect_link_in_row, detect_url_in_row, open_link};
 use daedalus_ui::renderer::{
-    GpuRenderer, RenderError, close_modal_cancel_rect, close_modal_compose_rect,
-    close_modal_confirm_rect, close_modal_force_rect, close_modal_worktree_rect,
-    close_workspace_modal_rect, picker_item_rect, picker_modal_rect, search_bar_rect,
-    worktree_modal_rect,
+    GpuRenderer, RenderError, action_palette_layout, close_modal_cancel_rect,
+    close_modal_compose_rect, close_modal_confirm_rect, close_modal_force_rect,
+    close_modal_worktree_rect, close_workspace_modal_rect, picker_item_rect, picker_modal_rect,
+    search_bar_rect, worktree_modal_rect,
 };
 use daedalus_ui::selection::{CellPos, Selection, extract_selected_text, select_word_at};
 use daedalus_ui::state::{AgentPreset, AppState};
@@ -39,11 +39,15 @@ const FALLBACK_PANE_ROWS: u16 = 36;
 #[derive(Debug, Parser)]
 #[command(name = "daedalus-ui", about = "Daedalus native GPU terminal workbench")]
 struct Args {
-    /// Unix socket path for `daedalusd`.
+    /// Local daemon socket path or ssh:// URI.
     #[arg(long, env = "DAEDALUS_SOCKET")]
     socket: Option<PathBuf>,
 
-    /// Initial workspace directory (defaults to current working directory).
+    /// Bearer token for an authenticated daemon.
+    #[arg(long, env = "DAEDALUS_AUTH_TOKEN", hide_env_values = true)]
+    auth_token: Option<String>,
+
+    /// Initial workspace directory on the daemon host (defaults to its working directory for SSH).
     #[arg(long)]
     dir: Option<PathBuf>,
 
@@ -545,7 +549,11 @@ impl DaedalusApp {
                 .state
                 .active_workspace()
                 .map(|ws| ws.root_dir.as_path());
-            detect_link_in_row(grid_row, col as usize, cwd, root_dir)
+            if self.state.remote_host.is_some() {
+                detect_url_in_row(grid_row, col as usize)
+            } else {
+                detect_link_in_row(grid_row, col as usize, cwd, root_dir)
+            }
         };
 
         let Some(link) = link else {
@@ -556,6 +564,21 @@ impl DaedalusApp {
             warn!(error = %err, link = ?link, "failed to open clicked link");
             self.show_toast(format!("Failed to open link: {err}"), true);
         }
+    }
+
+    fn confirm_workspace_action(&mut self) {
+        let selected = self.state.action_palette.selected_index;
+        if let (Some(workspace_id), Some(action)) = (
+            self.state.active_workspace_id,
+            self.state.active_actions().get(selected),
+        ) {
+            self.send_command(UiCommand::RunWorkspaceAction {
+                workspace_id,
+                action_id: action.id.clone(),
+            });
+        }
+        self.state.action_palette.close();
+        self.request_redraw();
     }
 
     fn handle_ui_action(&mut self, action: UiAction) {
@@ -582,6 +605,29 @@ impl DaedalusApp {
             UiAction::ToggleSidebar => {
                 self.state.sidebar_visible = !self.state.sidebar_visible;
                 self.schedule_resize_flush();
+                self.request_redraw();
+            }
+            UiAction::ToggleActionPalette => {
+                if self.state.action_palette.open {
+                    self.state.action_palette.close();
+                } else {
+                    self.drag_anchor = None;
+                    self.state.open_action_palette();
+                }
+                self.request_redraw();
+            }
+            UiAction::ActionPaletteUp | UiAction::ActionPaletteDown => {
+                let count = self.state.active_actions().len();
+                if action == UiAction::ActionPaletteUp {
+                    self.state.action_palette.move_up(count);
+                } else {
+                    self.state.action_palette.move_down(count);
+                }
+                self.request_redraw();
+            }
+            UiAction::ActionPaletteConfirm => self.confirm_workspace_action(),
+            UiAction::ActionPaletteCancel => {
+                self.state.action_palette.close();
                 self.request_redraw();
             }
             UiAction::ToggleAgentPicker => {
@@ -742,6 +788,27 @@ impl DaedalusApp {
         let scale_factor = window.scale_factor() as f32;
         let (cell_w, cell_h) = renderer.cell_size();
         let (x, y) = self.cursor_pos;
+
+        if self.state.action_palette.open {
+            let (modal, visible) = action_palette_layout(
+                size.width as f32,
+                size.height as f32,
+                scale_factor,
+                self.state.active_actions().len(),
+                self.state.action_palette.selected_index,
+            );
+            if !modal.contains(x, y) {
+                self.state.action_palette.close();
+                self.request_redraw();
+            } else if let Some((_, index)) = visible
+                .enumerate()
+                .find(|(row, _)| picker_item_rect(modal, *row, scale_factor).contains(x, y))
+            {
+                self.state.action_palette.selected_index = index;
+                self.confirm_workspace_action();
+            }
+            return;
+        }
 
         if self.state.picker.open {
             let modal = picker_modal_rect(size.width as f32, size.height as f32, scale_factor);
@@ -975,6 +1042,15 @@ impl DaedalusApp {
             }
         };
         if scroll_lines == 0 {
+            return;
+        }
+
+        if self.state.action_palette.open {
+            self.handle_ui_action(if scroll_lines > 0 {
+                UiAction::ActionPaletteUp
+            } else {
+                UiAction::ActionPaletteDown
+            });
             return;
         }
 
@@ -1230,13 +1306,17 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
                         self.state.worktree_modal.open,
                         self.state.close_modal.open,
                         self.state.search.is_some(),
+                        self.state.action_palette.open,
                     );
                     self.handle_ui_action(action);
                 }
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                if self.state.picker.open || self.state.close_modal.open {
-                    // Picker and close modal swallow IME text.
+                if self.state.picker.open
+                    || self.state.close_modal.open
+                    || self.state.action_palette.open
+                {
+                    // Selection and confirmation modals swallow IME text.
                 } else if self.state.worktree_modal.open {
                     if let Some(cleaned) = filter_modal_text(&text, false) {
                         self.handle_ui_action(UiAction::WorktreeModalText(cleaned));
@@ -1360,12 +1440,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui_config = UiConfig::load(args.config.as_deref());
     let default_agent = args.agent.unwrap_or(ui_config.default_agent);
     let socket_path = args.socket.unwrap_or_else(default_socket_path);
-    let initial_dir = args
-        .dir
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let remote_host = socket_path
+        .to_str()
+        .filter(|path| path.starts_with("ssh://"))
+        .map(daedalus_proto::remote::SshTarget::parse)
+        .transpose()?
+        .map(|target| target.host);
+    let initial_dir = args.dir.unwrap_or_else(|| {
+        if remote_host.is_some() {
+            PathBuf::from(".")
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        }
+    });
 
     let config = BridgeConfig {
         socket_path,
+        auth_token: args.auth_token,
         initial_dir,
         default_agent,
         auto_spawn_daemon: !args.no_auto_spawn,
@@ -1374,6 +1465,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop: EventLoop<UiEvent> = EventLoop::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let mut app = DaedalusApp::new(config, ui_config, proxy);
+    app.state.remote_host = remote_host;
     event_loop.run_app(&mut app)?;
     Ok(())
 }

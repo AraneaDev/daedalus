@@ -95,6 +95,29 @@ printf '{"source":"cassandra","root_dir":"%s","level":"error","label":"retry 3/5
 
 ---
 
+## Remote workspaces and custom actions
+
+Start `daedalusd` on the remote host, then pass its Unix socket path to either client. The example assumes the SSH alias `devbox` and remote UID 1000. OpenSSH must be installed on the client and socket forwarding enabled on the server.
+
+```sh
+daedalus-ui --socket ssh://devbox/run/user/1000/daedalus/daedalusd.sock
+daedalus-ctl --socket ssh://devbox/run/user/1000/daedalus/daedalusd.sock ping
+```
+
+To require a bearer token, set `DAEDALUS_AUTH_TOKEN` in the daemon environment and supply the same value in the client environment.
+
+Define actions in the workspace root's `.daedalus.toml`. For example, this action submits the workspace test command to the runner pane.
+
+```toml
+[[actions]]
+id = "test"
+label = "Run workspace tests"
+target = "runner"
+command = "cargo test --workspace"
+```
+
+Open the action palette with **Ctrl+Shift+A** (**Cmd+Shift+A** on macOS), select an action, and press Enter. From the CLI, use `daedalus-ctl action list --workspace <uuid>` or `daedalus-ctl action run test --workspace <uuid>`. When connecting remotely, use the workspace UUID reported by the remote daemon.
+
 ## Development
 
 ```bash

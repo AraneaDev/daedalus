@@ -13,6 +13,11 @@ pub enum UiAction {
     ToggleZoom,
     ToggleSidebar,
     ToggleAgentPicker,
+    ToggleActionPalette,
+    ActionPaletteUp,
+    ActionPaletteDown,
+    ActionPaletteConfirm,
+    ActionPaletteCancel,
     ToggleWorktreeModal,
     OpenCloseWorkspaceModal,
     ToggleSearch,
@@ -62,6 +67,7 @@ pub fn filter_modal_text(raw: &str, allow_whitespace: bool) -> Option<String> {
 
 /// Translates a `winit` key press into either a workbench UI action, a modal
 /// navigation/input event, or XTerm VT bytes to forward to the focused pane's PTY.
+#[allow(clippy::too_many_arguments)]
 pub fn translate_key(
     key: &Key,
     text: Option<&str>,
@@ -70,7 +76,11 @@ pub fn translate_key(
     worktree_modal_open: bool,
     close_modal_open: bool,
     search_open: bool,
+    action_palette_open: bool,
 ) -> UiAction {
+    if action_palette_open {
+        return translate_palette_key(key, mods, cfg!(target_os = "macos"));
+    }
     translate_key_for_platform(
         key,
         text,
@@ -252,6 +262,7 @@ fn translate_primary_shift_char(ch: &str) -> UiAction {
         "l" => UiAction::FocusDir(FocusDirection::Right),
         "z" => UiAction::ToggleZoom,
         "b" => UiAction::ToggleSidebar,
+        "a" => UiAction::ToggleActionPalette,
         "p" => UiAction::ToggleAgentPicker,
         "w" => UiAction::ToggleWorktreeModal,
         "d" => UiAction::OpenCloseWorkspaceModal,
@@ -309,6 +320,19 @@ fn is_search_toggle_chord(key: &Key, mods: ModifiersState, is_macos: bool) -> bo
         mods.super_key() && !mods.control_key()
     } else {
         mods.control_key() && mods.shift_key() && !mods.super_key()
+    }
+}
+
+fn translate_palette_key(key: &Key, mods: ModifiersState, is_macos: bool) -> UiAction {
+    if is_primary_shift_char(key, mods, "a", is_macos) {
+        return UiAction::ToggleActionPalette;
+    }
+    match key {
+        Key::Named(NamedKey::ArrowUp) => UiAction::ActionPaletteUp,
+        Key::Named(NamedKey::ArrowDown) => UiAction::ActionPaletteDown,
+        Key::Named(NamedKey::Enter) => UiAction::ActionPaletteConfirm,
+        Key::Named(NamedKey::Escape) => UiAction::ActionPaletteCancel,
+        _ => UiAction::Ignore,
     }
 }
 
@@ -518,6 +542,49 @@ mod tests {
 
     fn t_macos(key: &Key, text: Option<&str>, mods: ModifiersState) -> UiAction {
         translate_key_for_platform(key, text, mods, false, false, false, false, true)
+    }
+
+    #[test]
+    fn palette_uses_platform_chord_and_captures_keys() {
+        let key = char_key("A");
+        for (macos, primary) in [
+            (true, ModifiersState::SUPER),
+            (false, ModifiersState::CONTROL),
+        ] {
+            let chord = primary | ModifiersState::SHIFT;
+            assert_eq!(
+                translate_key_for_platform(
+                    &key,
+                    Some("A"),
+                    chord,
+                    false,
+                    false,
+                    false,
+                    false,
+                    macos
+                ),
+                UiAction::ToggleActionPalette
+            );
+            assert_eq!(
+                translate_palette_key(&key, chord, macos),
+                UiAction::ToggleActionPalette
+            );
+        }
+        for (key, expected) in [
+            (NamedKey::ArrowUp, UiAction::ActionPaletteUp),
+            (NamedKey::ArrowDown, UiAction::ActionPaletteDown),
+            (NamedKey::Enter, UiAction::ActionPaletteConfirm),
+            (NamedKey::Escape, UiAction::ActionPaletteCancel),
+        ] {
+            assert_eq!(
+                translate_palette_key(&named_key(key), ModifiersState::empty(), false),
+                expected
+            );
+        }
+        assert_eq!(
+            translate_palette_key(&char_key("x"), ModifiersState::empty(), false),
+            UiAction::Ignore
+        );
     }
 
     #[test]
@@ -1383,7 +1450,16 @@ mod tests {
 
         // Platform wrapper matches cfg!(target_os = "macos")
         assert_eq!(
-            translate_key(&char_key("c"), Some("c"), cmd, false, false, false, false),
+            translate_key(
+                &char_key("c"),
+                Some("c"),
+                cmd,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
             translate_key_for_platform(
                 &char_key("c"),
                 Some("c"),

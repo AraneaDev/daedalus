@@ -1,24 +1,63 @@
+use daedalus_proto::remote::{SshTarget, SshTunnel};
 use daedalus_proto::transport::IpcStream;
 use daedalus_proto::{
     ClientMessage, Request, ResponsePayload, ServerEvent, ServerMessage, read_frame, write_frame,
 };
 use std::path::Path;
 
+pub type ClientError = Box<dyn std::error::Error>;
+
 pub struct DaemonClient {
     stream: IpcStream,
     next_id: u64,
+    _tunnel: Option<SshTunnel>,
 }
 
 impl DaemonClient {
-    pub async fn connect(socket: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let stream = IpcStream::connect(socket).await?;
-        Ok(Self { stream, next_id: 1 })
+    #[allow(dead_code)]
+    pub async fn connect(socket: &Path) -> Result<Self, ClientError> {
+        Self::connect_with_auth(socket, None).await
+    }
+
+    pub async fn connect_with_auth(
+        socket: &Path,
+        auth_token: Option<&str>,
+    ) -> Result<Self, ClientError> {
+        let socket_str = socket.to_string_lossy();
+        let (stream, tunnel) = if socket_str.starts_with("ssh://") {
+            let target = SshTarget::parse(&socket_str)?;
+            let tunnel = SshTunnel::start(target).await?;
+            let stream = IpcStream::connect(tunnel.local_endpoint()).await?;
+            (stream, Some(tunnel))
+        } else {
+            (IpcStream::connect(socket).await?, None)
+        };
+
+        let mut client = Self {
+            stream,
+            next_id: 1,
+            _tunnel: tunnel,
+        };
+
+        if let Some(token) = auth_token.filter(|t| !t.is_empty()) {
+            match client
+                .request(ClientMessage::Authenticate {
+                    token: token.to_string(),
+                })
+                .await?
+            {
+                ResponsePayload::Ok => {}
+                other => return Err(format!("unexpected authenticate response: {other:?}").into()),
+            }
+        }
+
+        Ok(client)
     }
 
     pub async fn request(
         &mut self,
         payload: ClientMessage,
-    ) -> Result<ResponsePayload, Box<dyn std::error::Error>> {
+    ) -> Result<ResponsePayload, ClientError> {
         let id = self.next_id;
         self.next_id += 1;
         write_frame(&mut self.stream, &Request { id, payload }).await?;

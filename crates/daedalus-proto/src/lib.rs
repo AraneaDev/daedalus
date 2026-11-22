@@ -1,4 +1,5 @@
 pub mod codec;
+pub mod remote;
 pub mod rpc;
 pub mod transport;
 pub mod types;
@@ -6,10 +7,10 @@ pub mod types;
 pub use codec::{CodecError, MAX_FRAME_SIZE, read_frame, write_frame};
 pub use rpc::{ClientMessage, ProtoError, Request, ResponsePayload, ServerEvent, ServerMessage};
 pub use types::{
-    AgentState, Cell, CellFlags, Color, ContainerHealth, CursorState, ExternalStatus, FailureTrace,
-    GitWorkspaceStatus, GitWorktreeInfo, GridDelta, GridRow, GridSnapshot, PaneId, PaneRole,
-    PaneStatus, PaneSummary, PortMapping, PortSource, SearchMatch, StatusLevel, WorkspaceId,
-    WorkspaceInfo, WorkspaceManifest, wrap_bracketed_paste,
+    AgentState, Cell, CellFlags, Color, ContainerHealth, CursorState, CustomAction, ExternalStatus,
+    FailureTrace, GitWorkspaceStatus, GitWorktreeInfo, GridDelta, GridRow, GridSnapshot, PaneId,
+    PaneRole, PaneStatus, PaneSummary, PortMapping, PortSource, SearchMatch, StatusLevel,
+    WorkspaceId, WorkspaceInfo, WorkspaceManifest, wrap_bracketed_paste,
 };
 
 use std::path::{Path, PathBuf};
@@ -706,6 +707,7 @@ mod tests {
             agent_command: Some(vec!["agy".to_string(), "--fast".to_string()]),
             service_command: Some(vec!["docker".to_string(), "compose".to_string()]),
             runner_command: Some(vec!["cargo".to_string(), "test".to_string()]),
+            actions: Vec::new(),
         };
         let ws_info = WorkspaceInfo {
             id: ws_id,
@@ -1194,5 +1196,104 @@ mod tests {
             strip_windows_verbatim_prefix(PathBuf::from("/home/tim/repo")),
             PathBuf::from("/home/tim/repo")
         );
+    }
+
+    #[tokio::test]
+    async fn round_trips_v0_0_6_auth_action_rpcs_and_manifest_actions() {
+        let (mut client, mut server) = duplex(16384);
+        let ws_id = WorkspaceId::new();
+
+        let requests = vec![
+            Request {
+                id: 201,
+                payload: ClientMessage::Authenticate {
+                    token: "secret-bearer-token".to_string(),
+                },
+            },
+            Request {
+                id: 202,
+                payload: ClientMessage::RunWorkspaceAction {
+                    workspace_id: ws_id,
+                    action_id: "test-all".to_string(),
+                },
+            },
+        ];
+
+        for req in requests {
+            write_frame(&mut client, &req).await.unwrap();
+            let decoded: Request = read_frame(&mut server).await.unwrap().unwrap();
+            assert_eq!(decoded, req);
+        }
+
+        let action = CustomAction {
+            id: "test-all".to_string(),
+            label: "Run Workspace Tests".to_string(),
+            target: PaneRole::Runner,
+            command: "cargo test --workspace".to_string(),
+            shortcut: Some("Ctrl+Shift+T".to_string()),
+        };
+        let manifest = WorkspaceManifest {
+            agent_preset: Some("agy".to_string()),
+            agent_command: None,
+            service_command: None,
+            runner_command: Some(vec!["cargo".to_string(), "test".to_string()]),
+            actions: vec![action.clone()],
+        };
+        let ws_info = WorkspaceInfo {
+            id: ws_id,
+            name: "actions-ws".to_string(),
+            root_dir: PathBuf::from("/tmp/actions-ws"),
+            slot_index: 0,
+            injected_env: HashMap::new(),
+            panes: Vec::new(),
+            port_offset: 0,
+            compose_project_name: None,
+            git_branch: None,
+            git_status: None,
+            bound_ports: Vec::new(),
+            containers: Vec::new(),
+            external_statuses: Vec::new(),
+            manifest: Some(manifest),
+        };
+
+        let server_msgs = vec![
+            ServerMessage::Response {
+                id: 201,
+                result: Err(ProtoError::Unauthorized("invalid bearer token".to_string())),
+            },
+            ServerMessage::Response {
+                id: 202,
+                result: Ok(ResponsePayload::WorkspaceCreated(ws_info)),
+            },
+        ];
+
+        for msg in server_msgs {
+            write_frame(&mut server, &msg).await.unwrap();
+            let decoded: ServerMessage = read_frame(&mut client).await.unwrap().unwrap();
+            assert_eq!(decoded, msg);
+        }
+    }
+
+    #[test]
+    fn serde_defaults_preserve_backward_compatibility_for_workspace_manifest_actions() {
+        #[derive(serde::Serialize)]
+        struct LegacyWorkspaceManifest {
+            agent_preset: Option<String>,
+            agent_command: Option<Vec<String>>,
+            service_command: Option<Vec<String>>,
+            runner_command: Option<Vec<String>>,
+        }
+
+        let legacy = LegacyWorkspaceManifest {
+            agent_preset: Some("claude".to_string()),
+            agent_command: Some(vec!["claude".to_string()]),
+            service_command: None,
+            runner_command: Some(vec!["cargo".to_string(), "test".to_string()]),
+        };
+
+        let bytes = rmp_serde::to_vec_named(&legacy).unwrap();
+        let decoded: WorkspaceManifest = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.agent_preset.as_deref(), Some("claude"));
+        assert!(decoded.actions.is_empty());
     }
 }

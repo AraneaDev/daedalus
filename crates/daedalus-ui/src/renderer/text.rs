@@ -16,8 +16,8 @@ use crate::state::{AgentPreset, AppState, SearchState};
 use crate::theme::{self, Theme};
 
 use super::{
-    CLOSE_MODAL_HEADER_LOGICAL_HEIGHT, active_external_detail_preview, agent_state_badge,
-    close_modal_cancel_rect, close_modal_compose_rect, close_modal_confirm_rect,
+    CLOSE_MODAL_HEADER_LOGICAL_HEIGHT, action_palette_layout, active_external_detail_preview,
+    agent_state_badge, close_modal_cancel_rect, close_modal_compose_rect, close_modal_confirm_rect,
     close_modal_dirty_banner_rect, close_modal_force_rect, close_modal_worktree_rect,
     close_workspace_modal_rect, external_status_color, format_docker_health,
     format_external_source_tag, format_ports_summary, pane_agent_state_pill_rect, picker_item_rect,
@@ -530,13 +530,14 @@ impl TextRenderer {
 
         // 4. Rebuild & prepare overlay text pass if a modal or search bar is open.
         self.modal_items.clear();
-        let modal_open = state.picker.open
+        let modal_open = state.action_palette.open
+            || state.picker.open
             || state.worktree_modal.open
             || state.close_modal.open
             || state.search.is_some();
         self.has_modal_text = modal_open;
         if modal_open {
-            if state.picker.open {
+            if state.picker.open || state.action_palette.open {
                 self.build_picker_items(state, theme, screen_w, screen_h);
             } else if state.worktree_modal.open {
                 self.build_worktree_modal_items(state, theme, screen_w, screen_h);
@@ -653,8 +654,12 @@ impl TextRenderer {
             let m = LayoutMetrics::for_scale(s);
             let header_rect =
                 Rect::new(sidebar.x, sidebar.y, sidebar.width, m.sidebar_header_height);
+            let header = state
+                .remote_host
+                .as_ref()
+                .map(|host| format!("[REMOTE: {host}]"));
             self.push_chrome_line(ChromeLineSpec {
-                text: "WORKSPACES",
+                text: header.as_deref().unwrap_or("WORKSPACES"),
                 left: header_rect.x + m.sidebar_pad + 4.0 * s,
                 top: header_rect.y
                     + (header_rect.height - CHROME_SUB_LINE_HEIGHT_LOGICAL * s) * 0.5,
@@ -1092,10 +1097,29 @@ impl TextRenderer {
         screen_h: f32,
     ) {
         let s = self.scale_factor;
-        let modal = picker_modal_rect(screen_w, screen_h, s);
+        let palette = state.action_palette.open;
+        let actions = state.active_actions();
+        let (modal, visible) = if palette {
+            action_palette_layout(
+                screen_w,
+                screen_h,
+                s,
+                actions.len(),
+                state.action_palette.selected_index,
+            )
+        } else {
+            (
+                picker_modal_rect(screen_w, screen_h, s),
+                0..AgentPreset::ALL.len(),
+            )
+        };
 
         self.push_modal_line(ChromeLineSpec {
-            text: "Select Agent Preset  (↑/↓ Enter · Esc)",
+            text: if palette {
+                "Action Palette  (↑/↓ Enter · Esc)"
+            } else {
+                "Select Agent Preset  (↑/↓ Enter · Esc)"
+            },
             left: modal.x + 16.0 * s,
             top: modal.y + 12.0 * s,
             max_w: (modal.width - 32.0 * s).max(1.0),
@@ -1106,11 +1130,37 @@ impl TextRenderer {
             bold: true,
         });
 
-        for (idx, preset) in AgentPreset::ALL.iter().enumerate() {
-            let item_rect = picker_item_rect(modal, idx, s);
-            let selected = idx == state.picker.selected_index;
+        if visible.is_empty() {
+            let row = picker_item_rect(modal, 0, s);
+            self.push_modal_line(ChromeLineSpec {
+                text: "No actions configured for this workspace",
+                left: row.x + 10.0 * s,
+                top: row.y + 6.0 * s,
+                max_w: (row.width - 20.0 * s).max(1.0),
+                bounds: row,
+                font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                color: theme.text_muted,
+                bold: false,
+            });
+        }
+        for (row, idx) in visible.enumerate() {
+            let item_rect = picker_item_rect(modal, row, s);
+            let (selected, label) = if palette {
+                let action = &actions[idx];
+                let shortcut = action.shortcut.as_deref().unwrap_or("");
+                (
+                    idx == state.action_palette.selected_index,
+                    format!("{} · {:?} {}", action.label, action.target, shortcut),
+                )
+            } else {
+                (
+                    idx == state.picker.selected_index,
+                    AgentPreset::ALL[idx].label().to_owned(),
+                )
+            };
             let prefix = if selected { "▸ " } else { "  " };
-            let label = format!("{prefix}{}", preset.label());
+            let label = format!("{prefix}{label}");
             self.push_modal_line(ChromeLineSpec {
                 text: &label,
                 left: item_rect.x + 10.0 * s,

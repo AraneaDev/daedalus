@@ -825,3 +825,262 @@ async fn cli_smoke_v0_0_3_agent_state_failure_trace_status_presets_and_worktree_
     let _ = shutdown_tx.send(());
     srv_handle.await.unwrap();
 }
+
+#[tokio::test]
+async fn cli_smoke_v0_0_6_auth_token_and_custom_actions() {
+    let dir = TempDir::new().unwrap();
+    let runtime = dir.path().join("runtime");
+    let ws_dir = dir.path().join("ws");
+    tokio::fs::create_dir_all(&ws_dir).await.unwrap();
+    tokio::fs::write(
+        ws_dir.join(".daedalus.toml"),
+        r#"
+[[actions]]
+id = "runner-ok"
+label = "Run Marker"
+target = "runner"
+command = "echo CLI_ACTION_OK"
+shortcut = "Ctrl+R"
+"#,
+    )
+    .await
+    .unwrap();
+
+    let server = DaemonServer::bind_with_supervisor(
+        std::path::PathBuf::from("tcp://127.0.0.1:0"),
+        runtime,
+        test_supervisor(),
+    )
+    .await
+    .unwrap()
+    .with_auth_token(Some("cli-secret-token".to_string()));
+    let endpoint = server.socket_path();
+    let endpoint_str = endpoint.to_string_lossy().to_string();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let bin = env!("CARGO_BIN_EXE_daedalus-ctl");
+
+    let unauth_ping = Command::new(bin)
+        .args(["--socket", &endpoint_str, "ping"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        !unauth_ping.status.success(),
+        "ping without --auth-token should be rejected"
+    );
+
+    let bad_auth_ping = Command::new(bin)
+        .args([
+            "--socket",
+            &endpoint_str,
+            "--auth-token",
+            "wrong-token",
+            "ping",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        !bad_auth_ping.status.success(),
+        "ping with wrong --auth-token should be rejected"
+    );
+
+    let ok_ping = Command::new(bin)
+        .args([
+            "--socket",
+            &endpoint_str,
+            "--auth-token",
+            "cli-secret-token",
+            "ping",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        ok_ping.status.success(),
+        "authenticated ping failed: {}",
+        String::from_utf8_lossy(&ok_ping.stderr)
+    );
+
+    let create_ws = Command::new(bin)
+        .args([
+            "--socket",
+            &endpoint_str,
+            "--auth-token",
+            "cli-secret-token",
+            "workspace",
+            "create",
+            "action-smoke",
+            "--dir",
+            ws_dir.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        create_ws.status.success(),
+        "workspace create failed: {}",
+        String::from_utf8_lossy(&create_ws.stderr)
+    );
+    let ws_id = String::from_utf8_lossy(&create_ws.stdout)
+        .trim()
+        .to_string();
+
+    #[cfg(unix)]
+    let shell_bin = "/bin/sh";
+    #[cfg(windows)]
+    let shell_bin = "cmd.exe";
+
+    let spawn = Command::new(bin)
+        .args([
+            "--socket",
+            &endpoint_str,
+            "--auth-token",
+            "cli-secret-token",
+            "pane",
+            "spawn",
+            &ws_id,
+            "--role",
+            "runner",
+            "--shell",
+            shell_bin,
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        spawn.status.success(),
+        "pane spawn failed: {}",
+        String::from_utf8_lossy(&spawn.stderr)
+    );
+    let pane_id = String::from_utf8_lossy(&spawn.stdout).trim().to_string();
+
+    let list_json = Command::new(bin)
+        .args([
+            "--socket",
+            &endpoint_str,
+            "--auth-token",
+            "cli-secret-token",
+            "action",
+            "list",
+            "--dir",
+            ws_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        list_json.status.success(),
+        "action list --json failed: {}",
+        String::from_utf8_lossy(&list_json.stderr)
+    );
+    let parsed_actions: Vec<daedalus_proto::CustomAction> =
+        serde_json::from_slice(&list_json.stdout).expect("valid JSON CustomAction array");
+    assert_eq!(
+        parsed_actions,
+        vec![daedalus_proto::CustomAction {
+            id: "runner-ok".to_string(),
+            label: "Run Marker".to_string(),
+            target: daedalus_proto::PaneRole::Runner,
+            command: "echo CLI_ACTION_OK".to_string(),
+            shortcut: Some("Ctrl+R".to_string()),
+        }]
+    );
+
+    let list_plain = Command::new(bin)
+        .args([
+            "--socket",
+            &endpoint_str,
+            "--auth-token",
+            "cli-secret-token",
+            "action",
+            "list",
+            "--workspace",
+            &ws_id,
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(list_plain.status.success());
+    let list_plain_out = String::from_utf8_lossy(&list_plain.stdout);
+    assert!(list_plain_out.contains("runner-ok"));
+    assert!(list_plain_out.contains("Run Marker"));
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let run_action = Command::new(bin)
+        .args([
+            "--socket",
+            &endpoint_str,
+            "--auth-token",
+            "cli-secret-token",
+            "action",
+            "run",
+            "runner-ok",
+            "--workspace",
+            &ws_id,
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        run_action.status.success(),
+        "action run failed: {}",
+        String::from_utf8_lossy(&run_action.stderr)
+    );
+
+    let mut found_marker = false;
+    for _ in 0..40 {
+        let snap = Command::new(bin)
+            .args([
+                "--socket",
+                &endpoint_str,
+                "--auth-token",
+                "cli-secret-token",
+                "pane",
+                "snapshot",
+                &pane_id,
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(snap.status.success());
+        if String::from_utf8_lossy(&snap.stdout).contains("CLI_ACTION_OK") {
+            found_marker = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        found_marker,
+        "timed out waiting for CLI_ACTION_OK in runner pane snapshot"
+    );
+
+    let close = Command::new(bin)
+        .args([
+            "--socket",
+            &endpoint_str,
+            "--auth-token",
+            "cli-secret-token",
+            "workspace",
+            "close",
+            &ws_id,
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(close.status.success());
+
+    let _ = shutdown_tx.send(());
+    srv_handle.await.unwrap();
+}

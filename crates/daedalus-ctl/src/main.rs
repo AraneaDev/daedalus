@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use client::DaemonClient;
 use daedalus_proto::{
     AgentState, ClientMessage, PaneId, PaneRole, ResponsePayload, StatusLevel, WorkspaceId,
-    default_socket_path, wrap_bracketed_paste,
+    WorkspaceInfo, default_socket_path, strip_windows_verbatim_prefix, wrap_bracketed_paste,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,6 +21,13 @@ const DEFAULT_DAEDALUSD_BIN: &str = "/usr/local/bin/daedalusd";
 struct Cli {
     #[arg(long, global = true, env = "DAEDALUS_SOCKET")]
     socket: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        env = "DAEDALUS_AUTH_TOKEN",
+        hide_env_values = true
+    )]
+    auth_token: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -44,6 +51,10 @@ enum Commands {
         #[command(subcommand)]
         action: PaneAction,
     },
+    Action {
+        #[command(subcommand)]
+        action: CustomActionCommand,
+    },
     AgentState {
         #[command(subcommand)]
         action: AgentStateAction,
@@ -62,6 +73,25 @@ enum Commands {
     Service {
         #[command(subcommand)]
         action: ServiceAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CustomActionCommand {
+    List {
+        #[arg(long, conflicts_with = "dir")]
+        workspace: Option<Uuid>,
+        #[arg(long, conflicts_with = "workspace")]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Run {
+        action_id: String,
+        #[arg(long, conflicts_with = "dir")]
+        workspace: Option<Uuid>,
+        #[arg(long, conflicts_with = "workspace")]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -306,6 +336,57 @@ fn resolve_target_root_dir(
     }
 }
 
+fn canonicalize_lossy(path: &Path) -> PathBuf {
+    strip_windows_verbatim_prefix(
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+    )
+}
+
+fn resolve_workspace_for_target(
+    workspaces: &[WorkspaceInfo],
+    workspace: Option<Uuid>,
+    dir: Option<PathBuf>,
+) -> Result<WorkspaceInfo, Box<dyn std::error::Error>> {
+    if let Some(id) = workspace {
+        return workspaces
+            .iter()
+            .find(|ws| ws.id == WorkspaceId(id))
+            .cloned()
+            .ok_or_else(|| format!("workspace not found: {id}").into());
+    }
+
+    let target_dir = resolve_dir(dir)?;
+    let canon_target = canonicalize_lossy(&target_dir);
+    let mut best: Option<(usize, u16, &WorkspaceInfo)> = None;
+    for ws in workspaces {
+        let match_len = if target_dir.starts_with(&ws.root_dir) {
+            Some(ws.root_dir.components().count())
+        } else {
+            let canon_root = canonicalize_lossy(&ws.root_dir);
+            if canon_target.starts_with(&canon_root) {
+                Some(canon_root.components().count())
+            } else {
+                None
+            }
+        };
+
+        if let Some(len) = match_len {
+            let replace = match best {
+                None => true,
+                Some((best_len, best_slot, _)) => {
+                    len > best_len || (len == best_len && ws.slot_index < best_slot)
+                }
+            };
+            if replace {
+                best = Some((len, ws.slot_index, ws));
+            }
+        }
+    }
+
+    best.map(|(_, _, ws)| ws.clone())
+        .ok_or_else(|| format!("no workspace matches directory: {}", target_dir.display()).into())
+}
+
 fn unexpected_response(payload: ResponsePayload) -> Box<dyn std::error::Error> {
     format!("unexpected response payload: {payload:?}").into()
 }
@@ -416,7 +497,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let mut client = DaemonClient::connect(&socket).await?;
+    let mut client = DaemonClient::connect_with_auth(&socket, cli.auth_token.as_deref()).await?;
 
     match cli.command {
         Commands::Ping => match client.request(ClientMessage::Ping).await? {
@@ -695,6 +776,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     other => return Err(unexpected_response(other)),
                 }
+            }
+        },
+        Commands::Action { action } => match action {
+            CustomActionCommand::List {
+                workspace,
+                dir,
+                json,
+            } => {
+                let workspaces = match client.request(ClientMessage::ListWorkspaces).await? {
+                    ResponsePayload::Workspaces(list) => list,
+                    other => return Err(unexpected_response(other)),
+                };
+                let ws = resolve_workspace_for_target(&workspaces, workspace, dir)?;
+                let actions = ws.manifest.map(|m| m.actions).unwrap_or_default();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&actions)?);
+                } else if actions.is_empty() {
+                    println!("no actions configured");
+                } else {
+                    for a in actions {
+                        if let Some(shortcut) = &a.shortcut {
+                            println!(
+                                "{}\t{}\t{}\t[{}]\t{}",
+                                a.id, a.target, a.label, shortcut, a.command
+                            );
+                        } else {
+                            println!("{}\t{}\t{}\t{}", a.id, a.target, a.label, a.command);
+                        }
+                    }
+                }
+            }
+            CustomActionCommand::Run {
+                action_id,
+                workspace,
+                dir,
+            } => {
+                let workspace_id = match workspace {
+                    Some(id) => WorkspaceId(id),
+                    None => {
+                        let workspaces = match client.request(ClientMessage::ListWorkspaces).await?
+                        {
+                            ResponsePayload::Workspaces(list) => list,
+                            other => return Err(unexpected_response(other)),
+                        };
+                        resolve_workspace_for_target(&workspaces, None, dir)?.id
+                    }
+                };
+                expect_ok(
+                    client
+                        .request(ClientMessage::RunWorkspaceAction {
+                            workspace_id,
+                            action_id: action_id.clone(),
+                        })
+                        .await?,
+                )?;
+                println!("ran action {action_id}");
             }
         },
         Commands::AgentState { action } => match action {
@@ -1228,6 +1365,107 @@ mod tests {
         assert!(
             escaped
                 .contains("<string>/tmp/log&amp;&lt;&quot;&apos;&gt;/daedalusd.err.log</string>")
+        );
+    }
+
+    #[test]
+    fn parses_v0_0_6_auth_token_and_action_subcommands() {
+        let id = Uuid::new_v4();
+        let id_str = id.to_string();
+
+        let ping = Cli::try_parse_from([
+            "daedalus-ctl",
+            "--auth-token",
+            "secret-token",
+            "--socket",
+            "ssh://devbox:2222/tmp/daedalusd.sock",
+            "ping",
+        ])
+        .expect("parse global --auth-token and --socket");
+        assert_eq!(ping.auth_token.as_deref(), Some("secret-token"));
+        assert_eq!(
+            ping.socket,
+            Some(PathBuf::from("ssh://devbox:2222/tmp/daedalusd.sock"))
+        );
+        assert!(matches!(ping.command, Commands::Ping));
+
+        let list_json = Cli::try_parse_from([
+            "daedalus-ctl",
+            "action",
+            "list",
+            "--workspace",
+            &id_str,
+            "--json",
+            "--auth-token",
+            "trailing-global-token",
+        ])
+        .expect("parse action list --workspace --json");
+        assert_eq!(
+            list_json.auth_token.as_deref(),
+            Some("trailing-global-token")
+        );
+        assert!(matches!(
+            list_json.command,
+            Commands::Action {
+                action: CustomActionCommand::List {
+                    workspace: Some(parsed_id),
+                    dir: None,
+                    json: true,
+                }
+            } if parsed_id == id
+        ));
+
+        let run_dir = Cli::try_parse_from([
+            "daedalus-ctl",
+            "action",
+            "run",
+            "test-all",
+            "--dir",
+            "/repo",
+        ])
+        .expect("parse action run --dir");
+        match run_dir.command {
+            Commands::Action {
+                action:
+                    CustomActionCommand::Run {
+                        action_id,
+                        workspace,
+                        dir,
+                    },
+            } => {
+                assert_eq!(action_id, "test-all");
+                assert!(workspace.is_none());
+                assert_eq!(dir, Some(PathBuf::from("/repo")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "daedalus-ctl",
+                "action",
+                "list",
+                "--workspace",
+                &id_str,
+                "--dir",
+                "/repo",
+            ])
+            .is_err(),
+            "--workspace and --dir should conflict on action list"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "daedalus-ctl",
+                "action",
+                "run",
+                "test-all",
+                "--workspace",
+                &id_str,
+                "--dir",
+                "/repo",
+            ])
+            .is_err(),
+            "--workspace and --dir should conflict on action run"
         );
     }
 }
