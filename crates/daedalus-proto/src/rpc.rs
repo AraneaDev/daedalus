@@ -17,6 +17,9 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMessage {
     Ping,
+    Authenticate {
+        token: String,
+    },
     CreateWorkspace {
         name: String,
         root_dir: PathBuf,
@@ -101,6 +104,10 @@ pub enum ClientMessage {
         pane_ids: Option<Vec<PaneId>>,
     },
     Unsubscribe,
+    RunWorkspaceAction {
+        workspace_id: WorkspaceId,
+        action_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +196,8 @@ pub enum ProtoError {
     PaneNotFound(PaneId),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
     #[error("failed to spawn process: {0}")]
     SpawnFailed(String),
     #[error("i/o error: {0}")]

@@ -73,6 +73,7 @@ pub fn parse_project_manifest(contents: &str) -> Result<LoadedManifest, toml::de
             agent_command: normalize_command(agent.command),
             service_command: normalize_command(service.command),
             runner_command: normalize_command(runner.command),
+            actions: Vec::new(),
         },
         extra_ports: ports.extra.into_iter().filter(|&p| p > 0).collect(),
         env: raw.env,
@@ -158,6 +159,7 @@ API_BASE = "http://localhost:8080"
                     "test".to_string(),
                     "--workspace".to_string(),
                 ]),
+                actions: Vec::new(),
             }
         );
         assert_eq!(loaded.extra_ports, vec![8080, 9000]);

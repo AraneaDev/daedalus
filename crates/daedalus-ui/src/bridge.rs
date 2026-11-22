@@ -1478,6 +1478,7 @@ mod tests {
                 "up".to_string(),
             ]),
             runner_command: Some(vec!["cargo".to_string(), "test".to_string()]),
+            actions: Vec::new(),
         };
 
         let (specs, warnings) =

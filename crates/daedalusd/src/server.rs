@@ -270,6 +270,7 @@ async fn dispatch_request(
                 isolation_mode: registry.isolation_mode().as_str().to_string(),
             })
         }
+        ClientMessage::Authenticate { .. } => Ok(ResponsePayload::Ok),
         ClientMessage::CreateWorkspace {
             name,
             root_dir,
@@ -417,6 +418,9 @@ async fn dispatch_request(
             f.pane_ids = None;
             Ok(ResponsePayload::Ok)
         }
+        ClientMessage::RunWorkspaceAction { .. } => Err(ProtoError::InvalidRequest(
+            "workspace actions are not yet implemented".to_string(),
+        )),
     }
 }
 
