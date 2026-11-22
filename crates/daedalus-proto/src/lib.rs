@@ -11,15 +11,37 @@ pub use types::{
     WorkspaceInfo, WorkspaceManifest, wrap_bracketed_paste,
 };
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-fn resolve_runtime_dir(xdg: Option<&str>) -> PathBuf {
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 96;
+
+fn resolve_runtime_dir_with_limit(
+    xdg: Option<&str>,
+    temp_dir: &Path,
+    uid: u32,
+    max_socket_bytes: usize,
+) -> PathBuf {
     if let Some(xdg) = xdg
         && !xdg.is_empty()
     {
         return PathBuf::from(xdg).join("daedalus");
     }
-    std::env::temp_dir().join(format!("daedalus-{}", nix::unistd::Uid::current()))
+    let dir_name = format!("daedalus-{uid}");
+    let candidate = temp_dir.join(&dir_name);
+    if candidate.join("daedalusd.sock").as_os_str().len() > max_socket_bytes {
+        PathBuf::from("/tmp").join(dir_name)
+    } else {
+        candidate
+    }
+}
+
+fn resolve_runtime_dir(xdg: Option<&str>) -> PathBuf {
+    resolve_runtime_dir_with_limit(
+        xdg,
+        &std::env::temp_dir(),
+        nix::unistd::Uid::current().as_raw(),
+        MAX_UNIX_SOCKET_PATH_BYTES,
+    )
 }
 
 pub fn default_runtime_dir() -> PathBuf {
@@ -226,10 +248,85 @@ mod tests {
             resolve_runtime_dir(Some("/run/user/1234")),
             PathBuf::from("/run/user/1234/daedalus")
         );
+        let uid = nix::unistd::Uid::current().as_raw();
+        let candidate = std::env::temp_dir().join(format!("daedalus-{uid}"));
         let expected_fallback =
-            std::env::temp_dir().join(format!("daedalus-{}", nix::unistd::Uid::current()));
+            if candidate.join("daedalusd.sock").as_os_str().len() > MAX_UNIX_SOCKET_PATH_BYTES {
+                PathBuf::from("/tmp").join(format!("daedalus-{uid}"))
+            } else {
+                candidate
+            };
         assert_eq!(resolve_runtime_dir(None), expected_fallback);
         assert_eq!(resolve_runtime_dir(Some("")), expected_fallback);
+    }
+
+    #[test]
+    fn runtime_dir_falls_back_to_tmp_when_temp_dir_exceeds_socket_limit() {
+        let short_tmp = Path::new("/tmp");
+        assert_eq!(
+            resolve_runtime_dir_with_limit(None, short_tmp, 501, MAX_UNIX_SOCKET_PATH_BYTES),
+            PathBuf::from("/tmp/daedalus-501")
+        );
+
+        let long_macos_tmp = Path::new(
+            "/var/folders/ab/cdefghijklmnopqrstuvwxyz0123456789_very_long_per_user_temp_dir/T",
+        );
+        assert!(
+            long_macos_tmp
+                .join("daedalus-501/daedalusd.sock")
+                .as_os_str()
+                .len()
+                > MAX_UNIX_SOCKET_PATH_BYTES
+        );
+        assert_eq!(
+            resolve_runtime_dir_with_limit(None, long_macos_tmp, 501, MAX_UNIX_SOCKET_PATH_BYTES),
+            PathBuf::from("/tmp/daedalus-501")
+        );
+
+        // XDG_RUNTIME_DIR takes precedence regardless of temp_dir length.
+        assert_eq!(
+            resolve_runtime_dir_with_limit(
+                Some("/run/user/501"),
+                long_macos_tmp,
+                501,
+                MAX_UNIX_SOCKET_PATH_BYTES,
+            ),
+            PathBuf::from("/run/user/501/daedalus")
+        );
+
+        // Exact boundary check: 96 bytes stays, 97 bytes falls back to /tmp.
+        let suffix_len = "daedalus-501/daedalusd.sock".len();
+        let exact_96_dir = PathBuf::from(format!(
+            "/{}",
+            "a".repeat(MAX_UNIX_SOCKET_PATH_BYTES - suffix_len - 2)
+        ));
+        assert_eq!(
+            exact_96_dir
+                .join("daedalus-501/daedalusd.sock")
+                .as_os_str()
+                .len(),
+            MAX_UNIX_SOCKET_PATH_BYTES
+        );
+        assert_eq!(
+            resolve_runtime_dir_with_limit(None, &exact_96_dir, 501, MAX_UNIX_SOCKET_PATH_BYTES),
+            exact_96_dir.join("daedalus-501")
+        );
+
+        let over_97_dir = PathBuf::from(format!(
+            "/{}",
+            "a".repeat(MAX_UNIX_SOCKET_PATH_BYTES - suffix_len - 1)
+        ));
+        assert_eq!(
+            over_97_dir
+                .join("daedalus-501/daedalusd.sock")
+                .as_os_str()
+                .len(),
+            MAX_UNIX_SOCKET_PATH_BYTES + 1
+        );
+        assert_eq!(
+            resolve_runtime_dir_with_limit(None, &over_97_dir, 501, MAX_UNIX_SOCKET_PATH_BYTES),
+            PathBuf::from("/tmp/daedalus-501")
+        );
     }
 
     #[test]

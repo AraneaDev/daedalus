@@ -5,7 +5,7 @@ use bollard::models::ContainerSummary;
 use bollard::query_parameters::ListContainersOptions;
 use daedalus_proto::{ContainerHealth, GitWorkspaceStatus, PortMapping, PortSource, WorkspaceId};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -66,7 +66,7 @@ pub fn parse_proc_net_tcp(content: &str) -> Vec<(u64, u16)> {
     out
 }
 
-fn parse_proc_stat_pid_ppid(stat: &str) -> Option<(u32, u32)> {
+pub(crate) fn parse_proc_stat_pid_ppid(stat: &str) -> Option<(u32, u32)> {
     let first_paren = stat.find('(')?;
     let last_paren = stat.rfind(')')?;
     if last_paren <= first_paren {
@@ -79,7 +79,104 @@ fn parse_proc_stat_pid_ppid(stat: &str) -> Option<(u32, u32)> {
     Some((pid, ppid))
 }
 
+/// Parses `ps -axo pid=,ppid=,comm=` output into `(pid, ppid, comm_basename)` tuples.
+pub fn parse_ps_pid_comm_table(output: &str) -> Vec<(u32, u32, String)> {
+    let mut rows = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(idx1) = trimmed.find(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = trimmed[..idx1].parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 {
+            continue;
+        }
+        let rest = trimmed[idx1..].trim_start();
+        let Some(idx2) = rest.find(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(ppid) = rest[..idx2].parse::<u32>() else {
+            continue;
+        };
+        let raw_comm = rest[idx2..].trim();
+        if raw_comm.is_empty() {
+            continue;
+        }
+        let comm = Path::new(raw_comm)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(raw_comm)
+            .to_string();
+        rows.push((pid, ppid, comm));
+    }
+    rows
+}
+
+/// Parses `lsof -nP -a -p <pids> -iTCP -sTCP:LISTEN -F pcn` output into deduplicated
+/// `(pid, port, cmd)` tuples.
+pub fn parse_lsof_listen_output(output: &str) -> Vec<(u32, u16, Option<String>)> {
+    let mut out: Vec<(u32, u16, Option<String>)> = Vec::new();
+    let mut seen: HashMap<(u32, u16), usize> = HashMap::new();
+    let mut current_pid: Option<u32> = None;
+    let mut current_cmd: Option<String> = None;
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        let Some(prefix) = line.chars().next() else {
+            continue;
+        };
+        let value = &line[prefix.len_utf8()..];
+        match prefix {
+            'p' => {
+                current_pid = value.trim().parse::<u32>().ok().filter(|&p| p > 0);
+                current_cmd = None;
+            }
+            'c' => {
+                let cmd = value.trim();
+                if !cmd.is_empty() {
+                    current_cmd = Some(cmd.to_string());
+                }
+            }
+            'n' => {
+                let Some(pid) = current_pid else {
+                    continue;
+                };
+                let addr = value.trim();
+                let local = addr.split("->").next().unwrap_or(addr);
+                let Some((_, port_str)) = local.rsplit_once(':') else {
+                    continue;
+                };
+                let Ok(port) = port_str.parse::<u16>() else {
+                    continue;
+                };
+                if port == 0 {
+                    continue;
+                }
+                if let Some(&idx) = seen.get(&(pid, port)) {
+                    if out[idx].2.is_none() && current_cmd.is_some() {
+                        out[idx].2 = current_cmd.clone();
+                    }
+                } else {
+                    let idx = out.len();
+                    seen.insert((pid, port), idx);
+                    out.push((pid, port, current_cmd.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
 /// Walks `/proc/<pid>/stat` to collect `roots` and all live descendant PIDs.
+#[cfg(target_os = "linux")]
 pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
     if roots.is_empty() {
         return HashSet::new();
@@ -125,12 +222,62 @@ pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
     collected
 }
 
-fn parse_socket_inode(link_target: &std::path::Path) -> Option<u64> {
+#[cfg(not(target_os = "linux"))]
+fn descendant_pids_with_comms(roots: &[u32]) -> (HashSet<u32>, HashMap<u32, String>) {
+    if roots.is_empty() {
+        return (HashSet::new(), HashMap::new());
+    }
+
+    let mut cmd = std::process::Command::new("ps");
+    cmd.args(["-axo", "pid=,ppid=,comm="]);
+    let Some(output) =
+        crate::supervisor::run_command_stdout_with_timeout(&mut cmd, Duration::from_secs(2), false)
+    else {
+        return (HashSet::new(), HashMap::new());
+    };
+
+    let mut children_by_ppid: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut comm_by_pid: HashMap<u32, String> = HashMap::new();
+    for (pid, ppid, comm) in parse_ps_pid_comm_table(&output) {
+        children_by_ppid.entry(ppid).or_default().push(pid);
+        comm_by_pid.insert(pid, comm);
+    }
+
+    let mut collected = HashSet::new();
+    let mut queue = VecDeque::new();
+    for &root in roots {
+        if root > 0 && collected.insert(root) {
+            queue.push_back(root);
+        }
+    }
+
+    while let Some(pid) = queue.pop_front() {
+        if let Some(children) = children_by_ppid.get(&pid) {
+            for &child in children {
+                if collected.insert(child) {
+                    queue.push_back(child);
+                }
+            }
+        }
+    }
+
+    (collected, comm_by_pid)
+}
+
+/// Walks `ps` output to collect `roots` and all live descendant PIDs.
+#[cfg(not(target_os = "linux"))]
+pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
+    descendant_pids_with_comms(roots).0
+}
+
+#[cfg(target_os = "linux")]
+fn parse_socket_inode(link_target: &Path) -> Option<u64> {
     let s = link_target.to_str()?;
     let inner = s.strip_prefix("socket:[")?.strip_suffix(']')?;
     inner.parse::<u64>().ok()
 }
 
+#[cfg(target_os = "linux")]
 fn read_process_comm(pid: u32) -> Option<String> {
     let raw = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
     let trimmed = raw.trim();
@@ -142,6 +289,7 @@ fn read_process_comm(pid: u32) -> Option<String> {
 }
 
 /// Discovers local TCP listening ports bound by processes in the subtrees rooted at `root_pids`.
+#[cfg(target_os = "linux")]
 pub fn discover_local_ports_for_roots(root_pids: &[u32]) -> Vec<PortMapping> {
     if root_pids.is_empty() {
         return Vec::new();
@@ -202,6 +350,111 @@ pub fn discover_local_ports_for_roots(root_pids: &[u32]) -> Vec<PortMapping> {
             source: PortSource::LocalProcess,
         })
         .collect()
+}
+
+/// Discovers local TCP listening ports bound by processes in the subtrees rooted at `root_pids`
+/// using `ps` and `lsof`.
+#[cfg(not(target_os = "linux"))]
+pub fn discover_local_ports_for_roots(root_pids: &[u32]) -> Vec<PortMapping> {
+    if root_pids.is_empty() {
+        return Vec::new();
+    }
+
+    let (pids_set, comm_by_pid) = descendant_pids_with_comms(root_pids);
+    if pids_set.is_empty() {
+        return Vec::new();
+    }
+
+    let mut pids: Vec<u32> = pids_set.into_iter().collect();
+    pids.sort_unstable();
+    let pid_csv = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let mut cmd = std::process::Command::new("lsof");
+    cmd.args([
+        "-nP",
+        "-a",
+        "-p",
+        &pid_csv,
+        "-iTCP",
+        "-sTCP:LISTEN",
+        "-F",
+        "pcn",
+    ]);
+    let Some(output) =
+        crate::supervisor::run_command_stdout_with_timeout(&mut cmd, Duration::from_secs(2), true)
+    else {
+        return Vec::new();
+    };
+
+    let mut by_port: BTreeMap<u16, Option<String>> = BTreeMap::new();
+    for (pid, host_port, lsof_cmd) in parse_lsof_listen_output(&output) {
+        let service = comm_by_pid.get(&pid).cloned().or(lsof_cmd);
+        match by_port.get_mut(&host_port) {
+            Some(existing) if existing.is_none() && service.is_some() => {
+                *existing = service;
+            }
+            Some(_) => {}
+            None => {
+                by_port.insert(host_port, service);
+            }
+        }
+    }
+
+    by_port
+        .into_iter()
+        .map(|(host_port, service)| PortMapping {
+            host_port,
+            container_port: None,
+            service,
+            source: PortSource::LocalProcess,
+        })
+        .collect()
+}
+
+/// Returns ordered candidate Docker Unix socket paths when `DOCKER_HOST` is unset.
+pub fn discover_docker_socket_candidates(
+    docker_host: Option<&str>,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    if docker_host.is_some_and(|h| !h.is_empty()) {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::with_capacity(5);
+    if let Some(home_dir) = home.filter(|p| !p.as_os_str().is_empty()) {
+        candidates.push(home_dir.join(".orbstack/run/docker.sock"));
+        candidates.push(home_dir.join(".docker/run/docker.sock"));
+        candidates.push(home_dir.join(".colima/default/docker.sock"));
+        candidates.push(home_dir.join(".config/colima/default/docker.sock"));
+    }
+    candidates.push(PathBuf::from("/var/run/docker.sock"));
+    candidates
+}
+
+/// Connects to Docker respecting `DOCKER_HOST` first, then probing OrbStack, Docker Desktop,
+/// Colima, and `/var/run/docker.sock`, falling back to `Docker::connect_with_local_defaults()`.
+pub fn connect_docker_client() -> Option<Docker> {
+    let docker_host = std::env::var("DOCKER_HOST").ok();
+    if docker_host.as_deref().is_some_and(|h| !h.is_empty()) {
+        return Docker::connect_with_local_defaults().ok();
+    }
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    for path in discover_docker_socket_candidates(docker_host.as_deref(), home.as_deref()) {
+        if path.exists()
+            && let Some(path_str) = path.to_str()
+            && let Ok(client) =
+                Docker::connect_with_unix(path_str, 120, bollard::API_DEFAULT_VERSION)
+        {
+            return Some(client);
+        }
+    }
+
+    Docker::connect_with_local_defaults().ok()
 }
 
 fn extract_container_health(status: Option<&str>) -> Option<String> {
@@ -382,11 +635,11 @@ pub fn spawn_runtime_monitor(
             };
 
             if targets.iter().any(|t| t.compose_project_name.is_some()) && docker_client.is_none() {
-                match Docker::connect_with_local_defaults() {
-                    Ok(client) => docker_client = Some(client),
-                    Err(e) => {
+                match connect_docker_client() {
+                    Some(client) => docker_client = Some(client),
+                    None => {
                         if !docker_unavailable_logged {
-                            debug!(error = %e, "docker unavailable; skipping container health polling");
+                            debug!("docker unavailable; skipping container health polling");
                             docker_unavailable_logged = true;
                         }
                     }
@@ -625,6 +878,97 @@ mod tests {
                 service: Some("web".to_string()),
                 source: PortSource::Docker,
             }]
+        );
+    }
+
+    #[test]
+    fn parse_ps_pid_comm_table_extracts_basenames_and_skips_headers() {
+        let sample = "\
+  PID  PPID COMM
+    0     0 kernel_task
+  100     1 /sbin/launchd
+ 1234   100 /opt/homebrew/bin/node
+ 1235   100 /Applications/Visual Studio Code.app/Contents/MacOS/Electron
+ 1236   100 python3
+malformed
+ 1237   bad foo
+ 1238   100
+";
+        assert_eq!(
+            parse_ps_pid_comm_table(sample),
+            vec![
+                (100, 1, "launchd".to_string()),
+                (1234, 100, "node".to_string()),
+                (1235, 100, "Electron".to_string()),
+                (1236, 100, "python3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_lsof_listen_output_handles_ipv4_wildcard_ipv6_multiple_pids_and_dedup() {
+        let sample = "\
+p1234
+cnode
+f12
+n127.0.0.1:3000
+f13
+n[::1]:3000
+f14
+n*:8080
+p5678
+cpostgres
+n[::]:5432
+n0.0.0.0:5432
+p9999
+n/tmp/ignore.sock
+n[::1]
+n127.0.0.1:0
+n127.0.0.1:9000
+";
+        assert_eq!(
+            parse_lsof_listen_output(sample),
+            vec![
+                (1234, 3000, Some("node".to_string())),
+                (1234, 8080, Some("node".to_string())),
+                (5678, 5432, Some("postgres".to_string())),
+                (9999, 9000, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn discover_docker_socket_candidates_respects_docker_host_and_socket_order() {
+        let home = Path::new("/Users/alice");
+        assert!(
+            discover_docker_socket_candidates(Some("unix:///custom.sock"), Some(home)).is_empty()
+        );
+
+        assert_eq!(
+            discover_docker_socket_candidates(None, Some(home)),
+            vec![
+                PathBuf::from("/Users/alice/.orbstack/run/docker.sock"),
+                PathBuf::from("/Users/alice/.docker/run/docker.sock"),
+                PathBuf::from("/Users/alice/.colima/default/docker.sock"),
+                PathBuf::from("/Users/alice/.config/colima/default/docker.sock"),
+                PathBuf::from("/var/run/docker.sock"),
+            ]
+        );
+
+        assert_eq!(
+            discover_docker_socket_candidates(Some(""), Some(home)),
+            vec![
+                PathBuf::from("/Users/alice/.orbstack/run/docker.sock"),
+                PathBuf::from("/Users/alice/.docker/run/docker.sock"),
+                PathBuf::from("/Users/alice/.colima/default/docker.sock"),
+                PathBuf::from("/Users/alice/.config/colima/default/docker.sock"),
+                PathBuf::from("/var/run/docker.sock"),
+            ]
+        );
+
+        assert_eq!(
+            discover_docker_socket_candidates(None, None),
+            vec![PathBuf::from("/var/run/docker.sock")]
         );
     }
 }
