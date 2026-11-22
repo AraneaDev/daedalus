@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.7](https://github.com/AraneaDev/daedalus/compare/v0.0.6...v0.0.7) (2026-11-22)
+
+
+### Features
+
+* ship downloadable native installers ([#26](https://github.com/AraneaDev/daedalus/issues/26)) ([7037607](https://github.com/AraneaDev/daedalus/commit/70376076c27a482481e4642f931a41c6764724cb))
+
 ## [0.0.6](https://github.com/AraneaDev/daedalus/compare/v0.0.5...v0.0.6) (2026-11-22)
 
 
