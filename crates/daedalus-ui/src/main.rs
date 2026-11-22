@@ -867,10 +867,7 @@ impl DaedalusApp {
             }
             HitTarget::PaneViewport { role, col, row } => {
                 self.state.focused_role = role;
-                if self.modifiers.control_key()
-                    && !self.modifiers.alt_key()
-                    && !self.modifiers.super_key()
-                {
+                if is_link_click_modifier(self.modifiers) {
                     self.open_clicked_link(role, col, row);
                     self.request_redraw();
                     return;
@@ -1332,6 +1329,18 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
     }
 }
 
+fn is_link_click_modifier_for_platform(mods: ModifiersState, is_macos: bool) -> bool {
+    if is_macos {
+        mods.super_key() && !mods.control_key() && !mods.alt_key()
+    } else {
+        mods.control_key() && !mods.super_key() && !mods.alt_key()
+    }
+}
+
+fn is_link_click_modifier(mods: ModifiersState) -> bool {
+    is_link_click_modifier_for_platform(mods, cfg!(target_os = "macos"))
+}
+
 fn workspace_name_from_dir(dir: &Path) -> String {
     dir.file_name()
         .and_then(|name| name.to_str())
@@ -1367,4 +1376,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = DaedalusApp::new(config, ui_config, proxy);
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_click_modifier_matches_platform_convention() {
+        let ctrl = ModifiersState::CONTROL;
+        let cmd = ModifiersState::SUPER;
+
+        // Linux uses Ctrl+Click
+        assert!(is_link_click_modifier_for_platform(ctrl, false));
+        assert!(!is_link_click_modifier_for_platform(cmd, false));
+        assert!(!is_link_click_modifier_for_platform(
+            ctrl | ModifiersState::ALT,
+            false
+        ));
+
+        // macOS uses Cmd+Click
+        assert!(is_link_click_modifier_for_platform(cmd, true));
+        assert!(!is_link_click_modifier_for_platform(ctrl, true));
+        assert!(!is_link_click_modifier_for_platform(
+            cmd | ModifiersState::ALT,
+            true
+        ));
+
+        let expected_current = if cfg!(target_os = "macos") {
+            is_link_click_modifier(cmd) && !is_link_click_modifier(ctrl)
+        } else {
+            is_link_click_modifier(ctrl) && !is_link_click_modifier(cmd)
+        };
+        assert!(expected_current);
+    }
 }

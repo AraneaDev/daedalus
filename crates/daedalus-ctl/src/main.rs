@@ -7,8 +7,11 @@ use daedalus_proto::{
     default_socket_path, wrap_bracketed_paste,
 };
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+const DEFAULT_LAUNCHD_LABEL: &str = "dev.aranea.daedalusd";
+const DEFAULT_DAEDALUSD_BIN: &str = "/usr/local/bin/daedalusd";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -55,6 +58,21 @@ enum Commands {
         pane: Option<Uuid>,
         #[arg(long)]
         json: bool,
+    },
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceAction {
+    /// Print a macOS launchd user agent plist (~/Library/LaunchAgents/dev.aranea.daedalusd.plist)
+    PrintLaunchd {
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        #[arg(long)]
+        label: Option<String>,
     },
 }
 
@@ -297,10 +315,103 @@ fn expect_ok(payload: ResponsePayload) -> Result<(), Box<dyn std::error::Error>>
     }
 }
 
+fn resolve_daedalusd_binary(explicit: Option<PathBuf>, current_exe: Option<&Path>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path;
+    }
+    if let Some(sibling) = current_exe
+        .and_then(|exe| exe.parent())
+        .map(|dir| dir.join("daedalusd"))
+        .filter(|path| path.is_file())
+    {
+        return sibling;
+    }
+    PathBuf::from(DEFAULT_DAEDALUSD_BIN)
+}
+
+fn default_launchd_log_dir(home: Option<&str>) -> PathBuf {
+    match home.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(h) => PathBuf::from(h).join("Library").join("Logs"),
+        None => std::env::temp_dir(),
+    }
+}
+
+fn escape_xml(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn render_launchd_plist(label: &str, binary: &Path, socket: &Path, log_dir: &Path) -> String {
+    let label_xml = escape_xml(label);
+    let binary_xml = escape_xml(&binary.to_string_lossy());
+    let socket_xml = escape_xml(&socket.to_string_lossy());
+    let stdout_xml = escape_xml(&log_dir.join("daedalusd.out.log").to_string_lossy());
+    let stderr_xml = escape_xml(&log_dir.join("daedalusd.err.log").to_string_lossy());
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label_xml}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{binary_xml}</string>
+    <string>--socket</string>
+    <string>{socket_xml}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{stdout_xml}</string>
+  <key>StandardErrorPath</key>
+  <string>{stderr_xml}</string>
+</dict>
+</plist>
+"#
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let socket = cli.socket.unwrap_or_else(default_socket_path);
+
+    if let Commands::Service { action } = cli.command {
+        match action {
+            ServiceAction::PrintLaunchd { binary, label } => {
+                let label = label
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(DEFAULT_LAUNCHD_LABEL)
+                    .to_string();
+                let current_exe = std::env::current_exe().ok();
+                let binary = resolve_daedalusd_binary(binary, current_exe.as_deref());
+                let home = std::env::var("HOME").ok();
+                let log_dir = default_launchd_log_dir(home.as_deref());
+                print!(
+                    "{}",
+                    render_launchd_plist(&label, &binary, &socket, &log_dir)
+                );
+            }
+        }
+        return Ok(());
+    }
+
     let mut client = DaemonClient::connect(&socket).await?;
 
     match cli.command {
@@ -657,6 +768,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Commands::Service { .. } => unreachable!("service commands exit before daemon connect"),
     }
 
     Ok(())
@@ -1000,5 +1112,116 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let expected = std::fs::canonicalize(&cwd).unwrap_or(cwd);
         assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn parses_service_print_launchd_cli_flags() {
+        let default_cmd = Cli::try_parse_from(["daedalus-ctl", "service", "print-launchd"])
+            .expect("parse service print-launchd");
+        assert!(default_cmd.socket.is_none());
+        assert!(matches!(
+            default_cmd.command,
+            Commands::Service {
+                action: ServiceAction::PrintLaunchd {
+                    binary: None,
+                    label: None
+                }
+            }
+        ));
+
+        let custom_cmd = Cli::try_parse_from([
+            "daedalus-ctl",
+            "service",
+            "print-launchd",
+            "--socket",
+            "/tmp/custom.sock",
+            "--binary",
+            "/opt/homebrew/bin/daedalusd",
+            "--label",
+            "com.example.daedalus",
+        ])
+        .expect("parse service print-launchd with flags");
+        assert_eq!(custom_cmd.socket, Some(PathBuf::from("/tmp/custom.sock")));
+        match custom_cmd.command {
+            Commands::Service {
+                action: ServiceAction::PrintLaunchd { binary, label },
+            } => {
+                assert_eq!(binary, Some(PathBuf::from("/opt/homebrew/bin/daedalusd")));
+                assert_eq!(label.as_deref(), Some("com.example.daedalus"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_daedalusd_binary_prefers_explicit_then_sibling_then_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl_exe = dir.path().join("daedalus-ctl");
+        let sibling_daemon = dir.path().join("daedalusd");
+
+        assert_eq!(
+            resolve_daedalusd_binary(None, Some(&ctl_exe)),
+            PathBuf::from(DEFAULT_DAEDALUSD_BIN)
+        );
+
+        std::fs::write(&sibling_daemon, b"").unwrap();
+        assert_eq!(
+            resolve_daedalusd_binary(None, Some(&ctl_exe)),
+            sibling_daemon
+        );
+
+        let explicit = PathBuf::from("/custom/bin/daedalusd");
+        assert_eq!(
+            resolve_daedalusd_binary(Some(explicit.clone()), Some(&ctl_exe)),
+            explicit
+        );
+    }
+
+    #[test]
+    fn render_launchd_plist_outputs_valid_structure_and_escapes_xml() {
+        let plist = render_launchd_plist(
+            DEFAULT_LAUNCHD_LABEL,
+            Path::new("/opt/homebrew/bin/daedalusd"),
+            Path::new("/tmp/daedalus-501/daedalusd.sock"),
+            Path::new("/Users/tim/Library/Logs"),
+        );
+
+        assert!(plist.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+        assert!(plist.contains("<plist version=\"1.0\">"));
+        assert!(plist.contains("<key>Label</key>\n  <string>dev.aranea.daedalusd</string>"));
+        assert!(plist.contains("<string>/opt/homebrew/bin/daedalusd</string>"));
+        assert!(plist.contains("<string>--socket</string>"));
+        assert!(plist.contains("<string>/tmp/daedalus-501/daedalusd.sock</string>"));
+        assert!(plist.contains("<key>RunAtLoad</key>\n  <true/>"));
+        assert!(plist.contains("<key>KeepAlive</key>\n  <true/>"));
+        assert!(
+            plist.contains(
+                "<key>StandardOutPath</key>\n  <string>/Users/tim/Library/Logs/daedalusd.out.log</string>"
+            )
+        );
+        assert!(
+            plist.contains(
+                "<key>StandardErrorPath</key>\n  <string>/Users/tim/Library/Logs/daedalusd.err.log</string>"
+            )
+        );
+        assert!(plist.trim_end().ends_with("</plist>"));
+
+        let escaped = render_launchd_plist(
+            "dev.test&<\"'>",
+            Path::new("/tmp/bin&<\"'>/daedalusd"),
+            Path::new("/tmp/sock&<\"'>.sock"),
+            Path::new("/tmp/log&<\"'>"),
+        );
+        assert!(escaped.contains("<string>dev.test&amp;&lt;&quot;&apos;&gt;</string>"));
+        assert!(escaped.contains("<string>/tmp/bin&amp;&lt;&quot;&apos;&gt;/daedalusd</string>"));
+        assert!(escaped.contains("<string>/tmp/sock&amp;&lt;&quot;&apos;&gt;.sock</string>"));
+        assert!(
+            escaped
+                .contains("<string>/tmp/log&amp;&lt;&quot;&apos;&gt;/daedalusd.out.log</string>")
+        );
+        assert!(
+            escaped
+                .contains("<string>/tmp/log&amp;&lt;&quot;&apos;&gt;/daedalusd.err.log</string>")
+        );
     }
 }
