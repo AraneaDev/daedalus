@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.6](https://github.com/AraneaDev/daedalus/compare/v0.0.5...v0.0.6) (2026-11-22)
+
+
+### Features
+
+* add remote daemon sessions and workspace actions ([#24](https://github.com/AraneaDev/daedalus/issues/24)) ([1432d74](https://github.com/AraneaDev/daedalus/commit/1432d74b195ad39aa57828879b61364f3b03f5f0))
+
 ## [0.0.5](https://github.com/AraneaDev/daedalus/compare/v0.0.4...v0.0.5) (2026-11-22)
 
 
