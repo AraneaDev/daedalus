@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.5](https://github.com/AraneaDev/daedalus/compare/v0.0.4...v0.0.5) (2026-11-22)
+
+
+### Features
+
+* add Windows native support, Named Pipes, WSL2 bridge, and tri-platform CI (v0.0.5) ([#22](https://github.com/AraneaDev/daedalus/issues/22)) ([e3fe4a5](https://github.com/AraneaDev/daedalus/commit/e3fe4a565e7c63a09b9c665569e3f4963be404fb))
+
 ## [0.0.4](https://github.com/AraneaDev/daedalus/compare/v0.0.3...v0.0.4) (2026-11-22)
 
 
