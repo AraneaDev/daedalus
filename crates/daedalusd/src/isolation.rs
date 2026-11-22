@@ -145,10 +145,11 @@ pub fn prepare_workspace_isolation_with_extra_ports(
         Some(base_path) => {
             let project = sanitize_compose_project(name, slot_index);
             let override_path = write_compose_override(root_dir, &compose_services, port_offset)?;
+            let sep = if cfg!(windows) { ";" } else { ":" };
             injected_env.insert("COMPOSE_PROJECT_NAME".to_string(), project.clone());
             injected_env.insert(
                 "COMPOSE_FILE".to_string(),
-                format!("{}:{}", base_path.display(), override_path.display()),
+                format!("{}{sep}{}", base_path.display(), override_path.display()),
             );
             (Some(project), Some(override_path))
         }
@@ -1038,9 +1039,10 @@ services:
                 .map(String::as_str),
             Some("my-repo-wt1")
         );
+        let sep = if cfg!(windows) { ";" } else { ":" };
         assert_eq!(
             plan.injected_env.get("COMPOSE_FILE").map(String::as_str),
-            Some(format!("{}:{}", compose_path.display(), override_path.display()).as_str())
+            Some(format!("{}{sep}{}", compose_path.display(), override_path.display()).as_str())
         );
 
         let yaml_text = std::fs::read_to_string(override_path).unwrap();
