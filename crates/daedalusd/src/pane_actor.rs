@@ -300,10 +300,17 @@ async fn run_pane_actor(
     let mut seq: u64 = 0;
     let mut has_pending_delta = false;
     let mut pty_open = true;
+    let mut exited_emitted = false;
     let mut delta_tick = tokio::time::interval(Duration::from_millis(16));
     delta_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut agent_tick = tokio::time::interval(Duration::from_millis(250));
     agent_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    #[cfg(windows)]
+    let mut exit_tick = {
+        let mut t = tokio::time::interval(Duration::from_millis(50));
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        t
+    };
 
     let emit_agent_state = |state: Option<AgentState>| {
         if let Some(state) = state {
@@ -359,21 +366,24 @@ async fn run_pane_actor(
                                 let _ = event_tx.send(ServerEvent::GridDelta(delta));
                             }
                         }
-                        let mut exit_code = proc_handle.try_wait_exit();
-                        if exit_code.is_none() {
-                            for _ in 0..20 {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
-                                exit_code = proc_handle.try_wait_exit();
-                                if exit_code.is_some() {
-                                    break;
+                        if !exited_emitted {
+                            let mut exit_code = proc_handle.try_wait_exit();
+                            if exit_code.is_none() {
+                                for _ in 0..20 {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                    exit_code = proc_handle.try_wait_exit();
+                                    if exit_code.is_some() {
+                                        break;
+                                    }
                                 }
                             }
+                            tracker.mark_exited(exit_code);
+                            if let Some(det) = detector.as_mut() {
+                                emit_agent_state(det.observe_exit(exit_code));
+                            }
+                            let _ = event_tx.send(ServerEvent::PaneExited { pane_id, exit_code });
+                            exited_emitted = true;
                         }
-                        tracker.mark_exited(exit_code);
-                        if let Some(det) = detector.as_mut() {
-                            emit_agent_state(det.observe_exit(exit_code));
-                        }
-                        let _ = event_tx.send(ServerEvent::PaneExited { pane_id, exit_code });
                     }
                 }
             }
@@ -387,6 +397,39 @@ async fn run_pane_actor(
             _ = agent_tick.tick(), if detector.is_some() => {
                 if let Some(det) = detector.as_mut() {
                     emit_agent_state(det.observe_tick(Instant::now()));
+                }
+            }
+            _ = async {
+                #[cfg(windows)]
+                {
+                    exit_tick.tick().await;
+                }
+                #[cfg(not(windows))]
+                {
+                    std::future::pending::<()>().await;
+                }
+            }, if !exited_emitted => {
+                if let Some(code) = proc_handle.try_wait_exit() {
+                    while let Ok(PtyOutput::Bytes(bytes)) = pty_rx.try_recv() {
+                        let _ = tracker.feed(&bytes);
+                        has_pending_delta = true;
+                    }
+                    if has_pending_delta {
+                        has_pending_delta = false;
+                        seq += 1;
+                        if let Some(delta) = tracker.engine_mut().take_dirty_delta(pane_id, seq) {
+                            let _ = event_tx.send(ServerEvent::GridDelta(delta));
+                        }
+                    }
+                    tracker.mark_exited(Some(code));
+                    if let Some(det) = detector.as_mut() {
+                        emit_agent_state(det.observe_exit(Some(code)));
+                    }
+                    let _ = event_tx.send(ServerEvent::PaneExited {
+                        pane_id,
+                        exit_code: Some(code),
+                    });
+                    exited_emitted = true;
                 }
             }
             maybe_cmd = cmd_rx.recv() => {
