@@ -106,13 +106,8 @@ jobs:
           $wix = "$env:RUNNER_TEMP/wix/wix.exe"
           & $wix extension add WixToolset.UI.wixext/5.0.2
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $license = Get-Content -LiteralPath LICENSE -Raw
-          $paragraphs = ($license.Trim() -split '(?:\r?\n){2,}') | ForEach-Object {
-            ($_ -replace '\r?\n', ' ').Replace('\', '\\').Replace('{', '\{').Replace('}', '\}')
-          }
           $rtf = Join-Path $env:RUNNER_TEMP 'daedalus-license.rtf'
-          $text = '{\rtf1\ansi\deff0{\fonttbl{\f0 Arial;}}\f0\fs18 ' + ($paragraphs -join '\par\par ') + '}'
-          [IO.File]::WriteAllText($rtf, $text, [Text.Encoding]::ASCII)
+          $text = & ./packaging/windows-license.ps1 -Destination $rtf
           & $wix build -arch x64 -ext WixToolset.UI.wixext -d "Version=$env:VERSION" -d "LicenseRtf=$rtf" packaging/windows.wxs -o $msi
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           if (!(Test-Path -LiteralPath $msi -PathType Leaf)) { throw "Missing package: $msi" }
