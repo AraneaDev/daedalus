@@ -2,6 +2,8 @@
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="Daedalus" Manufacturer="AraneaDev" Version="$(Version)"
            UpgradeCode="3E5E2423-624C-4A96-80BD-F9C3A1310FAE" Scope="perMachine">
+    <Icon Id="Daedalus.exe" SourceFile="packaging/daedalus.ico" />
+    <Property Id="ARPPRODUCTICON" Value="Daedalus.exe" />
     <MajorUpgrade DowngradeErrorMessage="A newer version of Daedalus is already installed." />
     <ui:WixUI Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="$(LicenseRtf)" />
@@ -10,7 +12,7 @@
       <Directory Id="INSTALLFOLDER" Name="Daedalus">
         <Component Id="Workbench" Guid="*">
           <File Id="Ui" Source="target/release/daedalus-ui.exe" KeyPath="yes">
-            <Shortcut Id="StartMenu" Directory="ProgramMenuFolder" Name="Daedalus" Advertise="yes" />
+            <Shortcut Id="StartMenu" Directory="ProgramMenuFolder" Name="Daedalus" Advertise="no" Icon="Daedalus.exe" Description="Open the Daedalus workbench" />
           </File>
         </Component>
         <Component Id="Daemon" Guid="*"><File Source="target/release/daedalusd.exe" /></Component>

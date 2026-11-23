@@ -274,7 +274,7 @@ impl ProcessHandle {
         }
 
         if let Some(pid) = self.pid {
-            let mut cmd = Command::new("taskkill");
+            let mut cmd = crate::background_command("taskkill");
             cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
             let _ = run_command_with_timeout(&mut cmd, Duration::from_secs(3));
         }

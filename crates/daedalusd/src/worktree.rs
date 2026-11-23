@@ -2,7 +2,9 @@ use daedalus_proto::{GitWorkspaceStatus, GitWorktreeInfo};
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+#[cfg(test)]
+use std::process::Command;
+use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -121,7 +123,7 @@ fn run_git_with_timeout_for(
     args: &[&OsStr],
     timeout: Duration,
 ) -> Result<GitOutput, String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::background_command("git");
     cmd.arg("-C").arg(repo_dir);
     for arg in args {
         cmd.arg(arg);

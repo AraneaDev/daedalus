@@ -135,6 +135,17 @@ jobs:
             $proc = Start-Process msiexec -ArgumentList "$mode `"$msi`" /qn /norestart" -Wait -PassThru
             if ($proc.ExitCode -ne 0) { throw "Installer exited with $($proc.ExitCode)" }
             if ($mode -eq '/i') {
+              $programs = [Environment]::GetFolderPath('CommonPrograms')
+              $link = Join-Path $programs 'Daedalus.lnk'
+              if (!(Test-Path -LiteralPath $link)) { throw "Start menu shortcut missing: $link" }
+              $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($link)
+              $gui = "$env:ProgramFiles\Daedalus\daedalus-ui.exe"
+              if ($shortcut.TargetPath -ine $gui) { throw "Unexpected shortcut target: $($shortcut.TargetPath)" }
+              $iconPath = ($shortcut.IconLocation -split ',')[0]
+              if (!$iconPath -or !(Test-Path -LiteralPath $iconPath)) { throw "Missing shortcut icon: $iconPath" }
+              $pe = [IO.File]::ReadAllBytes($gui)
+              $peOffset = [BitConverter]::ToInt32($pe, 0x3c)
+              if ([BitConverter]::ToUInt16($pe, $peOffset + 24 + 68) -ne 2) { throw "Workbench opens a console window" }
               foreach ($bin in 'daedalus-ui','daedalus-ctl','daedalusd') {
                 & "$env:ProgramFiles/Daedalus/$bin.exe" --help
                 if ($LASTEXITCODE) { exit $LASTEXITCODE }
