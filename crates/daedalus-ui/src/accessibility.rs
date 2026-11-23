@@ -1,9 +1,13 @@
-use accesskit::{Action, ActionRequest, Live, Node, NodeId, Role, TreeId, TreeInfo, TreeUpdate};
+use accesskit::{
+    Action, ActionData, ActionRequest, Invalid, Live, Node, NodeId, Role, TextPosition,
+    TextSelection, TreeId, TreeInfo, TreeUpdate,
+};
 use daedalus_proto::{AgentState, PaneRole, PaneStatus};
-use daedalus_ui::input::UiAction;
+use daedalus_ui::input::{UiAction, filter_modal_text};
 use daedalus_ui::layout::Rect;
-use daedalus_ui::renderer::{worktree_button_rects, worktree_modal_rect};
+use daedalus_ui::renderer::{worktree_button_rects, worktree_input_rect, worktree_modal_rect};
 use daedalus_ui::state::{AppState, ConnectionState};
+use unicode_segmentation::UnicodeSegmentation;
 
 const WINDOW: NodeId = NodeId(1);
 const STATUS: NodeId = NodeId(2);
@@ -18,11 +22,12 @@ const CLOSE: NodeId = NodeId(10);
 const SEARCH: NodeId = NodeId(11);
 
 const VALIDATION: NodeId = NodeId(12);
+const BRANCH_TEXT: NodeId = NodeId(13);
 
-fn worktree_buttons(state: &AppState) -> (NodeId, NodeId) {
+fn worktree_controls(state: &AppState) -> (NodeId, NodeId, NodeId) {
     // Queued platform actions from a prior dialog must not affect its successor.
-    let first = 100 + state.worktree_modal.session() * 2;
-    (NodeId(first), NodeId(first + 1))
+    let first = 100 + state.worktree_modal.session() * 3;
+    (NodeId(first), NodeId(first + 1), NodeId(first + 2))
 }
 
 pub(super) fn action(state: &AppState, request: &ActionRequest) -> Option<UiAction> {
@@ -30,11 +35,24 @@ pub(super) fn action(state: &AppState, request: &ActionRequest) -> Option<UiActi
         || state.picker.open
         || state.action_palette.open
         || request.target_tree != TreeId::ROOT
-        || request.action != Action::Click
     {
         return None;
     }
-    let (cancel, create) = worktree_buttons(state);
+    let (branch, cancel, create) = worktree_controls(state);
+    if request.target_node == branch && request.action == Action::SetValue {
+        let Some(ActionData::Value(value)) = &request.data else {
+            return None;
+        };
+        let text = if value.is_empty() {
+            String::new()
+        } else {
+            filter_modal_text(value, false)?
+        };
+        return Some(UiAction::WorktreeModalSetText(text));
+    }
+    if request.action != Action::Click {
+        return None;
+    }
     if request.target_node == cancel {
         Some(UiAction::WorktreeModalCancel)
     } else if request.target_node == create && state.can_create_worktree() {
@@ -67,14 +85,10 @@ fn overlay(state: &AppState) -> Option<(NodeId, Node)> {
         );
         (ACTIONS, "Action palette", selection)
     } else if state.worktree_modal.open {
-        let branch = &state.worktree_modal.branch_input;
         (
             WORKTREE,
             "New Git worktree",
-            format!(
-                "Branch name: {}. Enter to create. Escape to cancel.",
-                if branch.is_empty() { "empty" } else { branch }
-            ),
+            "Enter to create. Escape to cancel.".to_owned(),
         )
     } else if state.close_modal.open {
         let modal = &state.close_modal;
@@ -128,6 +142,24 @@ fn bounds(rect: Rect) -> accesskit::Rect {
     }
 }
 
+// The Linux adapter exposes EditableText when the input contains a TextRun.
+fn branch_text_run(text: &str) -> Node {
+    let mut lengths = Vec::new();
+    for grapheme in text.graphemes(true) {
+        if let Ok(length) = u8::try_from(grapheme.len()) {
+            lengths.push(length);
+        } else {
+            // Individual AccessKit lengths are bytes. Preserve all of an unusually
+            // long combining sequence by splitting it at valid scalar boundaries.
+            lengths.extend(grapheme.chars().map(|ch| ch.len_utf8() as u8));
+        }
+    }
+    let mut run = Node::new(Role::TextRun);
+    run.set_value(text);
+    run.set_character_lengths(lengths);
+    run
+}
+
 pub(super) fn tree(state: &AppState, width: f32, height: f32, scale: f32) -> TreeUpdate {
     let mut root = named(Role::Window, "Daedalus Workbench");
     root.set_bounds(bounds(Rect::new(0.0, 0.0, width, height)));
@@ -149,10 +181,33 @@ pub(super) fn tree(state: &AppState, width: f32, height: f32, scale: f32) -> Tre
     root.push_child(STATUS);
     let mut nodes = vec![(STATUS, status)];
     let focus = if let Some((id, mut node)) = overlay(state) {
+        let mut focus = id;
         if id == WORKTREE {
-            let (cancel, create) = worktree_buttons(state);
+            let (branch, cancel, create) = worktree_controls(state);
             let modal = worktree_modal_rect(width, height, scale);
             node.set_bounds(bounds(modal));
+            let mut field = named(Role::TextInput, "Branch name");
+            field.set_bounds(bounds(worktree_input_rect(modal, scale)));
+            let run = branch_text_run(&state.worktree_modal.branch_input);
+            let caret = TextPosition {
+                node: BRANCH_TEXT,
+                character_index: run.character_lengths().len(),
+            };
+            field.push_child(BRANCH_TEXT);
+            field.set_text_selection(TextSelection {
+                anchor: caret,
+                focus: caret,
+            });
+            nodes.push((BRANCH_TEXT, run));
+            field.set_required();
+            field.add_action(Action::SetValue);
+            if state.worktree_modal.missing_branch() {
+                field.set_invalid(Invalid::True);
+                field.set_error_message(VALIDATION);
+            }
+            node.push_child(branch);
+            nodes.push((branch, field));
+            focus = branch;
             let (cancel_rect, create_rect) = worktree_button_rects(modal, scale);
             for (button_id, name, enabled, rect) in [
                 (cancel, "Cancel", true, cancel_rect),
@@ -177,7 +232,7 @@ pub(super) fn tree(state: &AppState, width: f32, height: f32, scale: f32) -> Tre
         }
         root.push_child(id);
         nodes.push((id, node));
-        id
+        focus
     } else if let Some(ws) = state.active_workspace() {
         let mut workspace = named(Role::Group, format!("Workspace {}", ws.name));
         root.push_child(WORKSPACE);
@@ -263,7 +318,7 @@ mod tests {
         let mut state = AppState::new();
         state.worktree_modal.open();
         state.connection = ConnectionState::Connected;
-        let (cancel, create) = worktree_buttons(&state);
+        let (_, cancel, create) = worktree_controls(&state);
         let click = |target_node| ActionRequest {
             action: Action::Click,
             target_node,
@@ -301,6 +356,96 @@ mod tests {
         state.worktree_modal.open();
         assert_eq!(action(&state, &click(cancel)), None);
     }
+    #[test]
+    fn branch_field_tracks_focus_value_bounds_and_validation() {
+        let mut state = AppState::new();
+        state.worktree_modal.open();
+        state.worktree_modal.push_text("feat/café");
+        let branch = worktree_controls(&state).0;
+        let update = super::tree(&state, 320.0, 480.0, 1.5);
+        assert_eq!(update.focus, branch);
+        let field = &update.nodes.iter().find(|n| n.0 == branch).unwrap().1;
+        assert_eq!(field.role(), Role::TextInput);
+        assert_eq!(field.label(), Some("Branch name"));
+        assert_eq!(field.children(), &[BRANCH_TEXT]);
+        let run = &update.nodes.iter().find(|n| n.0 == BRANCH_TEXT).unwrap().1;
+        assert_eq!(run.value(), Some("feat/café"));
+        assert_eq!(field.text_selection().unwrap().focus.character_index, 9);
+        assert!(field.is_required() && field.supports_action(Action::SetValue));
+        assert_eq!(
+            field.bounds(),
+            Some(bounds(worktree_input_rect(
+                worktree_modal_rect(320.0, 480.0, 1.5),
+                1.5,
+            )))
+        );
+        state.worktree_modal.set_text(String::new());
+        assert!(state.worktree_modal.branch_for_submit().is_none());
+        let invalid = tree(&state);
+        let field = &invalid.nodes.iter().find(|n| n.0 == branch).unwrap().1;
+        assert_eq!(field.invalid(), Some(Invalid::True));
+        assert_eq!(field.error_message(), Some(VALIDATION));
+        state.worktree_modal.set_text("new".to_owned());
+        let valid = tree(&state);
+        let field = &valid.nodes.iter().find(|n| n.0 == branch).unwrap().1;
+        let run = &valid.nodes.iter().find(|n| n.0 == BRANCH_TEXT).unwrap().1;
+        assert_eq!(run.value(), Some("new"));
+        assert_eq!(field.invalid(), None);
+        assert_eq!(field.error_message(), None);
+    }
+
+    #[test]
+    fn branch_text_ranges_cover_combining_sequences_and_emoji() {
+        assert_eq!(
+            branch_text_run("e\u{301}/🌱").character_lengths(),
+            &[3, 1, 4]
+        );
+        let text = format!("e{}", "\u{301}".repeat(150));
+        let run = branch_text_run(&text);
+        let mut offset = 0;
+        for length in run.character_lengths() {
+            offset += usize::from(*length);
+            assert!(text.is_char_boundary(offset));
+        }
+        assert_eq!(offset, text.len());
+    }
+
+    #[test]
+    fn branch_replacement_uses_keyboard_filter_and_rejects_stale_requests() {
+        let mut state = AppState::new();
+        state.worktree_modal.open();
+        let branch = worktree_controls(&state).0;
+        let replace = |value: &str| ActionRequest {
+            action: Action::SetValue,
+            target_tree: TreeId::ROOT,
+            target_node: branch,
+            data: Some(ActionData::Value(value.into())),
+        };
+        assert_eq!(
+            action(&state, &replace("feat/ 日本語\n")),
+            Some(UiAction::WorktreeModalSetText("feat/日本語".into()))
+        );
+        assert_eq!(
+            action(&state, &replace("")),
+            Some(UiAction::WorktreeModalSetText(String::new()))
+        );
+        assert_eq!(action(&state, &replace(" \n")), None);
+        assert_eq!(
+            action(
+                &state,
+                &ActionRequest {
+                    data: None,
+                    ..replace("bad")
+                }
+            ),
+            None
+        );
+        state.worktree_modal.close();
+        assert_eq!(action(&state, &replace("late")), None);
+        state.worktree_modal.open();
+        assert_eq!(action(&state, &replace("late")), None);
+    }
+
     #[test]
     fn dialog_focus_returns_to_the_active_workspaces_focused_pane() {
         use daedalus_proto::{PaneId, PaneSummary, WorkspaceId, WorkspaceInfo};
@@ -346,7 +491,7 @@ mod tests {
         );
         state.worktree_modal.open();
         let modal = tree(&state);
-        assert_eq!(modal.focus, WORKTREE);
+        assert_eq!(modal.focus, worktree_controls(&state).0);
         assert!(modal.nodes.iter().all(|n| n.0 != AGENT));
         state.worktree_modal.close();
         assert_eq!(tree(&state), original);

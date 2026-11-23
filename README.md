@@ -4,6 +4,8 @@ Daedalus is a native workbench for running a coding agent, a development service
 side. Each Git worktree has its own panes, ports, and Compose project. A persistent daemon owns the
 processes, so you can close the window and reconnect later.
 
+![Agent pane showing a Git diff beside service output and a test run](docs/images/workbench.png)
+
 ## Install
 
 Download the installer for your machine from
@@ -54,10 +56,14 @@ the agent picker. Docker and Compose are needed only for container workflows.
 
 ---
 
-In narrow windows, the panes stack vertically. Click **Workspaces** to show or hide the sidebar. For
-long lists, scroll over the sidebar or use its page arrows.
+Click **Workspaces** to show or hide the sidebar at any window width. In narrow windows, the panes
+stack vertically. For long workspace lists, scroll over the sidebar or use its page arrows.
 
 On macOS, use Cmd for the workbench shortcuts shown with Ctrl+Shift.
+
+Use the **+ Worktree** button to open a branch in its own workspace.
+
+![New Git Worktree dialog with a branch name entered](docs/images/new-worktree.png)
 
 The native accessibility tree exposes the active workspace, focused pane, connection status, and
 open dialog or search context. In **New Git Worktree**, type the branch name and activate **Create**
@@ -130,6 +136,10 @@ experimental Ghostty feature generates C bindings and currently delegates termin
 built-in engine.
 
 ## Development
+
+Regenerate the README screenshots on Linux with `scripts/screenshots.sh`. It uses Xvfb, xauth,
+xdotool, ImageMagick, Python 3, Git, and a working Mesa software renderer to capture a disposable
+example project on a private display.
 
 CI checks the default Rust backend on Linux, macOS and Windows. From a checkout, run:
 

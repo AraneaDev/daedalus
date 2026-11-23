@@ -205,6 +205,11 @@ impl WorktreeModalState {
         self.show_missing_branch = false;
     }
 
+    pub fn set_text(&mut self, text: String) {
+        self.branch_input = text;
+        self.show_missing_branch = false;
+    }
+
     pub fn missing_branch(&self) -> bool {
         self.show_missing_branch
     }

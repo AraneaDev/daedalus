@@ -6,8 +6,7 @@ use super::{
     WorkspaceLayout, truncate_right_with_ellipsis,
 };
 use crate::layout::{
-    LayoutMetrics, PaneRect, sidebar_new_workspace_rect, sidebar_new_worktree_rect,
-    sidebar_workspace_close_rect,
+    PaneRect, sidebar_new_workspace_rect, sidebar_new_worktree_rect, sidebar_workspace_close_rect,
 };
 use crate::renderer::sidebar::{Badge, BadgeKind, Card};
 use crate::renderer::{
@@ -87,32 +86,6 @@ impl TextRenderer {
         // Sidebar text
         if let (Some(sidebar), Some(cards)) = (layout.sidebar, cards) {
             let list = &cards.list;
-            let m = LayoutMetrics::for_scale(s);
-            if layout.sidebar_toggle.is_none() {
-                let header_rect = Rect::new(
-                    sidebar.x,
-                    sidebar.y,
-                    arrows.map_or(sidebar.width, |(up, _)| (up.x - sidebar.x).max(0.0)),
-                    m.sidebar_header_height,
-                );
-                let header = state
-                    .remote_host
-                    .as_ref()
-                    .map(|host| format!("[REMOTE: {host}]"));
-                self.push_chrome_line(ChromeLineSpec {
-                    text: header.as_deref().unwrap_or("WORKSPACES"),
-                    left: header_rect.x + m.sidebar_pad + 4.0 * s,
-                    top: header_rect.y
-                        + (header_rect.height - CHROME_SUB_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                    max_w: header_rect.width - 2.0 * m.sidebar_pad,
-                    bounds: header_rect,
-                    font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
-                    line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
-                    color: theme.text_muted,
-                    bold: true,
-                });
-            }
-
             if let Some((up, down)) = arrows {
                 for (rect, label, enabled) in [
                     (up, "▲", list.visible.start > 0),

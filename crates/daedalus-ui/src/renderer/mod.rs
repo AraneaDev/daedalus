@@ -68,7 +68,7 @@ pub fn action_palette_layout(
     selected: usize,
 ) -> (Rect, std::ops::Range<usize>) {
     let s = sanitize_scale(scale_factor);
-    let row_height = PICKER_ITEM_LOGICAL_HEIGHT + PICKER_ITEM_LOGICAL_GAP;
+    let row_height = picker_row_stride(1.0);
     let available = window_h / s - 24.0 - PICKER_HEADER_LOGICAL_HEIGHT - PICKER_PAD_LOGICAL
         + PICKER_ITEM_LOGICAL_GAP;
     let rows = ((available / row_height) as usize).max(1).min(count.max(1));
@@ -103,15 +103,18 @@ fn picker_rect_for_rows(window_w: f32, window_h: f32, scale_factor: f32, rows: u
     Rect::new(x, y, modal_w, modal_h)
 }
 
+/// Distance between adjacent preset or action rows in physical pixels.
+pub fn picker_row_stride(scale_factor: f32) -> f32 {
+    (PICKER_ITEM_LOGICAL_HEIGHT + PICKER_ITEM_LOGICAL_GAP) * sanitize_scale(scale_factor)
+}
+
 /// Computes the physical-pixel rectangle of item `index` inside the Agent preset picker modal.
 pub fn picker_item_rect(modal: Rect, index: usize, scale_factor: f32) -> Rect {
     let s = sanitize_scale(scale_factor);
     let pad = PICKER_PAD_LOGICAL * s;
     let x = modal.x + pad;
     let w = (modal.width - 2.0 * pad).max(0.0);
-    let y = modal.y
-        + PICKER_HEADER_LOGICAL_HEIGHT * s
-        + (index as f32) * (PICKER_ITEM_LOGICAL_HEIGHT + PICKER_ITEM_LOGICAL_GAP) * s;
+    let y = modal.y + PICKER_HEADER_LOGICAL_HEIGHT * s + (index as f32) * picker_row_stride(s);
     Rect::new(x, y, w, PICKER_ITEM_LOGICAL_HEIGHT * s)
 }
 

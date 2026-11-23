@@ -255,7 +255,7 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
     let canvas_x = sidebar_w;
     let canvas_w = (window_w - sidebar_w).max(0.0);
 
-    let sidebar_toggle = (window_w < metrics.sidebar_width + min_split_width).then(|| {
+    let sidebar_toggle = (window_w > 0.0 && window_h > 0.0).then(|| {
         Rect::new(
             0.0,
             0.0,
@@ -641,12 +641,50 @@ mod tests {
         let layout = compute_layout(&input);
         assert!(layout.sidebar.is_none());
         let banner = layout.banner.expect("banner should exist");
-        assert_eq!(banner, Rect::new(0.0, 0.0, 2480.0, 48.0));
+        // The collapsed disclosure stays above the banner at desktop widths.
+        let toggle = layout.sidebar_toggle.unwrap();
+        assert_eq!(toggle, Rect::new(0.0, 0.0, 2480.0, 64.0));
+        assert_eq!(banner, Rect::new(0.0, toggle.bottom(), 2480.0, 48.0));
 
         let agent = layout.pane(PaneRole::Agent).unwrap();
         assert_eq!(agent.outer.x, 0.0);
-        assert_eq!(agent.outer.y, 48.0);
-        assert_eq!(agent.outer.height, 800.0 - 48.0);
+        assert_eq!(agent.outer.y, banner.bottom());
+        assert_eq!(agent.outer.height, input.window_h - banner.bottom());
+    }
+
+    #[test]
+    fn sidebar_disclosure_remains_clickable_after_resize_and_reopen() {
+        for scale in [1.0, 2.0] {
+            let mut input = default_input();
+            input.scale_factor = scale;
+            for (width, visible) in [(320.0, false), (1920.0, false), (1920.0, true)] {
+                input.window_w = width * scale;
+                input.sidebar_override = Some(visible);
+                let layout = compute_layout(&input);
+                let header = layout.sidebar_toggle.expect("visible workspace disclosure");
+                assert_eq!(layout.sidebar.is_some(), visible);
+                assert_eq!(
+                    hit_test(
+                        &layout,
+                        1,
+                        scale,
+                        input.cell_w,
+                        input.cell_h,
+                        header.x + 12.0 * scale,
+                        header.y + header.height / 2.0
+                    ),
+                    HitTarget::ToggleSidebar
+                );
+                let agent = layout.pane(PaneRole::Agent).unwrap();
+                if visible {
+                    assert_eq!(agent.outer.y, 0.0);
+                    assert_eq!(agent.outer.x, header.right());
+                } else {
+                    assert_eq!(agent.outer.y, header.bottom());
+                    assert_eq!(agent.outer.x, 0.0);
+                }
+            }
+        }
     }
 
     #[test]

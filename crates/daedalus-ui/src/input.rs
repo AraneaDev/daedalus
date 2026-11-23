@@ -40,6 +40,7 @@ pub enum UiAction {
     PickerConfirm,
     PickerCancel,
     WorktreeModalText(String),
+    WorktreeModalSetText(String),
     WorktreeModalBackspace,
     WorktreeModalConfirm,
     WorktreeModalCancel,

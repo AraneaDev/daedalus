@@ -16,8 +16,8 @@ use daedalus_ui::links::{detect_link_in_row, detect_url_in_row, open_link};
 use daedalus_ui::renderer::{
     GpuRenderer, RenderError, action_palette_layout, close_modal_cancel_rect,
     close_modal_compose_rect, close_modal_confirm_rect, close_modal_force_rect,
-    close_modal_worktree_rect, close_workspace_modal_rect, picker_item_rect, preset_picker_layout,
-    search_bar_rect, worktree_button_rects, worktree_modal_rect,
+    close_modal_worktree_rect, close_workspace_modal_rect, picker_item_rect, picker_row_stride,
+    preset_picker_layout, search_bar_rect, worktree_button_rects, worktree_modal_rect,
 };
 use daedalus_ui::selection::{CellPos, Selection, extract_selected_text, select_word_at};
 use daedalus_ui::state::{AgentPreset, AppState, ConnectionState};
@@ -26,7 +26,7 @@ use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
@@ -39,6 +39,46 @@ const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 const WHEEL_SCROLL_LINES: isize = 3;
 const FALLBACK_PANE_COLS: u16 = 120;
 const FALLBACK_PANE_ROWS: u16 = 36;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScrollTarget {
+    Sidebar,
+    Presets,
+    Actions,
+    Pane(PaneId),
+}
+
+#[derive(Default)]
+struct WheelScroll {
+    target: Option<ScrollTarget>,
+    remainder: f64,
+}
+
+impl WheelScroll {
+    fn steps(
+        &mut self,
+        target: ScrollTarget,
+        delta: MouseScrollDelta,
+        physical_step_height: f32,
+    ) -> isize {
+        if self.target != Some(target) {
+            self.target = Some(target);
+            self.remainder = 0.0;
+        }
+        self.remainder += match delta {
+            MouseScrollDelta::LineDelta(_, y) => match target {
+                ScrollTarget::Sidebar | ScrollTarget::Presets | ScrollTarget::Actions => {
+                    f64::from(y)
+                }
+                ScrollTarget::Pane(_) => f64::from(y) * WHEEL_SCROLL_LINES as f64,
+            },
+            MouseScrollDelta::PixelDelta(pos) => pos.y / f64::from(physical_step_height.max(1.0)),
+        };
+        let whole = self.remainder.trunc();
+        self.remainder -= whole;
+        whole as isize
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "daedalus-ui", about = "Daedalus native GPU terminal workbench")]
@@ -102,7 +142,7 @@ struct DaedalusApp {
     modifiers: ModifiersState,
     key_repeats: KeyRepeatGuard,
     cursor_pos: (f32, f32),
-    sidebar_wheel_remainder: f32,
+    wheel_scroll: WheelScroll,
     drag_anchor: Option<(PaneRole, PaneId, CellPos)>,
     last_click: Option<(Instant, PaneRole, u16, u16)>,
     pending_resize_flush_at: Option<Instant>,
@@ -125,7 +165,7 @@ impl DaedalusApp {
             modifiers: ModifiersState::empty(),
             key_repeats: KeyRepeatGuard::default(),
             cursor_pos: (0.0, 0.0),
-            sidebar_wheel_remainder: 0.0,
+            wheel_scroll: WheelScroll::default(),
             drag_anchor: None,
             last_click: None,
             pending_resize_flush_at: None,
@@ -781,6 +821,10 @@ impl DaedalusApp {
                 self.state.worktree_modal.push_text(&text);
                 self.request_redraw();
             }
+            UiAction::WorktreeModalSetText(text) => {
+                self.state.worktree_modal.set_text(text);
+                self.request_redraw();
+            }
             UiAction::WorktreeModalBackspace => {
                 self.state.worktree_modal.pop_char();
                 self.request_redraw();
@@ -1072,56 +1116,42 @@ impl DaedalusApp {
 
     fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
         if self.state.worktree_modal.open || self.state.close_modal.open {
+            self.wheel_scroll = WheelScroll::default();
             return;
         }
-        let scroll_lines = match delta {
-            MouseScrollDelta::LineDelta(_, y) => {
-                if y > 0.0 {
-                    WHEEL_SCROLL_LINES * (y.ceil() as isize).max(1)
-                } else if y < 0.0 {
-                    -WHEEL_SCROLL_LINES * ((-y).ceil() as isize).max(1)
-                } else {
-                    0
-                }
-            }
-            MouseScrollDelta::PixelDelta(pos) => {
-                if pos.y > 0.0 {
-                    WHEEL_SCROLL_LINES
-                } else if pos.y < 0.0 {
-                    -WHEEL_SCROLL_LINES
-                } else {
-                    0
-                }
-            }
-        };
-        if scroll_lines == 0 {
-            return;
-        }
-
-        if self.state.picker.open {
-            self.handle_ui_action(if scroll_lines > 0 {
-                UiAction::PickerUp
-            } else {
-                UiAction::PickerDown
-            });
-            return;
-        }
-        if self.state.action_palette.open {
-            self.handle_ui_action(if scroll_lines > 0 {
-                UiAction::ActionPaletteUp
-            } else {
-                UiAction::ActionPaletteDown
-            });
-            return;
-        }
-
         let Some(window) = self.window.as_ref() else {
             return;
         };
+        let scale_factor = window.scale_factor() as f32;
+        if self.state.picker.open || self.state.action_palette.open {
+            let (target, count, selected) = if self.state.picker.open {
+                (
+                    ScrollTarget::Presets,
+                    AgentPreset::ALL.len(),
+                    &mut self.state.picker.selected_index,
+                )
+            } else {
+                (
+                    ScrollTarget::Actions,
+                    self.state.active_actions().len(),
+                    &mut self.state.action_palette.selected_index,
+                )
+            };
+            let steps = self
+                .wheel_scroll
+                .steps(target, delta, picker_row_stride(scale_factor));
+            let next = selected
+                .saturating_add_signed(steps.saturating_neg())
+                .min(count.saturating_sub(1));
+            if next != *selected {
+                *selected = next;
+                self.request_redraw();
+            }
+            return;
+        }
         let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
-        let scale_factor = window.scale_factor() as f32;
         let (cell_w, cell_h) = renderer.cell_size();
         let Some(layout) = self.compute_current_layout() else {
             return;
@@ -1131,18 +1161,14 @@ impl DaedalusApp {
             .sidebar
             .is_some_and(|sidebar| sidebar.contains(self.cursor_pos.0, self.cursor_pos.1))
         {
-            let cards = match delta {
-                MouseScrollDelta::LineDelta(_, y) => -y,
-                MouseScrollDelta::PixelDelta(pos) => {
-                    let metrics = daedalus_ui::layout::LayoutMetrics::for_scale(scale_factor);
-                    -pos.y as f32 / (metrics.sidebar_row_height + metrics.sidebar_row_gap)
-                }
-            };
-            self.sidebar_wheel_remainder += cards;
-            let whole = self.sidebar_wheel_remainder.trunc();
-            if whole != 0.0 {
-                self.sidebar_wheel_remainder -= whole;
-                self.scroll_sidebar(whole as isize);
+            let metrics = daedalus_ui::layout::LayoutMetrics::for_scale(scale_factor);
+            let steps = self.wheel_scroll.steps(
+                ScrollTarget::Sidebar,
+                delta,
+                metrics.sidebar_row_height + metrics.sidebar_row_gap,
+            );
+            if steps != 0 {
+                self.scroll_sidebar(steps.saturating_neg());
             }
             return;
         }
@@ -1162,8 +1188,15 @@ impl DaedalusApp {
             _ => None,
         };
 
-        if let Some(role) = target_role {
-            self.scroll_pane(role, scroll_lines);
+        if let Some(role) = target_role
+            && let Some(pane_id) = self.state.pane_id_for_role(role)
+        {
+            let steps = self
+                .wheel_scroll
+                .steps(ScrollTarget::Pane(pane_id), delta, cell_h);
+            self.scroll_pane(role, steps);
+        } else {
+            self.wheel_scroll = WheelScroll::default();
         }
     }
 }
@@ -1453,6 +1486,7 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 self.modifiers = new_mods.state();
             }
             WindowEvent::Focused(false) => {
+                self.wheel_scroll = WheelScroll::default();
                 self.modifiers = ModifiersState::empty();
                 self.key_repeats = KeyRepeatGuard::default();
                 self.drag_anchor = None;
@@ -1515,8 +1549,16 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                     self.drag_anchor = None;
                 }
             },
-            WindowEvent::MouseWheel { delta, .. } => {
-                self.handle_mouse_wheel(delta);
+            WindowEvent::MouseWheel { delta, phase, .. } => {
+                if phase == TouchPhase::Started {
+                    self.wheel_scroll = WheelScroll::default();
+                }
+                if phase != TouchPhase::Cancelled {
+                    self.handle_mouse_wheel(delta);
+                }
+                if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                    self.wheel_scroll = WheelScroll::default();
+                }
             }
             WindowEvent::RedrawRequested => {
                 self.expire_toast_if_due(Instant::now());
@@ -1703,6 +1745,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn precision_scrolling_moves_by_rendered_rows_and_keeps_fractional_remainders_local() {
+        let pane = ScrollTarget::Pane(PaneId::new());
+        let other = ScrollTarget::Pane(PaneId::new());
+        let pixels = |y| MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, y));
+        let mut wheel = WheelScroll::default();
+
+        assert_eq!(wheel.steps(pane, pixels(1.0), 20.0), 0);
+        assert_eq!(wheel.steps(pane, pixels(49.0), 20.0), 2);
+        assert_eq!(wheel.steps(pane, pixels(-30.0), 20.0), -1);
+        assert_eq!(wheel.steps(pane, pixels(19.0), 20.0), 0);
+        assert_eq!(wheel.steps(other, pixels(1.0), 20.0), 0);
+        assert_eq!(wheel.steps(ScrollTarget::Sidebar, pixels(60.0), 120.0), 0);
+        assert_eq!(wheel.steps(ScrollTarget::Sidebar, pixels(60.0), 120.0), 1);
+
+        let stride = picker_row_stride(2.0);
+        assert_eq!(
+            wheel.steps(ScrollTarget::Presets, pixels(stride as f64 / 2.0), stride),
+            0
+        );
+        assert_eq!(
+            wheel.steps(ScrollTarget::Actions, pixels(stride as f64 / 2.0), stride),
+            0
+        );
+        assert_eq!(
+            wheel.steps(ScrollTarget::Actions, pixels(stride as f64 / 2.0), stride),
+            1
+        );
+
+        let lines = |y| MouseScrollDelta::LineDelta(0.0, y);
+        assert_eq!(wheel.steps(pane, lines(0.25), 20.0), 0);
+        assert_eq!(wheel.steps(pane, lines(0.25), 20.0), 1);
+        assert_eq!(wheel.steps(other, lines(-1.0), 40.0), -3);
+    }
 
     #[test]
     fn worktree_buttons_share_rendered_targets_and_require_nonblank_input() {
