@@ -11,7 +11,7 @@ trap 'rm -rf "$stage"' EXIT
 app="$stage/Applications/Daedalus.app"
 mkdir -p "$app/Contents/MacOS" "$stage/usr/local/bin" dist
 for program in daedalus-ui daedalusd daedalus-ctl; do
-    lipo -verify_arch "$arch" "target/release/$program"
+    lipo "target/release/$program" -verify_arch "$arch"
     install -m755 "target/release/$program" "$app/Contents/MacOS/$program"
     ln -s "/Applications/Daedalus.app/Contents/MacOS/$program" "$stage/usr/local/bin/$program"
 done

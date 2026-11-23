@@ -250,27 +250,26 @@ impl Recap {
             UiEvent::ServerEvent(ServerEvent::ExternalStatusUpdated {
                 workspace_id,
                 status,
-            }) => {
-                if workspace(*workspace_id).is_some_and(|ws| {
-                    !ws.external_statuses.iter().any(|old| {
-                        old.source == status.source
-                            && (old.updated_at_ms > status.updated_at_ms
-                                || (old.label == status.label
-                                    && old.level == status.level
-                                    && old.detail == status.detail))
-                    })
-                }) {
-                    self.record(*workspace_id, || {
-                        if status.label.trim().is_empty() {
-                            return format!("{} cleared status", short_label(&status.source));
-                        }
-                        format!(
-                            "{} reported {}",
-                            short_label(&status.source),
-                            short_label(&status.label)
-                        )
-                    });
-                }
+            }) if workspace(*workspace_id).is_some_and(|ws| {
+                !ws.external_statuses.iter().any(|old| {
+                    old.source == status.source
+                        && (old.updated_at_ms > status.updated_at_ms
+                            || (old.label == status.label
+                                && old.level == status.level
+                                && old.detail == status.detail))
+                })
+            }) =>
+            {
+                self.record(*workspace_id, || {
+                    if status.label.trim().is_empty() {
+                        return format!("{} cleared status", short_label(&status.source));
+                    }
+                    format!(
+                        "{} reported {}",
+                        short_label(&status.source),
+                        short_label(&status.label)
+                    )
+                });
             }
             _ => {}
         }
