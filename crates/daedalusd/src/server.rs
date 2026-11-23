@@ -305,9 +305,17 @@ async fn dispatch_request(
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 vt_backend,
                 isolation_mode: registry.isolation_mode().as_str().to_string(),
+                journal_supported: true,
             })
         }
         ClientMessage::Authenticate { .. } => Ok(ResponsePayload::Ok),
+        ClientMessage::CreateManualWorkspace { name, root_dir } => {
+            Ok(ResponsePayload::WorkspaceCreated(
+                registry
+                    .create_workspace_with_mode(name, root_dir, Default::default(), true)
+                    .await?,
+            ))
+        }
         ClientMessage::CreateWorkspace {
             name,
             root_dir,
@@ -318,6 +326,12 @@ async fn dispatch_request(
         ClientMessage::ResolveWorkspaceDirectory { root_dir } => Ok(
             ResponsePayload::WorkspaceResolved(registry.workspace_for_directory(root_dir).await?),
         ),
+        ClientMessage::ReadActivity {
+            workspace_id,
+            cursor,
+        } => Ok(ResponsePayload::Activity(
+            registry.read_activity(workspace_id, cursor).await?,
+        )),
         ClientMessage::ListWorkspaces => Ok(ResponsePayload::Workspaces(
             registry.list_workspaces().await,
         )),

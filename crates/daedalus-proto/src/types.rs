@@ -201,6 +201,32 @@ pub struct CustomAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProjectInfo {
+    /// Canonical primary checkout on the daemon host, shared by linked worktrees.
+    pub repository: Option<PathBuf>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct StatusProvider {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub statuses: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SidebarWidget {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub statuses: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkspaceManifest {
     #[serde(default)]
     pub agent_preset: Option<String>,
@@ -212,6 +238,10 @@ pub struct WorkspaceManifest {
     pub runner_command: Option<Vec<String>>,
     #[serde(default)]
     pub actions: Vec<CustomAction>,
+    #[serde(default)]
+    pub status_providers: Vec<StatusProvider>,
+    #[serde(default)]
+    pub sidebar_widgets: Vec<SidebarWidget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +271,8 @@ pub struct WorkspaceInfo {
     pub external_statuses: Vec<ExternalStatus>,
     #[serde(default)]
     pub manifest: Option<WorkspaceManifest>,
+    #[serde(default)]
+    pub project: ProjectInfo,
 }
 
 impl WorkspaceInfo {

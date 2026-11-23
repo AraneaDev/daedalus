@@ -1,16 +1,19 @@
+pub mod activity;
 pub mod codec;
 pub mod remote;
 pub mod rpc;
 pub mod transport;
 pub mod types;
 
+pub use activity::{ActivityCursor, ActivityEntry, ActivityKind, ActivityPage};
 pub use codec::{CodecError, MAX_FRAME_SIZE, read_frame, write_frame};
 pub use rpc::{ClientMessage, ProtoError, Request, ResponsePayload, ServerEvent, ServerMessage};
 pub use types::{
     AgentState, Cell, CellFlags, Color, ContainerHealth, CursorState, CustomAction, ExternalStatus,
     FailureTrace, GitWorkspaceStatus, GitWorktreeInfo, GridDelta, GridRow, GridSnapshot, PaneId,
-    PaneRole, PaneStatus, PaneSummary, PortMapping, PortSource, SearchMatch, StatusLevel,
-    WorkspaceId, WorkspaceInfo, WorkspaceManifest, wrap_bracketed_paste,
+    PaneRole, PaneStatus, PaneSummary, PortMapping, PortSource, ProjectInfo, SearchMatch,
+    SidebarWidget, StatusLevel, StatusProvider, WorkspaceId, WorkspaceInfo, WorkspaceManifest,
+    wrap_bracketed_paste,
 };
 
 use std::path::{Path, PathBuf};
@@ -606,6 +609,7 @@ mod tests {
         };
 
         let ws_info = WorkspaceInfo {
+            project: Default::default(),
             default_panes_pending: None,
             id: ws_id,
             name: "feat-auth".to_string(),
@@ -688,6 +692,7 @@ mod tests {
         assert!(decoded_ws.containers.is_empty());
         assert!(decoded_ws.external_statuses.is_empty());
         assert_eq!(decoded_ws.manifest, None);
+        assert_eq!(decoded_ws.project, ProjectInfo::default());
 
         let legacy_close = LegacyClientMessage::CloseWorkspace { id: ws_id };
         let close_bytes = rmp_serde::to_vec_named(&legacy_close).unwrap();
@@ -750,8 +755,10 @@ mod tests {
             service_command: Some(vec!["docker".to_string(), "compose".to_string()]),
             runner_command: Some(vec!["cargo".to_string(), "test".to_string()]),
             actions: Vec::new(),
+            ..Default::default()
         };
         let ws_info = WorkspaceInfo {
+            project: Default::default(),
             default_panes_pending: None,
             id: ws_id,
             name: "manifest-ws".to_string(),
@@ -1029,6 +1036,7 @@ mod tests {
         };
 
         let ws_info = WorkspaceInfo {
+            project: Default::default(),
             default_panes_pending: None,
             id: ws_id,
             name: "wt1".to_string(),
@@ -1282,8 +1290,10 @@ mod tests {
             service_command: None,
             runner_command: Some(vec!["cargo".to_string(), "test".to_string()]),
             actions: vec![action.clone()],
+            ..Default::default()
         };
         let ws_info = WorkspaceInfo {
+            project: Default::default(),
             default_panes_pending: None,
             id: ws_id,
             name: "actions-ws".to_string(),

@@ -20,7 +20,15 @@ pub(super) fn collect_pane_quads(
 ) {
     let is_focused = pane_rect.role == state.focused_role;
     let pane_state = state.pane_for_role(pane_rect.role);
-    collect_pane_chrome(quads, pane_rect, pane_state, theme, scale_factor, border_w);
+    collect_pane_chrome(
+        quads,
+        pane_rect,
+        pane_state,
+        theme,
+        scale_factor,
+        border_w,
+        state.zoomed,
+    );
     if let Some(pane) = pane_state {
         let visible = pane.visible_rows();
         let grid = PaneGrid {
@@ -57,6 +65,7 @@ fn collect_pane_chrome(
     theme: &Theme,
     scale_factor: f32,
     border_w: f32,
+    zoomed: bool,
 ) {
     // Pane body & header backgrounds
     quads.push(QuadInstance::new(pane_rect.outer, theme.bg_pane));
@@ -68,16 +77,19 @@ fn collect_pane_chrome(
         |p| status_dot_color(p.summary.status, theme),
     );
     let dot_size = 7.0 * scale_factor;
-    quads.push(QuadInstance::from_xywh(
-        pane_rect.header.x + 9.0 * scale_factor,
-        pane_rect.header.y + (pane_rect.header.height - dot_size) * 0.5,
-        dot_size,
-        dot_size,
-        dot_color,
-    ));
+    if !zoomed {
+        quads.push(QuadInstance::from_xywh(
+            pane_rect.header.x + 9.0 * scale_factor,
+            pane_rect.header.y + (pane_rect.header.height - dot_size) * 0.5,
+            dot_size,
+            dot_size,
+            dot_color,
+        ));
+    }
 
     // Agent state badge pill (left of action_pill in Agent pane header)
-    if pane_rect.role == PaneRole::Agent
+    if !zoomed
+        && pane_rect.role == PaneRole::Agent
         && let Some(agent_state) = pane_state.and_then(|p| p.summary.agent_state)
     {
         let (label, color) = agent_state_badge(agent_state, theme);

@@ -370,8 +370,7 @@ fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> bool {
     }
 }
 
-#[cfg(unix)]
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg(all(unix, any(test, not(any(target_os = "macos", target_os = "linux")))))]
 pub(crate) fn run_command_stdout_with_timeout(
     cmd: &mut Command,
     timeout: Duration,
@@ -409,52 +408,6 @@ pub(crate) fn run_command_stdout_with_timeout(
             }
             Err(_) => {
                 let _ = killpg(pgid, Signal::SIGKILL);
-                let _ = child.kill();
-                let _ = child.wait();
-                break false;
-            }
-        }
-    };
-
-    if !completed {
-        return None;
-    }
-
-    reader.join().ok().flatten()
-}
-
-#[cfg(windows)]
-pub(crate) fn run_command_stdout_with_timeout(
-    cmd: &mut Command,
-    timeout: Duration,
-    allow_nonzero_exit: bool,
-) -> Option<String> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        std::io::Read::read_to_end(&mut stdout, &mut buf).ok()?;
-        Some(String::from_utf8_lossy(&buf).into_owned())
-    });
-
-    let deadline = Instant::now() + timeout;
-    let completed = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break allow_nonzero_exit || status.success(),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break false;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 break false;
@@ -563,8 +516,8 @@ pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
     descendants_from_ppid_edges(root_pid, &edges)
 }
 
-/// Collects all live descendant PIDs of `root_pid` using `ps -axo pid=,ppid=`.
-#[cfg(all(unix, not(target_os = "linux")))]
+/// Collects descendants on Unix systems without a native port discovery backend.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
     if root_pid == 0 {
         return Vec::new();
@@ -579,34 +532,14 @@ pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
     descendants_from_ppid_edges(root_pid, &edges)
 }
 
-#[cfg(windows)]
-pub(crate) fn collect_windows_ppid_edges() -> Vec<(u32, u32)> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    let mut cmd = Command::new("powershell.exe");
-    cmd.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        r#"Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }"#,
-    ]);
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let Some(output) = run_command_stdout_with_timeout(&mut cmd, Duration::from_secs(2), false)
-    else {
-        return Vec::new();
-    };
-    parse_ps_ppid_table(&output)
-}
-
-/// Collects all live descendant PIDs of `root_pid` using `Win32_Process`.
-#[cfg(windows)]
+/// Uses the same native process inventory as workspace port discovery.
+#[cfg(any(windows, target_os = "macos"))]
 pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
-    if root_pid == 0 {
-        return Vec::new();
-    }
-    let edges = collect_windows_ppid_edges();
-    descendants_from_ppid_edges(root_pid, &edges)
+    let mut pids = crate::runtime_monitor::collect_descendant_pids(&[root_pid]);
+    pids.remove(&root_pid);
+    let mut pids: Vec<_> = pids.into_iter().collect();
+    pids.sort_unstable();
+    pids
 }
 
 #[cfg(target_os = "linux")]

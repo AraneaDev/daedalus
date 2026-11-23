@@ -108,4 +108,25 @@ if cmp -s "$scratch/workbench.png" "$scratch/new-worktree.png"; then
     echo "The worktree dialog did not appear in the second capture." >&2
     exit 1
 fi
-for name in workbench new-worktree; do install -m644 "$scratch/$name.png" "$out/$name.png"; done
+xdotool key Escape ctrl+shift+s
+# Exercise the saved assignment flow and capture a readable agent definition.
+xdotool mousemove --window "$window" 940 385 click 1
+xdotool type --delay 30 'Reviewer'
+xdotool mousemove --window "$window" 720 580 click 1
+for ((i=0; i<50; i++)); do
+    if grep -rq 'name = "Reviewer"' "$XDG_CONFIG_HOME"; then break; fi
+    sleep .1
+done
+if ! grep -rq 'name = "Reviewer"' "$XDG_CONFIG_HOME"; then
+    echo "The named assignment was not saved." >&2
+    exit 1
+fi
+xdotool key ctrl+shift+s
+xdotool mousemove --window "$window" 505 350 click 1
+xdotool mousemove 1439 899
+capture workspace-settings
+if cmp -s "$scratch/workbench.png" "$scratch/workspace-settings.png"; then
+    echo "The workspace settings dialog did not appear." >&2
+    exit 1
+fi
+for name in workbench new-worktree workspace-settings; do install -m644 "$scratch/$name.png" "$out/$name.png"; done

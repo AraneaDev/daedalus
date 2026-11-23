@@ -69,7 +69,30 @@ fn named(role: Role, name: impl Into<String>) -> Node {
 }
 
 fn overlay(state: &AppState) -> Option<(NodeId, Node)> {
-    let (id, label, description) = if state.picker.open {
+    let (id, label, description) = if let Some(choices) = &state.failure_recipients {
+        (
+            NodeId(16),
+            "Send failure to agent",
+            format!(
+                "Selected {}, {} of {}. Use Up and Down to choose a recipient, Enter to send, or Escape to cancel.",
+                state.failure_recipient_label(choices.agents[choices.selected]),
+                choices.selected + 1,
+                choices.agents.len()
+            ),
+        )
+    } else if state.settings.open {
+        (
+            NodeId(14),
+            "Workspace settings",
+            state.settings.accessibility_description(),
+        )
+    } else if state.workspace_form.open {
+        (
+            NodeId(15),
+            "New workspace",
+            state.workspace_form.accessibility_description(),
+        )
+    } else if state.picker.open {
         (
             PICKER,
             "Select agent preset",
@@ -235,6 +258,24 @@ pub(super) fn tree(state: &AppState, width: f32, height: f32, scale: f32) -> Tre
         focus
     } else if let Some(ws) = state.active_workspace() {
         let mut workspace = named(Role::Group, format!("Workspace {}", ws.name));
+        let mut description = Vec::new();
+        if let Some(repo) = &ws.project.repository {
+            description.push(format!("Repository {}", repo.display()));
+        }
+        for row in daedalus_ui::sidebar_content::workspace_details(ws) {
+            use daedalus_ui::sidebar_content::SidebarRow;
+            match row {
+                SidebarRow::Heading(text) | SidebarRow::Detail(text, None) => {
+                    description.push(text)
+                }
+                SidebarRow::Detail(text, Some(level)) => {
+                    description.push(format!("{text}, {level:?}"))
+                }
+                SidebarRow::Workspace(_) => {}
+            }
+        }
+        description.extend(state.recap.lines(ws.id));
+        workspace.set_description(description.join(". "));
         root.push_child(WORKSPACE);
         let mut focus = WORKSPACE;
         if let Some(pane) = state.pane_for_role(state.focused_role) {
@@ -464,6 +505,7 @@ mod tests {
             agent_state: Some(AgentState::WaitingForApproval),
         };
         state.set_workspaces(vec![WorkspaceInfo {
+            project: Default::default(),
             default_panes_pending: None,
             id: ws,
             name: "Project".into(),

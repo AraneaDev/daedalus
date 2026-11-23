@@ -13,10 +13,7 @@ use daedalus_proto::{
 };
 use winit::window::Window;
 
-use crate::layout::{
-    PaneRect, Rect, WorkspaceLayout, sidebar_new_workspace_rect, sidebar_new_worktree_rect,
-    sidebar_workspace_close_rect,
-};
+use crate::layout::{PaneRect, Rect, WorkspaceLayout, sidebar_workspace_close_rect};
 use crate::state::ConnectionState;
 use crate::state::{AgentPreset, AppState, CloseWorkspaceModalState};
 use crate::theme::{Rgba, Theme};
@@ -656,9 +653,15 @@ pub fn collect_quads(
     cell_size: (f32, f32),
 ) -> (Vec<QuadInstance>, u32) {
     let scale = sanitize_scale(scale_factor);
-    let cards = layout
-        .sidebar
-        .map(|sidebar| SidebarCards::new(state, sidebar, scale, theme));
+    let cards = layout.sidebar.map(|sidebar| {
+        SidebarCards::new(
+            state,
+            sidebar,
+            scale,
+            theme,
+            layout.sidebar_content.as_ref(),
+        )
+    });
     collect_prepared_quads(
         state,
         layout,
@@ -741,7 +744,7 @@ fn collect_sidebar_quads(
         theme.border_unfocused,
     ));
 
-    for (idx, card) in cards.list.visible.clone().zip(&cards.cards) {
+    for (idx, card) in cards.indices.iter().copied().zip(&cards.cards) {
         let ws = &state.workspaces[idx];
         let row_rect = card.rect;
         let is_active = state.active_workspace_id == Some(ws.id);
@@ -787,13 +790,13 @@ fn collect_sidebar_quads(
         }
     }
 
-    let new_btn = sidebar_new_workspace_rect(sidebar, state.workspaces.len(), s);
+    let new_btn = cards.list.new_workspace;
     if new_btn.y < sidebar.bottom() {
         quads.push(QuadInstance::new(new_btn, theme.bg_header));
         push_rect_border(quads, new_btn, border_w, theme.border_unfocused);
     }
 
-    let new_wt_btn = sidebar_new_worktree_rect(sidebar, state.workspaces.len(), s);
+    let new_wt_btn = cards.list.new_worktree;
     if new_wt_btn.y < sidebar.bottom() {
         quads.push(QuadInstance::new(new_wt_btn, theme.bg_header));
         push_rect_border(
@@ -841,6 +844,85 @@ fn collect_overlay_quads(
     border_w: f32,
 ) {
     let (screen_w, screen_h) = screen;
+    if let Some(choices) = &state.failure_recipients {
+        let (modal, visible) = action_palette_layout(
+            screen_w,
+            screen_h,
+            s,
+            choices.agents.len(),
+            choices.selected,
+        );
+        push_modal_frame(
+            quads,
+            modal,
+            screen,
+            theme,
+            border_w,
+            (PICKER_HEADER_LOGICAL_HEIGHT - 4.0) * s,
+        );
+        if visible.contains(&choices.selected) {
+            push_chrome_badge(
+                quads,
+                picker_item_rect(modal, choices.selected - visible.start, s),
+                theme,
+                border_w,
+                theme.border_focused,
+            );
+        }
+        return;
+    }
+    if state.workspace_form.open {
+        push_modal_frame(
+            quads,
+            crate::workspace_form::modal_rect(screen_w, screen_h, s),
+            screen,
+            theme,
+            border_w,
+            36. * s,
+        );
+        let modal = crate::workspace_form::modal_rect(screen_w, screen_h, s);
+        for (control, rect) in crate::workspace_form::controls(modal) {
+            let field = Rect::new(
+                rect.x + 2. * s,
+                rect.y + 2. * s,
+                (rect.width - 4. * s).max(0.),
+                (rect.height - 4. * s).max(0.),
+            );
+            let border = if state.workspace_form.focus == control {
+                theme.border_focused
+            } else {
+                theme.border_unfocused
+            };
+            push_chrome_badge(quads, field, theme, border_w, border);
+        }
+        return;
+    }
+    if state.settings.open {
+        push_modal_frame(
+            quads,
+            crate::settings::modal_rect(screen_w, screen_h, s),
+            screen,
+            theme,
+            border_w,
+            36. * s,
+        );
+        let modal = crate::settings::modal_rect(screen_w, screen_h, s);
+        for (control, rect) in crate::settings::controls(modal) {
+            let field = Rect::new(
+                rect.x + 2. * s,
+                rect.y + 2. * s,
+                (rect.width - 4. * s).max(0.),
+                (rect.height - 4. * s).max(0.),
+            );
+            let border = if state.settings.focus == control {
+                theme.border_focused
+            } else {
+                theme.border_unfocused
+            };
+            push_chrome_badge(quads, field, theme, border_w, border);
+        }
+        return;
+    }
     // 4. Centered Agent preset picker modal overlay (rendered after base text).
     if state.picker.open || state.action_palette.open {
         let (modal, selected) = if state.action_palette.open {
@@ -1156,18 +1238,28 @@ impl GpuRenderer {
         self.text_renderer.cell_size()
     }
 
+    pub fn recap_visible(&self) -> bool {
+        self.text_renderer.recap_drawn && !self.text_renderer.has_modal_text
+    }
+
     pub fn render(
         &mut self,
         state: &mut AppState,
         layout: &WorkspaceLayout,
-    ) -> Result<(), RenderError> {
+    ) -> Result<bool, RenderError> {
         let screen_w = self.config.width as f32;
         let screen_h = self.config.height as f32;
         let cell_size = self.text_renderer.cell_size();
 
-        let cards = layout
-            .sidebar
-            .map(|sidebar| SidebarCards::new(state, sidebar, self.scale_factor, &self.theme));
+        let cards = layout.sidebar.map(|sidebar| {
+            SidebarCards::new(
+                state,
+                sidebar,
+                self.scale_factor,
+                &self.theme,
+                layout.sidebar_content.as_ref(),
+            )
+        });
         let (quads, base_quad_count) = collect_prepared_quads(
             state,
             layout,
@@ -1195,7 +1287,7 @@ impl GpuRenderer {
         let (frame, suboptimal) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
-            wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Occluded => return Ok(false),
             wgpu::CurrentSurfaceTexture::Timeout => return Err(RenderError::Timeout),
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 return Err(RenderError::Reconfigure);
@@ -1260,7 +1352,7 @@ impl GpuRenderer {
         if suboptimal {
             return Err(RenderError::Reconfigure);
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -1280,6 +1372,7 @@ mod tests {
         let ws_id = WorkspaceId::new();
         let agent_id = PaneId::new();
         let ws = WorkspaceInfo {
+            project: Default::default(),
             default_panes_pending: None,
             id: ws_id,
             name: "main".to_string(),
@@ -1358,6 +1451,7 @@ mod tests {
         });
         pane.selection = Some(Selection::new(CellPos::new(0, 0), CellPos::new(2, 0)));
 
+        state.zoomed = false;
         let layout = compute_layout(&LayoutInput {
             window_w: 1200.0,
             window_h: 800.0,

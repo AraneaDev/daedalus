@@ -454,7 +454,7 @@ pub struct PaneViewState {
     /// Latest scroll target, including requests awaiting a daemon reply.
     pub requested_scroll_offset: usize,
     pending_scrollback: Option<u64>,
-    history_generation: u64,
+    pub(crate) history_generation: u64,
     pub scrolled_rows: Option<Vec<GridRow>>,
     pub dirty_row_indices: Vec<usize>,
     pub selection: Option<Selection>,
@@ -663,6 +663,23 @@ pub enum ConnectionState {
     Reconnecting,
 }
 
+#[derive(Debug)]
+pub struct FailureRecipients {
+    pub workspace: WorkspaceId,
+    pub runner: PaneId,
+    pub agents: Vec<PaneId>,
+    pub selected: usize,
+}
+
+impl FailureRecipients {
+    pub fn advance(&mut self, steps: isize) {
+        self.selected = self
+            .selected
+            .saturating_add_signed(steps)
+            .min(self.agents.len() - 1);
+    }
+}
+
 /// Top-level UI application state shared between input handling, daemon bridge events, and rendering.
 #[derive(Debug)]
 pub struct AppState {
@@ -671,10 +688,17 @@ pub struct AppState {
     pub active_workspace_id: Option<WorkspaceId>,
     pub panes: HashMap<PaneId, PaneViewState>,
     pub focused_role: PaneRole,
+    workspace_focus: HashMap<WorkspaceId, PaneRole>,
+    selected_panes: HashMap<(WorkspaceId, PaneRole), PaneId>,
     pub sidebar_override: Option<bool>,
     pub sidebar_first: usize,
     pub zoomed: bool,
     pub remote_host: Option<String>,
+    pub failure_recipients: Option<FailureRecipients>,
+    pub workspace_form: crate::workspace_form::WorkspaceForm,
+    pub settings: crate::settings::SettingsDialog,
+    pub recap: crate::recap::Recap,
+    pub session_names: HashMap<PaneId, String>,
     pub action_palette: ActionPaletteState,
     pub picker: PickerState,
     pub worktree_modal: WorktreeModalState,
@@ -706,8 +730,15 @@ impl AppState {
             focused_role: PaneRole::Agent,
             sidebar_override: None,
             sidebar_first: 0,
-            zoomed: false,
+            workspace_focus: HashMap::new(),
+            selected_panes: HashMap::new(),
+            zoomed: true,
             remote_host: None,
+            failure_recipients: None,
+            workspace_form: Default::default(),
+            settings: Default::default(),
+            recap: Default::default(),
+            session_names: HashMap::new(),
             action_palette: ActionPaletteState::default(),
             picker: PickerState::default(),
             worktree_modal: WorktreeModalState::default(),
@@ -843,12 +874,46 @@ impl AppState {
             }
         };
         let next_id = self.workspaces[next_idx].id;
-        if self.active_workspace_id != Some(next_id) {
-            self.action_palette.close();
-            self.active_workspace_id = Some(next_id);
-            self.close_search();
-        }
+        self.select_workspace(next_id);
         Some(next_id)
+    }
+
+    pub fn select_workspace(&mut self, id: WorkspaceId) {
+        if self.active_workspace_id == Some(id) {
+            return;
+        }
+        if let Some(previous) = self.active_workspace_id {
+            self.workspace_focus.insert(previous, self.focused_role);
+        }
+        self.focused_role = self
+            .workspace_focus
+            .get(&id)
+            .copied()
+            .unwrap_or(PaneRole::Agent);
+        self.active_workspace_id = Some(id);
+        self.focus_available_session();
+        self.failure_recipients = None;
+        self.recap.select(Some(id));
+        self.settings.open = false;
+        self.action_palette.close();
+        self.close_search();
+    }
+
+    /// Repeating a role shortcut visits each live terminal assigned to that role.
+    pub fn focus_role_shortcut(&mut self, role: PaneRole) {
+        if self.focused_role == role
+            && let Some(ws) = self.active_workspace()
+            && let Some(current) = self.pane_id_for_role(role)
+        {
+            let mut candidates = ws.panes.iter().filter(|pane| pane.role == role);
+            let first = candidates.clone().next().map(|pane| pane.id);
+            candidates.find(|pane| pane.id == current);
+            if let Some(next) = candidates.next().map(|pane| pane.id).or(first) {
+                self.selected_panes.insert((ws.id, role), next);
+            }
+        }
+        self.focused_role = role;
+        self.close_search();
     }
 
     /// Returns the `Agent` pane's current [`AgentState`] for `ws`, if any.
@@ -929,6 +994,14 @@ impl AppState {
 
     pub fn pane_id_for_role(&self, role: PaneRole) -> Option<PaneId> {
         let ws = self.active_workspace()?;
+        if let Some(id) = self.selected_panes.get(&(ws.id, role))
+            && ws
+                .panes
+                .iter()
+                .any(|pane| pane.id == *id && pane.role == role)
+        {
+            return Some(*id);
+        }
         ws.panes
             .iter()
             .rev()
@@ -946,8 +1019,116 @@ impl AppState {
         self.panes.get_mut(&id)
     }
 
+    pub fn remove_session(&mut self, id: PaneId) {
+        let focused = self.focused_pane_id() == Some(id);
+        self.session_names.remove(&id);
+        self.panes.remove(&id);
+        self.last_sent_sizes.remove(&id);
+        self.selected_panes.retain(|_, pane| *pane != id);
+        if self
+            .search
+            .as_ref()
+            .is_some_and(|search| search.pane_id == id)
+        {
+            self.close_search();
+        }
+        for ws in &mut self.workspaces {
+            ws.panes.retain(|p| p.id != id);
+        }
+        if focused {
+            self.focus_available_session();
+        }
+    }
+
+    fn focus_available_session(&mut self) {
+        if self.focused_pane_id().is_none()
+            && let Some(pane) = self.active_workspace().and_then(|ws| ws.panes.first())
+        {
+            self.focused_role = pane.role;
+        }
+    }
+
+    pub fn select_session(&mut self, workspace: WorkspaceId, role: PaneRole, pane: PaneId) {
+        self.selected_panes.insert((workspace, role), pane);
+        if self.active_workspace_id == Some(workspace) {
+            self.focused_role = role;
+            self.close_search();
+        } else {
+            self.workspace_focus.insert(workspace, role);
+        }
+    }
+
     pub fn focused_pane_id(&self) -> Option<PaneId> {
         self.pane_id_for_role(self.focused_role)
+    }
+
+    pub fn failure_recipient_choices(&self) -> Result<FailureRecipients, &'static str> {
+        let ws = self
+            .active_workspace()
+            .ok_or("Workspace is not available")?;
+        let runner = self
+            .pane_id_for_role(PaneRole::Runner)
+            .ok_or("Runner pane is not available")?;
+        if !self.runner_has_failure() {
+            return Err("No failure trace captured in Runner pane yet");
+        }
+        let agents: Vec<_> = ws
+            .panes
+            .iter()
+            .filter(|pane| {
+                pane.role == PaneRole::Agent && !matches!(pane.status, PaneStatus::Exited { .. })
+            })
+            .map(|pane| pane.id)
+            .collect();
+        if agents.is_empty() {
+            return Err("No live agent is available");
+        }
+        let current = self.pane_id_for_role(PaneRole::Agent);
+        let selected = agents
+            .iter()
+            .position(|id| Some(*id) == current)
+            .unwrap_or(0);
+        Ok(FailureRecipients {
+            workspace: ws.id,
+            runner,
+            agents,
+            selected,
+        })
+    }
+
+    pub fn validate_failure_recipient(
+        &self,
+        choices: &FailureRecipients,
+    ) -> Result<PaneId, &'static str> {
+        let ws = self
+            .active_workspace()
+            .filter(|ws| ws.id == choices.workspace)
+            .ok_or("The source workspace has changed")?;
+        if !ws.panes.iter().any(|pane| {
+            pane.role == PaneRole::Runner && pane.id == choices.runner && pane.has_failure_trace
+        }) {
+            return Err("The original Runner failure is no longer available");
+        }
+        choices
+            .agents
+            .get(choices.selected)
+            .copied()
+            .filter(|id| {
+                ws.panes.iter().any(|pane| {
+                    pane.id == *id
+                        && pane.role == PaneRole::Agent
+                        && !matches!(pane.status, PaneStatus::Exited { .. })
+                })
+            })
+            .ok_or("The selected agent is no longer available")
+    }
+
+    pub fn failure_recipient_label(&self, agent: PaneId) -> String {
+        let name = self
+            .session_names
+            .get(&agent)
+            .map_or("Agent", String::as_str);
+        format!("{name} · {}", agent.short())
     }
 
     pub fn runner_has_failure(&self) -> bool {
@@ -981,6 +1162,9 @@ impl AppState {
             self.search = None;
         }
 
+        self.workspace_focus
+            .retain(|id, _| workspaces.iter().any(|ws| ws.id == *id));
+        self.selected_panes.retain(|_, id| live_panes.contains(id));
         self.workspaces = workspaces;
         self.spawning_workspaces
             .retain(|ws_id| self.workspaces.iter().any(|ws| ws.id == *ws_id));
@@ -996,8 +1180,13 @@ impl AppState {
             .active_workspace_id
             .is_some_and(|id| self.workspaces.iter().any(|ws| ws.id == id));
         if !active_still_exists {
+            self.failure_recipients = None;
             self.action_palette.close();
-            self.active_workspace_id = self.workspaces.first().map(|ws| ws.id);
+            self.active_workspace_id = None;
+            self.focused_role = PaneRole::Agent;
+            if let Some(ws) = self.workspaces.first() {
+                self.select_workspace(ws.id);
+            }
         }
     }
 
@@ -1032,6 +1221,10 @@ impl AppState {
             } else {
                 ws.panes.push(summary.clone());
             }
+        }
+        if agent_preset.is_some() {
+            self.selected_panes
+                .insert((summary.workspace_id, summary.role), summary.id);
         }
         let entry = self
             .panes
@@ -1265,6 +1458,7 @@ mod tests {
         let runner = make_pane_summary(ws_id, PaneRole::Runner);
         let ids = (agent.id, service.id, runner.id);
         let ws = WorkspaceInfo {
+            project: Default::default(),
             default_panes_pending: None,
             id: ws_id,
             name: "demo".to_string(),
@@ -1282,6 +1476,55 @@ mod tests {
             manifest: None,
         };
         (ws, ids.0, ids.1, ids.2)
+    }
+
+    #[test]
+    fn closing_sessions_preserves_siblings_and_handles_the_last_pane() {
+        let (workspace, agent, service, runner) = make_workspace_with_three_panes();
+        let id = workspace.id;
+        let mut state = AppState::new();
+        state.set_workspaces(vec![workspace]);
+        state.select_session(id, PaneRole::Runner, runner);
+        state.toggle_search(runner);
+        state.remove_session(runner);
+        assert!(state.search.is_none());
+        assert_eq!(state.focused_pane_id(), Some(agent));
+        state.remove_session(agent);
+        assert_eq!(state.focused_pane_id(), Some(service));
+        state.remove_session(service);
+        assert_eq!(state.focused_pane_id(), None);
+        assert_eq!(state.active_workspace_id, Some(id));
+    }
+
+    #[test]
+    fn forwarding_checks_source_and_selected_agent_again_at_confirmation() {
+        let (mut ws, first, _, runner) = make_workspace_with_three_panes();
+        ws.panes
+            .iter_mut()
+            .find(|p| p.id == runner)
+            .unwrap()
+            .has_failure_trace = true;
+        let mut state = AppState::new();
+        state.set_workspaces(vec![ws.clone()]);
+        let single = state.failure_recipient_choices().unwrap();
+        assert_eq!(single.agents, [first]);
+        let other = make_pane_summary(ws.id, PaneRole::Agent);
+        ws.panes.push(other.clone());
+        state.set_workspaces(vec![ws.clone()]);
+        state.select_session(ws.id, PaneRole::Agent, first);
+        let mut choices = state.failure_recipient_choices().unwrap();
+        assert_eq!(state.validate_failure_recipient(&choices), Ok(first));
+        choices.advance(1);
+        assert_eq!(state.validate_failure_recipient(&choices), Ok(other.id));
+        ws.panes.last_mut().unwrap().status = PaneStatus::Exited { code: Some(0) };
+        state.set_workspaces(vec![ws.clone()]);
+        assert!(state.validate_failure_recipient(&choices).is_err());
+        choices.advance(-1);
+        ws.panes.retain(|p| p.id != runner);
+        state.set_workspaces(vec![ws]);
+        assert!(state.validate_failure_recipient(&choices).is_err());
+        state.active_workspace_id = None;
+        assert!(state.validate_failure_recipient(&choices).is_err());
     }
 
     #[test]
@@ -2039,6 +2282,7 @@ mod tests {
         let mut state = AppState::new();
         let ws_id = WorkspaceId::new();
         let dormant = WorkspaceInfo {
+            project: Default::default(),
             default_panes_pending: None,
             id: ws_id,
             name: "dormant".to_string(),
@@ -2357,6 +2601,28 @@ mod tests {
         let updated = state.active_workspace().unwrap();
         assert_eq!(updated.git_status, Some(gs));
         assert_eq!(updated.git_branch.as_deref(), Some("feat/v0.0.3"));
+    }
+
+    #[test]
+    fn repeated_role_shortcut_selects_a_specific_session_and_restores_it() {
+        let mut state = AppState::new();
+        let (mut first, original, _, _) = make_workspace_with_three_panes();
+        let second_agent = make_pane_summary(first.id, PaneRole::Agent);
+        let newest = second_agent.id;
+        first.panes.push(second_agent);
+        let (other, _, _, _) = make_workspace_with_three_panes();
+        state.set_workspaces(vec![first, other]);
+        assert_eq!(state.focused_pane_id(), Some(newest));
+        state.focus_role_shortcut(PaneRole::Agent);
+        assert_eq!(state.focused_pane_id(), Some(original));
+        state.cycle_workspace(1);
+        state.focus_role_shortcut(PaneRole::Runner);
+        state.cycle_workspace(-1);
+        assert_eq!(state.focused_pane_id(), Some(original));
+        state.focus_role_shortcut(PaneRole::Agent);
+        assert_eq!(state.focused_pane_id(), Some(newest));
+        state.cycle_workspace(1);
+        assert_eq!(state.focused_role, PaneRole::Runner);
     }
 
     #[test]

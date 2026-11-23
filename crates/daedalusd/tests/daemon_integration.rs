@@ -941,6 +941,19 @@ async fn external_status_ingests_via_ndjson_socket_and_rpc() {
     let ws_dir = dir.path().join("project");
     std::fs::create_dir_all(&ws_dir).unwrap();
 
+    std::fs::write(
+        ws_dir.join(".daedalus.toml"),
+        r#"[[status_providers]]
+id = "ci"
+statuses = ["build", "test"]
+[[sidebar_widgets]]
+title = "Checks"
+provider = "ci"
+statuses = ["build", "test"]
+"#,
+    )
+    .unwrap();
+
     let server = DaemonServer::bind_with_events_socket(
         sock.clone(),
         runtime,
@@ -1065,6 +1078,44 @@ async fn external_status_ingests_via_ndjson_socket_and_rpc() {
             .iter()
             .any(|s| s.source == "cassandra" && s.label == "retry 3/5")
     );
+
+    let manifest = workspaces[0].manifest.as_ref().unwrap();
+    assert_eq!(manifest.status_providers[0].id, "ci");
+    assert_eq!(manifest.sidebar_widgets[0].statuses, ["build", "test"]);
+    for (request_id, source) in [(5, "ci.build"), (6, "ci.test")] {
+        send_rpc(
+            &mut client,
+            request_id,
+            ClientMessage::PublishExternalStatus {
+                workspace_id: Some(ws.id),
+                root_dir: None,
+                source: source.into(),
+                level: StatusLevel::Ok,
+                label: "Passed".into(),
+                detail: None,
+            },
+        )
+        .await;
+    }
+    send_rpc(
+        &mut client,
+        7,
+        ClientMessage::ClearExternalStatus {
+            workspace_id: Some(ws.id),
+            root_dir: None,
+            source: "ci.test".into(),
+        },
+    )
+    .await;
+    let ResponsePayload::Workspaces(updated) =
+        send_rpc(&mut client, 8, ClientMessage::ListWorkspaces).await
+    else {
+        panic!("expected a workspace list after clearing one channel");
+    };
+    let statuses = &updated[0].external_statuses;
+    assert_eq!(statuses.len(), 3);
+    assert!(statuses.iter().any(|status| status.source == "ci.build"));
+    assert!(!statuses.iter().any(|status| status.source == "ci.test"));
 
     let _ = shutdown_tx.send(());
     srv_handle.await.unwrap();
@@ -2225,7 +2276,9 @@ async fn tcp_wsl2_bridge_rpc_round_trip() {
             version,
             vt_backend,
             isolation_mode,
+            journal_supported,
         } => {
+            assert!(journal_supported);
             assert_eq!(version, env!("CARGO_PKG_VERSION"));
             assert!(!vt_backend.is_empty());
             assert_eq!(isolation_mode, expected_mode);
@@ -2248,6 +2301,21 @@ async fn tcp_wsl2_bridge_rpc_round_trip() {
         other => panic!("expected WorkspaceCreated, got {other:?}"),
     };
     assert_eq!(created.name, "wsl2-bridge");
+    let ResponsePayload::Activity(baseline) = send_rpc(
+        &mut client,
+        30,
+        ClientMessage::ReadActivity {
+            workspace_id: created.id,
+            cursor: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected activity baseline")
+    };
+    assert_eq!(baseline.workspace_id, created.id);
+    assert!(baseline.entries.is_empty());
+    assert!(!baseline.gap);
 
     let listed = match send_rpc(&mut client, 3, ClientMessage::ListWorkspaces).await {
         ResponsePayload::Workspaces(list) => list,

@@ -21,8 +21,10 @@ pub enum UiAction {
     ActionPaletteCancel,
     ToggleWorktreeModal,
     OpenCloseWorkspaceModal,
+    CloseTerminal,
     ToggleSearch,
     NewWorkspace,
+    WorkspaceSettings,
     SwitchWorkspaceNext,
     SwitchWorkspacePrev,
     CopySelection,
@@ -38,6 +40,7 @@ pub enum UiAction {
     PickerUp,
     PickerDown,
     PickerConfirm,
+    PickerAdd,
     PickerCancel,
     WorktreeModalText(String),
     WorktreeModalSetText(String),
@@ -77,12 +80,15 @@ impl KeyRepeatGuard {
                 | UiAction::ActionPaletteConfirm
                 | UiAction::ActionPaletteCancel
                 | UiAction::ToggleWorktreeModal
+                | UiAction::CloseTerminal
                 | UiAction::OpenCloseWorkspaceModal
                 | UiAction::ToggleSearch
+                | UiAction::WorkspaceSettings
                 | UiAction::NewWorkspace
                 | UiAction::CopySelection
                 | UiAction::PasteClipboard
                 | UiAction::ForwardFailureToAgent
+                | UiAction::PickerAdd
                 | UiAction::PickerConfirm
                 | UiAction::PickerCancel
                 | UiAction::WorktreeModalConfirm
@@ -324,8 +330,10 @@ fn translate_primary_shift_char(ch: &str) -> UiAction {
         "p" => UiAction::ToggleAgentPicker,
         "w" => UiAction::ToggleWorktreeModal,
         "d" => UiAction::OpenCloseWorkspaceModal,
+        "x" => UiAction::CloseTerminal,
         "f" => UiAction::ToggleSearch,
         "n" => UiAction::NewWorkspace,
+        "s" => UiAction::WorkspaceSettings,
         "c" => UiAction::CopySelection,
         "v" => UiAction::PasteClipboard,
         "e" => UiAction::ForwardFailureToAgent,
@@ -402,6 +410,7 @@ fn translate_picker_key(key: &Key, mods: ModifiersState, is_macos: bool) -> UiAc
     match key {
         Key::Named(NamedKey::ArrowUp) => UiAction::PickerUp,
         Key::Named(NamedKey::ArrowDown) => UiAction::PickerDown,
+        Key::Named(NamedKey::Enter) if mods.shift_key() => UiAction::PickerAdd,
         Key::Named(NamedKey::Enter) => UiAction::PickerConfirm,
         Key::Named(NamedKey::Escape) => UiAction::PickerCancel,
         Key::Character(ch) if !mods.control_key() && !mods.alt_key() && !mods.super_key() => {
@@ -733,6 +742,7 @@ mod tests {
             ("C", UiAction::CopySelection),
             ("V", UiAction::PasteClipboard),
             ("E", UiAction::ForwardFailureToAgent),
+            ("X", UiAction::CloseTerminal),
         ];
 
         for (ch, expected) in cases {

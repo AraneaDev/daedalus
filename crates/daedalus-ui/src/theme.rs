@@ -58,19 +58,19 @@ impl Rgba {
 pub const DIM_FACTOR: f32 = 0.6;
 
 // Dark workbench palette constants
-pub const BG_WINDOW: Rgba = Rgba::from_rgb_u8(0x0E, 0x11, 0x16);
-pub const BG_SIDEBAR: Rgba = Rgba::from_rgb_u8(0x13, 0x17, 0x1F);
-pub const BG_PANE: Rgba = Rgba::from_rgb_u8(0x16, 0x1B, 0x22);
-pub const BG_HEADER: Rgba = Rgba::from_rgb_u8(0x1C, 0x22, 0x2D);
+pub const BG_WINDOW: Rgba = Rgba::from_rgb_u8(0x09, 0x0D, 0x10);
+pub const BG_SIDEBAR: Rgba = Rgba::from_rgb_u8(0x0D, 0x11, 0x16);
+pub const BG_PANE: Rgba = Rgba::from_rgb_u8(0x09, 0x0D, 0x10);
+pub const BG_HEADER: Rgba = Rgba::from_rgb_u8(0x10, 0x15, 0x1B);
 pub const BORDER_UNFOCUSED: Rgba = Rgba::from_rgb_u8(0x2B, 0x33, 0x42);
-pub const BORDER_FOCUSED: Rgba = Rgba::from_rgb_u8(0x58, 0xA6, 0xFF);
+pub const BORDER_FOCUSED: Rgba = Rgba::from_rgb_u8(0x89, 0xE5, 0xB2);
 pub const TEXT_PRIMARY: Rgba = Rgba::from_rgb_u8(0xE6, 0xED, 0xF3);
 pub const TEXT_MUTED: Rgba = Rgba::from_rgb_u8(0x8B, 0x94, 0x9E);
 pub const STATUS_OK: Rgba = Rgba::from_rgb_u8(0x3F, 0xB9, 0x50);
 pub const STATUS_BUSY: Rgba = Rgba::from_rgb_u8(0xD2, 0x99, 0x22);
 pub const STATUS_ERR: Rgba = Rgba::from_rgb_u8(0xF8, 0x51, 0x49);
 pub const SELECTION_BG: Rgba = Rgba::from_rgba_u8(0x38, 0x8B, 0xFD, 0x66);
-pub const CURSOR_BG: Rgba = Rgba::from_rgb_u8(0x58, 0xA6, 0xFF);
+pub const CURSOR_BG: Rgba = Rgba::from_rgb_u8(0xAD, 0xA0, 0xEB);
 pub const PICKER_BG: Rgba = Rgba::from_rgba_u8(0x18, 0x1E, 0x28, 0xF5);
 
 /// Standard 16-color ANSI palette tuned for a dark terminal workbench.

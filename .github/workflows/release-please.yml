@@ -67,6 +67,7 @@ jobs:
             git push origin "HEAD:refs/heads/$BRANCH"
           fi
           gh workflow run ci.yml --ref "$BRANCH"
+          gh workflow run ghostty-vt.yml --ref "$BRANCH"
           gh workflow run pr-title.yml --ref "$BRANCH" -f "pr=$PR"
 
   package:

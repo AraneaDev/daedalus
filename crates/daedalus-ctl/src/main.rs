@@ -455,6 +455,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 version,
                 vt_backend,
                 isolation_mode,
+                ..
             } => {
                 println!("daedalusd v{version} (vt={vt_backend}, isolation={isolation_mode})");
             }

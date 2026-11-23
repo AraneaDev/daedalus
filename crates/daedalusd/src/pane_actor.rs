@@ -97,6 +97,29 @@ impl PaneHandle {
         spawned: SpawnedPty,
         event_tx: broadcast::Sender<ServerEvent>,
     ) -> Self {
+        Self::spawn_journaled(
+            workspace_id,
+            pane_id,
+            role,
+            cols,
+            rows,
+            spawned,
+            event_tx,
+            Default::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_journaled(
+        workspace_id: WorkspaceId,
+        pane_id: PaneId,
+        role: PaneRole,
+        cols: u16,
+        rows: u16,
+        spawned: SpawnedPty,
+        event_tx: broadcast::Sender<ServerEvent>,
+        journal: crate::journal::Journal,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (pty_tx, pty_rx) = mpsc::channel(256);
         let (write_tx, mut write_rx) = mpsc::channel::<WriteRequest>(128);
@@ -141,6 +164,7 @@ impl PaneHandle {
             pty_rx,
             cmd_rx,
             event_tx,
+            journal,
         ));
 
         Self {
@@ -275,6 +299,9 @@ impl PaneHandle {
 }
 
 struct PaneOutput {
+    received_output: bool,
+    journal: crate::journal::Journal,
+    role: PaneRole,
     workspace_id: WorkspaceId,
     pane_id: PaneId,
     tracker: CommandTracker,
@@ -292,6 +319,7 @@ impl PaneOutput {
         cols: u16,
         rows: u16,
         events: broadcast::Sender<ServerEvent>,
+        journal: crate::journal::Journal,
     ) -> Self {
         let engine = create_vt_engine(VtConfig {
             cols,
@@ -301,6 +329,9 @@ impl PaneOutput {
         Self {
             workspace_id,
             pane_id,
+            journal,
+            role,
+            received_output: false,
             tracker: CommandTracker::new(pane_id, engine),
             detector: (role == PaneRole::Agent).then(AgentStateDetector::new),
             seq: 0,
@@ -311,6 +342,10 @@ impl PaneOutput {
 
     fn emit_agent_state(&self, state: Option<AgentState>) {
         if let Some(state) = state {
+            self.journal.record(daedalus_proto::ActivityKind::Agent {
+                pane_id: self.pane_id,
+                state,
+            });
             let _ = self.events.send(ServerEvent::AgentStateChanged {
                 workspace_id: self.workspace_id,
                 pane_id: self.pane_id,
@@ -331,6 +366,7 @@ impl PaneOutput {
             }
         }
         self.dirty = true;
+        self.received_output |= !bytes.is_empty();
         for (status, cwd) in outcome.status_changed {
             let _ = self.events.send(ServerEvent::PaneStatusChanged {
                 pane_id: self.pane_id,
@@ -339,6 +375,11 @@ impl PaneOutput {
             });
         }
         for (command, exit_code, has_failure_trace) in outcome.command_finished {
+            self.journal.record(daedalus_proto::ActivityKind::Command {
+                pane_id: self.pane_id,
+                role: self.role,
+                exit_code,
+            });
             let _ = self.events.send(ServerEvent::CommandFinished {
                 pane_id: self.pane_id,
                 command,
@@ -355,12 +396,34 @@ impl PaneOutput {
     fn flush_delta(&mut self) {
         if self.dirty {
             self.dirty = false;
+            let received_output = std::mem::take(&mut self.received_output);
             self.seq += 1;
             if let Some(delta) = self
                 .tracker
                 .engine_mut()
                 .take_dirty_delta(self.pane_id, self.seq)
             {
+                if received_output
+                    && self.role == PaneRole::Agent
+                    && let Some(row) = delta
+                        .dirty_rows
+                        .iter()
+                        .rev()
+                        .find(|row| {
+                            row.cells.iter().any(|cell| {
+                                cell.width > 0 && cell.text.chars().any(char::is_alphanumeric)
+                            })
+                        })
+                        .or_else(|| delta.dirty_rows.last())
+                {
+                    self.journal
+                        .record(daedalus_proto::ActivityKind::AgentOutput {
+                            pane_id: self.pane_id,
+                            abs_row: row.abs_row,
+                            pane_seq: delta.seq,
+                            history_generation: delta.history_generation,
+                        });
+                }
                 let _ = self.events.send(ServerEvent::GridDelta(delta));
             }
         }
@@ -373,6 +436,11 @@ impl PaneOutput {
             let state = detector.observe_exit(exit_code);
             self.emit_agent_state(state);
         }
+        self.journal.record(daedalus_proto::ActivityKind::Exit {
+            pane_id: self.pane_id,
+            role: self.role,
+            exit_code,
+        });
         let _ = self.events.send(ServerEvent::PaneExited {
             pane_id: self.pane_id,
             exit_code,
@@ -413,11 +481,12 @@ async fn run_pane_actor(
     mut pty_rx: mpsc::Receiver<PtyOutput>,
     mut cmd_rx: mpsc::Receiver<PaneCmd>,
     event_tx: broadcast::Sender<ServerEvent>,
+    journal: crate::journal::Journal,
 ) {
     let mut cols = cols.max(1);
     let mut rows = rows.max(1);
     let mut child_exit: Option<(i32, tokio::time::Instant)> = None;
-    let mut output = PaneOutput::new(workspace_id, pane_id, role, cols, rows, event_tx);
+    let mut output = PaneOutput::new(workspace_id, pane_id, role, cols, rows, event_tx, journal);
     let mut pty_open = true;
     let mut delta_tick = tokio::time::interval(Duration::from_millis(16));
     delta_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -504,6 +573,8 @@ async fn run_pane_actor(
                         let _ = reply.send(res);
                     }
                     Some(PaneCmd::GetSnapshot { reply }) => {
+                        // A snapshot and journal anchor with the same sequence must describe the same frame.
+                        output.flush_delta();
                         let _ = reply.send(output.tracker.engine().snapshot(pane_id, output.seq));
                     }
                     Some(PaneCmd::GetScrollback {
@@ -630,13 +701,18 @@ mod output_tests {
         let pane_id = PaneId::new();
         let (events, mut subscribed) = broadcast::channel(32);
         let (write_tx, mut write_rx) = mpsc::channel::<WriteRequest>(8);
+        let journal = crate::journal::Journal::default();
+        let workspace_id = WorkspaceId::new();
+        let epoch = WorkspaceId::new();
+        let start = journal.read(workspace_id, epoch, None).cursor;
         let mut output = PaneOutput::new(
-            WorkspaceId::new(),
+            workspace_id,
             pane_id,
             PaneRole::Runner,
             80,
             24,
             events,
+            journal.clone(),
         );
         let (tx, mut rx) = mpsc::channel(2);
         tx.send(PtyOutput::Bytes(b"abc\x1b[6n\x1b]133;C\x07".to_vec()))
@@ -659,6 +735,26 @@ mod output_tests {
             output.finish(Some(7));
         };
         tokio::join!(drain, reader);
+        let history = journal.read(workspace_id, epoch, Some(start));
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .map(|entry| &entry.kind)
+                .collect::<Vec<_>>(),
+            [
+                &daedalus_proto::ActivityKind::Command {
+                    pane_id,
+                    role: PaneRole::Runner,
+                    exit_code: 7
+                },
+                &daedalus_proto::ActivityKind::Exit {
+                    pane_id,
+                    role: PaneRole::Runner,
+                    exit_code: Some(7)
+                },
+            ]
+        );
         let mut observed = Vec::new();
         while let Ok(event) = subscribed.try_recv() {
             observed.push(event);

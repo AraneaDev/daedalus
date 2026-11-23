@@ -59,14 +59,25 @@ impl Registry {
                 .get_mut(&resolved_id)
                 .ok_or(ProtoError::WorkspaceNotFound(resolved_id))?;
 
-            if let Some(pos) = ws
+            let changed = if let Some(pos) = ws
                 .external_statuses
                 .iter()
                 .position(|existing| existing.source == status.source)
             {
-                ws.external_statuses.remove(pos);
-            } else if ws.external_statuses.len() >= MAX_EXTERNAL_STATUSES {
-                ws.external_statuses.remove(0);
+                let previous = ws.external_statuses.remove(pos);
+                previous.level != status.level
+                    || previous.label != status.label
+                    || previous.detail != status.detail
+            } else {
+                if ws.external_statuses.len() >= MAX_EXTERNAL_STATUSES {
+                    ws.external_statuses.remove(0);
+                }
+                true
+            };
+            if changed {
+                ws.journal.record(daedalus_proto::ActivityKind::External {
+                    level: status.level,
+                });
             }
             ws.external_statuses.push(status.clone());
             resolved_id
@@ -118,7 +129,11 @@ impl Registry {
             let before = ws.external_statuses.len();
             ws.external_statuses
                 .retain(|existing| existing.source != source);
-            (ws.external_statuses.len() != before).then_some(resolved_id)
+            (ws.external_statuses.len() != before).then(|| {
+                ws.journal
+                    .record(daedalus_proto::ActivityKind::ExternalCleared);
+                resolved_id
+            })
         };
 
         if let Some(target_id) = cleared_ws_id {

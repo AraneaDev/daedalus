@@ -1,0 +1,50 @@
+name: Native Ghostty VT
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'crates/daedalus-vt/**'
+      - 'crates/daedalus-proto/**'
+      - 'crates/daedalusd/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ghostty-vt.yml'
+  pull_request:
+    paths:
+      - 'crates/daedalus-vt/**'
+      - 'crates/daedalus-proto/**'
+      - 'crates/daedalusd/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ghostty-vt.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native-transcripts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: ghostty-org/ghostty
+          ref: df28358dd4a228749a237ed031de2f8dde163d99
+          path: upstream-ghostty
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build pinned libghostty-vt
+        working-directory: upstream-ghostty
+        run: |
+          curl --fail --location --silent --show-error https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/zig-x86_64-linux-0.17.1/zig" build -Demit-lib-vt -Doptimize=ReleaseFast -Dsimd=false --prefix "$RUNNER_TEMP/libghostty"
+          echo "GHOSTTY_VT_DIR=$RUNNER_TEMP/libghostty" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/libghostty/lib" >> "$GITHUB_ENV"
+      - run: cargo test --locked -p daedalus-vt --features ghostty-vt
+      - run: cargo test --locked -p daedalusd --features ghostty-vt --test daemon_integration bash_osc133_captures_failure_trace_and_survives_client_reconnect

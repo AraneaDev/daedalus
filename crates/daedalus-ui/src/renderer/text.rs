@@ -1,5 +1,7 @@
 mod chrome;
 mod modal;
+mod settings;
+mod workspace_form;
 
 use std::collections::{HashMap, HashSet};
 use unicode_segmentation::UnicodeSegmentation;
@@ -238,7 +240,8 @@ pub struct TextRenderer {
     pane_buffers: HashMap<PaneId, CachedPaneRows>,
     chrome_items: Vec<ChromeTextItem>,
     modal_items: Vec<ChromeTextItem>,
-    has_modal_text: bool,
+    pub(super) has_modal_text: bool,
+    pub(super) recap_drawn: bool,
 }
 
 impl TextRenderer {
@@ -300,6 +303,7 @@ impl TextRenderer {
             chrome_items: Vec::new(),
             modal_items: Vec::new(),
             has_modal_text: false,
+            recap_drawn: false,
         }
     }
 
@@ -372,9 +376,15 @@ impl TextRenderer {
         screen_w: f32,
         screen_h: f32,
     ) {
-        let cards = layout
-            .sidebar
-            .map(|sidebar| super::SidebarCards::new(state, sidebar, self.scale_factor, theme));
+        let cards = layout.sidebar.map(|sidebar| {
+            super::SidebarCards::new(
+                state,
+                sidebar,
+                self.scale_factor,
+                theme,
+                layout.sidebar_content.as_ref(),
+            )
+        });
         self.prepare_with_sidebar(
             device,
             queue,
@@ -489,6 +499,7 @@ impl TextRenderer {
 
         // 2. Rebuild UI chrome text buffers (sidebar, banner, pane headers, pills).
         self.chrome_items.clear();
+        self.recap_drawn = false;
         self.build_chrome_items(state, layout, theme, cards);
 
         // 3. Prepare base text pass (terminal rows + UI chrome).
@@ -534,19 +545,66 @@ impl TextRenderer {
             base_areas,
             &mut self.swash_cache,
         ) {
+            self.recap_drawn = false;
             tracing::warn!(%err, "glyphon base text prepare failed");
         }
 
         // 4. Rebuild & prepare overlay text pass if a modal or search bar is open.
         self.modal_items.clear();
-        let modal_open = state.action_palette.open
+        let modal_open = state.failure_recipients.is_some()
+            || state.workspace_form.open
+            || state.settings.open
+            || state.action_palette.open
             || state.picker.open
             || state.worktree_modal.open
             || state.close_modal.open
             || state.search.is_some();
         self.has_modal_text = modal_open;
         if modal_open {
-            if state.picker.open || state.action_palette.open {
+            if let Some(choices) = &state.failure_recipients {
+                let s = self.scale_factor;
+                let (modal, visible) = super::action_palette_layout(
+                    screen_w,
+                    screen_h,
+                    s,
+                    choices.agents.len(),
+                    choices.selected,
+                );
+                self.push_modal_line(ChromeLineSpec {
+                    text: "Send failure to agent · ↑↓ Enter Esc",
+                    left: modal.x + 16.0 * s,
+                    top: modal.y + 12.0 * s,
+                    max_w: (modal.width - 32.0 * s).max(1.0),
+                    bounds: modal,
+                    font_size_logical: MODAL_TITLE_FONT_SIZE_LOGICAL,
+                    line_height_logical: MODAL_TITLE_LINE_HEIGHT_LOGICAL,
+                    color: theme.text_primary,
+                    bold: true,
+                });
+                for (row, index) in visible.enumerate() {
+                    let rect = super::picker_item_rect(modal, row, s);
+                    let selected = choices.selected == index;
+                    self.push_modal_line(ChromeLineSpec {
+                        text: &state.failure_recipient_label(choices.agents[index]),
+                        left: rect.x + 10.0 * s,
+                        top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                        max_w: (rect.width - 20.0 * s).max(1.0),
+                        bounds: rect,
+                        font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+                        line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                        color: if selected {
+                            theme.text_primary
+                        } else {
+                            theme.text_muted
+                        },
+                        bold: selected,
+                    });
+                }
+            } else if state.workspace_form.open {
+                self.build_workspace_form_items(state, theme, screen_w, screen_h);
+            } else if state.settings.open {
+                self.build_settings_items(state, theme, screen_w, screen_h);
+            } else if state.picker.open || state.action_palette.open {
                 self.build_picker_items(state, theme, screen_w, screen_h);
             } else if state.worktree_modal.open {
                 self.build_worktree_modal_items(state, theme, screen_w, screen_h);

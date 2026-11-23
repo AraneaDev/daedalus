@@ -42,7 +42,7 @@ impl TextRenderer {
             text: if palette {
                 "Actions · ↑↓ Enter Esc"
             } else {
-                "Agent preset · ↑↓ Enter Esc"
+                "Enter: switch agent · Shift+Enter: add agent"
             },
             left: modal.x + 16.0 * s,
             top: modal.y + 12.0 * s,

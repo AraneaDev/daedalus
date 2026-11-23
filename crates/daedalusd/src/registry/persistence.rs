@@ -139,7 +139,13 @@ impl Registry {
                 }
             };
 
-            let record = build_workspace_record(entry.id, entry.name, entry.root_dir, prepared);
+            let record = build_workspace_record(
+                entry.id,
+                entry.name,
+                entry.root_dir,
+                prepared,
+                entry.manual_launch,
+            );
             used_slots.insert(record.slot_index);
             reserved_ports.extend(record.reserved_ports.iter().copied());
             existing_ids.insert(record.id);

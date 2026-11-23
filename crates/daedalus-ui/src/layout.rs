@@ -1,4 +1,4 @@
-use daedalus_proto::PaneRole;
+use daedalus_proto::{PaneId, PaneRole};
 
 pub const SIDEBAR_LOGICAL_WIDTH: f32 = 240.0;
 pub const HEADER_LOGICAL_HEIGHT: f32 = 26.0;
@@ -109,6 +109,29 @@ pub struct PaneRect {
     pub rows: u16,
 }
 
+/// Bounds shared by painting and pointer input for the focused terminal's role tabs.
+pub fn session_tabs(pane: &PaneRect, scale: f32) -> [(PaneRole, Rect); 3] {
+    let left = pane.header.x + 4.0 * scale;
+    let right = pane.action_pill.map_or(pane.header.right(), |pill| pill.x);
+    let width = ((right - left) / 3.0).clamp(0.0, 72.0 * scale);
+    [PaneRole::Agent, PaneRole::Service, PaneRole::Runner].map(|role| {
+        let index = match role {
+            PaneRole::Agent => 0.,
+            PaneRole::Service => 1.,
+            PaneRole::Runner => 2.,
+        };
+        (
+            role,
+            Rect::new(
+                left + width * index,
+                pane.header.y,
+                width,
+                pane.header.height,
+            ),
+        )
+    })
+}
+
 /// Inputs required to solve the workspace layout for a single frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayoutInput {
@@ -127,8 +150,12 @@ pub struct LayoutInput {
 /// Computed rectangles for the sidebar, optional top banner, and visible semantic panes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceLayout {
+    pub compact_recap: Option<Rect>,
+    pub close_tab: Option<(PaneId, Rect)>,
+    pub named_tabs: Vec<(PaneId, String, Rect)>,
     pub stacked: bool,
     pub sidebar_first: usize,
+    pub sidebar_content: Option<std::sync::Arc<crate::sidebar_content::SidebarContent>>,
     pub sidebar_toggle: Option<Rect>,
     pub sidebar: Option<Rect>,
     pub banner: Option<Rect>,
@@ -136,6 +163,67 @@ pub struct WorkspaceLayout {
 }
 
 impl WorkspaceLayout {
+    pub fn set_named_tabs(
+        &mut self,
+        entries: &[(PaneId, String)],
+        focused: Option<PaneId>,
+        scale: f32,
+    ) {
+        let [pane] = self.panes.as_slice() else {
+            return;
+        };
+        let left = pane.header.x + 3. * scale;
+        let right = pane.action_pill.map_or(pane.header.right(), |r| r.x);
+        let available = (right - left).max(0.);
+        if entries.is_empty() || available < 1. {
+            return;
+        }
+        let capacity = ((available / (100. * scale)).floor() as usize)
+            .max(3)
+            .min(entries.len());
+        let index = entries
+            .iter()
+            .position(|(id, _)| Some(*id) == focused)
+            .unwrap_or(0);
+        let overflow = entries.len() > capacity;
+        let visible = if overflow { capacity - 2 } else { capacity };
+        let start = (index / visible * visible).min(entries.len() - visible);
+        let width = (available / capacity as f32).min(132. * scale);
+        let mut push = |id, label: String| {
+            let x = left + self.named_tabs.len() as f32 * width;
+            self.named_tabs.push((
+                id,
+                label,
+                Rect::new(x, pane.header.y, width, pane.header.height),
+            ));
+        };
+        if overflow {
+            push(
+                entries[(start + entries.len() - 1) % entries.len()].0,
+                "‹ Prev".into(),
+            );
+        }
+        for (id, label) in &entries[start..start + visible] {
+            push(*id, label.clone());
+        }
+        if overflow {
+            push(
+                entries[(start + visible) % entries.len()].0,
+                "Next ›".into(),
+            );
+        }
+        if let Some(id) = focused
+            && let Some((_, _, rect)) = self.named_tabs.iter().rev().find(|(tab, _, _)| *tab == id)
+            && rect.width >= 52. * scale
+        {
+            let width = 22. * scale;
+            self.close_tab = Some((
+                id,
+                Rect::new(rect.right() - width, rect.y, width, rect.height),
+            ));
+        }
+    }
+
     pub fn pane(&self, role: PaneRole) -> Option<&PaneRect> {
         self.panes.iter().find(|p| p.role == role)
     }
@@ -145,12 +233,16 @@ impl WorkspaceLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
     ToggleSidebar,
+    WorkspaceSettings,
     SidebarPageUp,
     SidebarPageDown,
     SidebarWorkspace(usize),
     SidebarWorkspaceClose(usize),
     SidebarNewWorkspace,
     SidebarNewWorktree,
+    SessionTab(PaneRole),
+    SelectSession(PaneId),
+    CloseSession(PaneId),
     PaneHeaderAction(PaneRole),
     PaneViewport { role: PaneRole, col: u16, row: u16 },
     PaneHeader(PaneRole),
@@ -242,22 +334,37 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
     let window_h = input.window_h.max(0.0);
 
     let min_split_width = MIN_SPLIT_CANVAS_LOGICAL_WIDTH * metrics.scale_factor;
-    let show_sidebar = input
-        .sidebar_override
-        .unwrap_or(window_w >= metrics.sidebar_width + min_split_width);
+    let show_sidebar = input.sidebar_override.unwrap_or(
+        window_w >= metrics.sidebar_width + min_split_width
+            && (!input.zoomed
+                || (window_w >= 900.0 * metrics.scale_factor
+                    && window_h >= 520.0 * metrics.scale_factor)),
+    );
     let (sidebar, sidebar_w) = if show_sidebar {
-        let w = metrics.sidebar_width.min(window_w);
-        (Some(Rect::new(0.0, 0.0, w, window_h)), w)
+        let w = if input.zoomed {
+            metrics.sidebar_width.min(window_w * 0.21)
+        } else {
+            metrics.sidebar_width.min(window_w)
+        };
+        (
+            Some(Rect::new(
+                if input.zoomed { window_w - w } else { 0. },
+                0.0,
+                w,
+                window_h,
+            )),
+            w,
+        )
     } else {
         (None, 0.0)
     };
 
-    let canvas_x = sidebar_w;
+    let canvas_x = if input.zoomed { 0. } else { sidebar_w };
     let canvas_w = (window_w - sidebar_w).max(0.0);
 
     let sidebar_toggle = (window_w > 0.0 && window_h > 0.0).then(|| {
         Rect::new(
-            0.0,
+            sidebar.map_or(0., |rect| rect.x),
             0.0,
             sidebar.map_or(window_w, |rect| rect.width),
             metrics.sidebar_header_height.min(window_h),
@@ -277,7 +384,19 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
     };
 
     let canvas_y = canvas_top + banner_h;
-    let canvas_h = (window_h - canvas_y).max(0.0);
+    let mut canvas_h = (window_h - canvas_y).max(0.0);
+    let compact_recap =
+        if input.zoomed && sidebar.is_none() && input.sidebar_override != Some(false) {
+            let terminal_width = (canvas_w - 2. * metrics.viewport_pad).max(1.);
+            let required_height = window_w * window_h * (2. / 3.) / terminal_width
+                + metrics.header_height
+                + 2. * metrics.viewport_pad;
+            let height = (canvas_h - required_height).min(window_h * 0.19).max(0.);
+            canvas_h -= height;
+            Some(Rect::new(canvas_x, canvas_y + canvas_h, canvas_w, height))
+        } else {
+            None
+        };
 
     let stacked = canvas_w < min_split_width;
     let panes = if input.zoomed {
@@ -346,8 +465,12 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
     };
 
     WorkspaceLayout {
+        compact_recap,
+        close_tab: None,
+        named_tabs: Vec::new(),
         sidebar_toggle,
         sidebar_first: 0,
+        sidebar_content: None,
         stacked,
         sidebar,
         banner,
@@ -484,6 +607,13 @@ pub fn sidebar_new_worktree_rect(sidebar: Rect, workspace_count: usize, scale_fa
     )
 }
 
+/// Settings occupies the end of the workspace heading, before any paging arrows.
+pub fn settings_button(header: Rect, arrows: Option<(Rect, Rect)>, scale: f32) -> Rect {
+    let right = arrows.map_or(header.right(), |(up, _)| up.x);
+    let width = (64. * scale).min((right - header.x) * 0.48);
+    Rect::new(right - width, header.y, width, header.height)
+}
+
 /// Hit-tests a physical pixel coordinate `(x, y)` against the current `WorkspaceLayout`.
 pub fn hit_test(
     layout: &WorkspaceLayout,
@@ -494,9 +624,14 @@ pub fn hit_test(
     x: f32,
     y: f32,
 ) -> HitTarget {
-    let list = layout.sidebar.map(|sidebar| {
-        SidebarList::new(sidebar, workspace_count, layout.sidebar_first, scale_factor)
-    });
+    use crate::sidebar_content::{SidebarContent, SidebarRow};
+    let fallback = layout
+        .sidebar
+        .filter(|_| layout.sidebar_content.is_none())
+        .map(|rect| {
+            SidebarContent::plain(workspace_count, rect, layout.sidebar_first, scale_factor)
+        });
+    let list = layout.sidebar_content.as_deref().or(fallback.as_ref());
     if let Some((up, down)) = list.as_ref().and_then(|list| list.arrows) {
         if up.contains(x, y) {
             return HitTarget::SidebarPageUp;
@@ -504,6 +639,13 @@ pub fn hit_test(
         if down.contains(x, y) {
             return HitTarget::SidebarPageDown;
         }
+    }
+    if workspace_count > 0
+        && layout.sidebar_toggle.is_some_and(|rect| {
+            settings_button(rect, list.as_ref().and_then(|l| l.arrows), scale_factor).contains(x, y)
+        })
+    {
+        return HitTarget::WorkspaceSettings;
     }
     if layout
         .sidebar_toggle
@@ -514,22 +656,21 @@ pub fn hit_test(
     if let Some(sidebar) = layout.sidebar
         && sidebar.contains(x, y)
     {
-        for (row, i) in list.unwrap().visible.enumerate() {
-            let row_rect = sidebar_workspace_rect(sidebar, row, scale_factor);
-            if row_rect.contains(x, y) {
-                let close_rect = sidebar_workspace_close_rect(row_rect, scale_factor);
-                if close_rect.contains(x, y) {
-                    return HitTarget::SidebarWorkspaceClose(i);
+        let list = list.expect("visible sidebar has content");
+        for (row, rect) in list.rows[list.visible.clone()].iter().zip(&list.rects) {
+            if let SidebarRow::Workspace(i) = row
+                && rect.contains(x, y)
+            {
+                if sidebar_workspace_close_rect(*rect, scale_factor).contains(x, y) {
+                    return HitTarget::SidebarWorkspaceClose(*i);
                 }
-                return HitTarget::SidebarWorkspace(i);
+                return HitTarget::SidebarWorkspace(*i);
             }
         }
-        let new_btn_rect = sidebar_new_workspace_rect(sidebar, workspace_count, scale_factor);
-        if new_btn_rect.contains(x, y) {
+        if list.new_workspace.contains(x, y) {
             return HitTarget::SidebarNewWorkspace;
         }
-        let new_wt_rect = sidebar_new_worktree_rect(sidebar, workspace_count, scale_factor);
-        if new_wt_rect.contains(x, y) {
+        if list.new_worktree.contains(x, y) {
             return HitTarget::SidebarNewWorktree;
         }
         return HitTarget::None;
@@ -540,6 +681,26 @@ pub fn hit_test(
             && pill.contains(x, y)
         {
             return HitTarget::PaneHeaderAction(pane.role);
+        }
+        if let Some((id, rect)) = layout.close_tab
+            && rect.contains(x, y)
+        {
+            return HitTarget::CloseSession(id);
+        }
+        if let Some((id, _, _)) = layout
+            .named_tabs
+            .iter()
+            .find(|(_, _, rect)| rect.contains(x, y))
+        {
+            return HitTarget::SelectSession(*id);
+        }
+        if layout.named_tabs.is_empty()
+            && layout.panes.len() == 1
+            && let Some((role, _)) = session_tabs(pane, scale_factor)
+                .into_iter()
+                .find(|(_, rect)| rect.contains(x, y))
+        {
+            return HitTarget::SessionTab(role);
         }
         if pane.header.contains(x, y) {
             return HitTarget::PaneHeader(pane.role);
@@ -616,6 +777,76 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_session_tabs_reveal_and_select_the_requested_pane() {
+        let entries: Vec<_> = (0..12)
+            .map(|i| (PaneId::new(), format!("Session {i}")))
+            .collect();
+        let mut layout = compute_layout(&LayoutInput {
+            window_w: 320.,
+            window_h: 480.,
+            zoomed: true,
+            ..default_input()
+        });
+        layout.set_named_tabs(&entries, Some(entries[6].0), 1.);
+        assert!(
+            layout
+                .named_tabs
+                .iter()
+                .any(|(id, label, _)| *id == entries[6].0 && label == "Session 6")
+        );
+        for (id, _, rect) in &layout.named_tabs {
+            assert_eq!(
+                hit_test(
+                    &layout,
+                    1,
+                    1.,
+                    8.,
+                    16.,
+                    rect.x + rect.width * 0.5,
+                    rect.y + rect.height * 0.5
+                ),
+                HitTarget::SelectSession(*id)
+            );
+        }
+        if let Some((id, button)) = layout.close_tab {
+            assert_eq!(id, entries[6].0);
+            assert_eq!(
+                hit_test(&layout, 1, 1., 8., 16., button.x + 1., button.y + 1.),
+                HitTarget::CloseSession(id)
+            );
+        }
+        let next = layout.named_tabs.last().unwrap();
+        assert_eq!(next.1, "Next ›");
+        assert_eq!(next.0, entries[7].0);
+    }
+
+    #[test]
+    fn focused_terminal_uses_two_thirds_of_default_viewport() {
+        for (w, h) in [
+            (320., 480.),
+            (640., 320.),
+            (900., 520.),
+            (1280., 800.),
+            (2560., 1080.),
+        ] {
+            for s in [1., 2.] {
+                let layout = compute_layout(&LayoutInput {
+                    window_w: w * s,
+                    window_h: h * s,
+                    scale_factor: s,
+                    zoomed: true,
+                    has_top_banner: true,
+                    ..default_input()
+                });
+                assert!(
+                    layout.panes[0].viewport.area() >= w * h * s * s * 2. / 3.,
+                    "{w}x{h} at {s}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn zoomed_layout_gives_focused_role_100_percent_of_canvas() {
         let mut input = default_input();
         input.zoomed = true;
@@ -626,7 +857,7 @@ mod tests {
         assert_eq!(layout.panes.len(), 1);
         let pane = &layout.panes[0];
         assert_eq!(pane.role, PaneRole::Runner);
-        assert_eq!(pane.outer, Rect::new(240.0, 0.0, 1000.0, 800.0));
+        assert_eq!(pane.outer, Rect::new(0.0, 0.0, 1000.0, 800.0));
         assert!(pane.action_pill.is_some());
     }
 

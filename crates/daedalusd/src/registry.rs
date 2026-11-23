@@ -2,6 +2,7 @@ mod persistence;
 mod status;
 
 use crate::isolation;
+use crate::journal::Journal;
 use crate::manifest;
 use crate::pane_actor::PaneHandle;
 use crate::persistence::{PersistedWorkspace, StateStore};
@@ -22,6 +23,7 @@ use tracing::warn;
 const DEFAULT_ROLES: [PaneRole; 3] = [PaneRole::Agent, PaneRole::Service, PaneRole::Runner];
 
 enum DefaultPanes {
+    Manual,
     Pending(HashSet<PaneRole>),
     Complete,
 }
@@ -57,10 +59,12 @@ struct WorkspaceRecord {
     pane_ids: Vec<PaneId>,
     default_panes: DefaultPanes,
     lifecycle: std::sync::Arc<Mutex<()>>,
+    journal: Journal,
     bound_ports: Vec<PortMapping>,
     containers: Vec<ContainerHealth>,
     external_statuses: Vec<ExternalStatus>,
     manifest: Option<WorkspaceManifest>,
+    project: daedalus_proto::ProjectInfo,
 }
 
 impl WorkspaceRecord {
@@ -81,6 +85,7 @@ impl WorkspaceRecord {
             containers: self.containers.clone(),
             external_statuses: self.external_statuses.clone(),
             manifest: self.manifest.clone(),
+            project: self.project.clone(),
         }
     }
 
@@ -102,6 +107,7 @@ impl WorkspaceRecord {
             name: self.name.clone(),
             root_dir: self.root_dir.clone(),
             slot_index: self.slot_index,
+            manual_launch: matches!(self.default_panes, DefaultPanes::Manual),
             agent_preset: self.manifest.as_ref().and_then(|m| m.agent_preset.clone()),
         }
     }
@@ -113,6 +119,7 @@ struct PreparedWorkspaceComponents {
     git_status: Option<GitWorkspaceStatus>,
     canonical_root_dir: PathBuf,
     manifest: Option<WorkspaceManifest>,
+    project: daedalus_proto::ProjectInfo,
 }
 
 fn prepare_workspace_components(
@@ -148,7 +155,12 @@ fn prepare_workspace_components(
     let canonical_root_dir = daedalus_proto::strip_windows_verbatim_prefix(
         std::fs::canonicalize(root_dir).unwrap_or_else(|_| root_dir.to_path_buf()),
     );
+    let project = daedalus_proto::ProjectInfo {
+        repository: worktree::primary_checkout(root_dir),
+        tools: manifest::detect_tools(root_dir, plan.compose_project_name.is_some()),
+    };
     Ok(PreparedWorkspaceComponents {
+        project,
         plan,
         git_branch,
         git_status,
@@ -162,6 +174,7 @@ fn build_workspace_record(
     name: String,
     root_dir: PathBuf,
     prepared: PreparedWorkspaceComponents,
+    manual_launch: bool,
 ) -> WorkspaceRecord {
     let reserved_ports: HashSet<u16> = prepared.plan.remapped_ports.values().copied().collect();
     WorkspaceRecord {
@@ -177,16 +190,23 @@ fn build_workspace_record(
         injected_env: prepared.plan.injected_env,
         reserved_ports,
         pane_ids: Vec::new(),
-        default_panes: DefaultPanes::Pending(HashSet::new()),
+        default_panes: if manual_launch {
+            DefaultPanes::Manual
+        } else {
+            DefaultPanes::Pending(HashSet::new())
+        },
         lifecycle: Default::default(),
+        journal: Journal::default(),
         bound_ports: Vec::new(),
         containers: Vec::new(),
         external_statuses: Vec::new(),
         manifest: prepared.manifest,
+        project: prepared.project,
     }
 }
 
 pub struct Registry {
+    journal_epoch: WorkspaceId,
     supervisor: Supervisor,
     shell_integration: ShellIntegration,
     event_tx: broadcast::Sender<ServerEvent>,
@@ -215,6 +235,7 @@ impl Registry {
         state_store: Option<StateStore>,
     ) -> Self {
         Self {
+            journal_epoch: WorkspaceId::new(),
             supervisor,
             shell_integration,
             event_tx,
@@ -247,6 +268,18 @@ impl Registry {
         self.supervisor.isolation_mode()
     }
 
+    pub async fn read_activity(
+        &self,
+        id: WorkspaceId,
+        cursor: Option<daedalus_proto::ActivityCursor>,
+    ) -> Result<daedalus_proto::ActivityPage, ProtoError> {
+        let workspaces = self.workspaces.read().await;
+        let ws = workspaces
+            .get(&id)
+            .ok_or(ProtoError::WorkspaceNotFound(id))?;
+        Ok(ws.journal.read(id, self.journal_epoch, cursor))
+    }
+
     pub fn subscribe_events(&self) -> broadcast::Receiver<ServerEvent> {
         self.event_tx.subscribe()
     }
@@ -256,6 +289,17 @@ impl Registry {
         name: String,
         root_dir: PathBuf,
         env: HashMap<String, String>,
+    ) -> Result<WorkspaceInfo, ProtoError> {
+        self.create_workspace_with_mode(name, root_dir, env, false)
+            .await
+    }
+
+    pub(crate) async fn create_workspace_with_mode(
+        &self,
+        name: String,
+        root_dir: PathBuf,
+        env: HashMap<String, String>,
+        manual_launch: bool,
     ) -> Result<WorkspaceInfo, ProtoError> {
         let root_dir =
             std::path::absolute(root_dir).map_err(|err| ProtoError::IoError(err.to_string()))?;
@@ -290,7 +334,7 @@ impl Registry {
         .map_err(|e| ProtoError::IoError(e.to_string()))?;
 
         let id = WorkspaceId::new();
-        let record = build_workspace_record(id, name, root_dir, prepared);
+        let record = build_workspace_record(id, name, root_dir, prepared, manual_launch);
         let info = record.to_info(Vec::new());
         self.workspaces.write().await.insert(id, record);
         drop(_create_guard);
@@ -550,12 +594,16 @@ impl Registry {
         old_pane_id: Option<PaneId>,
         is_default: bool,
     ) -> Result<PaneSummary, ProtoError> {
-        let (root_dir, mut merged_env) = {
+        let (root_dir, mut merged_env, journal) = {
             let ws_map = self.workspaces.read().await;
             let ws = ws_map
                 .get(&workspace_id)
                 .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
-            (ws.root_dir.clone(), ws.injected_env.clone())
+            (
+                ws.root_dir.clone(),
+                ws.injected_env.clone(),
+                ws.journal.clone(),
+            )
         };
         merged_env.extend(pane_env);
 
@@ -578,7 +626,7 @@ impl Registry {
             )
             .map_err(ProtoError::SpawnFailed)?;
 
-        let handle = PaneHandle::spawn(
+        let handle = PaneHandle::spawn_journaled(
             workspace_id,
             pane_id,
             role,
@@ -586,6 +634,7 @@ impl Registry {
             rows,
             spawned,
             self.event_tx.clone(),
+            journal,
         );
 
         let summary = match handle.summary().await {
@@ -704,12 +753,17 @@ impl Registry {
                 .drain(..)
                 .filter_map(|id| panes.remove(&id))
                 .collect();
-            if remove_worktree && !handles.is_empty() {
+            if remove_worktree
+                && !handles.is_empty()
+                && !matches!(ws.default_panes, DefaultPanes::Manual)
+            {
                 // Git may still refuse removal. Reopen roles drained by this close while
                 // preserving any roles the user had already left closed.
                 let mut finished = match &ws.default_panes {
                     DefaultPanes::Pending(roles) => roles.clone(),
-                    DefaultPanes::Complete => DEFAULT_ROLES.into_iter().collect(),
+                    DefaultPanes::Manual | DefaultPanes::Complete => {
+                        DEFAULT_ROLES.into_iter().collect()
+                    }
                 };
                 for handle in &handles {
                     finished.remove(&handle.role());
@@ -992,6 +1046,24 @@ impl Registry {
                 && ws.git_branch == git_branch
             {
                 return false;
+            }
+            use daedalus_proto::ActivityKind;
+            if ws.bound_ports != bound_ports {
+                ws.journal.record(ActivityKind::Ports {
+                    bound: bound_ports.len(),
+                });
+            }
+            if ws.containers != containers {
+                ws.journal.record(ActivityKind::Containers {
+                    total: containers.len(),
+                    unhealthy: containers
+                        .iter()
+                        .filter(|c| c.health.as_deref() == Some("unhealthy"))
+                        .count(),
+                });
+            }
+            if ws.git_status != git_status || ws.git_branch != git_branch {
+                ws.journal.record(ActivityKind::Git);
             }
             ws.bound_ports = bound_ports.clone();
             ws.containers = containers.clone();
@@ -1347,6 +1419,7 @@ mod tests {
             .create_workspace("rt".to_string(), dir.path().to_path_buf(), HashMap::new())
             .await
             .unwrap();
+        let start = registry.read_activity(ws.id, None).await.unwrap().cursor;
         let mut events = registry.subscribe_events();
 
         let ports = vec![PortMapping {
@@ -1399,6 +1472,19 @@ mod tests {
             } if workspace_id == ws.id && gs == git_status && gb == git_branch
         ));
         assert!(events.try_recv().is_err());
+        let history = registry.read_activity(ws.id, Some(start)).await.unwrap();
+        assert!(!history.gap);
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .map(|e| e.kind.clone())
+                .collect::<Vec<_>>(),
+            [
+                daedalus_proto::ActivityKind::Ports { bound: 1 },
+                daedalus_proto::ActivityKind::Git
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1761,6 +1847,7 @@ SHARED_KEY = "from_manifest"
         let unresolved = PersistedWorkspace {
             id: WorkspaceId::new(),
             name: "legacy".into(),
+            manual_launch: false,
             root_dir: ".".into(),
             slot_index: 0,
             agent_preset: None,
@@ -1822,6 +1909,10 @@ SHARED_KEY = "from_manifest"
         reg1.close_all().await;
         assert!(state_path.is_file());
 
+        // Discovery is refreshed on restore, including for entries written by older daemons.
+        assert!(ws_keep.project.tools.is_empty());
+        std::fs::write(keep_dir.join("pyproject.toml"), "").unwrap();
+
         // Delete drop_dir before restart.
         std::fs::remove_dir_all(&drop_dir).unwrap();
 
@@ -1837,6 +1928,7 @@ SHARED_KEY = "from_manifest"
         let listed = reg2.list_workspaces().await;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, ws_keep.id);
+        assert_eq!(listed[0].project.tools, ["Python"]);
         assert!(listed[0].panes.is_empty());
         assert_eq!(
             listed[0].injected_env.get("SECRET_ENV").map(String::as_str),
