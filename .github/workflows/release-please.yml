@@ -21,6 +21,10 @@ concurrency:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
@@ -31,6 +35,39 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # Also find an existing PR on retries after a partial synchronization.
+      - name: Find the open release branch
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          branch=release-please--branches--master--components--daedalus
+          number=$(gh pr list --base master --head "$branch" --state open --json number,isCrossRepository --jq '.[] | select(.isCrossRepository == false) | .number')
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        if: steps.candidate.outputs.number != ''
+        with:
+          ref: ${{ steps.candidate.outputs.branch }}
+      - name: Synchronize release lockfile and run required checks
+        if: steps.candidate.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.candidate.outputs.branch }}
+          PR: ${{ steps.candidate.outputs.number }}
+        run: |
+          python3 scripts/sync-release-lock.py
+          if ! git diff --quiet -- Cargo.lock; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add Cargo.lock
+            git commit -m 'chore: synchronize release workspace lockfile'
+            git push origin "HEAD:refs/heads/$BRANCH"
+          fi
+          gh workflow run ci.yml --ref "$BRANCH"
+          gh workflow run pr-title.yml --ref "$BRANCH" -f "pr=$PR"
 
   package:
     needs: release-please

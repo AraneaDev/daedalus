@@ -606,6 +606,8 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorState::default(),
+            history_generation: 0,
+            scrollback_len: None,
             dirty_rows: Vec::new(),
         })
     }

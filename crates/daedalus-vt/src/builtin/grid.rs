@@ -44,6 +44,9 @@ pub struct Grid {
     scrollback: VecDeque<StoredRow>,
     viewport: Vec<StoredRow>,
     dirty: Vec<bool>,
+    last_emitted_cursor: Option<CursorState>,
+    history_generation: u64,
+    last_emitted_history_generation: u64,
     cursor_col: u16,
     cursor_row: u16,
     cursor_visible: bool,
@@ -74,6 +77,9 @@ impl Grid {
             scrollback: VecDeque::new(),
             viewport,
             dirty: vec![true; rows as usize],
+            last_emitted_cursor: None,
+            history_generation: 0,
+            last_emitted_history_generation: 0,
             cursor_col: 0,
             cursor_row: 0,
             cursor_visible: true,
@@ -302,7 +308,13 @@ impl Grid {
                     self.dirty[row_idx] = true;
                 }
             }
-            2 | 3 => {
+            3 => {
+                if !self.scrollback.is_empty() {
+                    self.scrollback.clear();
+                    self.history_generation += 1;
+                }
+            }
+            2 => {
                 for row_idx in 0..self.viewport.len() {
                     for cell in &mut self.viewport[row_idx].cells {
                         *cell = Cell::default();
@@ -434,6 +446,7 @@ impl Grid {
             cursor: self.cursor(),
             rows_data,
             scrollback_len: self.scrollback.len(),
+            history_generation: self.history_generation,
         }
     }
 
@@ -482,16 +495,24 @@ impl Grid {
                 });
             }
         }
-        if dirty_rows.is_empty() {
+        let cursor = self.cursor();
+        if dirty_rows.is_empty()
+            && self.last_emitted_cursor == Some(cursor)
+            && self.last_emitted_history_generation == self.history_generation
+        {
             return None;
         }
+        self.last_emitted_cursor = Some(cursor);
+        self.last_emitted_history_generation = self.history_generation;
         Some(GridDelta {
             pane_id,
             seq,
             cols: self.cols,
             rows: self.rows,
-            cursor: self.cursor(),
+            cursor,
             dirty_rows,
+            history_generation: self.history_generation,
+            scrollback_len: Some(self.scrollback.len()),
         })
     }
 

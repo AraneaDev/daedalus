@@ -866,3 +866,144 @@ async fn shutdown_interrupts_unanswered_initialization_rpc() {
         .expect("shutdown waited for the silent daemon")
         .unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn attached_client_receives_cursor_and_history_only_deltas() {
+    use daedalus_ui::state::PaneViewState;
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join(".daedalus.toml"),
+        "[runner]\ncommand = ['sh', 'runner.sh']\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("runner.sh"),
+        r#"stty -echo
+read step
+i=0
+while [ "$i" -lt 45 ]; do echo old; i=$((i + 1)); done
+printf LAST
+read step
+printf '\033[2D'
+read step
+printf '\033[?25l'
+read step
+printf '\033[3J'
+read step
+"#,
+    )
+    .unwrap();
+    let server = DaemonServer::bind_with_supervisor(
+        dir.path().join("daemon.sock"),
+        dir.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let socket_path = server.socket_path();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let daemon = tokio::spawn(server.serve(async {
+        let _ = stopped.await;
+    }));
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let bridge = DaemonBridge::start(
+        BridgeConfig {
+            socket_path,
+            initial_dir: dir.path().to_owned(),
+            default_agent: AgentPreset::Shell,
+            auto_spawn_daemon: false,
+            auth_token: None,
+        },
+        Arc::new(ChannelSink { tx }),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut pane = loop {
+            if let UiEvent::PaneSpawned { summary, .. } = events.recv().await.unwrap()
+                && summary.role == PaneRole::Runner
+            {
+                break PaneViewState::from_summary(summary);
+            }
+        };
+        let id = pane.summary.id;
+        bridge.send(UiCommand::SendInput {
+            pane_id: id,
+            data: b"start\n".to_vec(),
+        });
+        loop {
+            if let UiEvent::ServerEvent(ServerEvent::GridDelta(delta)) =
+                events.recv().await.unwrap()
+                && delta.pane_id == id
+            {
+                pane.apply_delta(delta);
+                if pane.scrollback_len > 0
+                    && pane.cursor.col == 4
+                    && pane
+                        .viewport_rows
+                        .last()
+                        .is_some_and(|row| row.cells[0].text == "L")
+                {
+                    break;
+                }
+            }
+        }
+        pane.set_scroll_offset(5);
+        let generation = pane.begin_scrollback_request().unwrap();
+        bridge.send(UiCommand::RequestScrollback {
+            pane_id: id,
+            generation,
+            offset_from_bottom: 5,
+            count: usize::from(pane.rows),
+        });
+        loop {
+            if let UiEvent::ScrollbackLoaded {
+                pane_id,
+                generation,
+                total_scrollback,
+                rows,
+            } = events.recv().await.unwrap()
+                && pane_id == id
+            {
+                pane.apply_scrollback(generation, total_scrollback, rows);
+                break;
+            }
+        }
+        assert_eq!(pane.scroll_offset, 5);
+        for (col, visible, scroll_offset) in [(2, true, 5), (2, false, 5), (2, false, 0)] {
+            bridge.send(UiCommand::SendInput {
+                pane_id: id,
+                data: b"step\n".to_vec(),
+            });
+            loop {
+                if let UiEvent::ServerEvent(ServerEvent::GridDelta(delta)) =
+                    events.recv().await.unwrap()
+                    && delta.pane_id == id
+                {
+                    assert!(delta.dirty_rows.is_empty());
+                    pane.apply_delta(delta);
+                    break;
+                }
+            }
+            assert_eq!(
+                (pane.cursor.col, pane.cursor.visible, pane.scroll_offset),
+                (col, visible, scroll_offset)
+            );
+        }
+        assert_eq!(pane.scrollback_len, 0);
+        let last = pane.visible_rows().last().unwrap();
+        assert!(
+            last.cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .starts_with("LAST")
+        );
+    })
+    .await
+    .expect("missing terminal delta");
+    tokio::task::spawn_blocking(move || bridge.shutdown())
+        .await
+        .unwrap();
+    stop.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+}

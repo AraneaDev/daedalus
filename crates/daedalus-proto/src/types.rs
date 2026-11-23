@@ -319,6 +319,9 @@ pub struct GridSnapshot {
     pub rows_data: Vec<GridRow>,
     #[serde(default)]
     pub scrollback_len: usize,
+    /// Changes when the terminal erases its saved lines.
+    #[serde(default)]
+    pub history_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,6 +332,11 @@ pub struct GridDelta {
     pub rows: u16,
     pub cursor: CursorState,
     pub dirty_rows: Vec<GridRow>,
+    #[serde(default)]
+    pub history_generation: u64,
+    /// Older daemons omit history length in incremental updates.
+    #[serde(default)]
+    pub scrollback_len: Option<usize>,
 }
 
 /// A single substring match in a pane's scrollback/viewport history (`end_col` is exclusive).

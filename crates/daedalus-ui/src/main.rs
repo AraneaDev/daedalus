@@ -418,7 +418,7 @@ impl DaedalusApp {
             return;
         };
         if delta > 0 {
-            // GridDelta omits the current history length. Probe beyond the cached length.
+            // Older daemons omit history length from deltas. Let the daemon clamp the request.
             pane.set_scroll_offset(pane.requested_scroll_offset.saturating_add(delta as usize));
         } else {
             pane.adjust_scroll_offset(delta);
@@ -1117,6 +1117,7 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UiEvent) {
+        let search_generation = self.state.search.as_ref().map(|search| search.generation);
         match event {
             UiEvent::Connected => {
                 self.state.connected = true;
@@ -1171,8 +1172,9 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
             }
             UiEvent::Snapshot(snapshot) => {
                 let pane_id = snapshot.pane_id;
-                if let Some(pane) = self.state.panes.get_mut(&pane_id) {
-                    pane.apply_snapshot(snapshot);
+                if let Some(pane_id) = self.state.apply_grid_snapshot(snapshot) {
+                    self.send_command(UiCommand::RequestSnapshot { pane_id });
+                } else {
                     self.request_scrollback_if_needed(pane_id);
                 }
             }
@@ -1244,6 +1246,11 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
             }
         }
 
+        if let Some(search) = &self.state.search
+            && Some(search.generation) != search_generation
+        {
+            self.run_pane_search();
+        }
         self.flush_due_resizes(false);
         self.request_redraw();
     }

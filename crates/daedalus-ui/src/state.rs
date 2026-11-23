@@ -394,6 +394,7 @@ pub struct PaneViewState {
     /// Latest scroll target, including requests awaiting a daemon reply.
     pub requested_scroll_offset: usize,
     pending_scrollback: Option<u64>,
+    history_generation: u64,
     pub scrolled_rows: Option<Vec<GridRow>>,
     pub dirty_row_indices: Vec<usize>,
     pub selection: Option<Selection>,
@@ -416,6 +417,7 @@ impl PaneViewState {
             scroll_offset: 0,
             requested_scroll_offset: 0,
             pending_scrollback: None,
+            history_generation: 0,
             scrolled_rows: None,
             dirty_row_indices: Vec::new(),
             selection: None,
@@ -425,8 +427,26 @@ impl PaneViewState {
         }
     }
 
+    fn update_history_generation(&mut self, generation: u64) -> bool {
+        if generation == self.history_generation {
+            return false;
+        }
+        self.history_generation = generation;
+        if self.scroll_offset > 0 {
+            self.selection = None;
+        }
+        self.requested_scroll_offset = 0;
+        self.scroll_offset = 0;
+        self.pending_scrollback = None;
+        self.scrolled_rows = None;
+        self.mark_all_visible_dirty();
+        true
+    }
+
     /// Replaces the cached viewport with a full `GridSnapshot` and marks all rows dirty.
-    pub fn apply_snapshot(&mut self, snapshot: GridSnapshot) {
+    /// Returns true when saved history was erased since the last update.
+    pub fn apply_snapshot(&mut self, snapshot: GridSnapshot) -> bool {
+        let erased = self.update_history_generation(snapshot.history_generation);
         self.cols = snapshot.cols;
         self.rows = snapshot.rows;
         self.summary.cols = snapshot.cols;
@@ -440,12 +460,20 @@ impl PaneViewState {
         self.pending_scrollback = None;
         self.scrolled_rows = None;
         self.mark_all_visible_dirty();
+        erased
     }
 
     /// Patches only the rows present in `delta` and records their indices for incremental shaping.
-    pub fn apply_delta(&mut self, delta: GridDelta) {
-        if self.last_seq != 0 && delta.seq <= self.last_seq {
-            return;
+    /// Returns true when saved history was erased since the last update.
+    pub fn apply_delta(&mut self, delta: GridDelta) -> bool {
+        if (self.last_seq != 0 && delta.seq <= self.last_seq)
+            || delta.history_generation < self.history_generation
+        {
+            return false;
+        }
+        let erased = self.update_history_generation(delta.history_generation);
+        if let Some(len) = delta.scrollback_len {
+            self.scrollback_len = len;
         }
         let resized = self.cols != delta.cols || self.rows != delta.rows;
         self.cols = delta.cols;
@@ -483,6 +511,7 @@ impl PaneViewState {
             self.scrolled_rows = None;
             self.mark_all_visible_dirty();
         }
+        erased
     }
 
     /// Claims a request for the desired history viewport, unless already loaded or pending.
@@ -938,13 +967,38 @@ impl AppState {
         }
     }
 
+    fn invalidate_history_search(&mut self, pane_id: PaneId) {
+        if let Some(search) = &mut self.search
+            && search.pane_id == pane_id
+        {
+            search.generation = SearchState::next_generation();
+            search.set_results(self.panes[&pane_id].scrollback_len, Vec::new());
+        }
+    }
+
+    /// Returns the pane to resync if newer updates arrived before the snapshot.
+    pub fn apply_grid_snapshot(&mut self, snapshot: GridSnapshot) -> Option<PaneId> {
+        let pane_id = snapshot.pane_id;
+        let pane = self.panes.get_mut(&pane_id)?;
+        if snapshot.seq < pane.last_seq || snapshot.history_generation < pane.history_generation {
+            return Some(pane_id);
+        }
+        if pane.apply_snapshot(snapshot) {
+            self.invalidate_history_search(pane_id);
+        }
+        None
+    }
+
     /// Applies a `ServerEvent` from `daedalusd`.
     /// Returns `Some(pane_id)` when `ServerEvent::ResyncRequired` requires a fresh `GetSnapshot`.
     pub fn apply_server_event(&mut self, event: ServerEvent) -> Option<PaneId> {
         match event {
             ServerEvent::GridDelta(delta) => {
-                if let Some(pane) = self.panes.get_mut(&delta.pane_id) {
-                    pane.apply_delta(delta);
+                let pane_id = delta.pane_id;
+                if let Some(pane) = self.panes.get_mut(&pane_id)
+                    && pane.apply_delta(delta)
+                {
+                    self.invalidate_history_search(pane_id);
                 }
                 None
             }
@@ -1168,6 +1222,7 @@ mod tests {
                 make_row(1, 11, "line one"),
                 make_row(2, 12, "line two"),
             ],
+            history_generation: 0,
             scrollback_len: 10,
         };
 
@@ -1188,6 +1243,8 @@ mod tests {
                 row: 1,
                 visible: true,
             },
+            history_generation: 0,
+            scrollback_len: None,
             dirty_rows: vec![make_row(1, 11, "PATCHED!")],
         };
         assert_eq!(
@@ -1216,6 +1273,8 @@ mod tests {
             cols: 10,
             rows: 2,
             cursor: CursorState::default(),
+            history_generation: 0,
+            scrollback_len: None,
             dirty_rows: vec![make_row(0, 0, "initial")],
         });
         assert_eq!(pane.last_seq, 1);
@@ -1233,6 +1292,7 @@ mod tests {
                 visible: true,
             },
             rows_data: vec![make_row(0, 10, "fresh-row"), make_row(1, 11, "row-one")],
+            history_generation: 0,
             scrollback_len: 0,
         });
         let _ = pane.take_dirty_rows();
@@ -1249,6 +1309,8 @@ mod tests {
                     row: 1,
                     visible: true,
                 },
+                history_generation: 0,
+                scrollback_len: None,
                 dirty_rows: vec![make_row(0, 10, "STALE")],
             });
             assert_eq!(pane.last_seq, 5);
@@ -1268,6 +1330,8 @@ mod tests {
                 row: 0,
                 visible: true,
             },
+            history_generation: 0,
+            scrollback_len: None,
             dirty_rows: vec![make_row(0, 10, "newer-row")],
         });
         assert_eq!(pane.last_seq, 6);
@@ -1296,6 +1360,7 @@ mod tests {
             rows: 2,
             cursor: CursorState::default(),
             rows_data: vec![make_row(0, 5, "live-0"), make_row(1, 6, "live-1")],
+            history_generation: 0,
             scrollback_len: 5,
         });
 
@@ -1351,6 +1416,86 @@ mod tests {
     }
 
     #[test]
+    fn history_reset_discards_displayed_rows_inflight_reads_and_search_results() {
+        let mut app = AppState::new();
+        let (ws, pane_id, _, _) = make_workspace_with_three_panes();
+        app.set_workspaces(vec![ws]);
+        app.toggle_search(pane_id);
+        let search = app.search.as_mut().unwrap();
+        search.push_text("hit");
+        let stale_search = search.generation;
+        search.set_results(
+            12,
+            vec![SearchMatch {
+                abs_row: 1,
+                start_col: 0,
+                end_col: 3,
+            }],
+        );
+        let pane = app.panes.get_mut(&pane_id).unwrap();
+        pane.viewport_rows = vec![make_row(0, 12, "live")];
+        pane.set_scroll_offset(4);
+        let initial = pane.begin_scrollback_request().unwrap();
+        pane.apply_scrollback(initial, 12, vec![make_row(0, 8, "old")]);
+        pane.set_scroll_offset(5);
+        let late = pane.begin_scrollback_request().unwrap();
+        let reset = GridDelta {
+            pane_id,
+            seq: 10,
+            cols: pane.cols,
+            rows: pane.rows,
+            cursor: pane.cursor,
+            dirty_rows: vec![],
+            history_generation: 1,
+            scrollback_len: Some(0),
+        };
+        app.apply_server_event(ServerEvent::GridDelta(reset));
+        let pane = app.panes.get_mut(&pane_id).unwrap();
+        pane.apply_scrollback(late, 12, vec![make_row(0, 7, "wrong")]);
+        assert_eq!(pane.requested_scroll_offset, 0);
+        assert_eq!(pane.scroll_offset, 0);
+        assert_eq!(pane.scrollback_len, 0);
+        assert_eq!(row_text(&pane.visible_rows()[0]), "live");
+        assert!(!app.apply_search_results(pane_id, stale_search, 12, vec![]));
+        assert!(app.search.as_ref().unwrap().matches.is_empty());
+    }
+
+    #[test]
+    fn resync_snapshot_invalidates_erased_history_even_if_new_lines_already_accumulated() {
+        let mut app = AppState::new();
+        let (ws, id, _, _) = make_workspace_with_three_panes();
+        app.set_workspaces(vec![ws]);
+        app.toggle_search(id);
+        let search = app.search.as_mut().unwrap();
+        search.push_text("old");
+        let generation = search.generation;
+        let pane = app.panes.get_mut(&id).unwrap();
+        pane.set_scroll_offset(2);
+        let pending = pane.begin_scrollback_request().unwrap();
+        let reset = GridSnapshot {
+            pane_id: id,
+            seq: 4,
+            cols: pane.cols,
+            rows: pane.rows,
+            cursor: pane.cursor,
+            rows_data: vec![make_row(0, 50, "live")],
+            scrollback_len: 5,
+            history_generation: 1,
+        };
+        let mut stale = reset.clone();
+        stale.history_generation = 0;
+        stale.scrollback_len = 20;
+        assert_eq!(app.apply_grid_snapshot(reset), None);
+        assert_eq!(app.apply_grid_snapshot(stale), Some(id));
+        assert!(!app.apply_search_results(id, generation, 20, vec![]));
+        let pane = app.panes.get_mut(&id).unwrap();
+        pane.apply_scrollback(pending, 20, vec![make_row(0, 1, "old")]);
+        assert_eq!(pane.scrollback_len, 5);
+        assert_eq!(pane.requested_scroll_offset, 0);
+        assert_eq!(row_text(&pane.visible_rows()[0]), "live");
+    }
+
+    #[test]
     fn resized_scrollback_requires_fresh_rows_even_at_the_same_offset() {
         let summary = make_pane_summary(WorkspaceId::new(), PaneRole::Runner);
         let mut pane = PaneViewState::from_summary(summary);
@@ -1361,6 +1506,8 @@ mod tests {
             seq: 1,
             cols: pane.cols,
             rows: pane.rows + 1,
+            history_generation: 0,
+            scrollback_len: None,
             dirty_rows: Vec::new(),
             cursor: CursorState::default(),
         });

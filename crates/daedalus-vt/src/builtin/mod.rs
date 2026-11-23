@@ -363,3 +363,56 @@ mod query_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod change_tests {
+    use super::*;
+
+    #[test]
+    fn cursor_only_changes_emit_once_without_dirty_rows() {
+        let mut vt = BuiltinVt::new(VtConfig::default());
+        let id = PaneId::new();
+        vt.feed(b"abc");
+        vt.take_dirty_delta(id, 1).unwrap();
+        vt.feed(b"\x1b[2D");
+        let moved = vt.take_dirty_delta(id, 2).unwrap();
+        assert!(moved.dirty_rows.is_empty());
+        assert_eq!(moved.cursor.col, 1);
+        assert!(moved.cursor.visible);
+        vt.feed(b"\x1b[?25l");
+        let hidden = vt.take_dirty_delta(id, 3).unwrap();
+        assert!(hidden.dirty_rows.is_empty());
+        assert!(!hidden.cursor.visible);
+        vt.feed(b"\x1b[?25l");
+        assert!(vt.take_dirty_delta(id, 4).is_none());
+    }
+
+    #[test]
+    fn erase_saved_lines_preserves_live_rows_and_erase_display_preserves_history() {
+        let mut vt = BuiltinVt::new(VtConfig {
+            cols: 10,
+            rows: 2,
+            scrollback_limit: 10,
+        });
+        let id = PaneId::new();
+        vt.feed(b"old\r\nlive\r\nlast");
+        vt.take_dirty_delta(id, 1).unwrap();
+        let before = vt.snapshot(id, 1);
+        assert_eq!(before.scrollback_len, 1);
+        vt.feed(b"\x1b[3J");
+        let after = vt.snapshot(id, 2);
+        assert_eq!(after.scrollback_len, 0);
+        assert_eq!(after.rows_data, before.rows_data);
+        assert_eq!(after.cursor, before.cursor);
+        assert!(vt.search("old", true).is_empty());
+        assert_eq!(vt.search("live", true).len(), 1);
+        assert!(vt.take_dirty_delta(id, 2).is_some());
+        assert!(vt.take_dirty_delta(id, 3).is_none());
+
+        vt.feed(b"\r\nnew\x1b[2J");
+        assert_eq!(vt.scrollback_len(), 1);
+        assert_eq!(vt.search("live", true).len(), 1);
+        assert!(vt.search("last", true).is_empty());
+        assert!(vt.search("new", true).is_empty());
+    }
+}
