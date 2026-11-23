@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.12](https://github.com/AraneaDev/daedalus/compare/v0.0.11...v0.0.12) (2026-11-23)
+
+
+### Bug Fixes
+
+* **packaging:** show a setup wizard for the Windows installer ([#37](https://github.com/AraneaDev/daedalus/issues/37)) ([9c195cc](https://github.com/AraneaDev/daedalus/commit/9c195ccfc5435e6557b0f9941b55243d30757f08))
+
 ## [0.0.11](https://github.com/AraneaDev/daedalus/compare/v0.0.10...v0.0.11) (2026-11-23)
 
 
