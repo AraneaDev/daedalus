@@ -2,7 +2,7 @@ use noyalib::compat::serde_yaml::{self, Mapping, Sequence, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 const COMPOSE_FILENAMES: [&str; 4] = [
@@ -26,7 +26,7 @@ pub(super) enum ParsedPortEntry {
 
 /// Runs `docker compose -p <compose_project_name> down` inside `root_dir` with a 15-second timeout.
 pub fn run_compose_down(root_dir: &Path, compose_project_name: &str) -> Result<(), String> {
-    let mut cmd = Command::new("docker");
+    let mut cmd = crate::background_command("docker");
     cmd.arg("compose")
         .arg("-p")
         .arg(compose_project_name)

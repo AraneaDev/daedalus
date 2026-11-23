@@ -106,12 +106,8 @@ jobs:
           $wix = "$env:RUNNER_TEMP/wix/wix.exe"
           & $wix extension add WixToolset.UI.wixext/5.0.2
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          Add-Type -AssemblyName System.Windows.Forms
-          $license = [System.Windows.Forms.RichTextBox]::new()
-          $license.Text = Get-Content -LiteralPath LICENSE -Raw
           $rtf = Join-Path $env:RUNNER_TEMP 'daedalus-license.rtf'
-          $license.SaveFile($rtf)
-          $license.Dispose()
+          $text = & ./packaging/windows-license.ps1 -Destination $rtf
           & $wix build -arch x64 -ext WixToolset.UI.wixext -d "Version=$env:VERSION" -d "LicenseRtf=$rtf" packaging/windows.wxs -o $msi
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           if (!(Test-Path -LiteralPath $msi -PathType Leaf)) { throw "Missing package: $msi" }
@@ -128,10 +124,28 @@ jobs:
             if (!$view.Fetch()) { throw "Missing setup UI in built MSI: $query" }
             $view.Close()
           }
+          $view = $database.OpenView("SELECT ``Text`` FROM ``Control`` WHERE ``Dialog_`` = 'WelcomeEulaDlg' AND ``Control`` = 'LicenseText'")
+          $view.Execute()
+          $record = $view.Fetch()
+          if (!$record -or $record.StringData(1) -cne $text) {
+            throw "The welcome dialog does not contain the full license text."
+          }
+          $view.Close()
           foreach ($mode in '/i','/x') {
             $proc = Start-Process msiexec -ArgumentList "$mode `"$msi`" /qn /norestart" -Wait -PassThru
             if ($proc.ExitCode -ne 0) { throw "Installer exited with $($proc.ExitCode)" }
             if ($mode -eq '/i') {
+              $programs = [Environment]::GetFolderPath('CommonPrograms')
+              $link = Join-Path $programs 'Daedalus.lnk'
+              if (!(Test-Path -LiteralPath $link)) { throw "Start menu shortcut missing: $link" }
+              $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($link)
+              $gui = "$env:ProgramFiles\Daedalus\daedalus-ui.exe"
+              if ($shortcut.TargetPath -ine $gui) { throw "Unexpected shortcut target: $($shortcut.TargetPath)" }
+              $iconPath = ($shortcut.IconLocation -split ',')[0]
+              if (!$iconPath -or !(Test-Path -LiteralPath $iconPath)) { throw "Missing shortcut icon: $iconPath" }
+              $pe = [IO.File]::ReadAllBytes($gui)
+              $peOffset = [BitConverter]::ToInt32($pe, 0x3c)
+              if ([BitConverter]::ToUInt16($pe, $peOffset + 24 + 68) -ne 2) { throw "Workbench opens a console window" }
               foreach ($bin in 'daedalus-ui','daedalus-ctl','daedalusd') {
                 & "$env:ProgramFiles/Daedalus/$bin.exe" --help
                 if ($LASTEXITCODE) { exit $LASTEXITCODE }
