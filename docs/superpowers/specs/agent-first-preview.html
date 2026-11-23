@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<!-- Backdrop derived from Aranea Desktop backgrounds/background-night.png at 7c08543.
+MIT License
+
+Copyright (c) 2026 AraneaDev
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the "Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Daedalus — Orbit handoff</title>
+<style>
+:root{color-scheme:dark;--mint:#3bff9e;--violet:#b0a0ff;--gold:#e6c98a;--ink:#edf3f6;--muted:#a2afbb;--rule:#2c393e;--mono:"JetBrains Mono","DejaVu Sans Mono",monospace;font:16px/1.5 Inter,system-ui,sans-serif;color:var(--ink);background:#08090b}
+*{box-sizing:border-box}body{margin:0}button,select{font:inherit;color:inherit;background:#151c24;border:1px solid var(--rule);padding:.45rem .7rem;border-radius:3px}button,select,summary{cursor:pointer}button:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid var(--mint);outline-offset:3px}button:hover,summary:hover{color:var(--mint)}h1,h2,h3,p,blockquote,pre{margin:0}code,time,.micro,select,.status{font-family:var(--mono)}.micro,time{font-size:.78rem;color:var(--muted)}.bar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px clamp(18px,4vw,72px);border-bottom:1px solid var(--rule);background:#090d10}.brand{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:.19em;font-size:.95rem}.mark{width:26px;height:26px;background:repeating-linear-gradient(135deg,var(--mint) 0 3px,transparent 3px 6px);clip-path:polygon(0 0,55% 0,100% 42%,100% 62%,57% 100%,0 100%,22% 65%,55% 65%,70% 52%,53% 37%,20% 37%)}select{font-size:.8rem}
+main{max-width:1510px;margin:auto;padding:26px clamp(18px,4vw,72px) 42px}.project{display:flex;gap:15px;align-items:baseline;margin-bottom:20px;flex-wrap:wrap}h1{font-size:2rem;line-height:1.15;letter-spacing:-.055em}.branch{font:.83rem var(--mono);color:var(--muted)}.hero{position:relative;isolation:isolate;overflow:hidden;background-color:#090e10;border-top:2px solid var(--mint);border-bottom:1px solid var(--rule);padding:clamp(20px,3.2vw,48px)}.hero:after{content:"";position:absolute;top:0;right:0;width:52px;height:5px;background:var(--mint);clip-path:polygon(6px 0,100% 0,100% 100%,0 100%)}.kicker{color:var(--mint);font:700 .79rem var(--mono);letter-spacing:.1em;text-transform:uppercase}.hero blockquote{max-width:23ch;margin:17px 0;font-size:clamp(1.9rem,3.7vw,3.8rem);font-weight:580;line-height:1.07;letter-spacing:-.055em;text-wrap:balance}.signature{display:flex;gap:12px;align-items:center;color:#c5cfd6;font-size:.9rem}.sig{width:19px;height:2px;background:var(--violet)}.activity{border-bottom:1px solid var(--rule);padding:12px clamp(10px,3.2vw,48px);background:#0d1116}.activity summary{font-size:.87rem;color:#c2ced5}.activity ol{padding-left:18px}.activity time{margin-right:12px}.grid{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(275px,1fr);gap:clamp(24px,4vw,64px);margin-top:28px}.sectionhead{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:13px}h2{font-size:1.12rem;letter-spacing:-.025em}.shell{background:#0c1014;border:1px solid var(--rule);min-height:204px}.tabs{display:flex;border-bottom:1px solid var(--rule)}.tabs button{border:0;border-radius:0;background:none;color:var(--muted);font-size:.85rem;padding:10px 15px}.tabs button[aria-pressed=true]{box-shadow:inset 0 -2px var(--mint);color:var(--ink)}pre{padding:19px;font: .86rem/1.65 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}.prompt{color:var(--mint)}.svc{display:grid;grid-template-columns:1fr auto;align-items:center;border-top:1px solid var(--rule);padding:11px 0;gap:8px}.svc strong{font-weight:580}.svc small{display:block;color:var(--muted);font-size:.79rem}.status{font-size:.8rem;color:var(--mint)}.urgent{display:none}body.alert .quiet{display:none}body.alert .urgent{display:inline}body.alert .hero{border-top-color:var(--gold)}body.alert .hero:after{background:var(--gold)}body.alert .kicker,.warn{color:var(--gold)}.send{border-color:#806946;color:#f4d79a;background:#251f16}.send[disabled]{opacity:.7}.runner{border-bottom:1px solid var(--rule)}.actionrow{margin-top:12px}footer{margin-top:24px;color:var(--muted);font:.74rem var(--mono)}@media(max-width:720px){.grid{display:flex;flex-direction:column-reverse;gap:22px}.hero{background-position:65% 70%}.hero blockquote{max-width:19ch}.bar{padding:10px 14px}.brand{letter-spacing:.1em}.sectionhead{margin-bottom:8px}}@media(max-width:380px){.brand{font-size:.78rem;gap:6px}.mark{width:19px;height:19px}select{max-width:150px}}
+
+/* The PTY surface owns the flexible area. Only the handoff rail scrolls on overflow. */
+body{margin:0;height:100vh;height:100dvh;display:grid;grid-template-rows:min(5dvh,48px) minmax(0,1fr)}
+.bar{min-width:0;display:flex;flex-wrap:nowrap;gap:clamp(8px,2vw,28px);padding:0 12px}
+.brand{flex-shrink:0}.project{flex:1;min-width:0;margin:0;flex-wrap:nowrap;align-items:center;gap:12px}
+.project h1{font-size:1rem;letter-spacing:0}.branch{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar select{padding:2px 6px;max-height:100%}
+main{width:100%;max-width:none;min-height:0;margin:0;padding:0;display:grid;grid-template-columns:minmax(0,1fr) min(21vw,460px)}
+.shell{display:grid;grid-template-rows:min(4dvh,40px) minmax(0,1fr);min-height:0;border:0;background:#090d10}
+.tabs{align-items:stretch;background:#10151b}.tabs button{padding:0 16px;line-height:1.1}
+.session{margin:auto 16px auto auto}.shell pre{height:100%;margin:0;padding:8px 10px;overflow:auto;font-size:clamp(.88rem,1.1vw,1rem);line-height:1.7}
+aside{min-height:0;overflow:auto;border-left:1px solid var(--rule);background:#0d1116}
+.hero{padding:10px 14px}
+.hero blockquote{margin:5px 0;font-size:1rem;line-height:1.3;letter-spacing:normal;max-width:none}
+.signature{flex-wrap:wrap;gap:7px;font-size:.8rem}.activity,.signals{padding:14px clamp(14px,1.7vw,26px)}
+.signals .sectionhead{flex-wrap:wrap;gap:4px}.svc{grid-template-columns:minmax(0,1fr) auto}.svc small{font-size:.75rem}
+@media(max-width:900px),(max-height:520px){
+ body{grid-template-rows:min(7dvh,44px) minmax(0,1fr)}
+ main{grid-template-columns:minmax(0,1fr);grid-template-rows:calc(68dvh + 16px + 5dvh + min(5dvh,36px)) minmax(0,1fr)}
+ .shell{grid-template-rows:min(5dvh,36px) minmax(0,1fr)}
+ aside{border-left:0;border-top:1px solid var(--rule)}
+ .hero{padding:8px 14px}
+ .activity,.signals{padding:10px 16px}.brand{letter-spacing:.06em}.project .branch{display:none}
+}
+@media(max-width:400px){.session{display:none}.bar{gap:7px;padding:0 6px}.brand{font-size:.72rem}.bar select{font-size:.68rem}}
+.workspace-nav{display:flex;align-items:center;min-width:0;gap:8px;flex:1}
+.workspace-nav label,.demo label{font-size:.78rem;color:var(--muted)}
+.workspace-nav button,.workspace-nav select{font-size:.82rem;line-height:1.25;padding:4px 8px}
+#workspace{border-color:#438064;background:#14261d;color:#caffdd;max-width:24vw}
+#add{color:var(--mint);border-color:#315741}.workspace-nav .branch{margin-left:auto}
+.demo{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:16px;border-top:1px solid var(--rule);padding-top:12px}
+dialog{background:#10151b;color:var(--ink);border:1px solid #40564d;border-top:2px solid var(--mint);width:min(440px,94vw);max-height:90dvh;padding:22px}
+dialog::backdrop{background:#030608aa}dialog form{display:grid;gap:12px}dialog label{display:grid;gap:4px;font-size:.85rem}dialog input,dialog select{background:#080d10;color:var(--ink);border:1px solid #40504c;padding:8px;font:inherit;width:100%}
+dialog menu{display:flex;justify-content:flex-end;gap:10px;padding:0;margin:4px 0 0}dialog button[type=submit]{color:var(--mint)}
+[hidden]{display:none!important}
+@media(max-width:720px){.bar .brand{font-size:0;gap:0}.workspace-nav .branch,.workspace-nav>label{display:none}.workspace-nav{gap:5px}.workspace-nav button,.workspace-nav select{padding:2px 4px;font-size:.73rem}.bar{gap:6px}.bar .mark{width:16px}.workspace-nav select{min-width:48px;flex:1}}
+.tabs{min-width:0;overflow-x:auto}.tabs button{flex:none;white-space:nowrap}.shell{min-width:0}
+fieldset{min-width:0;border:1px solid #40504c;padding:10px}legend{color:var(--mint)}.entry{display:grid;grid-template-columns:1fr 1.25fr auto;align-items:end;gap:6px;margin-bottom:10px}.entry input,.entry select{min-width:0;box-sizing:border-box}.entry button{height:36px}
+</style>
+<header class="bar"><div class="brand"><span class="mark" aria-hidden="true"></span>DAEDALUS</div>
+<div class="workspace-nav">
+<label for="workspace">Workspace</label>
+<select id="workspace"><option value="orbit">Orbit</option><option value="atlas">Atlas</option></select>
+<button id="add">+ New workspace</button>
+<button id="edit">Workspace settings</button>
+<span class="branch" id="branch"></span></div></header>
+<main aria-label="Orbit workspace">
+<section class="shell" aria-label="Workspace terminal">
+<div class="tabs" aria-label="Terminal pane"><button aria-pressed="true">Agent</button><button aria-pressed="false">Service</button><button aria-pressed="false">Runner</button><span class="session micro">Orbit / local</span></div>
+<pre id="transcript" tabindex="0" aria-label="Terminal output"></pre></section>
+<aside aria-label="Handoff and workspace signals" tabindex="0"><section class="hero" aria-labelledby="handoff"><h2 class="kicker" id="handoff">Since you left</h2>
+<blockquote><span class="quiet">“Added a database readiness check to /health.”</span><span class="urgent">“The database connection was refused. Retry after it restarts?”</span></blockquote>
+<div class="signature"><span class="sig"></span>Claude · Agent transcript <time>10:16</time></div></section>
+<details class="activity"><summary>Activity since 10:12 · <span class="quiet">2 events</span><span class="urgent">3 events</span></summary><ol><li><time>10:16</time>Agent produced the output quoted above.</li><li><time>10:18</time><span class="quiet">Health checks passed.</span><span class="urgent">Health checks failed.</span></li><li class="urgent"><time>10:19</time>Agent requested approval.</li></ol></details>
+<div class="signals"><div class="sectionhead"><h2>Workspace signals</h2><span class="micro">Current state</span></div>
+<div class="svc"><div><strong>API</strong><small>Local process</small></div><span class="status">↗ Listening :8080</span></div>
+<div class="svc"><div><strong>Database</strong><small>Container health check</small></div><span class="status"><span class="quiet">✓ Healthy</span><span class="urgent warn">! Unhealthy</span></span></div>
+<div class="svc runner"><div><strong>Health tests</strong><small>Last runner command</small></div><span class="status"><span class="quiet">✓ Passed</span><span class="urgent warn">× Failed · exit 1</span></span></div>
+<div class="actionrow"><select id="recipient" aria-label="Agent to receive failure"></select> <button id="send" class="send urgent">Send failure to agent ↗</button></div></div><div class="demo"><label for="scenario">Preview scenario</label> <select id="scenario" aria-label="Design preview scenario"><option value="quiet">Quiet return</option><option value="alert">Needs attention</option></select></div></aside></main>
+<dialog id="setup" aria-labelledby="form-title"><form id="settings-form">
+<h2 id="form-title">New workspace</h2>
+<label>Workspace name<input name="name" required maxlength="60" autofocus></label>
+<label>Project folder<input name="folder" required placeholder="/projects/orbit"></label>
+<fieldset><legend>Agents</legend><div id="agents"></div><button type="button" id="add-agent">Add agent</button></fieldset>
+<fieldset><legend>Commands</legend><div id="commands"></div><button type="button" id="add-command">Add command</button></fieldset>
+<small>Preview only · changes last until you reload. Commands are never executed.</small>
+<menu><button id="cancel" type="button">Cancel</button><button id="save" type="submit">Create workspace</button></menu>
+</form></dialog>
+<script>
+const scenario=document.querySelector('#scenario'), transcript=document.querySelector('#transcript'), send=document.querySelector('#send');
+let nextId=1;
+function session(kind,name,value,id='session-'+nextId++){return {kind,name,value,id}}
+const workspaces=new Map([
+ ['orbit',{name:'Orbit',folder:'/projects/orbit',branch:'feature/healthcheck',sessions:[session('agent','Claude','Claude','Agent'),session('agent','Reviewer','Codex'),session('command','Service','service logs','Service'),session('command','Runner','pytest -q','Runner')]}],
+ ['atlas',{name:'Atlas',folder:'/projects/atlas',branch:'main',sessions:[session('agent','Codex','Codex'),session('command','Tests','cargo test')]}]
+]);
+const picker=document.querySelector('#workspace'), dialog=document.querySelector('#setup'), form=document.querySelector('#settings-form'),recipient=document.querySelector('#recipient');
+let editing=false;
+function addRow(item){
+ const row=document.createElement('div');row.className='entry';row.dataset.id=item.id;row.dataset.kind=item.kind;
+ const agent=item.kind==='agent';
+ row.innerHTML='<label>Name<input required maxlength="50"></label>'+(agent?'<label>Provider<select><option>Claude</option><option>Codex</option><option>agy</option><option>Shell</option></select></label>':'<label>Command<input required placeholder="npm test"></label>')+'<button type="button">Remove</button>';
+ const [name,value]=row.querySelectorAll('input,select');name.value=item.name;value.value=item.value;
+ row.querySelector('button').onclick=()=>{row.remove();document.querySelector('#add-'+item.kind).focus()};
+ document.querySelector(agent?'#agents':'#commands').append(row);return name;
+}
+for(const kind of ['agent','command'])document.querySelector('#add-'+kind).onclick=()=>addRow(session(kind,'',kind==='agent'?'Claude':'')).focus();
+function openSetup(edit){
+ editing=edit;
+ const values=edit?workspaces.get(picker.value):{sessions:[session('agent','Claude','Claude')]};
+ for(const key of ['name','folder'])form.elements[key].value=values[key]||'';
+ document.querySelector('#agents').replaceChildren();document.querySelector('#commands').replaceChildren();
+ values.sessions.forEach(addRow);
+ document.querySelector('#form-title').textContent=edit?'Workspace settings':'New workspace';
+ document.querySelector('#save').textContent=edit?'Save settings':'Create workspace';
+ dialog.showModal();
+}
+document.querySelector('#add').onclick=()=>openSetup(false);
+document.querySelector('#edit').onclick=()=>openSetup(true);
+document.querySelector('#cancel').onclick=()=>dialog.close();
+form.onsubmit=e=>{
+ e.preventDefault();
+ for(const input of form.querySelectorAll('input')){if(!input.value.trim()){input.value='';input.reportValidity();return}}
+ const sessions=[...form.querySelectorAll('.entry')].map(row=>{
+  const [name,value]=row.querySelectorAll('input,select');return session(row.dataset.kind,name.value.trim(),value.value.trim(),row.dataset.id)
+ });
+ const values=Object.fromEntries(['name','folder'].map(key=>[key,form.elements[key].value.trim()]));
+ for(const key of ['name','folder'])if(!values[key]){form.elements[key].value='';form.elements[key].reportValidity();return}
+ values.sessions=sessions;
+ if(editing){Object.assign(workspaces.get(picker.value),values);picker.selectedOptions[0].textContent=values.name}
+ else{const id='new-'+nextId++;workspaces.set(id,values);picker.add(new Option(values.name,id));picker.value=id}
+ dialog.close();render();
+};
+picker.onchange=render;
+
+function render(){
+ const ws=workspaces.get(picker.value), orbit=picker.value==='orbit', active=ws.sessions.find(x=>x.id===ws.pane)||ws.sessions[0], pane=active?.id,sent=ws.sent;
+ scenario.value=ws.scenario||'quiet';
+ const alert=orbit && scenario.value==='alert';
+ document.querySelector('.demo').hidden=!orbit;
+ document.querySelector('#branch').textContent=ws.branch?'⑂ '+ws.branch:'';
+ document.querySelector('main').setAttribute('aria-label', ws.name+' workspace');
+ document.querySelector('.session').textContent=ws.name+' / local';
+ document.querySelector('.signature').lastChild.textContent=orbit?'10:16':'';
+ document.querySelector('.signature').childNodes[1].textContent=orbit?'Claude · Agent transcript ':ws.folder;
+ document.querySelector('.hero .quiet').textContent=orbit?'“Added a database readiness check to /health.”':'No activity recorded yet.';
+ document.querySelector('.activity').hidden=!orbit;
+ document.querySelectorAll('.svc').forEach(el=>el.hidden=!orbit);
+ let empty=document.querySelector('#empty-signals');
+ if(!empty){empty=document.createElement('p');empty.id='empty-signals';document.querySelector('.signals').append(empty)}
+ empty.hidden=orbit;empty.textContent='No service or runner observations yet.';
+
+ document.body.classList.toggle('alert',alert);
+ const output={
+ Agent:'› Add a readiness check for the database.\n\nReading health.py and test_health.py…\n\n  health.py\n  + def ready(db):\n  +     return db.ping()\n\n  test_health.py\n  + def test_database_ready():\n  +     assert ready(test_db)\n\n'+(alert?'The database connection was refused.\nRetry after the service restarts?':'Added a database readiness check to /health.'),
+ Service:'$ service logs\napi  listening on :8080\ndb   '+(alert?'health check failed: connection refused':'health check passed'),
+ Runner:'$ pytest -q\n'+(alert?'FAILED test_database_ready — connection refused\nexit 1':'test_database_ready passed\nexit 0')};
+ const fixture=orbit && (pane==='Agent' && active.value==='Claude' || pane==='Service' && active.value==='service logs' || pane==='Runner' && active.value==='pytest -q');
+ transcript.textContent=fixture?output[pane]:active?(active.kind==='agent'?active.value+' · '+ws.folder+'\n\nReady for input.':'$ '+active.value+'\n\nNo output yet.'):'Add an agent or command in Workspace settings.';
+ if(sent && sent===pane)transcript.textContent+='\n\n› Runner failure: connection refused (exit 1)';
+ const tabs=document.querySelector('.tabs'), badge=tabs.querySelector('.session');
+ const restore=tabs.contains(document.activeElement);
+ tabs.replaceChildren();
+ for(const item of ws.sessions){
+  const button=document.createElement('button');button.textContent=item.name;button.title=item.kind+' · '+item.value;
+  button.setAttribute('aria-pressed',String(item===active));button.onclick=()=>{ws.pane=item.id;render()};
+  tabs.append(button);if(restore && item===active)button.focus();
+ }
+ tabs.append(badge);
+ const agents=ws.sessions.filter(x=>x.kind==='agent');
+ recipient.replaceChildren(...agents.map(item=>new Option(item.name,item.id)));
+ recipient.value=agents.some(x=>x.id===ws.target)?ws.target:agents[0]?.id||'';
+ send.disabled=!recipient.value||Boolean(sent);send.textContent=sent?'Failure sent':'Send failure ↗';
+}
+recipient.onchange=()=>{workspaces.get(picker.value).target=recipient.value};
+scenario.onchange=()=>{Object.assign(workspaces.get(picker.value),{sent:false,scenario:scenario.value});render()};
+send.onclick=()=>{Object.assign(workspaces.get(picker.value),{sent:recipient.value,pane:recipient.value});render()};
+render();
+</script></html>

@@ -1,5 +1,7 @@
 mod chrome;
 mod modal;
+mod settings;
+mod workspace_form;
 
 use std::collections::{HashMap, HashSet};
 use unicode_segmentation::UnicodeSegmentation;
@@ -130,6 +132,27 @@ pub fn truncate_right_with_ellipsis(input: &str, columns: usize) -> String {
     format!("{}…", &input[..end])
 }
 
+fn recipient_row_label(name: &str, id: &str, columns: usize) -> String {
+    let suffix = format!(" · {id}");
+    if columns <= suffix.width() {
+        return truncate_right_with_ellipsis(id, columns);
+    }
+    format!(
+        "{}{suffix}",
+        truncate_right_with_ellipsis(name, columns - suffix.width())
+    )
+}
+
+/// Shows the field name and scrolls the value so the insertion point stays in view.
+pub(crate) fn editable_label(name: &str, value: &str, caret: usize, columns: usize) -> String {
+    let prefix = format!("{name}   ");
+    let available = columns.saturating_sub(prefix.width() + 1);
+    let (before, after) = value.split_at(caret);
+    let left = truncate_left_with_ellipsis(before, available);
+    let right = truncate_right_with_ellipsis(after, available.saturating_sub(left.width()));
+    format!("{prefix}{left}│{right}")
+}
+
 /// Measures the physical `(cell_w, cell_h)` of the chosen monospace font at
 /// `font_size_logical` and `scale_factor`.
 pub fn measure_cell_size_for_font(
@@ -238,7 +261,8 @@ pub struct TextRenderer {
     pane_buffers: HashMap<PaneId, CachedPaneRows>,
     chrome_items: Vec<ChromeTextItem>,
     modal_items: Vec<ChromeTextItem>,
-    has_modal_text: bool,
+    pub(super) has_modal_text: bool,
+    pub(super) recap_drawn: bool,
 }
 
 impl TextRenderer {
@@ -300,6 +324,7 @@ impl TextRenderer {
             chrome_items: Vec::new(),
             modal_items: Vec::new(),
             has_modal_text: false,
+            recap_drawn: false,
         }
     }
 
@@ -372,9 +397,15 @@ impl TextRenderer {
         screen_w: f32,
         screen_h: f32,
     ) {
-        let cards = layout
-            .sidebar
-            .map(|sidebar| super::SidebarCards::new(state, sidebar, self.scale_factor, theme));
+        let cards = layout.sidebar.map(|sidebar| {
+            super::SidebarCards::new(
+                state,
+                sidebar,
+                self.scale_factor,
+                theme,
+                layout.sidebar_content.as_ref(),
+            )
+        });
         self.prepare_with_sidebar(
             device,
             queue,
@@ -489,6 +520,7 @@ impl TextRenderer {
 
         // 2. Rebuild UI chrome text buffers (sidebar, banner, pane headers, pills).
         self.chrome_items.clear();
+        self.recap_drawn = false;
         self.build_chrome_items(state, layout, theme, cards);
 
         // 3. Prepare base text pass (terminal rows + UI chrome).
@@ -534,19 +566,65 @@ impl TextRenderer {
             base_areas,
             &mut self.swash_cache,
         ) {
+            self.recap_drawn = false;
             tracing::warn!(%err, "glyphon base text prepare failed");
         }
 
         // 4. Rebuild & prepare overlay text pass if a modal or search bar is open.
         self.modal_items.clear();
-        let modal_open = state.action_palette.open
+        let modal_open = state.failure_recipients.is_some()
+            || state.workspace_form.open
+            || state.settings.open
+            || state.action_palette.open
             || state.picker.open
             || state.worktree_modal.open
             || state.close_modal.open
             || state.search.is_some();
         self.has_modal_text = modal_open;
         if modal_open {
-            if state.picker.open || state.action_palette.open {
+            if let Some(choices) = &state.failure_recipients {
+                let s = self.scale_factor;
+                let (modal, visible) = super::action_palette_layout(
+                    screen_w,
+                    screen_h,
+                    s,
+                    choices.agents.len(),
+                    choices.selected,
+                );
+                self.build_picker_header(modal, theme, modal::PickerKind::Recipient);
+                for (row, index) in visible.enumerate() {
+                    let rect = super::picker_item_rect(modal, row, s);
+                    let selected = choices.selected == index;
+                    let pane = choices.agents[index];
+                    let max_w = (rect.width - 20. * s).max(1.);
+                    let glyph_width =
+                        self.cell_w * CHROME_FONT_SIZE_LOGICAL / self.font_size_logical;
+                    let label = recipient_row_label(
+                        state.recipient_name(pane),
+                        &pane.short(),
+                        (max_w / glyph_width) as usize,
+                    );
+                    self.push_modal_line(ChromeLineSpec {
+                        text: &label,
+                        left: rect.x + 10.0 * s,
+                        top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                        max_w,
+                        bounds: rect,
+                        font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+                        line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                        color: if selected {
+                            theme.text_primary
+                        } else {
+                            theme.text_muted
+                        },
+                        bold: selected,
+                    });
+                }
+            } else if state.workspace_form.open {
+                self.build_workspace_form_items(state, theme, screen_w, screen_h);
+            } else if state.settings.open {
+                self.build_settings_items(state, theme, screen_w, screen_h);
+            } else if state.picker.open || state.action_palette.open {
                 self.build_picker_items(state, theme, screen_w, screen_h);
             } else if state.worktree_modal.open {
                 self.build_worktree_modal_items(state, theme, screen_w, screen_h);
@@ -852,6 +930,15 @@ mod tests {
         assert_eq!(truncate_right_with_ellipsis("é-終", 2), "é…");
         assert_eq!(truncate_left_with_ellipsis("long-終", 2), "…");
         assert_eq!(truncate_right_with_ellipsis("終日", 2), "…");
+    }
+
+    #[test]
+    fn compact_recipient_rows_keep_the_disambiguating_id_after_long_names() {
+        for id in ["deadbeef", "cafefeed"] {
+            let label = recipient_row_label("長い同じ名前を持っているエージェント", id, 22);
+            assert!(label.ends_with(&format!("… · {id}")));
+            assert!(label.width() <= 22);
+        }
     }
 
     #[test]

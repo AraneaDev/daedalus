@@ -21,8 +21,10 @@ pub enum UiAction {
     ActionPaletteCancel,
     ToggleWorktreeModal,
     OpenCloseWorkspaceModal,
+    CloseTerminal,
     ToggleSearch,
     NewWorkspace,
+    WorkspaceSettings,
     SwitchWorkspaceNext,
     SwitchWorkspacePrev,
     CopySelection,
@@ -38,8 +40,10 @@ pub enum UiAction {
     PickerUp,
     PickerDown,
     PickerConfirm,
+    PickerAdd,
     PickerCancel,
     WorktreeModalText(String),
+    WorktreeModalSetText(String),
     WorktreeModalBackspace,
     WorktreeModalConfirm,
     WorktreeModalCancel,
@@ -49,6 +53,7 @@ pub enum UiAction {
     CloseModalConfirm,
     CloseModalCancel,
     SearchText(String),
+    PasteSearchQuery,
     SearchBackspace,
     SearchNext,
     SearchPrev,
@@ -76,12 +81,16 @@ impl KeyRepeatGuard {
                 | UiAction::ActionPaletteConfirm
                 | UiAction::ActionPaletteCancel
                 | UiAction::ToggleWorktreeModal
+                | UiAction::CloseTerminal
                 | UiAction::OpenCloseWorkspaceModal
                 | UiAction::ToggleSearch
+                | UiAction::WorkspaceSettings
                 | UiAction::NewWorkspace
                 | UiAction::CopySelection
+                | UiAction::PasteSearchQuery
                 | UiAction::PasteClipboard
                 | UiAction::ForwardFailureToAgent
+                | UiAction::PickerAdd
                 | UiAction::PickerConfirm
                 | UiAction::PickerCancel
                 | UiAction::WorktreeModalConfirm
@@ -102,7 +111,13 @@ impl KeyRepeatGuard {
         action
     }
 
-    /// Consume a synthetic focus-restoration press and its repeats until release.
+    /// Claim form input until release, including when the action closes the dialog.
+    pub fn form_press(&mut self, physical: PhysicalKey, logical: &Key, repeat: bool) -> bool {
+        self.suppress(physical);
+        !repeat || matches!(logical, Key::Named(NamedKey::Backspace))
+    }
+
+    /// Consume a press and its repeats until release.
     pub fn suppress(&mut self, key: PhysicalKey) {
         self.consumed.insert(key);
     }
@@ -323,8 +338,10 @@ fn translate_primary_shift_char(ch: &str) -> UiAction {
         "p" => UiAction::ToggleAgentPicker,
         "w" => UiAction::ToggleWorktreeModal,
         "d" => UiAction::OpenCloseWorkspaceModal,
+        "x" => UiAction::CloseTerminal,
         "f" => UiAction::ToggleSearch,
         "n" => UiAction::NewWorkspace,
+        "s" => UiAction::WorkspaceSettings,
         "c" => UiAction::CopySelection,
         "v" => UiAction::PasteClipboard,
         "e" => UiAction::ForwardFailureToAgent,
@@ -401,6 +418,7 @@ fn translate_picker_key(key: &Key, mods: ModifiersState, is_macos: bool) -> UiAc
     match key {
         Key::Named(NamedKey::ArrowUp) => UiAction::PickerUp,
         Key::Named(NamedKey::ArrowDown) => UiAction::PickerDown,
+        Key::Named(NamedKey::Enter) if mods.shift_key() => UiAction::PickerAdd,
         Key::Named(NamedKey::Enter) => UiAction::PickerConfirm,
         Key::Named(NamedKey::Escape) => UiAction::PickerCancel,
         Key::Character(ch) if !mods.control_key() && !mods.alt_key() && !mods.super_key() => {
@@ -478,6 +496,17 @@ fn translate_search_key(
 ) -> UiAction {
     if is_search_toggle_chord(key, mods, is_macos) {
         return UiAction::ToggleSearch;
+    }
+
+    let primary = if is_macos {
+        ModifiersState::SUPER
+    } else {
+        ModifiersState::CONTROL
+    };
+    if mods.difference(ModifiersState::SHIFT) == primary
+        && matches!(key, Key::Character(ch) if ch.eq_ignore_ascii_case("v"))
+    {
+        return UiAction::PasteSearchQuery;
     }
 
     if mods.control_key() || mods.alt_key() || mods.super_key() {
@@ -599,6 +628,34 @@ mod tests {
 
     fn t_macos(key: &Key, text: Option<&str>, mods: ModifiersState) -> UiAction {
         translate_key_for_platform(key, text, mods, false, false, false, false, true)
+    }
+
+    #[test]
+    fn submitting_or_dismissing_a_form_keeps_held_keys_out_of_the_terminal() {
+        use winit::keyboard::KeyCode;
+        let mut guard = KeyRepeatGuard::default();
+        for (code, key, byte) in [
+            (KeyCode::Enter, NamedKey::Enter, 13),
+            (KeyCode::Escape, NamedKey::Escape, 27),
+        ] {
+            let physical = PhysicalKey::Code(code);
+            assert!(guard.form_press(physical, &Key::Named(key), false));
+            assert!(!guard.form_press(physical, &Key::Named(key), true));
+            assert_eq!(
+                guard.press(physical, true, UiAction::SendBytes(vec![byte])),
+                UiAction::Ignore
+            );
+            guard.release(physical);
+            assert_eq!(
+                guard.press(physical, false, UiAction::SendBytes(vec![byte])),
+                UiAction::SendBytes(vec![byte])
+            );
+        }
+        assert!(guard.form_press(
+            PhysicalKey::Code(KeyCode::Backspace),
+            &Key::Named(NamedKey::Backspace),
+            true
+        ));
     }
 
     #[test]
@@ -732,6 +789,7 @@ mod tests {
             ("C", UiAction::CopySelection),
             ("V", UiAction::PasteClipboard),
             ("E", UiAction::ForwardFailureToAgent),
+            ("X", UiAction::CloseTerminal),
         ];
 
         for (ch, expected) in cases {
@@ -1260,6 +1318,25 @@ mod tests {
             ),
             UiAction::Ignore
         );
+    }
+
+    #[test]
+    fn search_paste_uses_the_query_on_each_platform() {
+        for (macos, primary) in [
+            (true, ModifiersState::SUPER),
+            (false, ModifiersState::CONTROL),
+        ] {
+            for mods in [primary, primary | ModifiersState::SHIFT] {
+                assert_eq!(
+                    translate_search_key(&char_key("V"), None, mods, macos),
+                    UiAction::PasteSearchQuery
+                );
+            }
+            assert_eq!(
+                translate_search_key(&char_key("v"), None, primary | ModifiersState::ALT, macos),
+                UiAction::Ignore
+            );
+        }
     }
 
     #[test]

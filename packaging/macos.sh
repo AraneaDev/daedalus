@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 version=${1:?supply the package version}
+arch=${2:?supply the target architecture (arm64 or x86_64)}
+case "$arch" in
+    arm64|x86_64) ;;
+    *) echo "Unsupported macOS architecture: $arch" >&2; exit 1 ;;
+esac
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 app="$stage/Applications/Daedalus.app"
 mkdir -p "$app/Contents/MacOS" "$stage/usr/local/bin" dist
 for program in daedalus-ui daedalusd daedalus-ctl; do
+    lipo "target/release/$program" -verify_arch "$arch"
     install -m755 "target/release/$program" "$app/Contents/MacOS/$program"
     ln -s "/Applications/Daedalus.app/Contents/MacOS/$program" "$stage/usr/local/bin/$program"
 done
@@ -22,4 +28,4 @@ cat > "$app/Contents/Info.plist" <<PLIST
 PLIST
 plutil -lint "$app/Contents/Info.plist"
 pkgbuild --root "$stage" --install-location / --identifier dev.aranea.daedalus.pkg \
-  --version "$version" "dist/daedalus-$version-$(uname -m).pkg"
+  --version "$version" "dist/daedalus-$version-$arch.pkg"

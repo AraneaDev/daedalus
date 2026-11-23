@@ -201,6 +201,32 @@ pub struct CustomAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProjectInfo {
+    /// Canonical primary checkout on the daemon host, shared by linked worktrees.
+    pub repository: Option<PathBuf>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct StatusProvider {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub statuses: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SidebarWidget {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub statuses: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkspaceManifest {
     #[serde(default)]
     pub agent_preset: Option<String>,
@@ -212,16 +238,24 @@ pub struct WorkspaceManifest {
     pub runner_command: Option<Vec<String>>,
     #[serde(default)]
     pub actions: Vec<CustomAction>,
+    #[serde(default)]
+    pub status_providers: Vec<StatusProvider>,
+    #[serde(default)]
+    pub sidebar_widgets: Vec<SidebarWidget>,
 }
 
+/// Workspace snapshot sent over the daemon protocol.
+pub type WorkspaceInfo = Workspace<PaneSummary>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceInfo {
+#[serde(rename = "WorkspaceInfo")]
+pub struct Workspace<P> {
     pub id: WorkspaceId,
     pub name: String,
     pub root_dir: PathBuf,
     pub slot_index: u16,
     pub injected_env: HashMap<String, String>,
-    pub panes: Vec<PaneSummary>,
+    pub panes: Vec<P>,
     /// Whether lazy pane initialization should start or resume. Older daemons omit this.
     #[serde(default)]
     pub default_panes_pending: Option<bool>,
@@ -241,9 +275,33 @@ pub struct WorkspaceInfo {
     pub external_statuses: Vec<ExternalStatus>,
     #[serde(default)]
     pub manifest: Option<WorkspaceManifest>,
+    #[serde(default)]
+    pub project: ProjectInfo,
 }
 
-impl WorkspaceInfo {
+impl<P> Workspace<P> {
+    /// Changes the pane representation while retaining workspace metadata and pane order.
+    pub fn map_panes<Q>(self, map: impl FnMut(P) -> Q) -> Workspace<Q> {
+        Workspace {
+            panes: self.panes.into_iter().map(map).collect(),
+            id: self.id,
+            name: self.name,
+            root_dir: self.root_dir,
+            slot_index: self.slot_index,
+            injected_env: self.injected_env,
+            default_panes_pending: self.default_panes_pending,
+            port_offset: self.port_offset,
+            compose_project_name: self.compose_project_name,
+            git_branch: self.git_branch,
+            git_status: self.git_status,
+            bound_ports: self.bound_ports,
+            containers: self.containers,
+            external_statuses: self.external_statuses,
+            manifest: self.manifest,
+            project: self.project,
+        }
+    }
+
     pub fn needs_default_panes(&self) -> bool {
         self.default_panes_pending.unwrap_or(self.panes.is_empty())
     }

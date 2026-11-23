@@ -9,16 +9,13 @@ use std::sync::Arc;
 
 use daedalus_proto::{
     AgentState, ContainerHealth, ExternalStatus, GitWorkspaceStatus, PaneRole, PaneStatus,
-    PortMapping, StatusLevel, WorkspaceInfo,
+    PortMapping, StatusLevel,
 };
 use winit::window::Window;
 
-use crate::layout::{
-    PaneRect, Rect, WorkspaceLayout, sidebar_new_workspace_rect, sidebar_new_worktree_rect,
-    sidebar_workspace_close_rect,
-};
+use crate::layout::{PaneRect, Rect, WorkspaceLayout, sidebar_workspace_close_rect};
 use crate::state::ConnectionState;
-use crate::state::{AgentPreset, AppState, CloseWorkspaceModalState};
+use crate::state::{AgentPreset, AppState, CloseWorkspaceModalState, WorkspaceView};
 use crate::theme::{Rgba, Theme};
 
 use self::quads::{QuadInstance, QuadPipeline, rgba_to_wgpu_clear_color};
@@ -68,7 +65,7 @@ pub fn action_palette_layout(
     selected: usize,
 ) -> (Rect, std::ops::Range<usize>) {
     let s = sanitize_scale(scale_factor);
-    let row_height = PICKER_ITEM_LOGICAL_HEIGHT + PICKER_ITEM_LOGICAL_GAP;
+    let row_height = picker_row_stride(1.0);
     let available = window_h / s - 24.0 - PICKER_HEADER_LOGICAL_HEIGHT - PICKER_PAD_LOGICAL
         + PICKER_ITEM_LOGICAL_GAP;
     let rows = ((available / row_height) as usize).max(1).min(count.max(1));
@@ -103,15 +100,18 @@ fn picker_rect_for_rows(window_w: f32, window_h: f32, scale_factor: f32, rows: u
     Rect::new(x, y, modal_w, modal_h)
 }
 
+/// Distance between adjacent preset or action rows in physical pixels.
+pub fn picker_row_stride(scale_factor: f32) -> f32 {
+    (PICKER_ITEM_LOGICAL_HEIGHT + PICKER_ITEM_LOGICAL_GAP) * sanitize_scale(scale_factor)
+}
+
 /// Computes the physical-pixel rectangle of item `index` inside the Agent preset picker modal.
 pub fn picker_item_rect(modal: Rect, index: usize, scale_factor: f32) -> Rect {
     let s = sanitize_scale(scale_factor);
     let pad = PICKER_PAD_LOGICAL * s;
     let x = modal.x + pad;
     let w = (modal.width - 2.0 * pad).max(0.0);
-    let y = modal.y
-        + PICKER_HEADER_LOGICAL_HEIGHT * s
-        + (index as f32) * (PICKER_ITEM_LOGICAL_HEIGHT + PICKER_ITEM_LOGICAL_GAP) * s;
+    let y = modal.y + PICKER_HEADER_LOGICAL_HEIGHT * s + (index as f32) * picker_row_stride(s);
     Rect::new(x, y, w, PICKER_ITEM_LOGICAL_HEIGHT * s)
 }
 
@@ -428,7 +428,7 @@ pub fn format_external_source_tag(source: &str) -> String {
     }
 }
 
-pub(super) fn active_external_detail_preview(ws: &WorkspaceInfo) -> Option<String> {
+pub(super) fn active_external_detail_preview(ws: &WorkspaceView) -> Option<String> {
     ws.external_statuses.iter().rev().find_map(|ext| {
         let detail = ext
             .detail
@@ -440,7 +440,7 @@ pub(super) fn active_external_detail_preview(ws: &WorkspaceInfo) -> Option<Strin
     })
 }
 
-pub(super) fn workspace_branch_badge(ws: &WorkspaceInfo) -> Option<(String, bool)> {
+pub(super) fn workspace_branch_badge(ws: &WorkspaceView) -> Option<(String, bool)> {
     let is_wt = ws.slot_index > 0 || ws.git_status.is_some_and(|g| g.is_worktree);
     let mut label = match (&ws.git_branch, ws.slot_index > 0) {
         (Some(branch), true) => format!("wt{} · {branch}", ws.slot_index),
@@ -522,7 +522,7 @@ pub(super) fn sidebar_docker_pill_rect(row_rect: Rect, scale_factor: f32) -> Rec
     )
 }
 
-pub(super) fn visible_external_statuses(ws: &WorkspaceInfo) -> &[ExternalStatus] {
+pub(super) fn visible_external_statuses(ws: &WorkspaceView) -> &[ExternalStatus] {
     let start = ws.external_statuses.len().saturating_sub(2);
     &ws.external_statuses[start..]
 }
@@ -653,9 +653,15 @@ pub fn collect_quads(
     cell_size: (f32, f32),
 ) -> (Vec<QuadInstance>, u32) {
     let scale = sanitize_scale(scale_factor);
-    let cards = layout
-        .sidebar
-        .map(|sidebar| SidebarCards::new(state, sidebar, scale, theme));
+    let cards = layout.sidebar.map(|sidebar| {
+        SidebarCards::new(
+            state,
+            sidebar,
+            scale,
+            theme,
+            layout.sidebar_content.as_ref(),
+        )
+    });
     collect_prepared_quads(
         state,
         layout,
@@ -738,7 +744,7 @@ fn collect_sidebar_quads(
         theme.border_unfocused,
     ));
 
-    for (idx, card) in cards.list.visible.clone().zip(&cards.cards) {
+    for (idx, card) in cards.indices.iter().copied().zip(&cards.cards) {
         let ws = &state.workspaces[idx];
         let row_rect = card.rect;
         let is_active = state.active_workspace_id == Some(ws.id);
@@ -784,13 +790,13 @@ fn collect_sidebar_quads(
         }
     }
 
-    let new_btn = sidebar_new_workspace_rect(sidebar, state.workspaces.len(), s);
+    let new_btn = cards.list.new_workspace;
     if new_btn.y < sidebar.bottom() {
         quads.push(QuadInstance::new(new_btn, theme.bg_header));
         push_rect_border(quads, new_btn, border_w, theme.border_unfocused);
     }
 
-    let new_wt_btn = sidebar_new_worktree_rect(sidebar, state.workspaces.len(), s);
+    let new_wt_btn = cards.list.new_worktree;
     if new_wt_btn.y < sidebar.bottom() {
         quads.push(QuadInstance::new(new_wt_btn, theme.bg_header));
         push_rect_border(
@@ -838,6 +844,85 @@ fn collect_overlay_quads(
     border_w: f32,
 ) {
     let (screen_w, screen_h) = screen;
+    if let Some(choices) = &state.failure_recipients {
+        let (modal, visible) = action_palette_layout(
+            screen_w,
+            screen_h,
+            s,
+            choices.agents.len(),
+            choices.selected,
+        );
+        push_modal_frame(
+            quads,
+            modal,
+            screen,
+            theme,
+            border_w,
+            (PICKER_HEADER_LOGICAL_HEIGHT - 4.0) * s,
+        );
+        if visible.contains(&choices.selected) {
+            push_chrome_badge(
+                quads,
+                picker_item_rect(modal, choices.selected - visible.start, s),
+                theme,
+                border_w,
+                theme.border_focused,
+            );
+        }
+        return;
+    }
+    if state.workspace_form.open {
+        push_modal_frame(
+            quads,
+            crate::workspace_form::modal_rect(screen_w, screen_h, s),
+            screen,
+            theme,
+            border_w,
+            36. * s,
+        );
+        let modal = crate::workspace_form::modal_rect(screen_w, screen_h, s);
+        for (control, rect) in crate::workspace_form::controls(modal) {
+            let field = Rect::new(
+                rect.x + 2. * s,
+                rect.y + 2. * s,
+                (rect.width - 4. * s).max(0.),
+                (rect.height - 4. * s).max(0.),
+            );
+            let border = if state.workspace_form.focus == control {
+                theme.border_focused
+            } else {
+                theme.border_unfocused
+            };
+            push_chrome_badge(quads, field, theme, border_w, border);
+        }
+        return;
+    }
+    if state.settings.open {
+        push_modal_frame(
+            quads,
+            crate::settings::modal_rect(screen_w, screen_h, s),
+            screen,
+            theme,
+            border_w,
+            36. * s,
+        );
+        let modal = crate::settings::modal_rect(screen_w, screen_h, s);
+        for (control, rect) in crate::settings::controls(modal) {
+            let field = Rect::new(
+                rect.x + 2. * s,
+                rect.y + 2. * s,
+                (rect.width - 4. * s).max(0.),
+                (rect.height - 4. * s).max(0.),
+            );
+            let border = if state.settings.focus == control {
+                theme.border_focused
+            } else {
+                theme.border_unfocused
+            };
+            push_chrome_badge(quads, field, theme, border_w, border);
+        }
+        return;
+    }
     // 4. Centered Agent preset picker modal overlay (rendered after base text).
     if state.picker.open || state.action_palette.open {
         let (modal, selected) = if state.action_palette.open {
@@ -1153,18 +1238,28 @@ impl GpuRenderer {
         self.text_renderer.cell_size()
     }
 
+    pub fn recap_visible(&self) -> bool {
+        self.text_renderer.recap_drawn && !self.text_renderer.has_modal_text
+    }
+
     pub fn render(
         &mut self,
         state: &mut AppState,
         layout: &WorkspaceLayout,
-    ) -> Result<(), RenderError> {
+    ) -> Result<bool, RenderError> {
         let screen_w = self.config.width as f32;
         let screen_h = self.config.height as f32;
         let cell_size = self.text_renderer.cell_size();
 
-        let cards = layout
-            .sidebar
-            .map(|sidebar| SidebarCards::new(state, sidebar, self.scale_factor, &self.theme));
+        let cards = layout.sidebar.map(|sidebar| {
+            SidebarCards::new(
+                state,
+                sidebar,
+                self.scale_factor,
+                &self.theme,
+                layout.sidebar_content.as_ref(),
+            )
+        });
         let (quads, base_quad_count) = collect_prepared_quads(
             state,
             layout,
@@ -1192,7 +1287,7 @@ impl GpuRenderer {
         let (frame, suboptimal) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
-            wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Occluded => return Ok(false),
             wgpu::CurrentSurfaceTexture::Timeout => return Err(RenderError::Timeout),
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 return Err(RenderError::Reconfigure);
@@ -1257,7 +1352,7 @@ impl GpuRenderer {
         if suboptimal {
             return Err(RenderError::Reconfigure);
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -1277,6 +1372,7 @@ mod tests {
         let ws_id = WorkspaceId::new();
         let agent_id = PaneId::new();
         let ws = WorkspaceInfo {
+            project: Default::default(),
             default_panes_pending: None,
             id: ws_id,
             name: "main".to_string(),
@@ -1355,6 +1451,7 @@ mod tests {
         });
         pane.selection = Some(Selection::new(CellPos::new(0, 0), CellPos::new(2, 0)));
 
+        state.zoomed = false;
         let layout = compute_layout(&LayoutInput {
             window_w: 1200.0,
             window_h: 800.0,
@@ -1369,6 +1466,42 @@ mod tests {
         });
 
         (state, layout)
+    }
+
+    #[test]
+    fn exited_terminals_keep_their_name_and_output_and_hide_the_input_cursor() {
+        use crate::state::terminal_title;
+        let (mut state, layout) = make_state_with_agent_row();
+        let pane_id = state.focused_pane_id().unwrap();
+        let theme = Theme::dark();
+        let has_cursor = |state: &AppState| {
+            let (quads, _) = collect_quads(state, &layout, &theme, 1200., 800., 1., (8., 19.));
+            quads
+                .iter()
+                .any(|q| q.color == theme.cursor_bg.with_alpha(0.65).to_array())
+        };
+        assert!(has_cursor(&state));
+        assert_eq!(
+            terminal_title("Reviewer".into(), PaneStatus::Idle),
+            "Reviewer"
+        );
+        let output = state.panes[&pane_id].viewport_rows.clone();
+        for (code, title) in [
+            (Some(0), "Exited 0 · Reviewer"),
+            (Some(17), "Exited 17 · Reviewer"),
+            (None, "Exited · Reviewer"),
+        ] {
+            state.apply_server_event(daedalus_proto::ServerEvent::PaneExited {
+                pane_id,
+                exit_code: code,
+            });
+            assert_eq!(
+                terminal_title("Reviewer".into(), state.panes[&pane_id].summary.status),
+                title
+            );
+            assert!(!has_cursor(&state));
+            assert_eq!(state.panes[&pane_id].viewport_rows, output);
+        }
     }
 
     #[test]

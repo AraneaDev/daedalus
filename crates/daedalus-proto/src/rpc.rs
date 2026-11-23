@@ -3,6 +3,7 @@ use crate::types::{
     GridDelta, GridRow, GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary, PortMapping,
     SearchMatch, StatusLevel, WorkspaceId, WorkspaceInfo,
 };
+use crate::{ActivityCursor, ActivityPage};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,6 +21,10 @@ pub enum ClientMessage {
     Authenticate {
         token: String,
     },
+    CreateManualWorkspace {
+        name: String,
+        root_dir: PathBuf,
+    },
     CreateWorkspace {
         name: String,
         root_dir: PathBuf,
@@ -35,6 +40,10 @@ pub enum ClientMessage {
         env: HashMap<String, String>,
     },
     ListWorkspaces,
+    ReadActivity {
+        workspace_id: WorkspaceId,
+        cursor: Option<ActivityCursor>,
+    },
     ResolveWorkspaceDirectory {
         root_dir: PathBuf,
     },
@@ -146,7 +155,10 @@ pub enum ResponsePayload {
         version: String,
         vt_backend: String,
         isolation_mode: String,
+        #[serde(default)]
+        journal_supported: bool,
     },
+    Activity(ActivityPage),
     WorkspaceCreated(WorkspaceInfo),
     WorkspaceResolved(WorkspaceInfo),
     Workspaces(Vec<WorkspaceInfo>),

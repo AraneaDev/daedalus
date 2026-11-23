@@ -36,15 +36,15 @@ pub(super) async fn replace_agent_preset(
         }
     };
 
-    if let Some(pane_id) = old_pane_id {
-        sink.emit(UiEvent::PaneClosed { pane_id });
-    }
-
     let pane_id = summary.id;
     sink.emit(UiEvent::PaneSpawned {
         summary,
         agent_preset: Some(preset),
     });
+
+    if let Some(pane_id) = old_pane_id {
+        sink.emit(UiEvent::PaneClosed { pane_id });
+    }
 
     if let ResponsePayload::Snapshot(snapshot) =
         conn.call(ClientMessage::GetSnapshot { pane_id }).await?
@@ -180,7 +180,7 @@ pub(super) async fn ensure_workspace_panes(
     result
 }
 
-async fn publish_pane(
+pub(super) async fn publish_pane(
     conn: &RpcConnection,
     sink: &Arc<dyn UiEventSink>,
     summary: daedalus_proto::PaneSummary,
@@ -362,6 +362,7 @@ mod tests {
             containers: vec![],
             external_statuses: vec![],
             manifest: Some(manifest),
+            project: Default::default(),
             default_panes_pending,
         };
         let request = async {
@@ -463,6 +464,7 @@ mod tests {
             ]),
             runner_command: Some(vec!["cargo".to_string(), "test".to_string()]),
             actions: Vec::new(),
+            ..Default::default()
         };
 
         let specs = resolve_pane_launch_specs(AgentPreset::Shell, Some(&manifest));

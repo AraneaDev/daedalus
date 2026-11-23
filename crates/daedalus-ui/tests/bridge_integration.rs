@@ -125,6 +125,41 @@ async fn daemon_bridge_bootstraps_three_panes_and_forwards_runner_failure_to_age
     let _service_pane_id = *panes_by_role.get(&PaneRole::Service).expect("Service pane");
     let runner_pane_id = *panes_by_role.get(&PaneRole::Runner).expect("Runner pane");
 
+    assert!(bridge.send(UiCommand::AddAgent {
+        workspace_id: created_workspace_id.unwrap(),
+        preset: AgentPreset::Shell,
+        cols: 80,
+        rows: 24,
+    }));
+    let additional_agent = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let UiEvent::PaneSpawned {
+                summary,
+                agent_preset,
+            } = evt_rx.recv().await.unwrap()
+            {
+                assert_eq!(summary.role, PaneRole::Agent);
+                assert_eq!(agent_preset, Some(AgentPreset::Shell));
+                break summary.id;
+            }
+        }
+    })
+    .await
+    .expect("additional agent should start");
+    assert_ne!(agent_pane_id, additional_agent);
+    assert!(bridge.send(UiCommand::ClosePane(additional_agent)));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let UiEvent::PaneClosed { pane_id } = evt_rx.recv().await.unwrap()
+                && pane_id == additional_agent
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("daemon should acknowledge closing just the additional agent");
+
     // Allow interactive shells to finish emitting their initial prompt / OSC 133 hooks.
     tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -938,6 +973,7 @@ async fn queued_terminal_input_stays_with_its_connection() {
                     version: "test".into(),
                     vt_backend: "builtin".into(),
                     isolation_mode: "test".into(),
+                    journal_supported: false,
                 },
                 _ => ResponsePayload::Ok,
             };
@@ -1140,7 +1176,7 @@ read step
             pane_id: id,
             generation,
             offset_from_bottom: 5,
-            count: usize::from(pane.rows),
+            count: usize::from(pane.summary.rows),
         });
         loop {
             if let UiEvent::ScrollbackLoaded {
@@ -1193,4 +1229,174 @@ read step
         .unwrap();
     stop.send(()).unwrap();
     daemon.await.unwrap().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn manual_workspace_runs_only_explicit_assignments_and_stays_manual_after_restart() {
+    use daedalus_ui::assignments::Assignment;
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("manual");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(
+        project.join(".daedalus.toml"),
+        r#"
+[runner]
+command = ["sh", "-c", "touch unexpected-manifest-launch"]
+"#,
+    )
+    .unwrap();
+    let mut manual_id = None;
+    for restarted in [false, true] {
+        let sock = dir.path().join("daemon.sock");
+        let server = DaemonServer::bind_with_options(
+            sock.clone(),
+            dir.path().join("runtime"),
+            None,
+            Some(dir.path().join("state.json")),
+            test_supervisor(),
+        )
+        .await
+        .unwrap();
+        let (stop, stopped) = oneshot::channel();
+        let daemon = tokio::spawn(async move {
+            server
+                .serve(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap()
+        });
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let bridge = DaemonBridge::start(
+            BridgeConfig {
+                socket_path: sock,
+                initial_dir: dir.path().into(),
+                default_agent: AgentPreset::Shell,
+                auth_token: None,
+                auto_spawn_daemon: false,
+            },
+            Arc::new(ChannelSink { tx }),
+        );
+        tokio::time::timeout(Duration::from_secs(12), async {
+            if restarted {
+                loop {
+                    if let UiEvent::WorkspacesLoaded(workspaces) = events.recv().await.unwrap() {
+                        let workspace = workspaces
+                            .iter()
+                            .find(|ws| Some(ws.id) == manual_id)
+                            .unwrap();
+                        assert!(!workspace.needs_default_panes());
+                        assert!(workspace.panes.is_empty());
+                        break;
+                    }
+                }
+                return;
+            }
+            let mut startup_panes = 0;
+            while startup_panes < 3 {
+                if matches!(events.recv().await.unwrap(), UiEvent::PaneSpawned { .. }) {
+                    startup_panes += 1;
+                }
+            }
+            assert!(bridge.send(UiCommand::CreateManualWorkspace {
+                session: 1,
+                name: "Manual project".into(),
+                root_dir: project.join("missing"),
+            }));
+            loop {
+                if let UiEvent::ManualWorkspaceFailed { session, message } =
+                    events.recv().await.unwrap()
+                {
+                    assert_eq!(session, 1);
+                    assert!(message.contains("not a directory"));
+                    break;
+                }
+            }
+            assert!(bridge.send(UiCommand::CreateManualWorkspace {
+                session: 2,
+                name: "Manual project".into(),
+                root_dir: project.clone()
+            }));
+            let ws = loop {
+                if let UiEvent::ManualWorkspaceCreated { session, workspace } =
+                    events.recv().await.unwrap()
+                {
+                    assert_eq!(session, 2);
+                    break workspace;
+                }
+            };
+            assert_eq!(ws.root_dir, project);
+            assert!(ws.manifest.is_some());
+            assert!(ws.panes.is_empty());
+            assert!(!ws.needs_default_panes());
+            manual_id = Some(ws.id);
+            let mut launched_panes = Vec::new();
+            for (id, role) in [("first", PaneRole::Agent), ("second", PaneRole::Runner)] {
+                assert!(!project.join(id).exists());
+                let assignment = Assignment {
+                    id: id.into(),
+                    name: format!("Assignment {id}"),
+                    role,
+                    argv: vec![
+                        "sh".into(),
+                        "-c".into(),
+                        r#"printf '%s\n' "$2" >> "$1""#.into(),
+                        "fixture".into(),
+                        id.into(),
+                        "two words $HOME".into(),
+                    ],
+                };
+                assert!(bridge.send(UiCommand::LaunchAssignment {
+                    workspace_id: ws.id,
+                    assignment: assignment.clone(),
+                    cols: 80,
+                    rows: 24
+                }));
+                let mut spawned = None;
+                loop {
+                    match events.recv().await.unwrap() {
+                        UiEvent::PaneSpawned { summary, .. } => {
+                            assert_eq!(summary.role, role);
+                            assert!(spawned.replace(summary.id).is_none());
+                        }
+                        UiEvent::AssignmentStarted {
+                            workspace_id,
+                            pane_id,
+                            assignment: actual,
+                        } => {
+                            assert_eq!(workspace_id, ws.id);
+                            assert_eq!(actual, assignment);
+                            assert_eq!(spawned, Some(pane_id));
+                            assert!(!launched_panes.contains(&pane_id));
+                            launched_panes.push(pane_id);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                while std::fs::read_to_string(project.join(id))
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        })
+        .await
+        .expect("manual workspace creation, launch or restoration timed out");
+        tokio::task::spawn_blocking(move || bridge.shutdown())
+            .await
+            .unwrap();
+        stop.send(()).unwrap();
+        daemon.await.unwrap();
+        assert!(!project.join("unexpected-manifest-launch").exists());
+        for id in ["first", "second"] {
+            assert_eq!(
+                std::fs::read_to_string(project.join(id)).unwrap(),
+                "two words $HOME\n"
+            );
+            assert!(!dir.path().join(id).exists());
+        }
+    }
 }

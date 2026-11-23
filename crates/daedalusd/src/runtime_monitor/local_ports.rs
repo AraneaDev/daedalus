@@ -1,9 +1,9 @@
 use daedalus_proto::{PortMapping, PortSource};
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use std::collections::{BTreeMap, VecDeque};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 use std::time::Duration;
 
 /// Parses Linux `/proc/net/tcp` and `/proc/net/tcp6` contents and returns `(inode, listening_port)`
@@ -260,7 +260,7 @@ pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
     collected
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn descendant_pids_with_comms(roots: &[u32]) -> (HashSet<u32>, HashMap<u32, String>) {
     if roots.is_empty() {
         return (HashSet::new(), HashMap::new());
@@ -303,27 +303,20 @@ fn descendant_pids_with_comms(roots: &[u32]) -> (HashSet<u32>, HashMap<u32, Stri
 }
 
 /// Walks `ps` output to collect `roots` and all live descendant PIDs.
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
     descendant_pids_with_comms(roots).0
 }
 
-/// Queries `Win32_Process` via PowerShell to collect `roots` and all live descendant PIDs.
+#[cfg(target_os = "macos")]
+#[path = "macos_ports.rs"]
+mod native;
 #[cfg(windows)]
-pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
-    let mut collected: HashSet<u32> = roots.iter().copied().filter(|&pid| pid > 0).collect();
-    if collected.is_empty() {
-        return collected;
-    }
+#[path = "windows_ports.rs"]
+mod native;
 
-    let edges = crate::supervisor::collect_windows_ppid_edges();
-    for &root in roots {
-        if root > 0 {
-            collected.extend(crate::supervisor::descendants_from_ppid_edges(root, &edges));
-        }
-    }
-    collected
-}
+#[cfg(any(target_os = "macos", windows))]
+pub use native::{collect_descendant_pids, discover_local_ports_for_roots};
 
 #[cfg(target_os = "linux")]
 fn parse_socket_inode(link_target: &Path) -> Option<u64> {
@@ -409,7 +402,7 @@ pub fn discover_local_ports_for_roots(root_pids: &[u32]) -> Vec<PortMapping> {
 
 /// Discovers local TCP listening ports bound by processes in the subtrees rooted at `root_pids`
 /// using `ps` and `lsof`.
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub fn discover_local_ports_for_roots(root_pids: &[u32]) -> Vec<PortMapping> {
     if root_pids.is_empty() {
         return Vec::new();
@@ -468,24 +461,6 @@ pub fn discover_local_ports_for_roots(root_pids: &[u32]) -> Vec<PortMapping> {
             source: PortSource::LocalProcess,
         })
         .collect()
-}
-
-/// Discovers local TCP listening ports bound by `root_pids` via `netstat -ano -p TCP`.
-#[cfg(windows)]
-pub fn discover_local_ports_for_roots(root_pids: &[u32]) -> Vec<PortMapping> {
-    let pid_filter = collect_descendant_pids(root_pids);
-    if pid_filter.is_empty() {
-        return Vec::new();
-    }
-
-    let mut cmd = std::process::Command::new("netstat");
-    cmd.args(["-ano", "-p", "TCP"]);
-    let Some(output) =
-        crate::supervisor::run_command_stdout_with_timeout(&mut cmd, Duration::from_secs(2), false)
-    else {
-        return Vec::new();
-    };
-    parse_windows_netstat_output(&output, &pid_filter)
 }
 
 #[cfg(test)]

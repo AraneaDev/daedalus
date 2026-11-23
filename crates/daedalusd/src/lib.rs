@@ -1,6 +1,7 @@
 pub mod agent_detector;
 pub mod external_hook;
 pub mod isolation;
+mod journal;
 pub mod manifest;
 pub mod pane_actor;
 pub mod persistence;

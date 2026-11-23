@@ -271,6 +271,15 @@ pub fn discover_worktrees(repo_dir: &Path) -> Result<Vec<GitWorktreeInfo>, Strin
         .collect())
 }
 
+/// All linked worktrees resolve to the same canonical primary checkout.
+pub(crate) fn primary_checkout(repo_dir: &Path) -> Option<PathBuf> {
+    discover_worktrees(repo_dir)
+        .ok()?
+        .into_iter()
+        .find(|entry| entry.is_primary)
+        .map(|entry| canonicalize_path(&entry.path))
+}
+
 fn list_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeEntry>, String> {
     if !repo_dir.is_dir() {
         return Err(format!(
@@ -351,11 +360,7 @@ pub fn create_worktree(
 
     let repo_root_raw = PathBuf::from(toplevel_out.stdout.trim_end_matches(['\r', '\n']));
     let repo_root = canonicalize_path(&repo_root_raw);
-    let primary_root = discover_worktrees(&repo_root)
-        .ok()
-        .and_then(|mut worktrees| (!worktrees.is_empty()).then(|| worktrees.remove(0).path))
-        .map(|p| canonicalize_path(&p))
-        .unwrap_or_else(|| repo_root.clone());
+    let primary_root = primary_checkout(&repo_root).unwrap_or_else(|| repo_root.clone());
     let repo_name = primary_root
         .file_name()
         .and_then(|n| n.to_str())
@@ -806,6 +811,10 @@ detached\r\n";
 
         // Create worktree with a brand new branch
         let created_new = create_worktree(&repo, "feat/auth", true, base_dir.path()).unwrap();
+        assert_eq!(
+            primary_checkout(&created_new.path),
+            Some(canonicalize_path(&repo))
+        );
         assert!(!created_new.is_primary);
         assert!(!created_new.is_detached);
         assert_eq!(created_new.branch, Some("feat/auth".to_string()));

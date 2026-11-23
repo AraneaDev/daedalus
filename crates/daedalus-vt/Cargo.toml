@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-ghostty-vt = ["dep:bindgen", "dep:pkg-config"]
+ghostty-vt = ["dep:cc", "dep:pkg-config"]
 
 [dependencies]
 daedalus-proto = { path = "../daedalus-proto" }
@@ -14,7 +14,7 @@ unicode-width = "0.1.14"
 vte.workspace = true
 
 [build-dependencies]
-bindgen = { version = "0.73", optional = true }
+cc = { version = "1", optional = true }
 pkg-config = { version = "0.3", optional = true }
 
 [lints]

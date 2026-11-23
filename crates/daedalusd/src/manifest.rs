@@ -1,4 +1,4 @@
-use daedalus_proto::{CustomAction, PaneRole, WorkspaceManifest};
+use daedalus_proto::{CustomAction, PaneRole, SidebarWidget, StatusProvider, WorkspaceManifest};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
@@ -30,6 +30,10 @@ struct RawManifest {
     env: HashMap<String, String>,
     #[serde(default)]
     actions: Vec<RawActionEntry>,
+    #[serde(default)]
+    status_providers: Vec<StatusProvider>,
+    #[serde(default)]
+    sidebar_widgets: Vec<SidebarWidget>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -122,6 +126,69 @@ fn normalize_actions(raw_actions: Vec<RawActionEntry>) -> Vec<CustomAction> {
     out
 }
 
+/// Discover tooling by file presence only, including heterogeneous projects.
+pub(crate) fn detect_tools(root: &Path, compose: bool) -> Vec<String> {
+    let mut tools = Vec::new();
+    if compose {
+        tools.push("Compose".into());
+    }
+    for (tool, files) in [
+        ("Cargo", &["Cargo.toml"][..]),
+        ("npm", &["package.json"]),
+        ("Composer", &["composer.json"]),
+        (
+            "Python",
+            &[
+                "pyproject.toml",
+                "requirements.txt",
+                "setup.py",
+                "setup.cfg",
+                "Pipfile",
+            ],
+        ),
+        ("Make", &["GNUmakefile", "makefile", "Makefile"]),
+    ] {
+        if files.iter().any(|file| root.join(file).is_file()) {
+            tools.push(tool.into());
+        }
+    }
+    tools
+}
+
+fn valid_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+fn normalize_extensions(
+    mut providers: Vec<StatusProvider>,
+    mut widgets: Vec<SidebarWidget>,
+) -> (Vec<StatusProvider>, Vec<SidebarWidget>) {
+    let mut ids = HashSet::new();
+    providers.retain_mut(|provider| {
+        let mut keys = HashSet::new();
+        provider
+            .statuses
+            .retain(|key| valid_identifier(key) && keys.insert(key.clone()));
+        valid_identifier(&provider.id)
+            && !provider.statuses.is_empty()
+            && ids.insert(provider.id.clone())
+    });
+    widgets.retain_mut(|widget| {
+        let Some(provider) = providers.iter().find(|p| p.id == widget.provider) else {
+            return false;
+        };
+        let mut keys = HashSet::new();
+        widget
+            .statuses
+            .retain(|key| provider.statuses.contains(key) && keys.insert(key.clone()));
+        !widget.title.trim().is_empty() && !widget.statuses.is_empty()
+    });
+    (providers, widgets)
+}
+
 /// Parses `.daedalus.toml` contents into a [`LoadedManifest`].
 pub fn parse_project_manifest(contents: &str) -> Result<LoadedManifest, toml::de::Error> {
     let raw: RawManifest = toml::from_str(contents)?;
@@ -130,6 +197,8 @@ pub fn parse_project_manifest(contents: &str) -> Result<LoadedManifest, toml::de
     let runner = raw.runner.unwrap_or_default();
     let ports = raw.ports.unwrap_or_default();
     let actions = normalize_actions(raw.actions);
+    let (status_providers, sidebar_widgets) =
+        normalize_extensions(raw.status_providers, raw.sidebar_widgets);
 
     Ok(LoadedManifest {
         workspace_manifest: WorkspaceManifest {
@@ -138,6 +207,8 @@ pub fn parse_project_manifest(contents: &str) -> Result<LoadedManifest, toml::de
             service_command: normalize_command(service.command),
             runner_command: normalize_command(runner.command),
             actions,
+            status_providers,
+            sidebar_widgets,
         },
         extra_ports: ports.extra.into_iter().filter(|&p| p > 0).collect(),
         env: raw.env,
@@ -182,6 +253,53 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn project_tools_are_discovered_without_running_manifests() {
+        let temp = tempdir().unwrap();
+        for name in [
+            "Cargo.toml",
+            "package.json",
+            "composer.json",
+            "pyproject.toml",
+            "Makefile",
+        ] {
+            std::fs::write(temp.path().join(name), "this is never parsed or executed").unwrap();
+        }
+        assert_eq!(
+            detect_tools(temp.path(), true),
+            ["Compose", "Cargo", "npm", "Composer", "Python", "Make"]
+        );
+        assert!(detect_tools(tempdir().unwrap().path(), false).is_empty());
+    }
+
+    #[test]
+    fn registers_only_distinct_providers_and_widgets_with_declared_statuses() {
+        let loaded = parse_project_manifest(
+            r#"
+[[status_providers]]
+id = "ci"
+statuses = ["build", "test", "build"]
+[[status_providers]]
+id = "ci"
+statuses = ["unreachable"]
+[[sidebar_widgets]]
+title = "Checks"
+provider = "ci"
+statuses = ["build", "invalid", "test"]
+[[sidebar_widgets]]
+title = "Unavailable"
+provider = "unknown"
+statuses = ["test"]
+"#,
+        )
+        .unwrap()
+        .workspace_manifest;
+        assert_eq!(loaded.status_providers.len(), 1);
+        assert_eq!(loaded.status_providers[0].statuses, ["build", "test"]);
+        assert_eq!(loaded.sidebar_widgets.len(), 1);
+        assert_eq!(loaded.sidebar_widgets[0].statuses, ["build", "test"]);
+    }
+
+    #[test]
     fn loads_full_valid_manifest() {
         let dir = tempdir().unwrap();
         std::fs::write(
@@ -224,6 +342,7 @@ API_BASE = "http://localhost:8080"
                     "--workspace".to_string(),
                 ]),
                 actions: Vec::new(),
+                ..Default::default()
             }
         );
         assert_eq!(loaded.extra_ports, vec![8080, 9000]);

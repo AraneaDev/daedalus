@@ -1,9 +1,15 @@
+pub mod activity_history;
+pub mod assignments;
 pub mod bridge;
 pub mod config;
 pub mod input;
 pub mod layout;
 pub mod links;
+pub mod recap;
 pub mod renderer;
 pub mod selection;
+pub mod settings;
+pub mod sidebar_content;
 pub mod state;
 pub mod theme;
+pub mod workspace_form;

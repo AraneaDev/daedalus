@@ -64,6 +64,16 @@ impl std::fmt::Debug for BridgeConfig {
 /// Commands sent from the UI thread to `DaemonBridge`.
 #[derive(Debug, Clone)]
 pub enum UiCommand {
+    ReadActivity {
+        workspace_id: WorkspaceId,
+        cursor: Option<daedalus_proto::ActivityCursor>,
+        token: u64,
+    },
+    CreateManualWorkspace {
+        session: u64,
+        name: String,
+        root_dir: PathBuf,
+    },
     CreateWorkspace {
         name: String,
         root_dir: PathBuf,
@@ -74,11 +84,24 @@ pub enum UiCommand {
         branch: String,
         default_agent: AgentPreset,
     },
+    ClosePane(PaneId),
     CloseWorkspace {
         id: WorkspaceId,
         compose_down: bool,
         remove_worktree: bool,
         force_remove_worktree: bool,
+    },
+    LaunchAssignment {
+        workspace_id: WorkspaceId,
+        assignment: crate::assignments::Assignment,
+        cols: u16,
+        rows: u16,
+    },
+    AddAgent {
+        workspace_id: WorkspaceId,
+        preset: AgentPreset,
+        cols: u16,
+        rows: u16,
     },
     ReplaceAgentPreset {
         workspace_id: WorkspaceId,
@@ -131,12 +154,26 @@ pub enum UiCommand {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum UiEvent {
+    JournalCapability(bool),
+    ActivityRead {
+        token: u64,
+        page: daedalus_proto::ActivityPage,
+    },
+    ActivityReadFailed(u64),
     Connected,
     Disconnected,
     WorkspacesLoaded(Vec<WorkspaceInfo>),
     WorkspaceCloseFailed(Vec<WorkspaceInfo>),
     WorkspaceCloseFinished(WorkspaceId),
     WorkspaceCreated(WorkspaceInfo),
+    ManualWorkspaceCreated {
+        session: u64,
+        workspace: WorkspaceInfo,
+    },
+    ManualWorkspaceFailed {
+        session: u64,
+        message: String,
+    },
     WorkspacePanesEnsured {
         workspace_id: WorkspaceId,
         complete: bool,
@@ -144,6 +181,11 @@ pub enum UiEvent {
     PaneSpawned {
         summary: PaneSummary,
         agent_preset: Option<AgentPreset>,
+    },
+    AssignmentStarted {
+        workspace_id: WorkspaceId,
+        pane_id: PaneId,
+        assignment: crate::assignments::Assignment,
     },
     PaneClosed {
         pane_id: PaneId,
@@ -358,12 +400,19 @@ async fn initialize_session(
             )));
         }
     }
-    let _ = conn.call(ClientMessage::Ping).await?;
+    let journal = matches!(
+        conn.call(ClientMessage::Ping).await?,
+        ResponsePayload::Pong {
+            journal_supported: true,
+            ..
+        }
+    );
     let _ = conn
         .call(ClientMessage::Subscribe { pane_ids: None })
         .await?;
     session.send_replace(Some(cmd_tx));
     sink.emit(UiEvent::Connected);
+    sink.emit(UiEvent::JournalCapability(journal));
 
     let workspaces = match conn.call(ClientMessage::ListWorkspaces).await? {
         ResponsePayload::Workspaces(ws) => ws,
@@ -455,6 +504,49 @@ async fn handle_command(
     cmd: UiCommand,
 ) -> Result<(), RpcError> {
     match cmd {
+        UiCommand::ReadActivity {
+            workspace_id,
+            cursor,
+            token,
+        } => {
+            match conn
+                .call(ClientMessage::ReadActivity {
+                    workspace_id,
+                    cursor,
+                })
+                .await
+            {
+                Ok(ResponsePayload::Activity(page)) if page.workspace_id == workspace_id => {
+                    sink.emit(UiEvent::ActivityRead { token, page })
+                }
+                Err(RpcError::Disconnected) => return Err(RpcError::Disconnected),
+                _ => sink.emit(UiEvent::ActivityReadFailed(token)),
+            }
+        }
+        UiCommand::CreateManualWorkspace {
+            session,
+            name,
+            root_dir,
+        } => {
+            let event = match conn
+                .call(ClientMessage::CreateManualWorkspace { name, root_dir })
+                .await
+            {
+                Ok(ResponsePayload::WorkspaceCreated(workspace)) => {
+                    UiEvent::ManualWorkspaceCreated { session, workspace }
+                }
+                Ok(_) => UiEvent::ManualWorkspaceFailed {
+                    session,
+                    message: "Unexpected reply to workspace creation.".into(),
+                },
+                Err(RpcError::Proto(error)) => UiEvent::ManualWorkspaceFailed {
+                    session,
+                    message: error.to_string(),
+                },
+                Err(RpcError::Disconnected) => return Err(RpcError::Disconnected),
+            };
+            sink.emit(event);
+        }
         UiCommand::CreateWorkspace {
             name,
             root_dir,
@@ -487,6 +579,10 @@ async fn handle_command(
             )
             .await?;
         }
+        UiCommand::ClosePane(pane_id) => {
+            conn.call(ClientMessage::ClosePane { pane_id }).await?;
+            sink.emit(UiEvent::PaneClosed { pane_id });
+        }
         UiCommand::CloseWorkspace {
             id,
             compose_down,
@@ -514,6 +610,73 @@ async fn handle_command(
                 }
             }
             close?;
+        }
+        UiCommand::LaunchAssignment {
+            workspace_id,
+            assignment,
+            cols,
+            rows,
+        } => {
+            let preset = (assignment.role == daedalus_proto::PaneRole::Agent)
+                .then(|| {
+                    assignment
+                        .argv
+                        .first()
+                        .and_then(|program| AgentPreset::from_cli_name(program))
+                })
+                .flatten();
+            let response = conn
+                .call(ClientMessage::SpawnPane {
+                    workspace_id,
+                    role: assignment.role,
+                    command: (!assignment.argv.is_empty()).then(|| assignment.argv.clone()),
+                    cols,
+                    rows,
+                    shell: None,
+                    env: Default::default(),
+                })
+                .await?;
+            let ResponsePayload::PaneSpawned(summary) = response else {
+                return Err(RpcError::Proto(ProtoError::Internal(
+                    "unexpected assignment launch response".into(),
+                )));
+            };
+            let pane_id = summary.id;
+            sink.emit(UiEvent::PaneSpawned {
+                summary,
+                agent_preset: preset,
+            });
+            sink.emit(UiEvent::AssignmentStarted {
+                workspace_id,
+                pane_id,
+                assignment,
+            });
+            if let ResponsePayload::Snapshot(snapshot) =
+                conn.call(ClientMessage::GetSnapshot { pane_id }).await?
+            {
+                sink.emit(UiEvent::Snapshot(snapshot));
+            }
+        }
+        UiCommand::AddAgent {
+            workspace_id,
+            preset,
+            cols,
+            rows,
+        } => {
+            let response = conn
+                .call(ClientMessage::SpawnPane {
+                    workspace_id,
+                    role: daedalus_proto::PaneRole::Agent,
+                    command: preset.command(),
+                    shell: None,
+                    env: Default::default(),
+                    cols,
+                    rows,
+                })
+                .await?;
+            if let ResponsePayload::PaneSpawned(summary) = response {
+                workspace::publish_pane(conn, sink, summary, Some(preset)).await?;
+            }
         }
         UiCommand::ReplaceAgentPreset {
             workspace_id,

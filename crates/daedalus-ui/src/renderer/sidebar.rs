@@ -1,4 +1,4 @@
-use daedalus_proto::{AgentState, PaneRole, PaneStatus, WorkspaceInfo};
+use daedalus_proto::{AgentState, PaneRole, PaneStatus};
 
 use super::{
     agent_state_badge, external_status_color, format_docker_health, format_external_source_tag,
@@ -6,29 +6,48 @@ use super::{
     sidebar_docker_pill_rect, sidebar_external_badge_rect, status_dot_color,
     visible_external_statuses, workspace_branch_badge,
 };
-use crate::layout::{Rect, SIDEBAR_ROW_LOGICAL_HEIGHT, SidebarList, sidebar_workspace_rect};
-use crate::state::AppState;
+use crate::layout::{Rect, SIDEBAR_ROW_LOGICAL_HEIGHT};
+use crate::sidebar_content::{SidebarContent, SidebarRow};
+use crate::state::{AppState, WorkspaceView};
 use crate::theme::{Rgba, Theme};
+use std::sync::Arc;
 
 pub(super) struct SidebarCards {
-    pub list: SidebarList,
+    pub list: Arc<SidebarContent>,
+    pub indices: Vec<usize>,
     pub cards: Vec<Card>,
 }
 
 impl SidebarCards {
-    pub fn new(state: &AppState, sidebar: Rect, scale: f32, theme: &Theme) -> Self {
-        let list = SidebarList::new(sidebar, state.workspaces.len(), state.sidebar_first, scale);
-        let cards = list
-            .visible
-            .clone()
-            .enumerate()
-            .map(|(row, index)| {
-                let rect = sidebar_workspace_rect(sidebar, row, scale);
-                let ws = &state.workspaces[index];
-                Card::new(ws, rect, state.workspace_agent_state(ws), scale, theme)
-            })
-            .collect();
-        Self { list, cards }
+    pub fn new(
+        state: &AppState,
+        sidebar: Rect,
+        scale: f32,
+        theme: &Theme,
+        prepared: Option<&Arc<SidebarContent>>,
+    ) -> Self {
+        let list = prepared.cloned().unwrap_or_else(|| {
+            Arc::new(SidebarContent::for_workspaces(
+                &state.workspaces,
+                sidebar,
+                state.sidebar_first,
+                scale,
+            ))
+        });
+        let mut cards = Vec::new();
+        let mut indices = Vec::new();
+        for (row, rect) in list.rows[list.visible.clone()].iter().zip(&list.rects) {
+            if let SidebarRow::Workspace(index) = row {
+                let ws = &state.workspaces[*index];
+                indices.push(*index);
+                cards.push(Card::new(ws, *rect, state, scale, theme));
+            }
+        }
+        Self {
+            list,
+            indices,
+            cards,
+        }
     }
 }
 
@@ -61,14 +80,9 @@ pub(super) struct Badge {
 }
 
 impl Card {
-    fn new(
-        ws: &WorkspaceInfo,
-        rect: Rect,
-        agent: Option<AgentState>,
-        s: f32,
-        theme: &Theme,
-    ) -> Self {
-        let panes = |role| ws.panes.iter().rev().find(|p| p.role == role);
+    fn new(ws: &WorkspaceView, rect: Rect, state: &AppState, s: f32, theme: &Theme) -> Self {
+        let agent = state.workspace_agent_state(ws);
+        let panes = |role| state.workspace_panes(ws).rev().find(|p| p.role == role);
         let dot = match agent {
             Some(AgentState::WaitingForApproval) => theme.status_busy,
             Some(AgentState::Error) => theme.status_err,
@@ -151,7 +165,7 @@ impl Card {
 
     fn add_identity_badges(
         &mut self,
-        ws: &WorkspaceInfo,
+        ws: &WorkspaceView,
         agent: Option<AgentState>,
         s: f32,
         theme: &Theme,

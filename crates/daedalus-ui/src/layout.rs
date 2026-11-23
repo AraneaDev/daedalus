@@ -1,4 +1,4 @@
-use daedalus_proto::PaneRole;
+use daedalus_proto::{PaneId, PaneRole};
 
 pub const SIDEBAR_LOGICAL_WIDTH: f32 = 240.0;
 pub const HEADER_LOGICAL_HEIGHT: f32 = 26.0;
@@ -109,6 +109,40 @@ pub struct PaneRect {
     pub rows: u16,
 }
 
+impl PaneRect {
+    /// The tab row shares horizontal space with an inline action. A wrapped action
+    /// sits below this row and leaves its full width available for navigation.
+    pub fn tab_strip(&self, scale: f32) -> Rect {
+        let mut strip = self.header;
+        strip.height = strip.height.min(HEADER_LOGICAL_HEIGHT * scale);
+        if let Some(pill) = self.action_pill
+            && pill.y < strip.bottom()
+        {
+            strip.width = (pill.x - strip.x).max(0.);
+        }
+        strip
+    }
+}
+
+/// Bounds shared by painting and pointer input for the focused terminal's role tabs.
+pub fn session_tabs(pane: &PaneRect, scale: f32) -> [(PaneRole, Rect); 3] {
+    let strip = pane.tab_strip(scale);
+    let left = strip.x + 4.0 * scale;
+    let right = strip.right();
+    let width = ((right - left) / 3.0).clamp(0.0, 72.0 * scale);
+    [PaneRole::Agent, PaneRole::Service, PaneRole::Runner].map(|role| {
+        let index = match role {
+            PaneRole::Agent => 0.,
+            PaneRole::Service => 1.,
+            PaneRole::Runner => 2.,
+        };
+        (
+            role,
+            Rect::new(left + width * index, strip.y, width, strip.height),
+        )
+    })
+}
+
 /// Inputs required to solve the workspace layout for a single frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayoutInput {
@@ -127,8 +161,12 @@ pub struct LayoutInput {
 /// Computed rectangles for the sidebar, optional top banner, and visible semantic panes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceLayout {
+    pub compact_recap: Option<Rect>,
+    pub close_tab: Option<(PaneId, Rect)>,
+    pub named_tabs: Vec<(PaneId, String, Rect)>,
     pub stacked: bool,
     pub sidebar_first: usize,
+    pub sidebar_content: Option<std::sync::Arc<crate::sidebar_content::SidebarContent>>,
     pub sidebar_toggle: Option<Rect>,
     pub sidebar: Option<Rect>,
     pub banner: Option<Rect>,
@@ -136,6 +174,78 @@ pub struct WorkspaceLayout {
 }
 
 impl WorkspaceLayout {
+    pub fn set_named_tabs(
+        &mut self,
+        entries: &[(PaneId, String)],
+        focused: Option<PaneId>,
+        scale: f32,
+    ) {
+        let [pane] = self.panes.as_slice() else {
+            return;
+        };
+        let strip = pane.tab_strip(scale);
+        let left = strip.x + 3. * scale;
+        let right = strip.right();
+        let available = (right - left).max(0.);
+        if entries.is_empty() || available < 1. {
+            return;
+        }
+        let capacity = ((available / (100. * scale)).floor() as usize)
+            .max(3)
+            .min(entries.len());
+        let index = entries
+            .iter()
+            .position(|(id, _)| Some(*id) == focused)
+            .unwrap_or(0);
+        let overflow = entries.len() > capacity || (entries.len() >= 3 && available < 150. * scale);
+        let visible = if overflow { capacity - 2 } else { capacity };
+        let start = (index / visible * visible).min(entries.len() - visible);
+        let compact = overflow && available < 300. * scale;
+        let arrow_width = if compact {
+            (available / 4.).min(26. * scale)
+        } else {
+            0.
+        };
+        let width = if compact {
+            (available - 2. * arrow_width) / visible as f32
+        } else {
+            (available / capacity as f32).min(132. * scale)
+        };
+        let mut x = left;
+        let mut push = |id, label: String, w| {
+            self.named_tabs
+                .push((id, label, Rect::new(x, strip.y, w, strip.height)));
+            x += w;
+        };
+        if overflow {
+            push(
+                entries[(start + entries.len() - 1) % entries.len()].0,
+                if compact { "‹" } else { "‹ Prev" }.into(),
+                if compact { arrow_width } else { width },
+            );
+        }
+        for (id, label) in &entries[start..start + visible] {
+            push(*id, label.clone(), width);
+        }
+        if overflow {
+            push(
+                entries[(start + visible) % entries.len()].0,
+                if compact { "›" } else { "Next ›" }.into(),
+                if compact { arrow_width } else { width },
+            );
+        }
+        if let Some(id) = focused
+            && let Some((_, _, rect)) = self.named_tabs.iter().rev().find(|(tab, _, _)| *tab == id)
+            && rect.width >= 52. * scale
+        {
+            let width = 22. * scale;
+            self.close_tab = Some((
+                id,
+                Rect::new(rect.right() - width, rect.y, width, rect.height),
+            ));
+        }
+    }
+
     pub fn pane(&self, role: PaneRole) -> Option<&PaneRect> {
         self.panes.iter().find(|p| p.role == role)
     }
@@ -145,12 +255,16 @@ impl WorkspaceLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
     ToggleSidebar,
+    WorkspaceSettings,
     SidebarPageUp,
     SidebarPageDown,
     SidebarWorkspace(usize),
     SidebarWorkspaceClose(usize),
     SidebarNewWorkspace,
     SidebarNewWorktree,
+    SessionTab(PaneRole),
+    SelectSession(PaneId),
+    CloseSession(PaneId),
     PaneHeaderAction(PaneRole),
     PaneViewport { role: PaneRole, col: u16, row: u16 },
     PaneHeader(PaneRole),
@@ -183,26 +297,33 @@ fn build_pane_rect(
     cell_w: f32,
     cell_h: f32,
     runner_has_failure: bool,
+    zoomed: bool,
 ) -> PaneRect {
-    let header_h = metrics.header_height.min(outer.height.max(0.0));
-    let header = Rect::new(outer.x, outer.y, outer.width.max(0.0), header_h);
-
     let pill_logical_w = match role {
         PaneRole::Agent => Some(AGENT_PILL_LOGICAL_WIDTH),
         PaneRole::Runner if runner_has_failure => Some(RUNNER_PILL_LOGICAL_WIDTH),
         PaneRole::Service | PaneRole::Runner => None,
     };
 
+    let narrow = zoomed && outer.width < 420. * metrics.scale_factor;
+    let wrap_action = narrow
+        && pill_logical_w.is_some()
+        && outer.width < 200. * metrics.scale_factor
+        && outer.height >= metrics.header_height * 3.;
+    let header_rows = if wrap_action { 2. } else { 1. };
+    let header_h = (metrics.header_height * header_rows).min(outer.height.max(0.0));
+    let header = Rect::new(outer.x, outer.y, outer.width.max(0.0), header_h);
     let action_pill = pill_logical_w.and_then(|logical_w| {
         let margin_x = PILL_MARGIN_X_LOGICAL * metrics.scale_factor;
         let margin_y = PILL_MARGIN_Y_LOGICAL * metrics.scale_factor;
         let max_w = (header.width - 2.0 * margin_x).max(0.0);
+        let logical_w = if narrow { 72. } else { logical_w };
         let pill_w = (logical_w * metrics.scale_factor).min(max_w);
-        let pill_h = (header.height - 2.0 * margin_y).max(0.0);
+        let pill_h = (header.height.min(metrics.header_height) - 2.0 * margin_y).max(0.0);
         if pill_w > 0.0 && pill_h > 0.0 {
             Some(Rect::new(
                 header.right() - margin_x - pill_w,
-                header.y + margin_y,
+                header.bottom() - margin_y - pill_h,
                 pill_w,
                 pill_h,
             ))
@@ -242,22 +363,37 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
     let window_h = input.window_h.max(0.0);
 
     let min_split_width = MIN_SPLIT_CANVAS_LOGICAL_WIDTH * metrics.scale_factor;
-    let show_sidebar = input
-        .sidebar_override
-        .unwrap_or(window_w >= metrics.sidebar_width + min_split_width);
+    let show_sidebar = input.sidebar_override.unwrap_or(
+        window_w >= metrics.sidebar_width + min_split_width
+            && (!input.zoomed
+                || (window_w >= 900.0 * metrics.scale_factor
+                    && window_h >= 520.0 * metrics.scale_factor)),
+    );
     let (sidebar, sidebar_w) = if show_sidebar {
-        let w = metrics.sidebar_width.min(window_w);
-        (Some(Rect::new(0.0, 0.0, w, window_h)), w)
+        let w = if input.zoomed && window_w >= metrics.sidebar_width + min_split_width {
+            metrics.sidebar_width.min(window_w * 0.21)
+        } else {
+            metrics.sidebar_width.min(window_w)
+        };
+        (
+            Some(Rect::new(
+                if input.zoomed { window_w - w } else { 0. },
+                0.0,
+                w,
+                window_h,
+            )),
+            w,
+        )
     } else {
         (None, 0.0)
     };
 
-    let canvas_x = sidebar_w;
+    let canvas_x = if input.zoomed { 0. } else { sidebar_w };
     let canvas_w = (window_w - sidebar_w).max(0.0);
 
-    let sidebar_toggle = (window_w < metrics.sidebar_width + min_split_width).then(|| {
+    let sidebar_toggle = (window_w > 0.0 && window_h > 0.0).then(|| {
         Rect::new(
-            0.0,
+            sidebar.map_or(0., |rect| rect.x),
             0.0,
             sidebar.map_or(window_w, |rect| rect.width),
             metrics.sidebar_header_height.min(window_h),
@@ -277,7 +413,19 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
     };
 
     let canvas_y = canvas_top + banner_h;
-    let canvas_h = (window_h - canvas_y).max(0.0);
+    let mut canvas_h = (window_h - canvas_y).max(0.0);
+    let compact_recap =
+        if input.zoomed && sidebar.is_none() && input.sidebar_override != Some(false) {
+            let terminal_width = (canvas_w - 2. * metrics.viewport_pad).max(1.);
+            let required_height = window_w * window_h * (2. / 3.) / terminal_width
+                + metrics.header_height
+                + 2. * metrics.viewport_pad;
+            let height = (canvas_h - required_height).min(window_h * 0.19).max(0.);
+            canvas_h -= height;
+            Some(Rect::new(canvas_x, canvas_y + canvas_h, canvas_w, height))
+        } else {
+            None
+        };
 
     let stacked = canvas_w < min_split_width;
     let panes = if input.zoomed {
@@ -289,6 +437,7 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
             input.cell_w,
             input.cell_h,
             input.runner_has_failure,
+            true,
         )]
     } else {
         let (agent_outer, service_outer, runner_outer) = if stacked {
@@ -325,6 +474,7 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
                 input.cell_w,
                 input.cell_h,
                 input.runner_has_failure,
+                false,
             ),
             build_pane_rect(
                 PaneRole::Service,
@@ -333,6 +483,7 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
                 input.cell_w,
                 input.cell_h,
                 input.runner_has_failure,
+                false,
             ),
             build_pane_rect(
                 PaneRole::Runner,
@@ -341,13 +492,18 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
                 input.cell_w,
                 input.cell_h,
                 input.runner_has_failure,
+                false,
             ),
         ]
     };
 
     WorkspaceLayout {
+        compact_recap,
+        close_tab: None,
+        named_tabs: Vec::new(),
         sidebar_toggle,
         sidebar_first: 0,
+        sidebar_content: None,
         stacked,
         sidebar,
         banner,
@@ -484,6 +640,13 @@ pub fn sidebar_new_worktree_rect(sidebar: Rect, workspace_count: usize, scale_fa
     )
 }
 
+/// Settings occupies the end of the workspace heading, before any paging arrows.
+pub fn settings_button(header: Rect, arrows: Option<(Rect, Rect)>, scale: f32) -> Rect {
+    let right = arrows.map_or(header.right(), |(up, _)| up.x);
+    let width = (64. * scale).min((right - header.x) * 0.48);
+    Rect::new(right - width, header.y, width, header.height)
+}
+
 /// Hit-tests a physical pixel coordinate `(x, y)` against the current `WorkspaceLayout`.
 pub fn hit_test(
     layout: &WorkspaceLayout,
@@ -494,9 +657,14 @@ pub fn hit_test(
     x: f32,
     y: f32,
 ) -> HitTarget {
-    let list = layout.sidebar.map(|sidebar| {
-        SidebarList::new(sidebar, workspace_count, layout.sidebar_first, scale_factor)
-    });
+    use crate::sidebar_content::{SidebarContent, SidebarRow};
+    let fallback = layout
+        .sidebar
+        .filter(|_| layout.sidebar_content.is_none())
+        .map(|rect| {
+            SidebarContent::plain(workspace_count, rect, layout.sidebar_first, scale_factor)
+        });
+    let list = layout.sidebar_content.as_deref().or(fallback.as_ref());
     if let Some((up, down)) = list.as_ref().and_then(|list| list.arrows) {
         if up.contains(x, y) {
             return HitTarget::SidebarPageUp;
@@ -504,6 +672,13 @@ pub fn hit_test(
         if down.contains(x, y) {
             return HitTarget::SidebarPageDown;
         }
+    }
+    if workspace_count > 0
+        && layout.sidebar_toggle.is_some_and(|rect| {
+            settings_button(rect, list.as_ref().and_then(|l| l.arrows), scale_factor).contains(x, y)
+        })
+    {
+        return HitTarget::WorkspaceSettings;
     }
     if layout
         .sidebar_toggle
@@ -514,32 +689,54 @@ pub fn hit_test(
     if let Some(sidebar) = layout.sidebar
         && sidebar.contains(x, y)
     {
-        for (row, i) in list.unwrap().visible.enumerate() {
-            let row_rect = sidebar_workspace_rect(sidebar, row, scale_factor);
-            if row_rect.contains(x, y) {
-                let close_rect = sidebar_workspace_close_rect(row_rect, scale_factor);
-                if close_rect.contains(x, y) {
-                    return HitTarget::SidebarWorkspaceClose(i);
+        let list = list.expect("visible sidebar has content");
+        for (row, rect) in list.rows[list.visible.clone()].iter().zip(&list.rects) {
+            if let SidebarRow::Workspace(i) = row
+                && rect.contains(x, y)
+            {
+                if sidebar_workspace_close_rect(*rect, scale_factor).contains(x, y) {
+                    return HitTarget::SidebarWorkspaceClose(*i);
                 }
-                return HitTarget::SidebarWorkspace(i);
+                return HitTarget::SidebarWorkspace(*i);
             }
         }
-        let new_btn_rect = sidebar_new_workspace_rect(sidebar, workspace_count, scale_factor);
-        if new_btn_rect.contains(x, y) {
+        if list.new_workspace.contains(x, y) {
             return HitTarget::SidebarNewWorkspace;
         }
-        let new_wt_rect = sidebar_new_worktree_rect(sidebar, workspace_count, scale_factor);
-        if new_wt_rect.contains(x, y) {
+        if list.new_worktree.contains(x, y) {
             return HitTarget::SidebarNewWorktree;
         }
         return HitTarget::None;
     }
 
     for pane in &layout.panes {
+        if workspace_count == 0 && pane.header.contains(x, y) {
+            return HitTarget::None;
+        }
         if let Some(pill) = pane.action_pill
             && pill.contains(x, y)
         {
             return HitTarget::PaneHeaderAction(pane.role);
+        }
+        if let Some((id, rect)) = layout.close_tab
+            && rect.contains(x, y)
+        {
+            return HitTarget::CloseSession(id);
+        }
+        if let Some((id, _, _)) = layout
+            .named_tabs
+            .iter()
+            .find(|(_, _, rect)| rect.contains(x, y))
+        {
+            return HitTarget::SelectSession(*id);
+        }
+        if layout.named_tabs.is_empty()
+            && layout.panes.len() == 1
+            && let Some((role, _)) = session_tabs(pane, scale_factor)
+                .into_iter()
+                .find(|(_, rect)| rect.contains(x, y))
+        {
+            return HitTarget::SessionTab(role);
         }
         if pane.header.contains(x, y) {
             return HitTarget::PaneHeader(pane.role);
@@ -616,6 +813,142 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_session_tabs_reveal_and_select_the_requested_pane() {
+        let entries: Vec<_> = (0..12)
+            .map(|i| (PaneId::new(), format!("Session {i}")))
+            .collect();
+        let mut layout = compute_layout(&LayoutInput {
+            window_w: 320.,
+            window_h: 480.,
+            zoomed: true,
+            ..default_input()
+        });
+        layout.set_named_tabs(&entries, Some(entries[6].0), 1.);
+        assert!(
+            layout
+                .named_tabs
+                .iter()
+                .any(|(id, label, _)| *id == entries[6].0 && label == "Session 6")
+        );
+        for (id, _, rect) in &layout.named_tabs {
+            assert_eq!(
+                hit_test(
+                    &layout,
+                    1,
+                    1.,
+                    8.,
+                    16.,
+                    rect.x + rect.width * 0.5,
+                    rect.y + rect.height * 0.5
+                ),
+                HitTarget::SelectSession(*id)
+            );
+        }
+        if let Some((id, button)) = layout.close_tab {
+            assert_eq!(id, entries[6].0);
+            assert_eq!(
+                hit_test(&layout, 1, 1., 8., 16., button.x + 1., button.y + 1.),
+                HitTarget::CloseSession(id)
+            );
+        }
+        let next = layout.named_tabs.last().unwrap();
+        assert_eq!(next.1, "›"); // Compact paging reserves width for the selected terminal.
+        assert_eq!(next.0, entries[7].0);
+    }
+
+    #[test]
+    fn empty_workbench_header_does_not_offer_terminal_actions() {
+        let input = LayoutInput {
+            zoomed: true,
+            ..default_input()
+        };
+        let layout = compute_layout(&input);
+        let pane = &layout.panes[0];
+        let pill = pane.action_pill.unwrap();
+        assert_eq!(
+            hit_test(
+                &layout,
+                0,
+                input.scale_factor,
+                input.cell_w,
+                input.cell_h,
+                pill.x + 1.,
+                pill.y + 1.
+            ),
+            HitTarget::None
+        );
+    }
+
+    #[test]
+    fn compact_headers_keep_terminal_paging_separate_from_preset_and_failure_actions() {
+        for scale in [1., 2.] {
+            for role in [PaneRole::Agent, PaneRole::Runner] {
+                let entries: Vec<_> = (0..5)
+                    .map(|n| (PaneId::new(), format!("Session {n}")))
+                    .collect();
+                let mut layout = compute_layout(&LayoutInput {
+                    window_w: 320. * scale,
+                    window_h: 568. * scale,
+                    scale_factor: scale,
+                    sidebar_override: Some(true),
+                    zoomed: true,
+                    focused_role: role,
+                    runner_has_failure: true,
+                    ..default_input()
+                });
+                layout.set_named_tabs(&entries, Some(entries[2].0), scale);
+                let pill = layout.panes[0].action_pill.unwrap();
+                let hit = |r: Rect| {
+                    hit_test(
+                        &layout,
+                        1,
+                        scale,
+                        8.,
+                        16.,
+                        r.x + r.width / 2.,
+                        r.y + r.height / 2.,
+                    )
+                };
+                assert_eq!(hit(pill), HitTarget::PaneHeaderAction(role));
+                assert_eq!(layout.named_tabs.len(), 3);
+                for (i, (id, _, rect)) in layout.named_tabs.iter().enumerate() {
+                    assert_eq!(*id, entries[i + 1].0);
+                    assert!(rect.bottom() <= pill.y);
+                    assert_eq!(hit(*rect), HitTarget::SelectSession(*id));
+                }
+                assert!(layout.named_tabs[1].2.width >= 36. * scale);
+                assert!(layout.panes[0].viewport.y >= pill.bottom());
+            }
+        }
+    }
+
+    #[test]
+    fn focused_terminal_uses_two_thirds_of_default_viewport() {
+        for (w, h) in [
+            (320., 480.),
+            (640., 320.),
+            (900., 520.),
+            (1280., 800.),
+            (2560., 1080.),
+        ] {
+            for s in [1., 2.] {
+                let layout = compute_layout(&LayoutInput {
+                    window_w: w * s,
+                    window_h: h * s,
+                    scale_factor: s,
+                    zoomed: true,
+                    has_top_banner: true,
+                    ..default_input()
+                });
+                assert!(
+                    layout.panes[0].viewport.area() >= w * h * s * s * 2. / 3.,
+                    "{w}x{h} at {s}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn zoomed_layout_gives_focused_role_100_percent_of_canvas() {
         let mut input = default_input();
         input.zoomed = true;
@@ -626,7 +959,7 @@ mod tests {
         assert_eq!(layout.panes.len(), 1);
         let pane = &layout.panes[0];
         assert_eq!(pane.role, PaneRole::Runner);
-        assert_eq!(pane.outer, Rect::new(240.0, 0.0, 1000.0, 800.0));
+        assert_eq!(pane.outer, Rect::new(0.0, 0.0, 1000.0, 800.0));
         assert!(pane.action_pill.is_some());
     }
 
@@ -641,12 +974,89 @@ mod tests {
         let layout = compute_layout(&input);
         assert!(layout.sidebar.is_none());
         let banner = layout.banner.expect("banner should exist");
-        assert_eq!(banner, Rect::new(0.0, 0.0, 2480.0, 48.0));
+        // The collapsed disclosure stays above the banner at desktop widths.
+        let toggle = layout.sidebar_toggle.unwrap();
+        assert_eq!(toggle, Rect::new(0.0, 0.0, 2480.0, 64.0));
+        assert_eq!(banner, Rect::new(0.0, toggle.bottom(), 2480.0, 48.0));
 
         let agent = layout.pane(PaneRole::Agent).unwrap();
         assert_eq!(agent.outer.x, 0.0);
-        assert_eq!(agent.outer.y, 48.0);
-        assert_eq!(agent.outer.height, 800.0 - 48.0);
+        assert_eq!(agent.outer.y, banner.bottom());
+        assert_eq!(agent.outer.height, input.window_h - banner.bottom());
+    }
+
+    #[test]
+    fn opening_workspaces_in_a_narrow_focused_terminal_exposes_full_controls() {
+        for scale in [1., 2.] {
+            let input = LayoutInput {
+                window_w: 320. * scale,
+                window_h: 568. * scale,
+                zoomed: true,
+                scale_factor: scale,
+                sidebar_override: Some(true),
+                ..default_input()
+            };
+            let layout = compute_layout(&input);
+            let sidebar = layout.sidebar.unwrap();
+            assert_eq!(sidebar.width, SIDEBAR_LOGICAL_WIDTH * scale);
+            assert_eq!(layout.panes[0].outer.right(), sidebar.x);
+            let list = crate::sidebar_content::SidebarContent::plain(10, sidebar, 0, scale);
+            let settings = settings_button(layout.sidebar_toggle.unwrap(), list.arrows, scale);
+            assert_eq!(settings.width, 64. * scale);
+            for (rect, target) in [
+                (settings, HitTarget::WorkspaceSettings),
+                (list.new_workspace, HitTarget::SidebarNewWorkspace),
+                (list.new_worktree, HitTarget::SidebarNewWorktree),
+            ] {
+                assert_eq!(
+                    hit_test(
+                        &layout,
+                        10,
+                        scale,
+                        input.cell_w,
+                        input.cell_h,
+                        rect.x + rect.width / 2.,
+                        rect.y + rect.height / 2.
+                    ),
+                    target
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sidebar_disclosure_remains_clickable_after_resize_and_reopen() {
+        for scale in [1.0, 2.0] {
+            let mut input = default_input();
+            input.scale_factor = scale;
+            for (width, visible) in [(320.0, false), (1920.0, false), (1920.0, true)] {
+                input.window_w = width * scale;
+                input.sidebar_override = Some(visible);
+                let layout = compute_layout(&input);
+                let header = layout.sidebar_toggle.expect("visible workspace disclosure");
+                assert_eq!(layout.sidebar.is_some(), visible);
+                assert_eq!(
+                    hit_test(
+                        &layout,
+                        1,
+                        scale,
+                        input.cell_w,
+                        input.cell_h,
+                        header.x + 12.0 * scale,
+                        header.y + header.height / 2.0
+                    ),
+                    HitTarget::ToggleSidebar
+                );
+                let agent = layout.pane(PaneRole::Agent).unwrap();
+                if visible {
+                    assert_eq!(agent.outer.y, 0.0);
+                    assert_eq!(agent.outer.x, header.right());
+                } else {
+                    assert_eq!(agent.outer.y, header.bottom());
+                    assert_eq!(agent.outer.x, 0.0);
+                }
+            }
+        }
     }
 
     #[test]

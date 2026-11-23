@@ -18,6 +18,8 @@ pub struct PersistedWorkspace {
     pub root_dir: PathBuf,
     pub slot_index: u16,
     #[serde(default)]
+    pub manual_launch: bool,
+    #[serde(default)]
     pub agent_preset: Option<String>,
 }
 
@@ -156,6 +158,7 @@ mod tests {
                 name: "alpha".to_string(),
                 root_dir: PathBuf::from("/tmp/alpha"),
                 slot_index: 0,
+                manual_launch: false,
                 agent_preset: Some("agy".to_string()),
             }],
         };
@@ -247,6 +250,7 @@ mod tests {
                 name: "one".to_string(),
                 root_dir: PathBuf::from("/tmp/one"),
                 slot_index: 0,
+                manual_launch: false,
                 agent_preset: None,
             }],
         };
@@ -259,6 +263,7 @@ mod tests {
                 name: "two".to_string(),
                 root_dir: PathBuf::from("/tmp/two"),
                 slot_index: 1,
+                manual_launch: false,
                 agent_preset: Some("claude".to_string()),
             }],
         };
