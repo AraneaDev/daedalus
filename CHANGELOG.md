@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.13](https://github.com/AraneaDev/daedalus/compare/v0.0.12...v0.0.13) (2026-11-23)
+
+
+### Bug Fixes
+
+* **windows:** show setup text and launch the workbench without extra consoles ([#39](https://github.com/AraneaDev/daedalus/issues/39)) ([cd7221c](https://github.com/AraneaDev/daedalus/commit/cd7221c79961f003225d70ae180fb40ad0e32b17))
+
 ## [0.0.12](https://github.com/AraneaDev/daedalus/compare/v0.0.11...v0.0.12) (2026-11-23)
 
 
