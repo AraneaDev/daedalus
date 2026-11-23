@@ -69,6 +69,27 @@ mod tests {
     use daedalus_proto::{CellFlags, Color};
 
     #[test]
+    fn erase_uses_the_physical_cursor_while_wrap_is_pending() {
+        for erase in [b"\x1b[K", b"\x1b[J"] {
+            let mut vt = BuiltinVt::new(VtConfig {
+                cols: 4,
+                rows: 2,
+                ..Default::default()
+            });
+            vt.feed(b"ABCD");
+            vt.feed(erase);
+            assert_eq!(vt.row_text_from(0, 0).trim_end(), "ABC");
+            assert_eq!(vt.cursor().col, 3);
+            vt.feed(b"E");
+            assert_eq!(vt.row_text_from(1, 0).trim_end(), "E");
+
+            vt.feed(b"\x1b[1;2H");
+            vt.feed(erase);
+            assert_eq!(vt.row_text_from(0, 0).trim_end(), "A");
+        }
+    }
+
+    #[test]
     fn renders_sgr_colors_and_flags_and_clears_dirty_delta() {
         let pane_id = PaneId::new();
         let mut vt = BuiltinVt::new(VtConfig {

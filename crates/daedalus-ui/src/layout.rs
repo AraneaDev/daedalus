@@ -5,6 +5,8 @@ pub const HEADER_LOGICAL_HEIGHT: f32 = 26.0;
 pub const BANNER_LOGICAL_HEIGHT: f32 = 24.0;
 pub const VIEWPORT_LOGICAL_PAD: f32 = 6.0;
 pub const AGENT_WIDTH_RATIO: f32 = 0.55;
+// Below this width the right column cannot comfortably fit the Runner title and action.
+const MIN_SPLIT_CANVAS_LOGICAL_WIDTH: f32 = 560.0;
 
 pub const SIDEBAR_HEADER_LOGICAL_HEIGHT: f32 = 32.0;
 pub const SIDEBAR_ROW_LOGICAL_HEIGHT: f32 = 96.0;
@@ -115,7 +117,7 @@ pub struct LayoutInput {
     pub scale_factor: f32,
     pub cell_w: f32,
     pub cell_h: f32,
-    pub sidebar_visible: bool,
+    pub sidebar_override: Option<bool>,
     pub has_top_banner: bool,
     pub zoomed: bool,
     pub focused_role: PaneRole,
@@ -125,6 +127,9 @@ pub struct LayoutInput {
 /// Computed rectangles for the sidebar, optional top banner, and visible semantic panes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceLayout {
+    pub stacked: bool,
+    pub sidebar_first: usize,
+    pub sidebar_toggle: Option<Rect>,
     pub sidebar: Option<Rect>,
     pub banner: Option<Rect>,
     pub panes: Vec<PaneRect>,
@@ -139,6 +144,9 @@ impl WorkspaceLayout {
 /// Result of hit-testing a physical pixel coordinate against a `WorkspaceLayout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
+    ToggleSidebar,
+    SidebarPageUp,
+    SidebarPageDown,
     SidebarWorkspace(usize),
     SidebarWorkspaceClose(usize),
     SidebarNewWorkspace,
@@ -233,7 +241,11 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
     let window_w = input.window_w.max(0.0);
     let window_h = input.window_h.max(0.0);
 
-    let (sidebar, sidebar_w) = if input.sidebar_visible {
+    let min_split_width = MIN_SPLIT_CANVAS_LOGICAL_WIDTH * metrics.scale_factor;
+    let show_sidebar = input
+        .sidebar_override
+        .unwrap_or(window_w >= metrics.sidebar_width + min_split_width);
+    let (sidebar, sidebar_w) = if show_sidebar {
         let w = metrics.sidebar_width.min(window_w);
         (Some(Rect::new(0.0, 0.0, w, window_h)), w)
     } else {
@@ -243,16 +255,31 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
     let canvas_x = sidebar_w;
     let canvas_w = (window_w - sidebar_w).max(0.0);
 
+    let sidebar_toggle = (window_w < metrics.sidebar_width + min_split_width).then(|| {
+        Rect::new(
+            0.0,
+            0.0,
+            sidebar.map_or(window_w, |rect| rect.width),
+            metrics.sidebar_header_height.min(window_h),
+        )
+    });
+    let canvas_top = if sidebar.is_none() {
+        sidebar_toggle.map_or(0.0, |rect| rect.bottom())
+    } else {
+        0.0
+    };
+
     let (banner, banner_h) = if input.has_top_banner {
-        let h = metrics.banner_height.min(window_h);
-        (Some(Rect::new(canvas_x, 0.0, canvas_w, h)), h)
+        let h = metrics.banner_height.min(window_h - canvas_top);
+        (Some(Rect::new(canvas_x, canvas_top, canvas_w, h)), h)
     } else {
         (None, 0.0)
     };
 
-    let canvas_y = banner_h;
-    let canvas_h = (window_h - banner_h).max(0.0);
+    let canvas_y = canvas_top + banner_h;
+    let canvas_h = (window_h - canvas_y).max(0.0);
 
+    let stacked = canvas_w < min_split_width;
     let panes = if input.zoomed {
         let outer = Rect::new(canvas_x, canvas_y, canvas_w, canvas_h);
         vec![build_pane_rect(
@@ -264,14 +291,31 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
             input.runner_has_failure,
         )]
     } else {
-        let agent_w = canvas_w * AGENT_WIDTH_RATIO;
-        let right_w = (canvas_w - agent_w).max(0.0);
-        let top_h = canvas_h * 0.5;
-        let bot_h = (canvas_h - top_h).max(0.0);
+        let (agent_outer, service_outer, runner_outer) = if stacked {
+            let agent_h = canvas_h * 0.5;
+            let service_h = (canvas_h - agent_h) * 0.5;
+            (
+                Rect::new(canvas_x, canvas_y, canvas_w, agent_h),
+                Rect::new(canvas_x, canvas_y + agent_h, canvas_w, service_h),
+                Rect::new(
+                    canvas_x,
+                    canvas_y + agent_h + service_h,
+                    canvas_w,
+                    canvas_h - agent_h - service_h,
+                ),
+            )
+        } else {
+            let agent_w = canvas_w * AGENT_WIDTH_RATIO;
+            let right_w = (canvas_w - agent_w).max(0.0);
+            let top_h = canvas_h * 0.5;
+            let bot_h = (canvas_h - top_h).max(0.0);
 
-        let agent_outer = Rect::new(canvas_x, canvas_y, agent_w, canvas_h);
-        let service_outer = Rect::new(canvas_x + agent_w, canvas_y, right_w, top_h);
-        let runner_outer = Rect::new(canvas_x + agent_w, canvas_y + top_h, right_w, bot_h);
+            let agent_outer = Rect::new(canvas_x, canvas_y, agent_w, canvas_h);
+            let service_outer = Rect::new(canvas_x + agent_w, canvas_y, right_w, top_h);
+            let runner_outer = Rect::new(canvas_x + agent_w, canvas_y + top_h, right_w, bot_h);
+
+            (agent_outer, service_outer, runner_outer)
+        };
 
         vec![
             build_pane_rect(
@@ -302,9 +346,64 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
     };
 
     WorkspaceLayout {
+        sidebar_toggle,
+        sidebar_first: 0,
+        stacked,
         sidebar,
         banner,
         panes,
+    }
+}
+
+/// Geometry shared by sidebar painting, scrolling and hit testing.
+pub struct SidebarList {
+    pub visible: std::ops::Range<usize>,
+    pub arrows: Option<(Rect, Rect)>,
+}
+
+impl SidebarList {
+    pub fn new(sidebar: Rect, count: usize, first: usize, scale: f32) -> Self {
+        let m = LayoutMetrics::for_scale(scale);
+        let available = (sidebar.height
+            - m.sidebar_header_height
+            - 2.0 * m.sidebar_pad
+            - m.sidebar_new_btn_height
+            - m.sidebar_row_gap)
+            .max(0.0);
+        let mut capacity =
+            (available / (m.sidebar_row_height + m.sidebar_row_gap)).floor() as usize;
+        if capacity == 0 && available >= m.header_height {
+            capacity = 1;
+        }
+        let capacity = capacity.min(count);
+        let start = first.min(count.saturating_sub(capacity));
+        let arrows = (capacity > 0 && count > capacity).then(|| {
+            let width = m.sidebar_header_height.min(sidebar.width * 0.25);
+            let right = sidebar.right() - m.sidebar_pad;
+            (
+                Rect::new(
+                    right - 2.0 * width,
+                    sidebar.y,
+                    width,
+                    m.sidebar_header_height,
+                ),
+                Rect::new(right - width, sidebar.y, width, m.sidebar_header_height),
+            )
+        });
+        Self {
+            visible: start..start + capacity,
+            arrows,
+        }
+    }
+
+    pub fn reveal(&self, index: usize) -> usize {
+        if index < self.visible.start {
+            index
+        } else if index >= self.visible.end {
+            (index + 1).saturating_sub(self.visible.len())
+        } else {
+            self.visible.start
+        }
     }
 }
 
@@ -317,7 +416,9 @@ pub fn sidebar_workspace_rect(sidebar: Rect, index: usize, scale_factor: f32) ->
         + m.sidebar_header_height
         + m.sidebar_pad
         + (index as f32) * (m.sidebar_row_height + m.sidebar_row_gap);
-    Rect::new(x, y, w, m.sidebar_row_height)
+    let footer_top =
+        sidebar.bottom() - m.sidebar_pad - m.sidebar_new_btn_height - m.sidebar_row_gap;
+    Rect::new(x, y, w, m.sidebar_row_height.min((footer_top - y).max(0.0)))
 }
 
 /// Computes the compact `×` close button rectangle in the top-right corner of a sidebar workspace card.
@@ -336,11 +437,14 @@ pub fn sidebar_workspace_close_rect(card: Rect, scale_factor: f32) -> Rect {
 }
 
 fn sidebar_footer_buttons_y(sidebar: Rect, workspace_count: usize, m: &LayoutMetrics) -> f32 {
-    sidebar.y
+    let after_cards = sidebar.y
         + m.sidebar_header_height
         + m.sidebar_pad
         + (workspace_count as f32) * (m.sidebar_row_height + m.sidebar_row_gap)
-        + m.sidebar_row_gap
+        + m.sidebar_row_gap;
+    after_cards
+        .min(sidebar.bottom() - m.sidebar_pad - m.sidebar_new_btn_height)
+        .max(sidebar.y + m.sidebar_header_height.min(sidebar.height))
 }
 
 /// Computes the rectangle of the "+ Workspace" button inside the sidebar.
@@ -354,7 +458,13 @@ pub fn sidebar_new_workspace_rect(
     let btn_w = ((total_w - m.sidebar_row_gap) * 0.5).max(0.0);
     let x = sidebar.x + m.sidebar_pad;
     let y = sidebar_footer_buttons_y(sidebar, workspace_count, &m);
-    Rect::new(x, y, btn_w, m.sidebar_new_btn_height)
+    Rect::new(
+        x,
+        y,
+        btn_w,
+        m.sidebar_new_btn_height
+            .min((sidebar.bottom() - y).max(0.0)),
+    )
 }
 
 /// Computes the rectangle of the "+ Worktree" button next to "+ Workspace" inside the sidebar.
@@ -365,7 +475,13 @@ pub fn sidebar_new_worktree_rect(sidebar: Rect, workspace_count: usize, scale_fa
     let right_w = (total_w - left_w - m.sidebar_row_gap).max(0.0);
     let x = sidebar.x + m.sidebar_pad + left_w + m.sidebar_row_gap;
     let y = sidebar_footer_buttons_y(sidebar, workspace_count, &m);
-    Rect::new(x, y, right_w, m.sidebar_new_btn_height)
+    Rect::new(
+        x,
+        y,
+        right_w,
+        m.sidebar_new_btn_height
+            .min((sidebar.bottom() - y).max(0.0)),
+    )
 }
 
 /// Hit-tests a physical pixel coordinate `(x, y)` against the current `WorkspaceLayout`.
@@ -378,11 +494,28 @@ pub fn hit_test(
     x: f32,
     y: f32,
 ) -> HitTarget {
+    let list = layout.sidebar.map(|sidebar| {
+        SidebarList::new(sidebar, workspace_count, layout.sidebar_first, scale_factor)
+    });
+    if let Some((up, down)) = list.as_ref().and_then(|list| list.arrows) {
+        if up.contains(x, y) {
+            return HitTarget::SidebarPageUp;
+        }
+        if down.contains(x, y) {
+            return HitTarget::SidebarPageDown;
+        }
+    }
+    if layout
+        .sidebar_toggle
+        .is_some_and(|rect| rect.contains(x, y))
+    {
+        return HitTarget::ToggleSidebar;
+    }
     if let Some(sidebar) = layout.sidebar
         && sidebar.contains(x, y)
     {
-        for i in 0..workspace_count {
-            let row_rect = sidebar_workspace_rect(sidebar, i, scale_factor);
+        for (row, i) in list.unwrap().visible.enumerate() {
+            let row_rect = sidebar_workspace_rect(sidebar, row, scale_factor);
             if row_rect.contains(x, y) {
                 let close_rect = sidebar_workspace_close_rect(row_rect, scale_factor);
                 if close_rect.contains(x, y) {
@@ -446,7 +579,7 @@ mod tests {
             scale_factor: 1.0,
             cell_w: 8.0,
             cell_h: 16.0,
-            sidebar_visible: true,
+            sidebar_override: None,
             has_top_banner: false,
             zoomed: false,
             focused_role: PaneRole::Agent,
@@ -500,19 +633,124 @@ mod tests {
     #[test]
     fn sidebar_toggle_and_top_banner_adjust_canvas() {
         let mut input = default_input();
-        input.sidebar_visible = false;
+        input.sidebar_override = Some(false);
         input.has_top_banner = true;
         input.scale_factor = 2.0;
+        input.window_w = 2480.0;
 
         let layout = compute_layout(&input);
         assert!(layout.sidebar.is_none());
         let banner = layout.banner.expect("banner should exist");
-        assert_eq!(banner, Rect::new(0.0, 0.0, 1240.0, 48.0));
+        assert_eq!(banner, Rect::new(0.0, 0.0, 2480.0, 48.0));
 
         let agent = layout.pane(PaneRole::Agent).unwrap();
         assert_eq!(agent.outer.x, 0.0);
         assert_eq!(agent.outer.y, 48.0);
         assert_eq!(agent.outer.height, 800.0 - 48.0);
+    }
+
+    #[test]
+    fn narrow_windows_stack_all_roles_and_keep_them_reachable_at_both_scales() {
+        for scale in [1.0, 2.0] {
+            let mut input = default_input();
+            input.scale_factor = scale;
+            input.window_w = 320.0 * scale;
+            input.window_h = 568.0 * scale;
+            input.cell_w *= scale;
+            input.cell_h *= scale;
+            input.has_top_banner = true;
+            let layout = compute_layout(&input);
+            assert!(layout.sidebar.is_none());
+            assert!(layout.stacked);
+            assert_eq!(
+                hit_test(
+                    &layout,
+                    0,
+                    scale,
+                    input.cell_w,
+                    input.cell_h,
+                    8.0 * scale,
+                    8.0 * scale
+                ),
+                HitTarget::ToggleSidebar
+            );
+            let mut top = layout.banner.unwrap().bottom();
+            for pane in &layout.panes {
+                assert_eq!(pane.outer.y, top);
+                assert_eq!(pane.outer.width, input.window_w);
+                assert_eq!(pane.cols, 38);
+                assert!(pane.rows > 0);
+                assert!(
+                    matches!(hit_test(&layout, 0, scale, input.cell_w, input.cell_h, pane.viewport.x, pane.viewport.y), HitTarget::PaneViewport {role, ..} if role == pane.role)
+                );
+                top = pane.outer.bottom();
+            }
+            assert_eq!(top, input.window_h);
+            input.sidebar_override = Some(true);
+            assert!(compute_layout(&input).sidebar.is_some());
+            input.zoomed = true;
+            input.focused_role = PaneRole::Runner;
+            assert_eq!(compute_layout(&input).panes.len(), 1);
+        }
+    }
+
+    #[test]
+    fn sidebar_page_reveals_active_workspace_and_keeps_footer_reachable() {
+        for scale in [1.0, 2.0] {
+            let mut input = default_input();
+            input.sidebar_override = Some(true);
+            input.scale_factor = scale;
+            input.window_w = 640.0 * scale;
+            input.window_h = 420.0 * scale;
+            let mut layout = compute_layout(&input);
+            let sidebar = layout.sidebar.unwrap();
+            let count = 50;
+            let first = SidebarList::new(sidebar, count, 0, scale);
+            assert_eq!(first.visible, 0..3);
+            layout.sidebar_first = first.reveal(49);
+            let list = SidebarList::new(sidebar, count, layout.sidebar_first, scale);
+            assert_eq!(list.visible, 47..50);
+            assert_eq!(list.reveal(48), 47);
+            assert_eq!(list.reveal(1), 1);
+
+            let hit = |rect: Rect| {
+                hit_test(
+                    &layout,
+                    count,
+                    scale,
+                    8.0 * scale,
+                    16.0 * scale,
+                    rect.x + rect.width / 2.0,
+                    rect.y + rect.height / 2.0,
+                )
+            };
+            let bottom_card = sidebar_workspace_rect(sidebar, 2, scale);
+            assert_eq!(hit(bottom_card), HitTarget::SidebarWorkspace(49));
+            assert_eq!(
+                hit(sidebar_workspace_close_rect(bottom_card, scale)),
+                HitTarget::SidebarWorkspaceClose(49)
+            );
+            let workspace_btn = sidebar_new_workspace_rect(sidebar, count, scale);
+            let worktree_btn = sidebar_new_worktree_rect(sidebar, count, scale);
+            assert!(bottom_card.bottom() <= workspace_btn.y);
+            assert!(worktree_btn.bottom() <= sidebar.bottom());
+            assert_eq!(hit(workspace_btn), HitTarget::SidebarNewWorkspace);
+            assert_eq!(hit(worktree_btn), HitTarget::SidebarNewWorktree);
+            let (up, down) = list.arrows.unwrap();
+            assert_eq!(hit(up), HitTarget::SidebarPageUp);
+            assert_eq!(hit(down), HitTarget::SidebarPageDown);
+            assert_eq!(SidebarList::new(sidebar, 2, 47, scale).visible, 0..2);
+        }
+    }
+
+    #[test]
+    fn short_sidebar_keeps_one_condensed_workspace_card_above_footer() {
+        let sidebar = Rect::new(0.0, 0.0, 240.0, 140.0);
+        let list = SidebarList::new(sidebar, 10, 9, 1.0);
+        assert_eq!(list.visible, 9..10);
+        let card = sidebar_workspace_rect(sidebar, 0, 1.0);
+        assert!(card.height >= HEADER_LOGICAL_HEIGHT && card.height < SIDEBAR_ROW_LOGICAL_HEIGHT);
+        assert!(card.bottom() <= sidebar_new_workspace_rect(sidebar, 10, 1.0).y);
     }
 
     #[test]

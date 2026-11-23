@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+accesskit = "0.25.1"
+accesskit_winit = "0.34.1"
+unicode-segmentation = "1"
+unicode-width = "0.1"
 arboard.workspace = true
 bytemuck.workspace = true
 clap.workspace = true

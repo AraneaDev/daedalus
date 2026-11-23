@@ -273,7 +273,8 @@ impl Grid {
         if r >= self.viewport.len() {
             return;
         }
-        let col = (self.cursor_col as usize).min(self.cols as usize);
+        // A pending wrap may put the write position one past the visible cursor.
+        let col = usize::from(self.cursor().col);
         let cols = self.cols as usize;
         let (start, end) = match mode {
             0 => (col, cols),

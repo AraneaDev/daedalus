@@ -565,6 +565,7 @@ mod tests {
         };
 
         let ws_info = WorkspaceInfo {
+            default_panes_pending: None,
             id: ws_id,
             name: "feat-auth".to_string(),
             root_dir: PathBuf::from("/tmp/wt1"),
@@ -710,6 +711,7 @@ mod tests {
             actions: Vec::new(),
         };
         let ws_info = WorkspaceInfo {
+            default_panes_pending: None,
             id: ws_id,
             name: "manifest-ws".to_string(),
             root_dir: PathBuf::from("/tmp/manifest-ws"),
@@ -986,6 +988,7 @@ mod tests {
         };
 
         let ws_info = WorkspaceInfo {
+            default_panes_pending: None,
             id: ws_id,
             name: "wt1".to_string(),
             root_dir: PathBuf::from("/tmp/wt1"),
@@ -1240,6 +1243,7 @@ mod tests {
             actions: vec![action.clone()],
         };
         let ws_info = WorkspaceInfo {
+            default_panes_pending: None,
             id: ws_id,
             name: "actions-ws".to_string(),
             root_dir: PathBuf::from("/tmp/actions-ws"),

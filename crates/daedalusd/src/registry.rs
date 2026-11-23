@@ -19,6 +19,29 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tracing::warn;
 
+const DEFAULT_ROLES: [PaneRole; 3] = [PaneRole::Agent, PaneRole::Service, PaneRole::Runner];
+
+enum DefaultPanes {
+    Pending(HashSet<PaneRole>),
+    Complete,
+}
+
+impl DefaultPanes {
+    fn record_install(&mut self, role: PaneRole, is_default: bool) {
+        if let Self::Pending(roles) = self {
+            // A manually populated workspace keeps the pane arrangement its caller selected.
+            if !is_default && roles.is_empty() {
+                *self = Self::Complete;
+            } else {
+                roles.insert(role);
+                if DEFAULT_ROLES.iter().all(|role| roles.contains(role)) {
+                    *self = Self::Complete;
+                }
+            }
+        }
+    }
+}
+
 struct WorkspaceRecord {
     id: WorkspaceId,
     name: String,
@@ -32,6 +55,7 @@ struct WorkspaceRecord {
     injected_env: HashMap<String, String>,
     reserved_ports: HashSet<u16>,
     pane_ids: Vec<PaneId>,
+    default_panes: DefaultPanes,
     lifecycle: std::sync::Arc<Mutex<()>>,
     bound_ports: Vec<PortMapping>,
     containers: Vec<ContainerHealth>,
@@ -48,6 +72,7 @@ impl WorkspaceRecord {
             slot_index: self.slot_index,
             injected_env: self.injected_env.clone(),
             panes,
+            default_panes_pending: Some(matches!(self.default_panes, DefaultPanes::Pending(_))),
             port_offset: self.port_offset,
             compose_project_name: self.compose_project_name.clone(),
             git_branch: self.git_branch.clone(),
@@ -152,6 +177,7 @@ fn build_workspace_record(
         injected_env: prepared.plan.injected_env,
         reserved_ports,
         pane_ids: Vec::new(),
+        default_panes: DefaultPanes::Pending(HashSet::new()),
         lifecycle: Default::default(),
         bound_ports: Vec::new(),
         containers: Vec::new(),
@@ -411,8 +437,58 @@ impl Registry {
             rows,
             pane_env,
             None,
+            false,
         )
         .await
+    }
+
+    pub async fn ensure_default_pane(
+        &self,
+        workspace_id: WorkspaceId,
+        role: PaneRole,
+        command: Option<Vec<String>>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<daedalus_proto::ResponsePayload, ProtoError> {
+        use daedalus_proto::ResponsePayload;
+        let _lifecycle = self.lock_workspace_lifecycle(workspace_id).await?;
+        let workspaces = self.workspaces.read().await;
+        let ws = workspaces
+            .get(&workspace_id)
+            .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
+        if matches!(&ws.default_panes, DefaultPanes::Pending(done) if !done.contains(&role)) {
+            drop(workspaces);
+            return self
+                .install_pane(
+                    workspace_id,
+                    role,
+                    command,
+                    None,
+                    cols,
+                    rows,
+                    HashMap::new(),
+                    None,
+                    true,
+                )
+                .await
+                .map(ResponsePayload::PaneSpawned);
+        }
+
+        let existing = {
+            let panes = self.panes.read().await;
+            ws.pane_ids
+                .iter()
+                .rev()
+                .filter_map(|id| panes.get(id))
+                .find(|pane| pane.role() == role)
+                .cloned()
+        };
+        drop(workspaces);
+        let summary = match existing {
+            Some(handle) => Some(handle.summary().await?),
+            None => None,
+        };
+        Ok(ResponsePayload::DefaultPaneExisting(summary))
     }
 
     pub async fn replace_agent_pane(
@@ -455,6 +531,7 @@ impl Registry {
             rows,
             HashMap::new(),
             old_pane_id,
+            false,
         )
         .await
     }
@@ -471,6 +548,7 @@ impl Registry {
         rows: u16,
         pane_env: HashMap<String, String>,
         old_pane_id: Option<PaneId>,
+        is_default: bool,
     ) -> Result<PaneSummary, ProtoError> {
         let (root_dir, mut merged_env) = {
             let ws_map = self.workspaces.read().await;
@@ -529,6 +607,7 @@ impl Registry {
                 panes.remove(&old)
             });
             ws.pane_ids.push(pane_id);
+            ws.default_panes.record_install(role, is_default);
             panes.insert(pane_id, handle);
             previous
         };
@@ -620,10 +699,24 @@ impl Registry {
                 .get_mut(&workspace_id)
                 .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
             let mut panes = self.panes.write().await;
-            ws.pane_ids
+            let handles: Vec<_> = ws
+                .pane_ids
                 .drain(..)
                 .filter_map(|id| panes.remove(&id))
-                .collect()
+                .collect();
+            if remove_worktree && !handles.is_empty() {
+                // Git may still refuse removal. Reopen roles drained by this close while
+                // preserving any roles the user had already left closed.
+                let mut finished = match &ws.default_panes {
+                    DefaultPanes::Pending(roles) => roles.clone(),
+                    DefaultPanes::Complete => DEFAULT_ROLES.into_iter().collect(),
+                };
+                for handle in &handles {
+                    finished.remove(&handle.role());
+                }
+                ws.default_panes = DefaultPanes::Pending(finished);
+            }
+            handles
         };
         for handle in handles {
             handle.close().await;
@@ -1362,6 +1455,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_default_initializers_share_panes_and_respect_closed_roles() {
+        use daedalus_proto::ResponsePayload::{DefaultPaneExisting, PaneSpawned};
+        let dir = TempDir::new().unwrap();
+        let reg = test_registry(dir.path());
+        let ws = reg
+            .create_workspace("default".into(), dir.path().into(), HashMap::new())
+            .await
+            .unwrap();
+        let initialize = || async {
+            let mut results = Vec::new();
+            for role in [PaneRole::Agent, PaneRole::Service, PaneRole::Runner] {
+                results.push(
+                    reg.ensure_default_pane(ws.id, role, Some(interactive_shell_command()), 80, 24)
+                        .await
+                        .unwrap(),
+                );
+            }
+            results
+        };
+        let (first, second) = tokio::join!(initialize(), initialize());
+        for (a, b) in first.into_iter().zip(second) {
+            match (a, b) {
+                (PaneSpawned(new), DefaultPaneExisting(Some(existing)))
+                | (DefaultPaneExisting(Some(existing)), PaneSpawned(new)) => {
+                    assert_eq!(new.id, existing.id)
+                }
+                results => panic!("both initializers must share each pane: {results:?}"),
+            }
+        }
+        let current = reg.list_workspaces().await.pop().unwrap();
+        assert_eq!(current.panes.len(), 3);
+        assert_eq!(reg.panes.read().await.len(), 3);
+        assert_eq!(
+            current
+                .panes
+                .iter()
+                .map(|p| p.role)
+                .collect::<HashSet<_>>()
+                .len(),
+            3
+        );
+        assert!(!current.needs_default_panes());
+        for pane in current.panes {
+            reg.close_pane(pane.id).await.unwrap();
+        }
+        assert!(
+            initialize()
+                .await
+                .iter()
+                .all(|result| matches!(result, DefaultPaneExisting(None)))
+        );
+        assert!(reg.panes.read().await.is_empty());
+        assert!(!reg.list_workspaces().await[0].needs_default_panes());
+        reg.close_all().await;
+    }
+
+    #[tokio::test]
     async fn pane_spawn_send_input_snapshot_resize_and_workspace_close() {
         let dir = TempDir::new().unwrap();
         let registry = test_registry(dir.path());
@@ -1384,6 +1534,16 @@ mod tests {
             .unwrap();
         assert_eq!(summary.cols, 80);
         assert_eq!(summary.rows, 24);
+        // A manual workspace with only a Runner remains exactly as its caller configured it.
+        assert!(!registry.list_workspaces().await[0].needs_default_panes());
+        assert!(matches!(
+            registry
+                .ensure_default_pane(ws.id, PaneRole::Service, None, 80, 24)
+                .await
+                .unwrap(),
+            daedalus_proto::ResponsePayload::DefaultPaneExisting(None)
+        ));
+        assert_eq!(registry.panes.read().await.len(), 1);
 
         let targets = registry.monitor_targets().await;
         assert_eq!(targets.len(), 1);

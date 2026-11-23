@@ -222,6 +222,9 @@ pub struct WorkspaceInfo {
     pub slot_index: u16,
     pub injected_env: HashMap<String, String>,
     pub panes: Vec<PaneSummary>,
+    /// Whether lazy pane initialization should start or resume. Older daemons omit this.
+    #[serde(default)]
+    pub default_panes_pending: Option<bool>,
     #[serde(default)]
     pub port_offset: u16,
     #[serde(default)]
@@ -238,6 +241,12 @@ pub struct WorkspaceInfo {
     pub external_statuses: Vec<ExternalStatus>,
     #[serde(default)]
     pub manifest: Option<WorkspaceManifest>,
+}
+
+impl WorkspaceInfo {
+    pub fn needs_default_panes(&self) -> bool {
+        self.default_panes_pending.unwrap_or(self.panes.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

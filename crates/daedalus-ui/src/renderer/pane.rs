@@ -1,12 +1,12 @@
 use super::quads::QuadInstance;
 use super::{
-    agent_state_badge, emit_cell_run_quad, pane_agent_state_pill_rect, push_rect_border,
-    status_dot_color,
+    agent_state_badge, emit_cell_run_quad, pane_agent_state_pill_rect, push_chrome_badge,
+    push_rect_border, status_dot_color,
 };
 use crate::layout::{PaneRect, Rect};
 use crate::state::{AppState, PaneViewState, SearchState};
 use crate::theme::{Rgba, Theme};
-use daedalus_proto::{AgentState, CellFlags, GridRow, PaneRole};
+use daedalus_proto::{CellFlags, GridRow, PaneRole};
 use std::collections::HashMap;
 
 pub(super) fn collect_pane_quads(
@@ -82,31 +82,18 @@ fn collect_pane_chrome(
     {
         let (label, color) = agent_state_badge(agent_state, theme);
         if let Some(pill) = pane_agent_state_pill_rect(pane_rect, label, scale_factor) {
-            let fill_alpha = if agent_state == AgentState::WaitingForApproval {
-                0.28
-            } else {
-                0.20
-            };
-            quads.push(QuadInstance::new(pill, color.with_alpha(fill_alpha)));
-            push_rect_border(quads, pill, border_w, color.with_alpha(0.70));
+            push_chrome_badge(quads, pill, theme, border_w, color.with_alpha(0.70));
         }
     }
 
     // Action pill background + border
     if let Some(pill) = pane_rect.action_pill {
-        let (pill_bg, pill_border) = match pane_rect.role {
-            PaneRole::Agent => (
-                theme.border_focused.with_alpha(0.20),
-                theme.border_focused.with_alpha(0.55),
-            ),
-            PaneRole::Runner => (
-                theme.status_err.with_alpha(0.25),
-                theme.status_err.with_alpha(0.75),
-            ),
-            PaneRole::Service => (theme.bg_pane, theme.border_unfocused),
+        let border = match pane_rect.role {
+            PaneRole::Agent => theme.border_focused.with_alpha(0.55),
+            PaneRole::Runner => theme.status_err.with_alpha(0.75),
+            PaneRole::Service => theme.border_unfocused,
         };
-        quads.push(QuadInstance::new(pill, pill_bg));
-        push_rect_border(quads, pill, border_w, pill_border);
+        push_chrome_badge(quads, pill, theme, border_w, border);
     }
 
     // Header separator

@@ -33,17 +33,23 @@ The UI starts the local daemon automatically. The left pane hosts the agent, the
 | `Ctrl+Shift+H/J/K/L` | Directional focus across panes |
 | `Ctrl+Shift+Z` | Toggle pane zoom |
 | `Ctrl+Shift+B` | Toggle left sidebar |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Switch to the next / previous workspace |
 | `Ctrl+Shift+P` | Open/close Agent preset picker (`agy`, `claude`, `codex`, `shell`) |
 | `Ctrl+Shift+W` | Open/close New Git Worktree modal |
 | `Ctrl+Shift+A` | Open workspace action palette |
 | `Ctrl+Shift+N` | Create a new workspace in the current directory |
 | `Ctrl+Shift+E` | Forward latest `Runner` failure trace to `Agent` (bracketed paste) |
 | `Ctrl+Shift+C` / `V` | Copy selection / Bracketed-paste clipboard |
+| `Ctrl+Shift+F` | Search the focused pane. Enter advances, Shift+Enter goes back, and Esc closes search. |
 | `Shift+PageUp` / `PageDown` / `End` | Scrollback navigation |
 
 ---
 
+In narrow windows, the panes stack vertically. Click **Workspaces** to show or hide the sidebar. For long lists, scroll over the sidebar or use its page arrows.
+
 On macOS, use Cmd for the workbench shortcuts shown with Ctrl+Shift.
+
+The native accessibility tree exposes the active workspace, focused pane, connection status, and open dialog or search context. In **New Git Worktree**, type the branch name and activate **Create** or **Cancel** with the pointer, keyboard, or an assistive tool. Create becomes available when a branch name is present and the daemon is connected.
 
 ## CLI & External Status Hook (`daedalus-ctl` / `events.sock`)
 

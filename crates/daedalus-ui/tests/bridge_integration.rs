@@ -233,15 +233,23 @@ async fn daemon_bridge_handles_mid_session_disconnect_and_reconnects_cleanly() {
     let (shutdown1_tx, shutdown1_rx) = oneshot::channel::<()>();
     let sock1 = sock.clone();
     let runtime1 = runtime.clone();
+    let state_file = dir.path().join("state.json");
+    let state_file1 = state_file.clone();
     let srv1_thread = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async move {
-            let server1 = DaemonServer::bind_with_supervisor(sock1, runtime1, test_supervisor())
-                .await
-                .unwrap();
+            let server1 = DaemonServer::bind_with_options(
+                sock1,
+                runtime1,
+                None,
+                Some(state_file1),
+                test_supervisor(),
+            )
+            .await
+            .unwrap();
             let _ = ready1_tx.send(());
             let _ = server1
                 .serve(async {
@@ -268,11 +276,13 @@ async fn daemon_bridge_handles_mid_session_disconnect_and_reconnects_cleanly() {
     );
 
     // Wait for initial bootstrap to finish completely (3 panes spawned + 3 initial snapshots).
+    let mut initial_workspace = None;
     let mut initial_panes = 0usize;
     let mut initial_snapshots = 0usize;
     tokio::time::timeout(Duration::from_secs(10), async {
         while initial_panes < 3 || initial_snapshots < 3 {
             match evt_rx.recv().await.expect("event channel closed") {
+                UiEvent::WorkspaceCreated(ws) => initial_workspace = Some(ws.id),
                 UiEvent::PaneSpawned { .. } => initial_panes += 1,
                 UiEvent::Snapshot(_) => initial_snapshots += 1,
                 _ => {}
@@ -301,10 +311,45 @@ async fn daemon_bridge_handles_mid_session_disconnect_and_reconnects_cleanly() {
     .await
     .expect("timed out waiting for UiEvent::Disconnected");
 
+    let original_id = initial_workspace.expect("bootstrap should create a workspace");
+    let create_workspace = |name: &str| UiCommand::CreateWorkspace {
+        name: name.into(),
+        root_dir: dir.path().to_path_buf(),
+        agent_preset: AgentPreset::Shell,
+    };
+    assert!(!bridge.send(create_workspace("rejected")));
+    assert!(!bridge.send(UiCommand::CloseWorkspace {
+        id: original_id,
+        compose_down: false,
+        remove_worktree: false,
+        force_remove_worktree: false,
+    }));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut rejected = 0;
+        while rejected < 2 {
+            if let UiEvent::Toast {
+                message,
+                is_error: true,
+            } = evt_rx.recv().await.unwrap()
+                && message.contains("unavailable")
+            {
+                rejected += 1;
+            }
+        }
+    })
+    .await
+    .expect("both rejected commands should have visible feedback");
+
     // Start daemon 2 on the same socket and verify DaemonBridge reconnects and reloads workspaces.
-    let server2 = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
-        .await
-        .unwrap();
+    let server2 = DaemonServer::bind_with_options(
+        sock.clone(),
+        runtime,
+        None,
+        Some(state_file),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
     let (shutdown2_tx, shutdown2_rx) = oneshot::channel::<()>();
     let srv2_handle = tokio::spawn(async move {
         let _ = server2
@@ -327,6 +372,39 @@ async fn daemon_bridge_handles_mid_session_disconnect_and_reconnects_cleanly() {
     })
     .await
     .expect("timed out waiting for bridge reconnect + WorkspacesLoaded");
+
+    assert!(bridge.send(create_workspace("after reconnect")));
+    let created_id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let UiEvent::WorkspaceCreated(ws) = evt_rx.recv().await.unwrap() {
+                assert_eq!(ws.name, "after reconnect");
+                break ws.id;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(bridge.send(UiCommand::CloseWorkspace {
+        id: created_id,
+        compose_down: false,
+        remove_worktree: false,
+        force_remove_worktree: false,
+    }));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let UiEvent::WorkspacesLoaded(workspaces) = evt_rx.recv().await.unwrap() {
+                assert!(workspaces.iter().any(|ws| ws.id == original_id));
+                assert!(
+                    workspaces
+                        .iter()
+                        .all(|ws| ws.id != created_id && ws.name != "rejected")
+                );
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
 
     tokio::task::spawn_blocking(move || bridge.shutdown())
         .await
@@ -483,9 +561,10 @@ command = ["cmd.exe", "/C", "echo", "MANIFEST_RUNNER_NEEDLE", "&", "ping", "-n",
                         runner_pane_id = Some(summary.id);
                     }
                 }
-                UiEvent::WorkspacePanesEnsured { workspace_id }
-                    if workspace_id == dormant_ws.id =>
-                {
+                UiEvent::WorkspacePanesEnsured {
+                    workspace_id,
+                    complete: true,
+                } if workspace_id == dormant_ws.id => {
                     ensured = true;
                 }
                 _ => {}
@@ -840,6 +919,114 @@ command = "mkdir action-result"
         .unwrap();
     stop.send(()).unwrap();
     daemon.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn queued_terminal_input_stays_with_its_connection() {
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn handshake(listener: &TcpListener) -> (TcpStream, Request) {
+        let (mut peer, _) = listener.accept().await.unwrap();
+        for expected in [
+            ClientMessage::Ping,
+            ClientMessage::Subscribe { pane_ids: None },
+        ] {
+            let request = read_frame::<_, Request>(&mut peer).await.unwrap().unwrap();
+            assert_eq!(request.payload, expected);
+            let result = match expected {
+                ClientMessage::Ping => ResponsePayload::Pong {
+                    version: "test".into(),
+                    vt_backend: "builtin".into(),
+                    isolation_mode: "test".into(),
+                },
+                _ => ResponsePayload::Ok,
+            };
+            write_frame(
+                &mut peer,
+                &ServerMessage::Response {
+                    id: request.id,
+                    result: Ok(result),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let list = read_frame::<_, Request>(&mut peer).await.unwrap().unwrap();
+        assert_eq!(list.payload, ClientMessage::ListWorkspaces);
+        (peer, list)
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let bridge = DaemonBridge::start(
+        BridgeConfig {
+            socket_path: format!("tcp://{}", listener.local_addr().unwrap()).into(),
+            initial_dir: ".".into(),
+            default_agent: AgentPreset::Shell,
+            auto_spawn_daemon: false,
+            auth_token: None,
+        },
+        Arc::new(ChannelSink { tx }),
+    );
+    let reconnect = async {
+        let (peer, _) = handshake(&listener).await;
+        let pane_id = daedalus_proto::PaneId::new();
+        // The bridge is ready for submissions but cannot dispatch until ListWorkspaces returns.
+        assert!(bridge.send(UiCommand::SendInput {
+            pane_id,
+            data: b"stale".to_vec(),
+        }));
+        drop(peer);
+        let mut reported = false;
+        loop {
+            match events.recv().await.unwrap() {
+                UiEvent::Toast {
+                    is_error: true,
+                    message,
+                } if message.contains("Pending commands") => {
+                    reported = true;
+                }
+                UiEvent::Disconnected => break,
+                _ => {}
+            }
+        }
+        assert!(reported);
+        let (mut peer, list) = handshake(&listener).await;
+        let workspace = toml::from_str(&format!(
+            r#"id = "{}"
+               name = "test"
+               root_dir = "."
+               slot_index = 0
+               panes = []
+               injected_env = {{}}"#,
+            daedalus_proto::WorkspaceId::new()
+        ))
+        .unwrap();
+        write_frame(
+            &mut peer,
+            &ServerMessage::Response {
+                id: list.id,
+                result: Ok(ResponsePayload::Workspaces(vec![workspace])),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(bridge.send(UiCommand::SendInput {
+            pane_id,
+            data: b"fresh".to_vec(),
+        }));
+        let request = read_frame::<_, Request>(&mut peer).await.unwrap().unwrap();
+        assert_eq!(
+            request.payload,
+            ClientMessage::SendInput {
+                pane_id,
+                data: b"fresh".to_vec(),
+            }
+        );
+    };
+    tokio::time::timeout(Duration::from_secs(10), reconnect)
+        .await
+        .expect("bridge failed to recover after interrupted initialization");
 }
 
 #[tokio::test]

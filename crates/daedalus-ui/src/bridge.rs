@@ -135,9 +135,11 @@ pub enum UiEvent {
     Disconnected,
     WorkspacesLoaded(Vec<WorkspaceInfo>),
     WorkspaceCloseFailed(Vec<WorkspaceInfo>),
+    WorkspaceCloseFinished(WorkspaceId),
     WorkspaceCreated(WorkspaceInfo),
     WorkspacePanesEnsured {
         workspace_id: WorkspaceId,
+        complete: bool,
     },
     PaneSpawned {
         summary: PaneSummary,
@@ -180,7 +182,8 @@ pub enum UiEvent {
 
 /// Background async bridge between the UI thread and `daedalusd`.
 pub struct DaemonBridge {
-    cmd_tx: mpsc::UnboundedSender<UiCommand>,
+    session: watch::Receiver<Option<mpsc::UnboundedSender<UiCommand>>>,
+    sink: Arc<dyn UiEventSink>,
     shutdown_tx: watch::Sender<()>,
     thread_handle: Option<JoinHandle<()>>,
 }
@@ -188,7 +191,8 @@ pub struct DaemonBridge {
 impl DaemonBridge {
     /// Spawns a dedicated 2-worker Tokio runtime thread and begins connecting to `daedalusd`.
     pub fn start(config: BridgeConfig, sink: Arc<dyn UiEventSink>) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (session_tx, session) = watch::channel(None);
+        let thread_sink = Arc::clone(&sink);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(());
         let thread_handle = std::thread::Builder::new()
             .name("daedalus-bridge".to_string())
@@ -202,26 +206,38 @@ impl DaemonBridge {
                     tokio::select! {
                         biased;
                         _ = shutdown_rx.changed() => {}
-                        _ = run_bridge(config, sink, cmd_rx) => {}
+                        _ = run_bridge(config, thread_sink, session_tx) => {}
                     }
                 });
             })
             .expect("failed to spawn DaemonBridge thread");
 
         Self {
-            cmd_tx,
+            session,
+            sink,
             shutdown_tx,
             thread_handle: Some(thread_handle),
         }
     }
 
-    /// Enqueues a command for the background bridge runtime.
-    pub fn send(&self, cmd: UiCommand) {
+    /// Submits a command only to the current session. Returns whether it was accepted.
+    pub fn send(&self, cmd: UiCommand) -> bool {
         if matches!(cmd, UiCommand::Shutdown) {
-            let _ = self.shutdown_tx.send(());
-        } else {
-            let _ = self.cmd_tx.send(cmd);
+            return self.shutdown_tx.send(()).is_ok();
         }
+        let accepted = self
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|tx| tx.send(cmd).is_ok());
+        if accepted {
+            return true;
+        }
+        self.sink.emit(UiEvent::Toast {
+            message: "Daemon unavailable. Try again after reconnecting.".into(),
+            is_error: true,
+        });
+        false
     }
 
     /// Requests a clean shutdown and waits for the background runtime thread to exit.
@@ -242,7 +258,7 @@ impl Drop for DaemonBridge {
 async fn run_bridge(
     config: BridgeConfig,
     sink: Arc<dyn UiEventSink>,
-    mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
+    session: watch::Sender<Option<mpsc::UnboundedSender<UiCommand>>>,
 ) {
     let mut bootstrapped = false;
     let mut backoff = INITIAL_BACKOFF;
@@ -255,41 +271,35 @@ async fn run_bridge(
                 spawn_attempted = false;
                 let mut conn = RpcConnection::new(stream, Arc::clone(&sink));
 
-                match initialize_session(&conn, &config, &sink, &mut bootstrapped).await {
-                    Ok(()) => {}
-                    Err(RpcError::Disconnected) => {
-                        conn.close().await;
-                        sink.emit(UiEvent::Disconnected);
-                        if !sleep_or_shutdown(RECONNECT_DELAY, &mut cmd_rx).await {
-                            return;
-                        }
-                        continue;
+                // A queue belongs to exactly one connection. Dropping the connection
+                // also invalidates commands accepted just before its loss.
+                let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+                let initialized =
+                    initialize_session(&conn, &config, &sink, &mut bootstrapped, &session, cmd_tx)
+                        .await;
+                match initialized {
+                    Ok(()) => {
+                        session_loop(&mut conn, &sink, &mut cmd_rx).await;
                     }
+                    Err(RpcError::Disconnected) => {}
                     Err(RpcError::Proto(err)) => {
                         warn!(error = %err, "session initialization RPC failed");
                         sink.emit(UiEvent::Toast {
                             message: format!("Daemon error: {err}"),
                             is_error: true,
                         });
-                        conn.close().await;
-                        sink.emit(UiEvent::Disconnected);
-                        if !sleep_or_shutdown(RECONNECT_DELAY, &mut cmd_rx).await {
-                            return;
-                        }
-                        continue;
                     }
                 }
-
-                let should_exit = session_loop(&mut conn, &sink, &mut cmd_rx).await;
-                conn.close().await;
-                if should_exit {
-                    return;
+                session.send_replace(None);
+                if cmd_rx.try_recv().is_ok() {
+                    sink.emit(UiEvent::Toast {
+                        message: "Connection lost. Pending commands were not sent.".into(),
+                        is_error: true,
+                    });
                 }
-
                 sink.emit(UiEvent::Disconnected);
-                if !sleep_or_shutdown(RECONNECT_DELAY, &mut cmd_rx).await {
-                    return;
-                }
+                conn.close().await;
+                tokio::time::sleep(RECONNECT_DELAY).await;
             }
             Err(err) => {
                 debug!(
@@ -321,33 +331,8 @@ async fn run_bridge(
                     }
                 }
 
-                if !sleep_or_shutdown(backoff, &mut cmd_rx).await {
-                    return;
-                }
+                tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
-            }
-        }
-    }
-}
-
-/// Sleeps for `duration` unless `UiCommand::Shutdown` arrives (or the command channel closes).
-/// Returns `true` to keep running, `false` to exit the bridge.
-async fn sleep_or_shutdown(
-    duration: Duration,
-    cmd_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
-) -> bool {
-    let sleep = tokio::time::sleep(duration);
-    tokio::pin!(sleep);
-    loop {
-        tokio::select! {
-            _ = &mut sleep => return true,
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    None | Some(UiCommand::Shutdown) => return false,
-                    Some(_) => {
-                        // Ignore commands while disconnected; UI will resync after reconnect.
-                    }
-                }
             }
         }
     }
@@ -358,6 +343,8 @@ async fn initialize_session(
     config: &BridgeConfig,
     sink: &Arc<dyn UiEventSink>,
     bootstrapped: &mut bool,
+    session: &watch::Sender<Option<mpsc::UnboundedSender<UiCommand>>>,
+    cmd_tx: mpsc::UnboundedSender<UiCommand>,
 ) -> Result<(), RpcError> {
     if let Some(token) = config.auth_token.as_ref().filter(|token| !token.is_empty()) {
         let response = conn
@@ -375,6 +362,7 @@ async fn initialize_session(
     let _ = conn
         .call(ClientMessage::Subscribe { pane_ids: None })
         .await?;
+    session.send_replace(Some(cmd_tx));
     sink.emit(UiEvent::Connected);
 
     let workspaces = match conn.call(ClientMessage::ListWorkspaces).await? {
@@ -413,29 +401,38 @@ async fn initialize_session(
     Ok(())
 }
 
-/// Runs the connected command loop. Returns `true` if shutdown was requested,
-/// or `false` if the daemon connection was lost.
+/// Processes commands for a single connection until it closes.
 async fn session_loop(
     conn: &mut RpcConnection,
     sink: &Arc<dyn UiEventSink>,
     cmd_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
-) -> bool {
+) {
     loop {
         tokio::select! {
             biased;
             _ = conn.disconnected() => {
-                return false;
+                return;
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else {
-                    return true;
+                    return;
                 };
                 if matches!(cmd, UiCommand::Shutdown) {
-                    return true;
+                    return;
                 }
+                let close_id = match &cmd {
+                    UiCommand::CloseWorkspace { id, .. } => Some(*id),
+                    _ => None,
+                };
                 match handle_command(conn, sink, cmd).await {
                     Ok(()) => {}
-                    Err(RpcError::Disconnected) => return false,
+                    Err(RpcError::Disconnected) => {
+                        sink.emit(UiEvent::Toast {
+                            message: "Connection lost before the daemon confirmed the command.".into(),
+                            is_error: true,
+                        });
+                        return;
+                    }
                     Err(RpcError::Proto(err)) => {
                         warn!(error = %err, "daemon RPC returned error");
                         sink.emit(UiEvent::Toast {
@@ -443,6 +440,9 @@ async fn session_loop(
                             is_error: true,
                         });
                     }
+                }
+                if let Some(id) = close_id {
+                    sink.emit(UiEvent::WorkspaceCloseFinished(id));
                 }
             }
         }
