@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.9](https://github.com/AraneaDev/daedalus/compare/v0.0.8...v0.0.9) (2026-11-23)
+
+
+### Bug Fixes
+
+* restore terminal cursor and preserve pane output and scrollback ordering ([#30](https://github.com/AraneaDev/daedalus/issues/30)) ([5e29603](https://github.com/AraneaDev/daedalus/commit/5e29603bf02cb4c0dec5a0d1986a8952c6de99ae))
+
 ## [0.0.8](https://github.com/AraneaDev/daedalus/compare/v0.0.7...v0.0.8) (2026-11-22)
 
 
