@@ -46,3 +46,9 @@ Capture the real quiet and attention states at desktop and narrow widths. Check 
 ## Decisions for review
 
 The user selected an agent-first initial focus with situational workspace switching. The native stack, bounded journal, layout, typography, palette and acknowledgement rules are proposed design choices. Exact adaptive widths, theme token values and drawing primitives are implementation decisions. This iteration covers the active workspace. Agent-provider transcript parsers, remote model summarization and a dedicated fleet dashboard are outside its scope.
+
+### Multiple agents and commands per workspace
+
+Workspace settings hold an ordered list of named agents and an ordered list of named commands. Two agents can use the same provider. Each entry has a stable identity so renaming a terminal preserves its selection and output attribution. The terminal strip exposes every assigned entry by name and scrolls horizontally when needed. Switching workspaces restores the selected terminal. Sending a failure requires an agent destination within that workspace.
+
+The native implementation should persist these definitions, migrate existing agent, service and runner settings into entries, and associate terminal events with the originating entry. Saving settings does not start a process. The interactive preview keeps assignments in memory and simulates terminal selection and failure delivery.

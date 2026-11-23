@@ -63,6 +63,8 @@ dialog::backdrop{background:#030608aa}dialog form{display:grid;gap:12px}dialog l
 dialog menu{display:flex;justify-content:flex-end;gap:10px;padding:0;margin:4px 0 0}dialog button[type=submit]{color:var(--mint)}
 [hidden]{display:none!important}
 @media(max-width:720px){.bar .brand{font-size:0;gap:0}.workspace-nav .branch,.workspace-nav>label{display:none}.workspace-nav{gap:5px}.workspace-nav button,.workspace-nav select{padding:2px 4px;font-size:.73rem}.bar{gap:6px}.bar .mark{width:16px}.workspace-nav select{min-width:48px;flex:1}}
+.tabs{min-width:0;overflow-x:auto}.tabs button{flex:none;white-space:nowrap}.shell{min-width:0}
+fieldset{min-width:0;border:1px solid #40504c;padding:10px}legend{color:var(--mint)}.entry{display:grid;grid-template-columns:1fr 1.25fr auto;align-items:end;gap:6px;margin-bottom:10px}.entry input,.entry select{min-width:0;box-sizing:border-box}.entry button{height:36px}
 </style>
 <header class="bar"><div class="brand"><span class="mark" aria-hidden="true"></span>DAEDALUS</div>
 <div class="workspace-nav">
@@ -83,30 +85,41 @@ dialog menu{display:flex;justify-content:flex-end;gap:10px;padding:0;margin:4px 
 <div class="svc"><div><strong>API</strong><small>Local process</small></div><span class="status">↗ Listening :8080</span></div>
 <div class="svc"><div><strong>Database</strong><small>Container health check</small></div><span class="status"><span class="quiet">✓ Healthy</span><span class="urgent warn">! Unhealthy</span></span></div>
 <div class="svc runner"><div><strong>Health tests</strong><small>Last runner command</small></div><span class="status"><span class="quiet">✓ Passed</span><span class="urgent warn">× Failed · exit 1</span></span></div>
-<div class="actionrow"><button id="send" class="send urgent">Send failure to agent ↗</button></div></div><div class="demo"><label for="scenario">Preview scenario</label> <select id="scenario" aria-label="Design preview scenario"><option value="quiet">Quiet return</option><option value="alert">Needs attention</option></select></div></aside></main>
+<div class="actionrow"><select id="recipient" aria-label="Agent to receive failure"></select> <button id="send" class="send urgent">Send failure to agent ↗</button></div></div><div class="demo"><label for="scenario">Preview scenario</label> <select id="scenario" aria-label="Design preview scenario"><option value="quiet">Quiet return</option><option value="alert">Needs attention</option></select></div></aside></main>
 <dialog id="setup" aria-labelledby="form-title"><form id="settings-form">
 <h2 id="form-title">New workspace</h2>
 <label>Workspace name<input name="name" required maxlength="60" autofocus></label>
 <label>Project folder<input name="folder" required placeholder="/projects/orbit"></label>
-<label>Agent<select name="agent"><option>Claude</option><option>Codex</option><option>agy</option><option>Shell</option></select></label>
-<label>Service command (optional)<input name="service" placeholder="npm run dev"></label>
-<label>Test command (optional)<input name="runner" placeholder="npm test"></label>
+<fieldset><legend>Agents</legend><div id="agents"></div><button type="button" id="add-agent">Add agent</button></fieldset>
+<fieldset><legend>Commands</legend><div id="commands"></div><button type="button" id="add-command">Add command</button></fieldset>
 <small>Preview only · changes last until you reload. Commands are never executed.</small>
 <menu><button id="cancel" type="button">Cancel</button><button id="save" type="submit">Create workspace</button></menu>
 </form></dialog>
 <script>
 const scenario=document.querySelector('#scenario'), transcript=document.querySelector('#transcript'), send=document.querySelector('#send');
-const buttons=[...document.querySelectorAll('.tabs button')]; const workspaces=new Map([
- ['orbit',{name:'Orbit',folder:'/projects/orbit',branch:'feature/healthcheck',agent:'Claude',service:'service logs',runner:'pytest -q'}],
- ['atlas',{name:'Atlas',folder:'/projects/atlas',branch:'main',agent:'Codex',service:'',runner:'cargo test'}]
+let nextId=1;
+function session(kind,name,value,id='session-'+nextId++){return {kind,name,value,id}}
+const workspaces=new Map([
+ ['orbit',{name:'Orbit',folder:'/projects/orbit',branch:'feature/healthcheck',sessions:[session('agent','Claude','Claude','Agent'),session('agent','Reviewer','Codex'),session('command','Service','service logs','Service'),session('command','Runner','pytest -q','Runner')]}],
+ ['atlas',{name:'Atlas',folder:'/projects/atlas',branch:'main',sessions:[session('agent','Codex','Codex'),session('command','Tests','cargo test')]}]
 ]);
-const picker=document.querySelector('#workspace'), dialog=document.querySelector('#setup'), form=document.querySelector('#settings-form');
-let editing=false, nextId=1;
-const fields=['name','folder','agent','service','runner'];
+const picker=document.querySelector('#workspace'), dialog=document.querySelector('#setup'), form=document.querySelector('#settings-form'),recipient=document.querySelector('#recipient');
+let editing=false;
+function addRow(item){
+ const row=document.createElement('div');row.className='entry';row.dataset.id=item.id;row.dataset.kind=item.kind;
+ const agent=item.kind==='agent';
+ row.innerHTML='<label>Name<input required maxlength="50"></label>'+(agent?'<label>Provider<select><option>Claude</option><option>Codex</option><option>agy</option><option>Shell</option></select></label>':'<label>Command<input required placeholder="npm test"></label>')+'<button type="button">Remove</button>';
+ const [name,value]=row.querySelectorAll('input,select');name.value=item.name;value.value=item.value;
+ row.querySelector('button').onclick=()=>{row.remove();document.querySelector('#add-'+item.kind).focus()};
+ document.querySelector(agent?'#agents':'#commands').append(row);return name;
+}
+for(const kind of ['agent','command'])document.querySelector('#add-'+kind).onclick=()=>addRow(session(kind,'',kind==='agent'?'Claude':'')).focus();
 function openSetup(edit){
  editing=edit;
- const values=edit?workspaces.get(picker.value):{agent:'Claude'};
- for(const field of fields)form.elements[field].value=values[field]||'';
+ const values=edit?workspaces.get(picker.value):{sessions:[session('agent','Claude','Claude')]};
+ for(const key of ['name','folder'])form.elements[key].value=values[key]||'';
+ document.querySelector('#agents').replaceChildren();document.querySelector('#commands').replaceChildren();
+ values.sessions.forEach(addRow);
  document.querySelector('#form-title').textContent=edit?'Workspace settings':'New workspace';
  document.querySelector('#save').textContent=edit?'Save settings':'Create workspace';
  dialog.showModal();
@@ -116,8 +129,13 @@ document.querySelector('#edit').onclick=()=>openSetup(true);
 document.querySelector('#cancel').onclick=()=>dialog.close();
 form.onsubmit=e=>{
  e.preventDefault();
- const values=Object.fromEntries(fields.map(key=>[key,form.elements[key].value.trim()]));
+ for(const input of form.querySelectorAll('input')){if(!input.value.trim()){input.value='';input.reportValidity();return}}
+ const sessions=[...form.querySelectorAll('.entry')].map(row=>{
+  const [name,value]=row.querySelectorAll('input,select');return session(row.dataset.kind,name.value.trim(),value.value.trim(),row.dataset.id)
+ });
+ const values=Object.fromEntries(['name','folder'].map(key=>[key,form.elements[key].value.trim()]));
  for(const key of ['name','folder'])if(!values[key]){form.elements[key].value='';form.elements[key].reportValidity();return}
+ values.sessions=sessions;
  if(editing){Object.assign(workspaces.get(picker.value),values);picker.selectedOptions[0].textContent=values.name}
  else{const id='new-'+nextId++;workspaces.set(id,values);picker.add(new Option(values.name,id));picker.value=id}
  dialog.close();render();
@@ -125,7 +143,7 @@ form.onsubmit=e=>{
 picker.onchange=render;
 
 function render(){
- const ws=workspaces.get(picker.value), orbit=picker.value==='orbit', pane=ws.pane||'Agent',sent=ws.sent;
+ const ws=workspaces.get(picker.value), orbit=picker.value==='orbit', active=ws.sessions.find(x=>x.id===ws.pane)||ws.sessions[0], pane=active?.id,sent=ws.sent;
  scenario.value=ws.scenario||'quiet';
  const alert=orbit && scenario.value==='alert';
  document.querySelector('.demo').hidden=!orbit;
@@ -133,7 +151,7 @@ function render(){
  document.querySelector('main').setAttribute('aria-label', ws.name+' workspace');
  document.querySelector('.session').textContent=ws.name+' / local';
  document.querySelector('.signature').lastChild.textContent=orbit?'10:16':'';
- document.querySelector('.signature').childNodes[1].textContent=orbit?ws.agent+' · Agent transcript ':ws.agent+' · '+ws.folder;
+ document.querySelector('.signature').childNodes[1].textContent=orbit?'Claude · Agent transcript ':ws.folder;
  document.querySelector('.hero .quiet').textContent=orbit?'“Added a database readiness check to /health.”':'No activity recorded yet.';
  document.querySelector('.activity').hidden=!orbit;
  document.querySelectorAll('.svc').forEach(el=>el.hidden=!orbit);
@@ -143,11 +161,28 @@ function render(){
 
  document.body.classList.toggle('alert',alert);
  const output={
- Agent:'› Add a readiness check for the database.\n\nReading health.py and test_health.py…\n\n  health.py\n  + def ready(db):\n  +     return db.ping()\n\n  test_health.py\n  + def test_database_ready():\n  +     assert ready(test_db)\n\n'+(alert?'The database connection was refused.\nRetry after the service restarts?':'Added a database readiness check to /health.')+(sent?'\n\n› Runner failure: connection refused (exit 1)':''),
+ Agent:'› Add a readiness check for the database.\n\nReading health.py and test_health.py…\n\n  health.py\n  + def ready(db):\n  +     return db.ping()\n\n  test_health.py\n  + def test_database_ready():\n  +     assert ready(test_db)\n\n'+(alert?'The database connection was refused.\nRetry after the service restarts?':'Added a database readiness check to /health.'),
  Service:'$ service logs\napi  listening on :8080\ndb   '+(alert?'health check failed: connection refused':'health check passed'),
  Runner:'$ pytest -q\n'+(alert?'FAILED test_database_ready — connection refused\nexit 1':'test_database_ready passed\nexit 0')};
- transcript.textContent=orbit?output[pane]:({Agent:ws.agent+' · '+ws.folder+'\n\nReady for input.',Service:ws.service?'Configured command: '+ws.service+'\nNo output yet.':'No service command configured.',Runner:ws.runner?'Configured command: '+ws.runner+'\nNo runs yet.':'No test command configured.'})[pane]; buttons.forEach(b=>b.setAttribute('aria-pressed',String(b.textContent===pane)));
- send.disabled=sent;send.textContent=sent?'Failure sent to agent':'Send failure to agent ↗';
+ const fixture=orbit && (pane==='Agent' && active.value==='Claude' || pane==='Service' && active.value==='service logs' || pane==='Runner' && active.value==='pytest -q');
+ transcript.textContent=fixture?output[pane]:active?(active.kind==='agent'?active.value+' · '+ws.folder+'\n\nReady for input.':'$ '+active.value+'\n\nNo output yet.'):'Add an agent or command in Workspace settings.';
+ if(sent && sent===pane)transcript.textContent+='\n\n› Runner failure: connection refused (exit 1)';
+ const tabs=document.querySelector('.tabs'), badge=tabs.querySelector('.session');
+ const restore=tabs.contains(document.activeElement);
+ tabs.replaceChildren();
+ for(const item of ws.sessions){
+  const button=document.createElement('button');button.textContent=item.name;button.title=item.kind+' · '+item.value;
+  button.setAttribute('aria-pressed',String(item===active));button.onclick=()=>{ws.pane=item.id;render()};
+  tabs.append(button);if(restore && item===active)button.focus();
+ }
+ tabs.append(badge);
+ const agents=ws.sessions.filter(x=>x.kind==='agent');
+ recipient.replaceChildren(...agents.map(item=>new Option(item.name,item.id)));
+ recipient.value=agents.some(x=>x.id===ws.target)?ws.target:agents[0]?.id||'';
+ send.disabled=!recipient.value||Boolean(sent);send.textContent=sent?'Failure sent':'Send failure ↗';
 }
-buttons.forEach(b=>b.onclick=()=>{workspaces.get(picker.value).pane=b.textContent;render()});scenario.onchange=()=>{Object.assign(workspaces.get(picker.value),{sent:false,scenario:scenario.value});render()};send.onclick=()=>{Object.assign(workspaces.get(picker.value),{sent:true,pane:'Agent'});render()};render();
+recipient.onchange=()=>{workspaces.get(picker.value).target=recipient.value};
+scenario.onchange=()=>{Object.assign(workspaces.get(picker.value),{sent:false,scenario:scenario.value});render()};
+send.onclick=()=>{Object.assign(workspaces.get(picker.value),{sent:recipient.value,pane:recipient.value});render()};
+render();
 </script></html>
