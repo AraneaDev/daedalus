@@ -1,7 +1,10 @@
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="Daedalus" Manufacturer="AraneaDev" Version="$(Version)"
            UpgradeCode="3E5E2423-624C-4A96-80BD-F9C3A1310FAE" Scope="perMachine">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Daedalus is already installed." />
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(LicenseRtf)" />
     <MediaTemplate EmbedCab="yes" />
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Daedalus">

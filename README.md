@@ -17,7 +17,7 @@ with the 0.0.7 series. Earlier releases provide portable archives.
 | Ubuntu 24.04 or compatible Debian-based Linux, x86-64 | `.deb` | Run `sudo apt install ./daedalus-<version>-amd64.deb`. Launch **Daedalus** from the applications menu. |
 | Arch Linux, x86-64 (v0.0.10 onward) | `.pkg.tar.zst` | Run `sudo pacman -U ./daedalus-<version>-1-x86_64.pkg.tar.zst`. Launch **Daedalus** from the applications menu. |
 | macOS, Apple Silicon or Intel (Intel packages start with v0.0.11) | `*-arm64.pkg` or `*-x86_64.pkg` | Open the package, follow Installer, then open **Daedalus** from Applications. CLI tools are linked in `/usr/local/bin`. |
-| Windows, x64 | `.msi` | Run the installer, then open **Daedalus** from Start. Open a new terminal to use the CLI. |
+| Windows, x64 | `.msi` | Open the setup wizard, choose **Install**, then launch **Daedalus** from Start. Open a new terminal to use the CLI. |
 
 Packages include the UI, daemon and control CLI. The macOS and Windows installers are unsigned. Each
 asset has a sibling SHA-256 checksum. Compare the downloaded file with its checksum using

@@ -103,9 +103,31 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force dist
           $msi = Join-Path (Resolve-Path dist).Path "daedalus-$env:VERSION-x64.msi"
-          & "$env:RUNNER_TEMP/wix/wix.exe" build -arch x64 -d "Version=$env:VERSION" packaging/windows.wxs -o $msi
+          $wix = "$env:RUNNER_TEMP/wix/wix.exe"
+          & $wix extension add WixToolset.UI.wixext/5.0.2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Add-Type -AssemblyName System.Windows.Forms
+          $license = [System.Windows.Forms.RichTextBox]::new()
+          $license.Text = Get-Content -LiteralPath LICENSE -Raw
+          $rtf = Join-Path $env:RUNNER_TEMP 'daedalus-license.rtf'
+          $license.SaveFile($rtf)
+          $license.Dispose()
+          & $wix build -arch x64 -ext WixToolset.UI.wixext -d "Version=$env:VERSION" -d "LicenseRtf=$rtf" packaging/windows.wxs -o $msi
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           if (!(Test-Path -LiteralPath $msi -PathType Leaf)) { throw "Missing package: $msi" }
+          # A quiet install alone also succeeds for packages with no setup dialogs.
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $installer.OpenDatabase($msi, 0)
+          foreach ($query in @(
+            "SELECT ``Dialog`` FROM ``Dialog`` WHERE ``Dialog`` = 'WelcomeEulaDlg'",
+            "SELECT ``Action`` FROM ``InstallUISequence`` WHERE ``Action`` = 'WelcomeEulaDlg'",
+            "SELECT ``Dialog`` FROM ``Dialog`` WHERE ``Dialog`` = 'ExitDialog'"
+          )) {
+            $view = $database.OpenView($query)
+            $view.Execute()
+            if (!$view.Fetch()) { throw "Missing setup UI in built MSI: $query" }
+            $view.Close()
+          }
           foreach ($mode in '/i','/x') {
             $proc = Start-Process msiexec -ArgumentList "$mode `"$msi`" /qn /norestart" -Wait -PassThru
             if ($proc.ExitCode -ne 0) { throw "Installer exited with $($proc.ExitCode)" }
