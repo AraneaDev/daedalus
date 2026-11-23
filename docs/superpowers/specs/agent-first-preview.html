@@ -52,10 +52,25 @@ aside{min-height:0;overflow:auto;border-left:1px solid var(--rule);background:#0
  .activity,.signals{padding:10px 16px}.brand{letter-spacing:.06em}.project .branch{display:none}
 }
 @media(max-width:400px){.session{display:none}.bar{gap:7px;padding:0 6px}.brand{font-size:.72rem}.bar select{font-size:.68rem}}
+.workspace-nav{display:flex;align-items:center;min-width:0;gap:8px;flex:1}
+.workspace-nav label,.demo label{font-size:.78rem;color:var(--muted)}
+.workspace-nav button,.workspace-nav select{font-size:.82rem;line-height:1.25;padding:4px 8px}
+#workspace{border-color:#438064;background:#14261d;color:#caffdd;max-width:24vw}
+#add{color:var(--mint);border-color:#315741}.workspace-nav .branch{margin-left:auto}
+.demo{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:16px;border-top:1px solid var(--rule);padding-top:12px}
+dialog{background:#10151b;color:var(--ink);border:1px solid #40564d;border-top:2px solid var(--mint);width:min(440px,94vw);max-height:90dvh;padding:22px}
+dialog::backdrop{background:#030608aa}dialog form{display:grid;gap:12px}dialog label{display:grid;gap:4px;font-size:.85rem}dialog input,dialog select{background:#080d10;color:var(--ink);border:1px solid #40504c;padding:8px;font:inherit;width:100%}
+dialog menu{display:flex;justify-content:flex-end;gap:10px;padding:0;margin:4px 0 0}dialog button[type=submit]{color:var(--mint)}
+[hidden]{display:none!important}
+@media(max-width:720px){.bar .brand{font-size:0;gap:0}.workspace-nav .branch,.workspace-nav>label{display:none}.workspace-nav{gap:5px}.workspace-nav button,.workspace-nav select{padding:2px 4px;font-size:.73rem}.bar{gap:6px}.bar .mark{width:16px}.workspace-nav select{min-width:48px;flex:1}}
 </style>
 <header class="bar"><div class="brand"><span class="mark" aria-hidden="true"></span>DAEDALUS</div>
-<div class="project"><h1>Orbit</h1><span class="branch">⑂ feature/healthcheck</span></div>
-<select id="scenario" aria-label="Design preview scenario"><option value="quiet">Quiet return</option><option value="alert">Needs attention</option></select></header>
+<div class="workspace-nav">
+<label for="workspace">Workspace</label>
+<select id="workspace"><option value="orbit">Orbit</option><option value="atlas">Atlas</option></select>
+<button id="add">+ New workspace</button>
+<button id="edit">Workspace settings</button>
+<span class="branch" id="branch"></span></div></header>
 <main aria-label="Orbit workspace">
 <section class="shell" aria-label="Workspace terminal">
 <div class="tabs" aria-label="Terminal pane"><button aria-pressed="true">Agent</button><button aria-pressed="false">Service</button><button aria-pressed="false">Runner</button><span class="session micro">Orbit / local</span></div>
@@ -68,19 +83,71 @@ aside{min-height:0;overflow:auto;border-left:1px solid var(--rule);background:#0
 <div class="svc"><div><strong>API</strong><small>Local process</small></div><span class="status">↗ Listening :8080</span></div>
 <div class="svc"><div><strong>Database</strong><small>Container health check</small></div><span class="status"><span class="quiet">✓ Healthy</span><span class="urgent warn">! Unhealthy</span></span></div>
 <div class="svc runner"><div><strong>Health tests</strong><small>Last runner command</small></div><span class="status"><span class="quiet">✓ Passed</span><span class="urgent warn">× Failed · exit 1</span></span></div>
-<div class="actionrow"><button id="send" class="send urgent">Send failure to agent ↗</button></div></div></aside></main>
+<div class="actionrow"><button id="send" class="send urgent">Send failure to agent ↗</button></div></div><div class="demo"><label for="scenario">Preview scenario</label> <select id="scenario" aria-label="Design preview scenario"><option value="quiet">Quiet return</option><option value="alert">Needs attention</option></select></div></aside></main>
+<dialog id="setup" aria-labelledby="form-title"><form id="settings-form">
+<h2 id="form-title">New workspace</h2>
+<label>Workspace name<input name="name" required maxlength="60" autofocus></label>
+<label>Project folder<input name="folder" required placeholder="/projects/orbit"></label>
+<label>Agent<select name="agent"><option>Claude</option><option>Codex</option><option>agy</option><option>Shell</option></select></label>
+<label>Service command (optional)<input name="service" placeholder="npm run dev"></label>
+<label>Test command (optional)<input name="runner" placeholder="npm test"></label>
+<small>Preview only · changes last until you reload. Commands are never executed.</small>
+<menu><button id="cancel" type="button">Cancel</button><button id="save" type="submit">Create workspace</button></menu>
+</form></dialog>
 <script>
 const scenario=document.querySelector('#scenario'), transcript=document.querySelector('#transcript'), send=document.querySelector('#send');
-const buttons=[...document.querySelectorAll('.tabs button')]; let pane='Agent',sent=false;
+const buttons=[...document.querySelectorAll('.tabs button')]; const workspaces=new Map([
+ ['orbit',{name:'Orbit',folder:'/projects/orbit',branch:'feature/healthcheck',agent:'Claude',service:'service logs',runner:'pytest -q'}],
+ ['atlas',{name:'Atlas',folder:'/projects/atlas',branch:'main',agent:'Codex',service:'',runner:'cargo test'}]
+]);
+const picker=document.querySelector('#workspace'), dialog=document.querySelector('#setup'), form=document.querySelector('#settings-form');
+let editing=false, nextId=1;
+const fields=['name','folder','agent','service','runner'];
+function openSetup(edit){
+ editing=edit;
+ const values=edit?workspaces.get(picker.value):{agent:'Claude'};
+ for(const field of fields)form.elements[field].value=values[field]||'';
+ document.querySelector('#form-title').textContent=edit?'Workspace settings':'New workspace';
+ document.querySelector('#save').textContent=edit?'Save settings':'Create workspace';
+ dialog.showModal();
+}
+document.querySelector('#add').onclick=()=>openSetup(false);
+document.querySelector('#edit').onclick=()=>openSetup(true);
+document.querySelector('#cancel').onclick=()=>dialog.close();
+form.onsubmit=e=>{
+ e.preventDefault();
+ const values=Object.fromEntries(fields.map(key=>[key,form.elements[key].value.trim()]));
+ for(const key of ['name','folder'])if(!values[key]){form.elements[key].value='';form.elements[key].reportValidity();return}
+ if(editing){Object.assign(workspaces.get(picker.value),values);picker.selectedOptions[0].textContent=values.name}
+ else{const id='new-'+nextId++;workspaces.set(id,values);picker.add(new Option(values.name,id));picker.value=id}
+ dialog.close();render();
+};
+picker.onchange=render;
+
 function render(){
- const alert=scenario.value==='alert';
+ const ws=workspaces.get(picker.value), orbit=picker.value==='orbit', pane=ws.pane||'Agent',sent=ws.sent;
+ scenario.value=ws.scenario||'quiet';
+ const alert=orbit && scenario.value==='alert';
+ document.querySelector('.demo').hidden=!orbit;
+ document.querySelector('#branch').textContent=ws.branch?'⑂ '+ws.branch:'';
+ document.querySelector('main').setAttribute('aria-label', ws.name+' workspace');
+ document.querySelector('.session').textContent=ws.name+' / local';
+ document.querySelector('.signature').lastChild.textContent=orbit?'10:16':'';
+ document.querySelector('.signature').childNodes[1].textContent=orbit?ws.agent+' · Agent transcript ':ws.agent+' · '+ws.folder;
+ document.querySelector('.hero .quiet').textContent=orbit?'“Added a database readiness check to /health.”':'No activity recorded yet.';
+ document.querySelector('.activity').hidden=!orbit;
+ document.querySelectorAll('.svc').forEach(el=>el.hidden=!orbit);
+ let empty=document.querySelector('#empty-signals');
+ if(!empty){empty=document.createElement('p');empty.id='empty-signals';document.querySelector('.signals').append(empty)}
+ empty.hidden=orbit;empty.textContent='No service or runner observations yet.';
+
  document.body.classList.toggle('alert',alert);
  const output={
  Agent:'› Add a readiness check for the database.\n\nReading health.py and test_health.py…\n\n  health.py\n  + def ready(db):\n  +     return db.ping()\n\n  test_health.py\n  + def test_database_ready():\n  +     assert ready(test_db)\n\n'+(alert?'The database connection was refused.\nRetry after the service restarts?':'Added a database readiness check to /health.')+(sent?'\n\n› Runner failure: connection refused (exit 1)':''),
  Service:'$ service logs\napi  listening on :8080\ndb   '+(alert?'health check failed: connection refused':'health check passed'),
  Runner:'$ pytest -q\n'+(alert?'FAILED test_database_ready — connection refused\nexit 1':'test_database_ready passed\nexit 0')};
- transcript.textContent=output[pane]; buttons.forEach(b=>b.setAttribute('aria-pressed',String(b.textContent===pane)));
+ transcript.textContent=orbit?output[pane]:({Agent:ws.agent+' · '+ws.folder+'\n\nReady for input.',Service:ws.service?'Configured command: '+ws.service+'\nNo output yet.':'No service command configured.',Runner:ws.runner?'Configured command: '+ws.runner+'\nNo runs yet.':'No test command configured.'})[pane]; buttons.forEach(b=>b.setAttribute('aria-pressed',String(b.textContent===pane)));
  send.disabled=sent;send.textContent=sent?'Failure sent to agent':'Send failure to agent ↗';
 }
-buttons.forEach(b=>b.onclick=()=>{pane=b.textContent;render()});scenario.onchange=()=>{sent=false;render()};send.onclick=()=>{sent=true;pane='Agent';render()};render();
+buttons.forEach(b=>b.onclick=()=>{workspaces.get(picker.value).pane=b.textContent;render()});scenario.onchange=()=>{Object.assign(workspaces.get(picker.value),{sent:false,scenario:scenario.value});render()};send.onclick=()=>{Object.assign(workspaces.get(picker.value),{sent:true,pane:'Agent'});render()};render();
 </script></html>
