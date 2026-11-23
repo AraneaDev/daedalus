@@ -49,6 +49,9 @@ jobs:
           /usr/bin/daedalus-ctl --help >/dev/null
           /usr/bin/daedalusd --help >/dev/null
           sudo dpkg -r daedalus
+      - name: Build and test Arch Linux package
+        if: runner.os == 'Linux'
+        run: packaging/arch.sh "$VERSION"
       - name: Build and test macOS package
         if: runner.os == 'macOS'
         run: |
@@ -82,7 +85,7 @@ jobs:
         shell: bash
         run: |
           cd dist
-          for file in *.msi *.deb *.pkg; do
+          for file in *.msi *.deb *.pkg *.pkg.tar.zst; do
             [[ -f "$file" ]] || continue
             if command -v sha256sum >/dev/null; then sha256sum "$file"; else shasum -a 256 "$file"; fi > "$file.sha256"
           done
@@ -91,6 +94,7 @@ jobs:
           name: daedalus-installer-${{ runner.os }}
           path: |
             dist/*.deb
+            dist/*.pkg.tar.zst
             dist/*.pkg
             dist/*.msi
             dist/*.sha256
@@ -102,4 +106,4 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           shopt -s nullglob
-          gh release upload "$RELEASE_TAG" dist/*.msi dist/*.deb dist/*.pkg dist/*.sha256 --clobber
+          gh release upload "$RELEASE_TAG" dist/*.msi dist/*.deb dist/*.pkg dist/*.pkg.tar.zst dist/*.sha256 --clobber

@@ -1,0 +1,18 @@
+pkgname=daedalus
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Native coding-agent and worktree workbench'
+arch=('x86_64')
+url='https://github.com/AraneaDev/daedalus'
+license=('MIT')
+depends=('glibc' 'gcc-libs' 'libxkbcommon' 'libx11' 'libxcb' 'wayland' 'git')
+options=('!strip' '!debug')
+source=('daedalus-ui' 'daedalus-ctl' 'daedalusd' 'daedalus.desktop' 'LICENSE')
+
+package() {
+    for program in daedalus-ui daedalus-ctl daedalusd; do
+        install -Dm755 "$srcdir/$program" "$pkgdir/usr/bin/$program"
+    done
+    install -Dm644 "$srcdir/daedalus.desktop" "$pkgdir/usr/share/applications/daedalus.desktop"
+    install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
