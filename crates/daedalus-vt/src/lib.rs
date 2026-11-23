@@ -29,6 +29,7 @@ impl Default for VtConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticEvent {
+    TerminalReply(Vec<u8>),
     CwdChanged(PathBuf),
     PromptStart,
     CommandInputStart,
@@ -152,6 +153,75 @@ mod tests {
         let sliced = vt.slice_plain_text(0, vt.current_abs_row());
         assert!(sliced.len() <= MAX_TRACE_BYTES);
         assert!(sliced.contains("row-0899-"));
+    }
+
+    #[test]
+    fn alternate_screen_restores_cursor_and_pending_wrap() {
+        let mut vt = BuiltinVt::new(VtConfig {
+            cols: 5,
+            rows: 3,
+            scrollback_limit: 10,
+        });
+        vt.feed(b"abc\x1b[?1049h\x1b[3;2H\x1b[?1049l");
+        assert_eq!((vt.cursor().col, vt.cursor().row), (3, 0));
+        vt.feed(b"DE\x1b[?1049h\x1b[?1049lX");
+        assert_eq!(vt.slice_plain_text(0, 1), "abcDE\nX");
+        vt.feed(b"\x1b[3;5H\x1b[?1049h");
+        vt.resize(2, 2);
+        vt.feed(b"\x1b[?1049l");
+        assert_eq!((vt.cursor().col, vt.cursor().row), (1, 1));
+    }
+
+    #[test]
+    fn wide_cells_and_combining_marks_follow_terminal_columns() {
+        let mut vt = BuiltinVt::new(VtConfig {
+            cols: 5,
+            rows: 3,
+            scrollback_limit: 10,
+        });
+        vt.feed("A界e\u{301}".as_bytes());
+        assert_eq!(vt.cursor().col, 4);
+        let row = &vt.snapshot(PaneId::new(), 0).rows_data[0];
+        assert_eq!(row.cells[1].width, 2);
+        assert_eq!(row.cells[2].width, 0);
+        assert!(row.cells[2].text.is_empty());
+        assert_eq!(row.cells[3].text, "e\u{301}");
+        let hit = &vt.search("界", true)[0];
+        assert_eq!((hit.start_col, hit.end_col), (1, 3));
+        vt.feed("界".as_bytes());
+        assert_eq!((vt.cursor().col, vt.cursor().row), (2, 1));
+        vt.feed(b"\x1b[1;3HX");
+        assert_eq!(vt.slice_plain_text(0, 0), "A Xe\u{301}");
+        vt.feed(b"\x1b[2;1H\x1b[1K");
+        assert!(vt.slice_plain_text(1, 1).is_empty());
+        vt.feed("界".as_bytes());
+        vt.resize(1, 3);
+        let snapshot = vt.snapshot(PaneId::new(), 0);
+        assert_eq!(
+            snapshot.rows_data[1].cells[0],
+            daedalus_proto::Cell::default()
+        );
+    }
+
+    #[test]
+    fn single_column_panes_keep_wide_and_combining_output_in_bounds() {
+        let mut vt = BuiltinVt::new(VtConfig {
+            cols: 1,
+            rows: 2,
+            scrollback_limit: 0,
+        });
+        vt.feed("界".as_bytes());
+        vt.feed("\u{301}".repeat(4096).as_bytes());
+        let snapshot = vt.snapshot(PaneId::new(), 0);
+        let cell = &snapshot.rows_data[0].cells[0];
+        assert_eq!(cell.width, 1);
+        assert!(cell.text.starts_with("�\u{301}"));
+        assert!(cell.text.len() <= 256);
+        vt.feed(b"z");
+        assert_eq!(
+            vt.snapshot(PaneId::new(), 1).rows_data[1].cells[0].text,
+            "z"
+        );
     }
 
     #[test]

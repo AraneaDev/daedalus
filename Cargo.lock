@@ -672,6 +672,7 @@ dependencies = [
  "bindgen",
  "daedalus-proto",
  "pkg-config",
+ "unicode-width",
  "vte",
 ]
 

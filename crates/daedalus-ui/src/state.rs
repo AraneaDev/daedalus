@@ -378,6 +378,8 @@ impl SearchState {
     }
 }
 
+static NEXT_SCROLLBACK_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 /// Client-side cached terminal state for a single daemon pane.
 #[derive(Debug, Clone)]
 pub struct PaneViewState {
@@ -387,7 +389,11 @@ pub struct PaneViewState {
     pub cursor: CursorState,
     pub viewport_rows: Vec<GridRow>,
     pub scrollback_len: usize,
+    /// Offset of the rows currently displayed.
     pub scroll_offset: usize,
+    /// Latest scroll target, including requests awaiting a daemon reply.
+    pub requested_scroll_offset: usize,
+    pending_scrollback: Option<u64>,
     pub scrolled_rows: Option<Vec<GridRow>>,
     pub dirty_row_indices: Vec<usize>,
     pub selection: Option<Selection>,
@@ -408,6 +414,8 @@ impl PaneViewState {
             viewport_rows: Vec::new(),
             scrollback_len: 0,
             scroll_offset: 0,
+            requested_scroll_offset: 0,
+            pending_scrollback: None,
             scrolled_rows: None,
             dirty_row_indices: Vec::new(),
             selection: None,
@@ -427,10 +435,10 @@ impl PaneViewState {
         self.last_seq = snapshot.seq;
         self.scrollback_len = snapshot.scrollback_len;
         self.viewport_rows = snapshot.rows_data;
-        self.scroll_offset = self.scroll_offset.min(self.scrollback_len);
-        if self.scroll_offset == 0 {
-            self.scrolled_rows = None;
-        }
+        self.requested_scroll_offset = self.requested_scroll_offset.min(self.scrollback_len);
+        self.scroll_offset = 0;
+        self.pending_scrollback = None;
+        self.scrolled_rows = None;
         self.mark_all_visible_dirty();
     }
 
@@ -470,14 +478,36 @@ impl PaneViewState {
         }
 
         if resized {
+            self.scroll_offset = 0;
+            self.pending_scrollback = None;
+            self.scrolled_rows = None;
             self.mark_all_visible_dirty();
         }
     }
 
-    /// Applies a `GetScrollback` response from `daedalusd`.
-    pub fn apply_scrollback(&mut self, total_scrollback: usize, rows: Vec<GridRow>) {
+    /// Claims a request for the desired history viewport, unless already loaded or pending.
+    pub fn begin_scrollback_request(&mut self) -> Option<u64> {
+        if self.requested_scroll_offset == self.scroll_offset || self.pending_scrollback.is_some() {
+            return None;
+        }
+        let generation = NEXT_SCROLLBACK_GENERATION.fetch_add(1, Ordering::Relaxed);
+        self.pending_scrollback = Some(generation);
+        Some(generation)
+    }
+
+    pub fn apply_scrollback(
+        &mut self,
+        generation: u64,
+        total_scrollback: usize,
+        rows: Vec<GridRow>,
+    ) {
+        if self.pending_scrollback != Some(generation) {
+            return;
+        }
+        self.pending_scrollback = None;
         self.scrollback_len = total_scrollback;
-        self.scroll_offset = self.scroll_offset.min(total_scrollback);
+        self.requested_scroll_offset = self.requested_scroll_offset.min(total_scrollback);
+        self.scroll_offset = self.requested_scroll_offset;
         if self.scroll_offset == 0 {
             self.scrolled_rows = None;
         } else {
@@ -488,40 +518,42 @@ impl PaneViewState {
 
     /// Returns the rows currently visible in the pane viewport (scrolled history or live viewport).
     pub fn visible_rows(&self) -> &[GridRow] {
-        if self.scroll_offset > 0
-            && let Some(ref scrolled) = self.scrolled_rows
-        {
-            return scrolled.as_slice();
+        if self.scroll_offset > 0 {
+            self.scrolled_rows.as_deref().unwrap_or_default()
+        } else {
+            &self.viewport_rows
         }
-        &self.viewport_rows
     }
 
-    /// Adjusts `scroll_offset` by `delta` (positive = scroll up into history,
-    /// negative = scroll down toward live output), clamped to `0..=scrollback_len`.
-    pub fn adjust_scroll_offset(&mut self, delta: isize) -> usize {
-        let candidate = if delta >= 0 {
-            self.scroll_offset.saturating_add(delta as usize)
-        } else {
-            self.scroll_offset.saturating_sub(delta.unsigned_abs())
-        };
-        let clamped = candidate.min(self.scrollback_len);
-        if clamped != self.scroll_offset {
-            self.scroll_offset = clamped;
-            if self.scroll_offset == 0 {
+    pub fn set_scroll_offset(&mut self, offset: usize) {
+        if self.requested_scroll_offset != offset {
+            self.requested_scroll_offset = offset;
+            self.pending_scrollback = None;
+            if offset == 0 {
+                self.scroll_offset = 0;
                 self.scrolled_rows = None;
                 self.mark_all_visible_dirty();
             }
         }
-        self.scroll_offset
+    }
+
+    /// Adjusts the requested offset by `delta` (positive = scroll up into history,
+    /// negative = scroll down toward live output), clamped to `0..=scrollback_len`.
+    pub fn adjust_scroll_offset(&mut self, delta: isize) -> usize {
+        let candidate = if delta >= 0 {
+            self.requested_scroll_offset.saturating_add(delta as usize)
+        } else {
+            self.requested_scroll_offset
+                .saturating_sub(delta.unsigned_abs())
+        };
+        let clamped = candidate.min(self.scrollback_len);
+        self.set_scroll_offset(clamped);
+        self.requested_scroll_offset
     }
 
     /// Returns the pane to the live bottom viewport (`scroll_offset = 0`).
     pub fn reset_scroll(&mut self) {
-        if self.scroll_offset != 0 || self.scrolled_rows.is_some() {
-            self.scroll_offset = 0;
-            self.scrolled_rows = None;
-            self.mark_all_visible_dirty();
-        }
+        self.set_scroll_offset(0);
     }
 
     /// Drains and returns dirty row indices that need `glyphon` re-shaping.
@@ -1274,7 +1306,12 @@ mod tests {
 
         // Scroll up 3 lines and load scrollback rows
         assert_eq!(pane.adjust_scroll_offset(3), 3);
-        pane.apply_scrollback(5, vec![make_row(0, 2, "hist-2"), make_row(1, 3, "hist-3")]);
+        let generation = pane.begin_scrollback_request().unwrap();
+        pane.apply_scrollback(
+            generation,
+            5,
+            vec![make_row(0, 2, "hist-2"), make_row(1, 3, "hist-3")],
+        );
         assert_eq!(row_text(&pane.visible_rows()[0]), "hist-2");
         assert_eq!(row_text(&pane.visible_rows()[1]), "hist-3");
 
@@ -1283,6 +1320,55 @@ mod tests {
         assert_eq!(pane.scroll_offset, 0);
         assert!(pane.scrolled_rows.is_none());
         assert_eq!(row_text(&pane.visible_rows()[0]), "live-0");
+    }
+
+    #[test]
+    fn stale_scrollback_cannot_replace_a_newer_offset_or_live_viewport() {
+        let summary = make_pane_summary(WorkspaceId::new(), PaneRole::Runner);
+        let mut pane = PaneViewState::from_summary(summary);
+        pane.set_scroll_offset(5);
+        let older = pane.begin_scrollback_request().unwrap();
+        pane.set_scroll_offset(10);
+        let newer = pane.begin_scrollback_request().unwrap();
+        pane.apply_scrollback(older, 3, vec![make_row(0, 1, "stale")]);
+        assert_eq!(pane.requested_scroll_offset, 10);
+        assert_eq!(pane.scroll_offset, 0);
+        assert_eq!(pane.scrollback_len, 0);
+        assert!(pane.visible_rows().is_empty());
+        assert!(pane.begin_scrollback_request().is_none());
+        pane.apply_scrollback(newer, 30, vec![make_row(0, 20, "current")]);
+        assert_eq!(row_text(&pane.visible_rows()[0]), "current");
+
+        pane.set_scroll_offset(15);
+        let pending = pane.begin_scrollback_request().unwrap();
+        assert_eq!(pane.scroll_offset, 10);
+        assert_eq!(row_text(&pane.visible_rows()[0]), "current");
+        pane.reset_scroll();
+        pane.apply_scrollback(pending, 40, vec![make_row(0, 25, "late")]);
+        assert_eq!(pane.scroll_offset, 0);
+        assert_eq!(pane.scrollback_len, 30);
+        assert!(pane.scrolled_rows.is_none());
+    }
+
+    #[test]
+    fn resized_scrollback_requires_fresh_rows_even_at_the_same_offset() {
+        let summary = make_pane_summary(WorkspaceId::new(), PaneRole::Runner);
+        let mut pane = PaneViewState::from_summary(summary);
+        pane.set_scroll_offset(5);
+        let original = pane.begin_scrollback_request().unwrap();
+        pane.apply_delta(GridDelta {
+            pane_id: pane.summary.id,
+            seq: 1,
+            cols: pane.cols,
+            rows: pane.rows + 1,
+            dirty_rows: Vec::new(),
+            cursor: CursorState::default(),
+        });
+        let resized = pane.begin_scrollback_request().unwrap();
+        pane.apply_scrollback(original, 20, vec![make_row(0, 15, "wrong size")]);
+        assert!(pane.scrolled_rows.is_none());
+        pane.apply_scrollback(resized, 20, vec![make_row(0, 15, "resized")]);
+        assert_eq!(row_text(&pane.visible_rows()[0]), "resized");
     }
 
     #[test]

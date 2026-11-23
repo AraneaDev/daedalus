@@ -392,6 +392,21 @@ impl DaedalusApp {
         self.request_redraw();
     }
 
+    fn request_scrollback_if_needed(&mut self, pane_id: PaneId) {
+        let Some(pane) = self.state.panes.get_mut(&pane_id) else {
+            return;
+        };
+        if let Some(generation) = pane.begin_scrollback_request() {
+            let command = UiCommand::RequestScrollback {
+                pane_id,
+                generation,
+                offset_from_bottom: pane.requested_scroll_offset,
+                count: usize::from(pane.rows).max(1),
+            };
+            self.send_command(command);
+        }
+    }
+
     fn scroll_pane(&mut self, role: PaneRole, delta: isize) {
         if delta == 0 {
             return;
@@ -399,36 +414,16 @@ impl DaedalusApp {
         let Some(pane_id) = self.state.pane_id_for_role(role) else {
             return;
         };
-        let request = {
-            let Some(pane) = self.state.panes.get_mut(&pane_id) else {
-                return;
-            };
-            let count = (pane.rows as usize).max(1);
-            if delta > 0 {
-                // Allow probing beyond cached `scrollback_len` because `GridDelta`
-                // does not carry updated scrollback lengths; `apply_scrollback`
-                // clamps to the daemon's authoritative `total_scrollback`.
-                let next = pane.scroll_offset.saturating_add(delta as usize);
-                pane.scroll_offset = next;
-                Some((next, count))
-            } else {
-                let prev = pane.scroll_offset;
-                let next = pane.adjust_scroll_offset(delta);
-                if next != prev && next > 0 {
-                    Some((next, count))
-                } else {
-                    None
-                }
-            }
+        let Some(pane) = self.state.panes.get_mut(&pane_id) else {
+            return;
         };
-
-        if let Some((offset_from_bottom, count)) = request {
-            self.send_command(UiCommand::RequestScrollback {
-                pane_id,
-                offset_from_bottom,
-                count,
-            });
+        if delta > 0 {
+            // GridDelta omits the current history length. Probe beyond the cached length.
+            pane.set_scroll_offset(pane.requested_scroll_offset.saturating_add(delta as usize));
+        } else {
+            pane.adjust_scroll_offset(delta);
         }
+        self.request_scrollback_if_needed(pane_id);
         self.request_redraw();
     }
 
@@ -470,7 +465,7 @@ impl DaedalusApp {
             return;
         };
         let pane_id = search.pane_id;
-        let request = {
+        {
             let Some(pane) = self.state.panes.get_mut(&pane_id) else {
                 return;
             };
@@ -480,7 +475,7 @@ impl DaedalusApp {
                 .iter()
                 .any(|r| r.abs_row == active.abs_row)
             {
-                None
+                pane.set_scroll_offset(pane.scroll_offset);
             } else {
                 let viewport_rows = (pane.rows as usize).max(1);
                 let live_start = pane
@@ -491,23 +486,10 @@ impl DaedalusApp {
                 let target_offset = search
                     .target_scroll_offset_with_live_start(viewport_rows, live_start)
                     .unwrap_or(0);
-                if target_offset == 0 {
-                    pane.reset_scroll();
-                    None
-                } else {
-                    pane.scroll_offset = target_offset;
-                    Some((target_offset, viewport_rows))
-                }
+                pane.set_scroll_offset(target_offset);
             }
-        };
-
-        if let Some((offset_from_bottom, count)) = request {
-            self.send_command(UiCommand::RequestScrollback {
-                pane_id,
-                offset_from_bottom,
-                count,
-            });
         }
+        self.request_scrollback_if_needed(pane_id);
     }
 
     fn apply_font_size_delta(&mut self, delta: f32) {
@@ -1188,17 +1170,20 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
                 }
             }
             UiEvent::Snapshot(snapshot) => {
-                if let Some(pane) = self.state.panes.get_mut(&snapshot.pane_id) {
+                let pane_id = snapshot.pane_id;
+                if let Some(pane) = self.state.panes.get_mut(&pane_id) {
                     pane.apply_snapshot(snapshot);
+                    self.request_scrollback_if_needed(pane_id);
                 }
             }
             UiEvent::ScrollbackLoaded {
                 pane_id,
+                generation,
                 total_scrollback,
                 rows,
             } => {
                 if let Some(pane) = self.state.panes.get_mut(&pane_id) {
-                    pane.apply_scrollback(total_scrollback, rows);
+                    pane.apply_scrollback(generation, total_scrollback, rows);
                 }
             }
             UiEvent::SearchResults {
@@ -1237,10 +1222,17 @@ impl ApplicationHandler<UiEvent> for DaedalusApp {
                 );
             }
             UiEvent::ServerEvent(server_event) => {
+                let changed_pane = match &server_event {
+                    daedalus_proto::ServerEvent::GridDelta(delta) => Some(delta.pane_id),
+                    _ => None,
+                };
                 if let Some(resync_pane_id) = self.state.apply_server_event(server_event) {
                     self.send_command(UiCommand::RequestSnapshot {
                         pane_id: resync_pane_id,
                     });
+                }
+                if let Some(pane_id) = changed_pane {
+                    self.request_scrollback_if_needed(pane_id);
                 }
             }
             UiEvent::Toast { message, is_error } => {
