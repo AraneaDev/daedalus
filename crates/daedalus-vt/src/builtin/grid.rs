@@ -2,14 +2,39 @@ use daedalus_proto::{
     Cell, CellFlags, Color, CursorState, GridDelta, GridRow, GridSnapshot, PaneId, SearchMatch,
 };
 use std::collections::VecDeque;
+use unicode_width::UnicodeWidthChar;
 
 pub const MAX_TRACE_BYTES: usize = 64 * 1024;
 pub const MAX_SEARCH_MATCHES: usize = 2_000;
+// Combining input can arrive indefinitely without advancing the cursor.
+const MAX_CELL_TEXT_BYTES: usize = 256;
 
 #[derive(Debug, Clone)]
 struct StoredRow {
     abs_row: u64,
     cells: Vec<Cell>,
+}
+
+struct SavedScreen {
+    rows: Vec<StoredRow>,
+    cursor_col: u16,
+    cursor_row: u16,
+    wrap_pending: bool,
+}
+
+impl StoredRow {
+    /// Clear only the halves of wide glyphs that lie outside a replacement range.
+    fn clear_overlapping_glyphs(&mut self, start: usize, end: usize) {
+        if start == end {
+            return;
+        }
+        if start > 0 && self.cells[start].width == 0 {
+            self.cells[start - 1] = Cell::default();
+        }
+        if end < self.cells.len() && self.cells[end].width == 0 {
+            self.cells[end] = Cell::default();
+        }
+    }
 }
 
 pub struct Grid {
@@ -28,7 +53,7 @@ pub struct Grid {
     pen_fg: Color,
     pen_bg: Color,
     pen_flags: CellFlags,
-    saved_main: Option<Vec<StoredRow>>,
+    saved_main: Option<SavedScreen>,
 }
 
 impl Grid {
@@ -106,23 +131,54 @@ impl Grid {
     }
 
     pub fn put_char(&mut self, ch: char) {
-        if self.cursor_col >= self.cols {
+        let width = ch.width().unwrap_or(0);
+        if width == 0 {
+            if let Some(previous) = self.cursor_col.checked_sub(1) {
+                let row = &mut self.viewport[self.cursor_row as usize];
+                let mut col = previous as usize;
+                if row.cells[col].width == 0 {
+                    col = col.saturating_sub(1);
+                }
+                if row.cells[col].text.len() + ch.len_utf8() <= MAX_CELL_TEXT_BYTES {
+                    row.cells[col].text.push(ch);
+                    self.dirty[self.cursor_row as usize] = true;
+                }
+            }
+            return;
+        }
+
+        // A one-column viewport cannot represent a double-width glyph and its continuation.
+        let (ch, width) = if width > self.cols as usize {
+            ('�', 1)
+        } else {
+            (ch, width)
+        };
+        if self.cursor_col as usize + width > self.cols as usize {
             self.cursor_col = 0;
             self.linefeed();
         }
         let r = self.cursor_row as usize;
-        let c = self.cursor_col as usize;
-        if r < self.viewport.len() && c < self.viewport[r].cells.len() {
-            self.viewport[r].cells[c] = Cell {
-                text: ch.to_string(),
+        let col = self.cursor_col as usize;
+        let row = &mut self.viewport[r];
+        row.clear_overlapping_glyphs(col, col + width);
+        row.cells[col] = Cell {
+            text: ch.to_string(),
+            fg: self.pen_fg,
+            bg: self.pen_bg,
+            flags: self.pen_flags,
+            width: width as u8,
+        };
+        if width == 2 {
+            row.cells[col + 1] = Cell {
+                text: String::new(),
                 fg: self.pen_fg,
                 bg: self.pen_bg,
                 flags: self.pen_flags,
-                width: 1,
+                width: 0,
             };
-            self.dirty[r] = true;
         }
-        self.cursor_col = self.cursor_col.saturating_add(1);
+        self.dirty[r] = true;
+        self.cursor_col += width as u16;
     }
 
     pub fn carriage_return(&mut self) {
@@ -212,25 +268,16 @@ impl Grid {
             return;
         }
         let col = (self.cursor_col as usize).min(self.cols as usize);
-        match mode {
-            0 => {
-                for cell in &mut self.viewport[r].cells[col..] {
-                    *cell = Cell::default();
-                }
-            }
-            1 => {
-                let end = (col + 1).min(self.cols as usize);
-                for cell in &mut self.viewport[r].cells[..end] {
-                    *cell = Cell::default();
-                }
-            }
-            2 => {
-                for cell in &mut self.viewport[r].cells {
-                    *cell = Cell::default();
-                }
-            }
-            _ => {}
-        }
+        let cols = self.cols as usize;
+        let (start, end) = match mode {
+            0 => (col, cols),
+            1 => (0, (col + 1).min(cols)),
+            2 => (0, cols),
+            _ => return,
+        };
+        let row = &mut self.viewport[r];
+        row.clear_overlapping_glyphs(start, end);
+        row.cells[start..end].fill(Cell::default());
         self.dirty[r] = true;
     }
 
@@ -277,7 +324,12 @@ impl Grid {
                 });
             }
             let main = std::mem::replace(&mut self.viewport, alt);
-            self.saved_main = Some(main);
+            self.saved_main = Some(SavedScreen {
+                rows: main,
+                cursor_col: self.cursor_col,
+                cursor_row: self.cursor_row,
+                wrap_pending: self.cursor_col == self.cols,
+            });
             self.dirty.fill(true);
             self.move_cursor(0, 0);
         }
@@ -286,7 +338,7 @@ impl Grid {
     pub fn leave_alt_screen(&mut self) {
         if let Some(mut main) = self.saved_main.take() {
             Self::conform_rows(
-                &mut main,
+                &mut main.rows,
                 self.cols,
                 self.rows,
                 &mut self.next_abs_row,
@@ -294,7 +346,13 @@ impl Grid {
                 self.scrollback_limit,
                 true,
             );
-            self.viewport = main;
+            self.viewport = main.rows;
+            self.cursor_row = main.cursor_row.min(self.rows - 1);
+            self.cursor_col = if main.wrap_pending && main.cursor_col == self.cols {
+                self.cols
+            } else {
+                main.cursor_col.min(self.cols - 1)
+            };
             self.dirty.fill(true);
         }
     }
@@ -333,6 +391,11 @@ impl Grid {
     ) {
         for row in buf.iter_mut() {
             row.cells.resize(cols as usize, Cell::default());
+            if let Some(last) = row.cells.last_mut()
+                && last.width == 2
+            {
+                *last = Cell::default();
+            }
         }
         while buf.len() < rows as usize {
             buf.push(StoredRow {

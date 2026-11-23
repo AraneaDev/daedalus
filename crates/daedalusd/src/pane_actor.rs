@@ -54,6 +54,25 @@ enum PtyOutput {
     Closed,
 }
 
+fn read_pty_output(reader: &mut impl Read, tx: mpsc::Sender<PtyOutput>) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(0) | Err(_) => {
+                let _ = tx.blocking_send(PtyOutput::Closed);
+                return;
+            }
+            Ok(n) if !tx.is_closed() => {
+                let _ = tx.blocking_send(PtyOutput::Bytes(buf[..n].to_vec()));
+            }
+            // ClosePseudoConsole can wait for pending output to be read. Keep
+            // draining the pipe even after the actor has stopped accepting bytes.
+            Ok(_) => {}
+        }
+    }
+}
+
 struct WriteRequest {
     data: Vec<u8>,
     reply: oneshot::Sender<Result<(), ProtoError>>,
@@ -92,25 +111,7 @@ impl PaneHandle {
 
         std::thread::Builder::new()
             .name(format!("pty-reader-{}", pane_id.short()))
-            .spawn(move || {
-                let mut buf = [0u8; 4096];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => {
-                            let _ = pty_tx.blocking_send(PtyOutput::Closed);
-                            break;
-                        }
-                        Ok(n) => {
-                            if pty_tx
-                                .blocking_send(PtyOutput::Bytes(buf[..n].to_vec()))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-            })
+            .spawn(move || read_pty_output(&mut reader, pty_tx))
             .expect("failed to spawn PTY reader thread");
 
         let writer_handle = std::thread::Builder::new()
@@ -273,6 +274,131 @@ impl PaneHandle {
     }
 }
 
+struct PaneOutput {
+    workspace_id: WorkspaceId,
+    pane_id: PaneId,
+    tracker: CommandTracker,
+    detector: Option<AgentStateDetector>,
+    seq: u64,
+    dirty: bool,
+    events: broadcast::Sender<ServerEvent>,
+}
+
+impl PaneOutput {
+    fn new(
+        workspace_id: WorkspaceId,
+        pane_id: PaneId,
+        role: PaneRole,
+        cols: u16,
+        rows: u16,
+        events: broadcast::Sender<ServerEvent>,
+    ) -> Self {
+        let engine = create_vt_engine(VtConfig {
+            cols,
+            rows,
+            scrollback_limit: 10_000,
+        });
+        Self {
+            workspace_id,
+            pane_id,
+            tracker: CommandTracker::new(pane_id, engine),
+            detector: (role == PaneRole::Agent).then(AgentStateDetector::new),
+            seq: 0,
+            dirty: false,
+            events,
+        }
+    }
+
+    fn emit_agent_state(&self, state: Option<AgentState>) {
+        if let Some(state) = state {
+            let _ = self.events.send(ServerEvent::AgentStateChanged {
+                workspace_id: self.workspace_id,
+                pane_id: self.pane_id,
+                state,
+            });
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8], writer: &mpsc::Sender<WriteRequest>) {
+        let outcome = self.tracker.feed(bytes);
+        if !outcome.terminal_replies.is_empty() {
+            let (reply, _) = oneshot::channel();
+            if let Err(error) = writer.try_send(WriteRequest {
+                data: outcome.terminal_replies,
+                reply,
+            }) {
+                tracing::warn!(pane_id = %self.pane_id, %error, "could not queue terminal reply");
+            }
+        }
+        self.dirty = true;
+        for (status, cwd) in outcome.status_changed {
+            let _ = self.events.send(ServerEvent::PaneStatusChanged {
+                pane_id: self.pane_id,
+                status,
+                cwd,
+            });
+        }
+        for (command, exit_code, has_failure_trace) in outcome.command_finished {
+            let _ = self.events.send(ServerEvent::CommandFinished {
+                pane_id: self.pane_id,
+                command,
+                exit_code,
+                has_failure_trace,
+            });
+        }
+        if let Some(detector) = self.detector.as_mut() {
+            let state = detector.observe_output(bytes, Instant::now());
+            self.emit_agent_state(state);
+        }
+    }
+
+    fn flush_delta(&mut self) {
+        if self.dirty {
+            self.dirty = false;
+            self.seq += 1;
+            if let Some(delta) = self
+                .tracker
+                .engine_mut()
+                .take_dirty_delta(self.pane_id, self.seq)
+            {
+                let _ = self.events.send(ServerEvent::GridDelta(delta));
+            }
+        }
+    }
+
+    fn finish(&mut self, exit_code: Option<i32>) {
+        self.flush_delta();
+        self.tracker.mark_exited(exit_code);
+        if let Some(detector) = self.detector.as_mut() {
+            let state = detector.observe_exit(exit_code);
+            self.emit_agent_state(state);
+        }
+        let _ = self.events.send(ServerEvent::PaneExited {
+            pane_id: self.pane_id,
+            exit_code,
+        });
+    }
+}
+
+// ConPTY does not guarantee EOF on child exit. Allow the reader to deliver trailing
+// output, then stop admitting bytes and process everything already in its queue.
+const CONPTY_EXIT_DRAIN: Duration = Duration::from_millis(250);
+
+async fn next_pty_output(
+    receiver: &mut mpsc::Receiver<PtyOutput>,
+    deadline: Option<tokio::time::Instant>,
+) -> Option<PtyOutput> {
+    if let Some(deadline) = deadline {
+        if tokio::time::Instant::now() < deadline
+            && let Ok(output) = tokio::time::timeout_at(deadline, receiver.recv()).await
+        {
+            return output;
+        }
+        receiver.close();
+    }
+    receiver.recv().await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_pane_actor(
     workspace_id: WorkspaceId,
@@ -290,17 +416,9 @@ async fn run_pane_actor(
 ) {
     let mut cols = cols.max(1);
     let mut rows = rows.max(1);
-    let engine = create_vt_engine(VtConfig {
-        cols,
-        rows,
-        scrollback_limit: 10_000,
-    });
-    let mut tracker = CommandTracker::new(pane_id, engine);
-    let mut detector = (role == PaneRole::Agent).then(AgentStateDetector::new);
-    let mut seq: u64 = 0;
-    let mut has_pending_delta = false;
+    let mut child_exit: Option<(i32, tokio::time::Instant)> = None;
+    let mut output = PaneOutput::new(workspace_id, pane_id, role, cols, rows, event_tx);
     let mut pty_open = true;
-    let mut exited_emitted = false;
     let mut delta_tick = tokio::time::interval(Duration::from_millis(16));
     delta_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut agent_tick = tokio::time::interval(Duration::from_millis(250));
@@ -312,91 +430,34 @@ async fn run_pane_actor(
         t
     };
 
-    let emit_agent_state = |state: Option<AgentState>| {
-        if let Some(state) = state {
-            let _ = event_tx.send(ServerEvent::AgentStateChanged {
-                workspace_id,
-                pane_id,
-                state,
-            });
-        }
-    };
-
     loop {
         tokio::select! {
-            maybe_out = pty_rx.recv(), if pty_open => {
+            maybe_out = next_pty_output(&mut pty_rx, child_exit.map(|(_, deadline)| deadline)), if pty_open => {
                 match maybe_out {
                     Some(PtyOutput::Bytes(bytes)) => {
-                        let outcome = tracker.feed(&bytes);
-                        let reply_bytes =
-                            terminal_query_replies(&bytes, tracker.engine().snapshot(pane_id, seq).cursor);
-                        if !reply_bytes.is_empty() {
-                            let (reply_tx, _reply_rx) = oneshot::channel();
-                            let _ = write_tx.try_send(WriteRequest {
-                                data: reply_bytes,
-                                reply: reply_tx,
-                            });
-                        }
-                        has_pending_delta = true;
-                        for (status, cwd) in outcome.status_changed {
-                            let _ = event_tx.send(ServerEvent::PaneStatusChanged {
-                                pane_id,
-                                status,
-                                cwd,
-                            });
-                        }
-                        for (command, exit_code, has_failure_trace) in outcome.command_finished {
-                            let _ = event_tx.send(ServerEvent::CommandFinished {
-                                pane_id,
-                                command,
-                                exit_code,
-                                has_failure_trace,
-                            });
-                        }
-                        if let Some(det) = detector.as_mut() {
-                            emit_agent_state(det.observe_output(&bytes, Instant::now()));
-                        }
+                        output.feed(&bytes, &write_tx);
                     }
                     Some(PtyOutput::Closed) | None => {
                         pty_open = false;
-                        if has_pending_delta {
-                            has_pending_delta = false;
-                            seq += 1;
-                            if let Some(delta) = tracker.engine_mut().take_dirty_delta(pane_id, seq) {
-                                let _ = event_tx.send(ServerEvent::GridDelta(delta));
+                        let mut exit_code = child_exit.map(|(code, _)| code).or_else(|| proc_handle.try_wait_exit());
+                        for _ in 0..20 {
+                            if exit_code.is_some() {
+                                break;
                             }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            exit_code = proc_handle.try_wait_exit();
                         }
-                        if !exited_emitted {
-                            let mut exit_code = proc_handle.try_wait_exit();
-                            if exit_code.is_none() {
-                                for _ in 0..20 {
-                                    tokio::time::sleep(Duration::from_millis(10)).await;
-                                    exit_code = proc_handle.try_wait_exit();
-                                    if exit_code.is_some() {
-                                        break;
-                                    }
-                                }
-                            }
-                            tracker.mark_exited(exit_code);
-                            if let Some(det) = detector.as_mut() {
-                                emit_agent_state(det.observe_exit(exit_code));
-                            }
-                            let _ = event_tx.send(ServerEvent::PaneExited { pane_id, exit_code });
-                            exited_emitted = true;
-                        }
+                        output.finish(exit_code);
                     }
                 }
             }
-            _ = delta_tick.tick(), if has_pending_delta => {
-                has_pending_delta = false;
-                seq += 1;
-                if let Some(delta) = tracker.engine_mut().take_dirty_delta(pane_id, seq) {
-                    let _ = event_tx.send(ServerEvent::GridDelta(delta));
-                }
+            _ = delta_tick.tick(), if output.dirty => {
+                output.flush_delta();
             }
-            _ = agent_tick.tick(), if detector.is_some() => {
-                if let Some(det) = detector.as_mut() {
-                    emit_agent_state(det.observe_tick(Instant::now()));
+            _ = agent_tick.tick(), if output.detector.is_some() => {
+                if let Some(detector) = output.detector.as_mut() {
+                    let state = detector.observe_tick(Instant::now());
+                    output.emit_agent_state(state);
                 }
             }
             _ = async {
@@ -408,28 +469,9 @@ async fn run_pane_actor(
                 {
                     std::future::pending::<()>().await;
                 }
-            }, if !exited_emitted => {
+            }, if pty_open && child_exit.is_none() => {
                 if let Some(code) = proc_handle.try_wait_exit() {
-                    while let Ok(PtyOutput::Bytes(bytes)) = pty_rx.try_recv() {
-                        let _ = tracker.feed(&bytes);
-                        has_pending_delta = true;
-                    }
-                    if has_pending_delta {
-                        has_pending_delta = false;
-                        seq += 1;
-                        if let Some(delta) = tracker.engine_mut().take_dirty_delta(pane_id, seq) {
-                            let _ = event_tx.send(ServerEvent::GridDelta(delta));
-                        }
-                    }
-                    tracker.mark_exited(Some(code));
-                    if let Some(det) = detector.as_mut() {
-                        emit_agent_state(det.observe_exit(Some(code)));
-                    }
-                    let _ = event_tx.send(ServerEvent::PaneExited {
-                        pane_id,
-                        exit_code: Some(code),
-                    });
-                    exited_emitted = true;
+                    child_exit = Some((code, tokio::time::Instant::now() + CONPTY_EXIT_DRAIN));
                 }
             }
             maybe_cmd = cmd_rx.recv() => {
@@ -450,27 +492,26 @@ async fn run_pane_actor(
                     Some(PaneCmd::Resize { cols: new_cols, rows: new_rows, reply }) => {
                         cols = new_cols.max(1);
                         rows = new_rows.max(1);
-                        let res = master
-                            .resize(PtySize {
+                        let res = master.resize(PtySize {
                                 rows,
                                 cols,
                                 pixel_width: 0,
                                 pixel_height: 0,
                             })
                             .map_err(|e| ProtoError::IoError(e.to_string()));
-                        tracker.engine_mut().resize(cols, rows);
-                        has_pending_delta = true;
+                        output.tracker.engine_mut().resize(cols, rows);
+                        output.dirty = true;
                         let _ = reply.send(res);
                     }
                     Some(PaneCmd::GetSnapshot { reply }) => {
-                        let _ = reply.send(tracker.engine().snapshot(pane_id, seq));
+                        let _ = reply.send(output.tracker.engine().snapshot(pane_id, output.seq));
                     }
                     Some(PaneCmd::GetScrollback {
                         offset_from_bottom,
                         count,
                         reply,
                     }) => {
-                        let engine = tracker.engine();
+                        let engine = output.tracker.engine();
                         let _ = reply.send((
                             engine.scrollback_len(),
                             engine.scrollback_window(offset_from_bottom, count),
@@ -481,37 +522,38 @@ async fn run_pane_actor(
                         case_sensitive,
                         reply,
                     }) => {
-                        let engine = tracker.engine();
+                        let engine = output.tracker.engine();
                         let _ = reply.send((
                             engine.scrollback_len(),
                             engine.search(&query, case_sensitive),
                         ));
                     }
                     Some(PaneCmd::GetFailureTrace { reply }) => {
-                        let _ = reply.send(tracker.last_failure_trace().cloned());
+                        let _ = reply.send(output.tracker.last_failure_trace().cloned());
                     }
                     Some(PaneCmd::GetSummary { reply }) => {
                         let summary = PaneSummary {
                             id: pane_id,
                             workspace_id,
                             role,
-                            status: tracker.status(),
+                            status: output.tracker.status(),
                             cols,
                             rows,
-                            cwd: tracker.cwd().cloned(),
-                            last_exit_code: tracker.last_exit_code(),
-                            has_failure_trace: tracker.last_failure_trace().is_some(),
-                            agent_state: detector.as_ref().map(AgentStateDetector::state),
+                            cwd: output.tracker.cwd().cloned(),
+                            last_exit_code: output.tracker.last_exit_code(),
+                            has_failure_trace: output.tracker.last_failure_trace().is_some(),
+                            agent_state: output.detector.as_ref().map(AgentStateDetector::state),
                         };
                         let _ = reply.send(summary);
                     }
                     Some(PaneCmd::SetAgentState { state, reply }) => {
-                        let res = if let Some(det) = detector.as_mut() {
-                            emit_agent_state(det.set_override(
+                        let res = if let Some(det) = output.detector.as_mut() {
+                            let update = det.set_override(
                                 state,
                                 Instant::now(),
                                 Duration::from_secs(30),
-                            ));
+                            );
+                            output.emit_agent_state(update);
                             Ok(())
                         } else {
                             Err(ProtoError::InvalidRequest(format!(
@@ -521,11 +563,13 @@ async fn run_pane_actor(
                         let _ = reply.send(res);
                     }
                     Some(PaneCmd::Close { reply }) => {
+                        pty_rx.close();
                         teardown_pane(write_tx, master, writer_handle, proc_handle).await;
                         let _ = reply.send(());
                         break;
                     }
                     None => {
+                        pty_rx.close();
                         teardown_pane(write_tx, master, writer_handle, proc_handle).await;
                         break;
                     }
@@ -542,7 +586,6 @@ async fn teardown_pane(
     mut proc_handle: crate::supervisor::ProcessHandle,
 ) {
     drop(write_tx);
-    drop(master);
     let _ = tokio::task::spawn_blocking(move || {
         // Give the writer thread a brief window to observe channel closure and drop the writer fd
         // before process teardown; if it is blocked on a full PTY, teardown kills the child to unblock it.
@@ -551,53 +594,101 @@ async fn teardown_pane(
             std::thread::sleep(Duration::from_millis(1));
         }
         proc_handle.teardown();
+        drop(master);
         let _ = writer_handle.join();
     })
     .await;
 }
 
-/// Builds terminal responses for synchronous VT queries that Windows ConPTY,
-/// PowerShell PSReadLine, and modern shells/TUIs expect back on PTY stdin:
-/// - `CSI 6 n` (DSR cursor position report) -> `CSI <row>;<col> R`
-/// - `CSI c` / `CSI 0 c` (DA1 primary device attributes) -> `CSI ? 1 ; 2 c`
-fn terminal_query_replies(bytes: &[u8], cursor: daedalus_proto::CursorState) -> Vec<u8> {
-    let mut replies = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(b"\x1b[6n") {
-            let row = cursor.row.saturating_add(1);
-            let col = cursor.col.saturating_add(1);
-            replies.extend_from_slice(format!("\x1b[{row};{col}R").as_bytes());
-            i += 4;
-        } else if bytes[i..].starts_with(b"\x1b[0c") {
-            replies.extend_from_slice(b"\x1b[?1;2c");
-            i += 4;
-        } else if bytes[i..].starts_with(b"\x1b[c") {
-            replies.extend_from_slice(b"\x1b[?1;2c");
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    replies
-}
-
 #[cfg(test)]
-mod tests {
+mod output_tests {
     use super::*;
-    use daedalus_proto::CursorState;
 
     #[test]
-    fn responds_to_dsr_cursor_position_and_da1_queries() {
-        let cursor = CursorState {
-            col: 4,
-            row: 2,
-            visible: true,
-        };
-        assert_eq!(
-            terminal_query_replies(b"hello\x1b[6nworld\x1b[0c\x1b[c", cursor),
-            b"\x1b[3;5R\x1b[?1;2c\x1b[?1;2c"
+    fn closed_receiver_keeps_reader_draining_through_eof() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let mut pipe = std::io::Cursor::new(vec![0; 16_384]);
+        read_pty_output(&mut pipe, tx);
+        assert_eq!(pipe.position(), 16_384);
+    }
+
+    #[tokio::test]
+    async fn timed_out_exit_drains_buffered_output_without_waiting_for_eof() {
+        let (reader, mut receiver) = mpsc::channel(2);
+        reader.send(PtyOutput::Bytes(vec![42])).await.unwrap();
+        let elapsed = Some(tokio::time::Instant::now());
+        assert!(
+            matches!(next_pty_output(&mut receiver, elapsed).await, Some(PtyOutput::Bytes(bytes)) if bytes == [42])
         );
-        assert!(terminal_query_replies(b"plain text", cursor).is_empty());
+        assert!(next_pty_output(&mut receiver, elapsed).await.is_none());
+        assert!(reader.is_closed());
+    }
+
+    #[tokio::test]
+    async fn exits_after_queued_and_late_output_and_flushes_once() {
+        let pane_id = PaneId::new();
+        let (events, mut subscribed) = broadcast::channel(32);
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteRequest>(8);
+        let mut output = PaneOutput::new(
+            WorkspaceId::new(),
+            pane_id,
+            PaneRole::Runner,
+            80,
+            24,
+            events,
+        );
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.send(PtyOutput::Bytes(b"abc\x1b[6n\x1b]133;C\x07".to_vec()))
+            .await
+            .unwrap();
+        let reader = async {
+            let reply = write_rx.recv().await.unwrap();
+            assert_eq!(reply.data, b"\x1b[1;4R");
+            tx.send(PtyOutput::Bytes(b"late\x1b]133;D;7\x07".to_vec()))
+                .await
+                .unwrap();
+            tx.send(PtyOutput::Closed).await.unwrap();
+        };
+        let drain = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while let Some(PtyOutput::Bytes(bytes)) = next_pty_output(&mut rx, Some(deadline)).await
+            {
+                output.feed(&bytes, &write_tx);
+            }
+            output.finish(Some(7));
+        };
+        tokio::join!(drain, reader);
+        let mut observed = Vec::new();
+        while let Ok(event) = subscribed.try_recv() {
+            observed.push(event);
+        }
+        assert!(
+            matches!(
+                &observed[..],
+                [
+                    ServerEvent::PaneStatusChanged { .. },
+                    ServerEvent::CommandFinished {
+                        exit_code: 7,
+                        has_failure_trace: true,
+                        ..
+                    },
+                    ServerEvent::GridDelta(_),
+                    ServerEvent::PaneExited {
+                        exit_code: Some(7),
+                        ..
+                    },
+                ]
+            ),
+            "{observed:?}"
+        );
+        assert!(
+            output
+                .tracker
+                .last_failure_trace()
+                .unwrap()
+                .output
+                .contains("late")
+        );
     }
 }

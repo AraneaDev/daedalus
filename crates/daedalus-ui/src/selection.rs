@@ -110,6 +110,11 @@ pub fn extract_selected_text(rows: &[GridRow], selection: &Selection) -> String 
             continue;
         }
 
+        let col_start = if row.cells[col_start].width == 0 {
+            col_start.saturating_sub(1)
+        } else {
+            col_start
+        };
         let mut line = String::new();
         for cell in &row.cells[col_start..=col_end] {
             if cell.width == 0 {
@@ -262,6 +267,16 @@ mod tests {
             extract_selected_text(&rows, &multi),
             "world\n  middle line\nfinal"
         );
+    }
+
+    #[test]
+    fn copy_starting_on_a_continuation_includes_the_wide_glyph_once() {
+        let mut row = make_row(0, 7, "界 B", 3);
+        row.cells[0].width = 2;
+        row.cells[1].text.clear();
+        row.cells[1].width = 0;
+        let selection = Selection::new(CellPos::new(1, 7), CellPos::new(2, 7));
+        assert_eq!(extract_selected_text(&[row], &selection), "界B");
     }
 
     #[test]

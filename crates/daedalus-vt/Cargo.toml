@@ -10,6 +10,7 @@ ghostty-vt = ["dep:bindgen", "dep:pkg-config"]
 
 [dependencies]
 daedalus-proto = { path = "../daedalus-proto" }
+unicode-width = "0.1.14"
 vte.workspace = true
 
 [build-dependencies]

@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Default)]
 pub struct TrackedOutcome {
+    pub terminal_replies: Vec<u8>,
     pub status_changed: Vec<(PaneStatus, Option<PathBuf>)>,
     pub command_finished: Vec<(Option<String>, i32, bool)>,
 }
@@ -62,6 +63,7 @@ impl CommandTracker {
     fn process_events(&mut self, events: Vec<SemanticEvent>, outcome: &mut TrackedOutcome) {
         for event in events {
             match event {
+                SemanticEvent::TerminalReply(bytes) => outcome.terminal_replies.extend(bytes),
                 SemanticEvent::CwdChanged(path) => {
                     self.cwd = Some(path);
                     outcome.status_changed.push((self.status, self.cwd.clone()));

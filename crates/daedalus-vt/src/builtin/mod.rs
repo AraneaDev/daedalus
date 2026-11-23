@@ -102,7 +102,28 @@ impl Perform for PerformerState {
         }
     }
 
-    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        if !ignore && intermediates.is_empty() {
+            let mut args = params.iter();
+            let first = args.next();
+            if args.next().is_none() {
+                match (action, first) {
+                    ('n', Some([6])) => {
+                        let cursor = self.grid.cursor();
+                        let reply = format!("\x1b[{};{}R", cursor.row + 1, cursor.col + 1);
+                        self.pending_events
+                            .push(SemanticEvent::TerminalReply(reply.into_bytes()));
+                        return;
+                    }
+                    ('c', None | Some([0])) => {
+                        self.pending_events
+                            .push(SemanticEvent::TerminalReply(b"\x1b[?1;2c".to_vec()));
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
         let mut flat: Vec<u16> = params.iter().map(|p| p[0]).collect();
         let is_private = intermediates == b"?";
 
@@ -308,4 +329,37 @@ fn percent_decode(input: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    use crate::CommandTracker;
+
+    #[test]
+    fn replies_use_query_position_across_every_read_boundary() {
+        let stream = b"a\x1b[6nbc\x1b[6nZ\x1b[c\x1b[0c";
+        for split in 0..=stream.len() {
+            let mut tracker =
+                CommandTracker::new(PaneId::new(), Box::new(BuiltinVt::new(VtConfig::default())));
+            let mut replies = tracker.feed(&stream[..split]).terminal_replies;
+            replies.extend(tracker.feed(&stream[split..]).terminal_replies);
+            assert_eq!(
+                replies, b"\x1b[1;2R\x1b[1;4R\x1b[?1;2c\x1b[?1;2c",
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_output_and_unsupported_queries_do_not_generate_replies() {
+        let mut tracker =
+            CommandTracker::new(PaneId::new(), Box::new(BuiltinVt::new(VtConfig::default())));
+        assert!(
+            tracker
+                .feed(b"text\x1b[?6n\x1b[>c\x1b[6;7n\x1b[6:0n")
+                .terminal_replies
+                .is_empty()
+        );
+    }
 }

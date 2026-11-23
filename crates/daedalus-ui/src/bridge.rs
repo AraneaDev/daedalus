@@ -105,6 +105,7 @@ pub enum UiCommand {
     },
     RequestScrollback {
         pane_id: PaneId,
+        generation: u64,
         offset_from_bottom: usize,
         count: usize,
     },
@@ -148,6 +149,7 @@ pub enum UiEvent {
     Snapshot(GridSnapshot),
     ScrollbackLoaded {
         pane_id: PaneId,
+        generation: u64,
         total_scrollback: usize,
         rows: Vec<GridRow>,
     },
@@ -559,6 +561,7 @@ async fn handle_command(
         }
         UiCommand::RequestScrollback {
             pane_id,
+            generation,
             offset_from_bottom,
             count,
         } => {
@@ -576,6 +579,7 @@ async fn handle_command(
             {
                 sink.emit(UiEvent::ScrollbackLoaded {
                     pane_id,
+                    generation,
                     total_scrollback,
                     rows,
                 });

@@ -497,6 +497,28 @@ command = ["cmd.exe", "/C", "echo", "MANIFEST_RUNNER_NEEDLE", "&", "ping", "-n",
 
     let runner_id = runner_pane_id.expect("runner pane must be spawned");
 
+    bridge2.send(UiCommand::RequestScrollback {
+        pane_id: runner_id,
+        generation: 42,
+        offset_from_bottom: 1,
+        count: 2,
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let UiEvent::ScrollbackLoaded {
+                pane_id,
+                generation,
+                ..
+            } = evt_rx.recv().await.unwrap()
+            {
+                assert_eq!((pane_id, generation), (runner_id, 42));
+                break;
+            }
+        }
+    })
+    .await
+    .expect("scrollback reply should carry its request generation");
+
     // Poll SearchPane until the manifest runner command output appears in the VT grid.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut found = false;
