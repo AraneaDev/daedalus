@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Daedalus
+Exec=daedalus-ui
+Categories=Development;TerminalEmulator;
+Terminal=false

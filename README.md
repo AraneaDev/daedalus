@@ -9,6 +9,7 @@ Download the installer for your machine from [GitHub Releases](https://github.co
 | Platform | Asset | Installation |
 | --- | --- | --- |
 | Ubuntu 24.04 or compatible Debian-based Linux, x86-64 | `.deb` | Run `sudo apt install ./daedalus-<version>-amd64.deb`. Launch **Daedalus** from the applications menu. |
+| Arch Linux, x86-64 (v0.0.9 onward) | `.pkg.tar.zst` | Run `sudo pacman -U ./daedalus-<version>-1-x86_64.pkg.tar.zst`. Launch **Daedalus** from the applications menu. |
 | macOS, Apple Silicon | `.pkg` | Open the package, follow Installer, then open **Daedalus** from Applications. CLI tools are linked in `/usr/local/bin`. |
 | Windows, x64 | `.msi` | Run the installer, then open **Daedalus** from Start. Open a new terminal to use the CLI. |
 

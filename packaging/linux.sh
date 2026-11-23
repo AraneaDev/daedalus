@@ -8,14 +8,7 @@ for program in daedalus-ui daedalus-ctl daedalusd; do
     install -m755 "target/release/$program" "$stage/usr/bin/$program"
 done
 install -m644 LICENSE "$stage/usr/share/doc/daedalus/copyright"
-cat > "$stage/usr/share/applications/daedalus.desktop" <<'DESKTOP'
-[Desktop Entry]
-Type=Application
-Name=Daedalus
-Exec=daedalus-ui
-Categories=Development;TerminalEmulator;
-Terminal=false
-DESKTOP
+install -m644 packaging/daedalus.desktop "$stage/usr/share/applications/daedalus.desktop"
 # Resolve the actual linked library versions from the release binaries.
 mkdir -p "$stage/build/debian"
 touch "$stage/build/debian/control"
