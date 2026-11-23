@@ -69,6 +69,21 @@ mod tests {
     use daedalus_proto::{CellFlags, Color};
 
     #[test]
+    fn erase_line_modes_include_the_cursor_and_preserve_unaffected_cells() {
+        for (sequence, expected) in [
+            (b"\x1b[0K".as_slice(), "AB"),
+            (b"\x1b[1K", "   DE"),
+            (b"\x1b[2K", ""),
+            (b"\x1b[9K", "ABCDE"),
+        ] {
+            let mut vt = BuiltinVt::new(VtConfig::default());
+            vt.feed(b"ABCDE\x1b[1;3H");
+            vt.feed(sequence);
+            assert_eq!(vt.row_text_from(0, 0).trim_end(), expected);
+        }
+    }
+
+    #[test]
     fn erase_uses_the_physical_cursor_while_wrap_is_pending() {
         for erase in [b"\x1b[K", b"\x1b[J"] {
             let mut vt = BuiltinVt::new(VtConfig {

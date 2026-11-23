@@ -1,4 +1,4 @@
-use serde_yml::{Mapping, Sequence, Value};
+use noyalib::compat::serde_yaml::{self, Mapping, Sequence, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -147,7 +147,7 @@ pub(super) fn parse_compose_ports(
         return Ok(BTreeMap::new());
     }
 
-    let doc: Value = match serde_yml::from_str(&contents) {
+    let doc: Value = match serde_yaml::from_str(&contents) {
         Ok(v) => v,
         Err(err) => {
             tracing::warn!(path = %path.display(), error = %err, "failed to parse compose file; skipping port extraction");
@@ -405,18 +405,16 @@ pub(super) fn write_compose_override(
         remappable_services.push((svc_name, port_seq));
     }
 
-    // Emit `!override` YAML tags directly because `serde_yml 0.0.13`'s generic
-    // `to_string` routes `Value::Tagged` through `serialize_map` instead of
-    // writing YAML tag syntax.
+    // Compose requires an explicit !override tag to replace the original port list.
     let mut yaml = String::from("services:");
     if remappable_services.is_empty() {
         yaml.push_str(" {}\n");
     } else {
         yaml.push('\n');
         for (svc_name, port_seq) in remappable_services {
-            let key_yaml = serde_yml::to_string(svc_name)
+            let key_yaml = serde_yaml::to_string(svc_name)
                 .map_err(|e| io::Error::other(format!("failed to serialize service name: {e}")))?;
-            let seq_yaml = serde_yml::to_string(&Value::Sequence(port_seq)).map_err(|e| {
+            let seq_yaml = serde_yaml::to_string(&Value::Sequence(port_seq)).map_err(|e| {
                 io::Error::other(format!("failed to serialize compose.override.yml: {e}"))
             })?;
             yaml.push_str("  ");

@@ -16,3 +16,6 @@ vte.workspace = true
 [build-dependencies]
 bindgen = { version = "0.73", optional = true }
 pkg-config = { version = "0.3", optional = true }
+
+[lints]
+workspace = true

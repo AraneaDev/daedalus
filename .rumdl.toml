@@ -1,0 +1,14 @@
+[global]
+extend-enable = ["MD057"]
+
+[MD013]
+line-length = 100
+reflow = true
+code-blocks = false
+tables = false
+
+[per-file-ignores]
+# Release Please owns the changelog's spacing, bullets and generated link text.
+"CHANGELOG.md" = ["MD012", "MD013", "MD024"]
+# GitHub supplies the PR title above the template.
+".github/pull_request_template.md" = ["MD041"]

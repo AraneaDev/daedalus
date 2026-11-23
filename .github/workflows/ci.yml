@@ -13,10 +13,18 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  RUSTDOCFLAGS: -D warnings
+
 jobs:
   check:
+    needs: [source-quality, test-quality]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
+      - name: Require source and test quality gates
+        if: needs.source-quality.result != 'success' || needs.test-quality.result != 'success'
+        run: exit 1
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -29,9 +37,10 @@ jobs:
       - name: Install Linux GUI build headers
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo build --workspace
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo doc --workspace --locked --no-deps
+      - run: cargo build --workspace --locked
 
   check-macos:
     runs-on: macos-latest
@@ -46,9 +55,9 @@ jobs:
         shell: bash
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo build --workspace
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --locked
 
   check-windows:
     runs-on: windows-latest
@@ -63,6 +72,44 @@ jobs:
         shell: bash
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo build --workspace
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --locked
+
+  source-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install source checkers
+        run: |
+          python3 -m venv "$RUNNER_TEMP/quality-env"
+          "$RUNNER_TEMP/quality-env/bin/pip" install -r scripts/quality-tools.txt
+          echo "$RUNNER_TEMP/quality-env/bin" >> "$GITHUB_PATH"
+      - run: scripts/check-sources.sh
+      - run: cargo install cargo-audit --version 0.23.0 --locked
+      - run: python3 scripts/check_audit.py
+
+  test-quality:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install coverage and mutation tools
+        run: |
+          cargo install cargo-llvm-cov --version 0.9.0 --locked
+          cargo install cargo-mutants --version 27.1.0 --locked
+      - name: Install Linux GUI build headers
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - run: scripts/check-test-quality.sh

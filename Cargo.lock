@@ -978,10 +978,10 @@ dependencies = [
  "daedalus-proto",
  "daedalus-vt",
  "nix 0.32.0",
+ "noyalib",
  "portable-pty",
  "serde",
  "serde_json",
- "serde_yml",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -2126,14 +2126,16 @@ dependencies = [
 
 [[package]]
 name = "noyalib"
-version = "0.0.5"
+version = "0.0.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e493c05128df7a83b9676b709d590e0ebc285c7ed3152bc679668e8c1e506af5"
+checksum = "962838abbd8dd2cd3844d2208dc502458bba6985f8bf1dc21761b30260fcbd7f"
 dependencies = [
+ "hashbrown 0.17.1",
  "indexmap",
+ "libm",
  "memchr",
  "rustc-hash 2.1.3",
- "serde",
+ "serde_core",
  "smallvec",
 ]
 
@@ -3121,16 +3123,6 @@ dependencies = [
  "form_urlencoded",
  "itoa",
  "ryu",
- "serde",
-]
-
-[[package]]
-name = "serde_yml"
-version = "0.0.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "909764a65f86829ccdb5eea9ab355843aa02c019a7bfd47465092953565caa05"
-dependencies = [
- "noyalib",
  "serde",
 ]
 

@@ -4,9 +4,9 @@
 
 ## Verification
 
-- [ ] `cargo fmt --all -- --check`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
+- [ ] Describe the regression or acceptance case exercised by the tests.
+- [ ] Run the relevant [development checks](https://github.com/AraneaDev/daedalus#development).
+- [ ] Explain any platform or graphical behavior that still needs manual verification.
 
 ## Release note
 
