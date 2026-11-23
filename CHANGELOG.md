@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.0.10](https://github.com/AraneaDev/daedalus/compare/v0.0.9...v0.0.10) (2026-11-23)
+
+
+### Features
+
+* **packaging:** ship an Arch Linux pacman package ([#32](https://github.com/AraneaDev/daedalus/issues/32)) ([eb5ac7b](https://github.com/AraneaDev/daedalus/commit/eb5ac7b4371dc22cc06fa2a834c26c03cad0f5c7))
+
+
+### Bug Fixes
+
+* improve workbench accessibility, terminal behavior and session reliability ([#34](https://github.com/AraneaDev/daedalus/issues/34)) ([24e86cd](https://github.com/AraneaDev/daedalus/commit/24e86cdc584796b00e78ee37f07054278a9a58a4))
+
 ## [0.0.9](https://github.com/AraneaDev/daedalus/compare/v0.0.8...v0.0.9) (2026-11-23)
 
 
