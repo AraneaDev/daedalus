@@ -132,6 +132,27 @@ pub fn truncate_right_with_ellipsis(input: &str, columns: usize) -> String {
     format!("{}…", &input[..end])
 }
 
+fn recipient_row_label(name: &str, id: &str, columns: usize) -> String {
+    let suffix = format!(" · {id}");
+    if columns <= suffix.width() {
+        return truncate_right_with_ellipsis(id, columns);
+    }
+    format!(
+        "{}{suffix}",
+        truncate_right_with_ellipsis(name, columns - suffix.width())
+    )
+}
+
+/// Shows the field name and scrolls the value so the insertion point stays in view.
+pub(crate) fn editable_label(name: &str, value: &str, caret: usize, columns: usize) -> String {
+    let prefix = format!("{name}   ");
+    let available = columns.saturating_sub(prefix.width() + 1);
+    let (before, after) = value.split_at(caret);
+    let left = truncate_left_with_ellipsis(before, available);
+    let right = truncate_right_with_ellipsis(after, available.saturating_sub(left.width()));
+    format!("{prefix}{left}│{right}")
+}
+
 /// Measures the physical `(cell_w, cell_h)` of the chosen monospace font at
 /// `font_size_logical` and `scale_factor`.
 pub fn measure_cell_size_for_font(
@@ -570,25 +591,24 @@ impl TextRenderer {
                     choices.agents.len(),
                     choices.selected,
                 );
-                self.push_modal_line(ChromeLineSpec {
-                    text: "Send failure to agent · ↑↓ Enter Esc",
-                    left: modal.x + 16.0 * s,
-                    top: modal.y + 12.0 * s,
-                    max_w: (modal.width - 32.0 * s).max(1.0),
-                    bounds: modal,
-                    font_size_logical: MODAL_TITLE_FONT_SIZE_LOGICAL,
-                    line_height_logical: MODAL_TITLE_LINE_HEIGHT_LOGICAL,
-                    color: theme.text_primary,
-                    bold: true,
-                });
+                self.build_picker_header(modal, theme, modal::PickerKind::Recipient);
                 for (row, index) in visible.enumerate() {
                     let rect = super::picker_item_rect(modal, row, s);
                     let selected = choices.selected == index;
+                    let pane = choices.agents[index];
+                    let max_w = (rect.width - 20. * s).max(1.);
+                    let glyph_width =
+                        self.cell_w * CHROME_FONT_SIZE_LOGICAL / self.font_size_logical;
+                    let label = recipient_row_label(
+                        state.recipient_name(pane),
+                        &pane.short(),
+                        (max_w / glyph_width) as usize,
+                    );
                     self.push_modal_line(ChromeLineSpec {
-                        text: &state.failure_recipient_label(choices.agents[index]),
+                        text: &label,
                         left: rect.x + 10.0 * s,
                         top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                        max_w: (rect.width - 20.0 * s).max(1.0),
+                        max_w,
                         bounds: rect,
                         font_size_logical: CHROME_FONT_SIZE_LOGICAL,
                         line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
@@ -910,6 +930,15 @@ mod tests {
         assert_eq!(truncate_right_with_ellipsis("é-終", 2), "é…");
         assert_eq!(truncate_left_with_ellipsis("long-終", 2), "…");
         assert_eq!(truncate_right_with_ellipsis("終日", 2), "…");
+    }
+
+    #[test]
+    fn compact_recipient_rows_keep_the_disambiguating_id_after_long_names() {
+        for id in ["deadbeef", "cafefeed"] {
+            let label = recipient_row_label("長い同じ名前を持っているエージェント", id, 22);
+            assert!(label.ends_with(&format!("… · {id}")));
+            assert!(label.width() <= 22);
+        }
     }
 
     #[test]

@@ -1176,7 +1176,7 @@ read step
             pane_id: id,
             generation,
             offset_from_bottom: 5,
-            count: usize::from(pane.rows),
+            count: usize::from(pane.summary.rows),
         });
         loop {
             if let UiEvent::ScrollbackLoaded {
@@ -1300,12 +1300,30 @@ command = ["sh", "-c", "touch unexpected-manifest-launch"]
                 }
             }
             assert!(bridge.send(UiCommand::CreateManualWorkspace {
+                session: 1,
+                name: "Manual project".into(),
+                root_dir: project.join("missing"),
+            }));
+            loop {
+                if let UiEvent::ManualWorkspaceFailed { session, message } =
+                    events.recv().await.unwrap()
+                {
+                    assert_eq!(session, 1);
+                    assert!(message.contains("not a directory"));
+                    break;
+                }
+            }
+            assert!(bridge.send(UiCommand::CreateManualWorkspace {
+                session: 2,
                 name: "Manual project".into(),
                 root_dir: project.clone()
             }));
             let ws = loop {
-                if let UiEvent::ManualWorkspaceCreated(ws) = events.recv().await.unwrap() {
-                    break ws;
+                if let UiEvent::ManualWorkspaceCreated { session, workspace } =
+                    events.recv().await.unwrap()
+                {
+                    assert_eq!(session, 2);
+                    break workspace;
                 }
             };
             assert_eq!(ws.root_dir, project);

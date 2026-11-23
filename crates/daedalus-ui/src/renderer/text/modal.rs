@@ -15,7 +15,61 @@ use crate::renderer::{
 use crate::state::{AgentPreset, SearchState};
 use crate::theme;
 
+pub(super) enum PickerKind {
+    Preset,
+    Action,
+    Recipient,
+}
+
+impl PickerKind {
+    pub(super) fn header(self, modal: Rect, theme: &Theme, s: f32) -> [ChromeLineSpec<'static>; 2] {
+        let (title, hint) = match self {
+            Self::Preset => ("Agent preset", "Enter to switch · Shift+Enter to add"),
+            Self::Action => ("Workspace actions", "↑↓ to choose · Enter to run · Esc"),
+            Self::Recipient => (
+                "Send failure to agent",
+                "↑↓ to choose · Enter to send · Esc",
+            ),
+        };
+        [
+            (
+                title,
+                4.,
+                MODAL_TITLE_FONT_SIZE_LOGICAL,
+                MODAL_TITLE_LINE_HEIGHT_LOGICAL,
+                theme.text_primary,
+                true,
+            ),
+            (
+                hint,
+                23.,
+                CHROME_SUB_FONT_SIZE_LOGICAL,
+                CHROME_SUB_LINE_HEIGHT_LOGICAL,
+                theme.text_muted,
+                false,
+            ),
+        ]
+        .map(|(text, offset, size, height, color, bold)| ChromeLineSpec {
+            text,
+            left: modal.x + 16. * s,
+            top: modal.y + offset * s,
+            max_w: (modal.width - 32. * s).max(1.),
+            bounds: modal,
+            font_size_logical: size,
+            line_height_logical: height,
+            color,
+            bold,
+        })
+    }
+}
+
 impl TextRenderer {
+    pub(super) fn build_picker_header(&mut self, modal: Rect, theme: &Theme, kind: PickerKind) {
+        for line in kind.header(modal, theme, self.scale_factor) {
+            self.push_modal_line(line);
+        }
+    }
+
     pub(super) fn build_picker_items(
         &mut self,
         state: &AppState,
@@ -38,26 +92,20 @@ impl TextRenderer {
             preset_picker_layout(screen_w, screen_h, s, state.picker.selected_index)
         };
 
-        self.push_modal_line(ChromeLineSpec {
-            text: if palette {
-                "Actions · ↑↓ Enter Esc"
+        self.build_picker_header(
+            modal,
+            theme,
+            if palette {
+                PickerKind::Action
             } else {
-                "Enter: switch agent · Shift+Enter: add agent"
+                PickerKind::Preset
             },
-            left: modal.x + 16.0 * s,
-            top: modal.y + 12.0 * s,
-            max_w: (modal.width - 32.0 * s).max(1.0),
-            bounds: modal,
-            font_size_logical: MODAL_TITLE_FONT_SIZE_LOGICAL,
-            line_height_logical: MODAL_TITLE_LINE_HEIGHT_LOGICAL,
-            color: theme.text_primary,
-            bold: true,
-        });
+        );
 
         if visible.is_empty() {
             let row = picker_item_rect(modal, 0, s);
             self.push_modal_line(ChromeLineSpec {
-                text: "No actions configured for this workspace",
+                text: "Add actions in .daedalus.toml",
                 left: row.x + 10.0 * s,
                 top: row.y + 6.0 * s,
                 max_w: (row.width - 20.0 * s).max(1.0),
@@ -460,5 +508,41 @@ impl TextRenderer {
             color: theme.text_muted,
             bold: false,
         });
+    }
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn picker_shortcuts_fit_the_compact_header_above_the_first_row() {
+        for scale in [1., 2.] {
+            let (modal, _) = preset_picker_layout(320. * scale, 144. * scale, scale, 3);
+            let row = picker_item_rect(modal, 0, scale);
+            for kind in [
+                PickerKind::Preset,
+                PickerKind::Action,
+                PickerKind::Recipient,
+            ] {
+                let [title, hint] = kind.header(modal, &Theme::dark(), scale);
+                assert!(title.top + title.line_height_logical * scale <= hint.top);
+                assert!(hint.top + hint.line_height_logical * scale <= row.y);
+                for line in [title, hint] {
+                    assert!(
+                        line.text.width() as f32 * line.font_size_logical * 0.65 * scale
+                            <= line.max_w,
+                        "{}",
+                        line.text
+                    );
+                }
+            }
+            assert!(
+                PickerKind::Preset.header(modal, &Theme::dark(), scale)[1]
+                    .text
+                    .contains("Shift+Enter")
+            );
+        }
     }
 }

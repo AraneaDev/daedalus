@@ -11,9 +11,78 @@ use crate::renderer::{
     SidebarCards, active_external_detail_preview, agent_state_badge, banner_appearance,
     format_ports_summary, pane_agent_state_pill_rect,
 };
-use daedalus_proto::{PaneRole, PaneStatus, WorkspaceInfo};
+use crate::state::WorkspaceView;
+use daedalus_proto::{PaneRole, PaneStatus};
 
-fn service_observations(ws: &WorkspaceInfo) -> Vec<String> {
+fn empty_terminal_message(
+    state: &AppState,
+    role: PaneRole,
+) -> Option<(&'static str, &'static str)> {
+    if state.connection != crate::state::ConnectionState::Connected
+        || role != state.focused_role
+        || state.pane_id_for_role(role).is_some()
+    {
+        return None;
+    }
+    let Some(workspace) = state.active_workspace() else {
+        return (state.workspace_list_loaded && state.workspaces.is_empty())
+            .then_some(("No workspaces open", "Choose Workspaces → + Workspace."));
+    };
+    if workspace.needs_default_panes() || state.spawning_workspaces.contains(&workspace.id) {
+        return None;
+    }
+    let title = if workspace.panes.is_empty() {
+        "No terminals open"
+    } else {
+        match role {
+            PaneRole::Agent => "No agent terminal open",
+            PaneRole::Service => "No service terminal open",
+            PaneRole::Runner => "No runner terminal open",
+        }
+    };
+    Some((title, "Open Settings to launch a terminal."))
+}
+
+fn widget_status_label(level: daedalus_proto::StatusLevel, text: &str) -> String {
+    use daedalus_proto::StatusLevel;
+    let severity = match level {
+        StatusLevel::Info => "Info",
+        StatusLevel::Ok => "OK",
+        StatusLevel::Warn => "Warning",
+        StatusLevel::Error => "Error",
+    };
+    format!("{severity} · {text}")
+}
+
+fn compact_service_summary(
+    ports: usize,
+    containers: usize,
+    connection: crate::state::ConnectionState,
+) -> Option<String> {
+    if ports == 0 && containers == 0 {
+        return None;
+    }
+    let prefix = if connection == crate::state::ConnectionState::Connected {
+        ""
+    } else {
+        "Last known · "
+    };
+    let port_label = if ports == 1 {
+        "listening port"
+    } else {
+        "listening ports"
+    };
+    let container_label = if containers == 1 {
+        "container"
+    } else {
+        "containers"
+    };
+    Some(format!(
+        "{prefix}{ports} {port_label} · {containers} {container_label}"
+    ))
+}
+
+fn service_observations(ws: &WorkspaceView) -> Vec<String> {
     let mut lines: Vec<_> = ws
         .containers
         .iter()
@@ -70,6 +139,26 @@ impl TextRenderer {
         theme: &Theme,
         cards: Option<&SidebarCards>,
     ) {
+        self.build_sidebar_toggle_text(state, layout, theme, cards);
+        self.build_sidebar_text(state, layout, theme, cards);
+        self.build_compact_recap_text(state, layout, theme);
+        self.build_banner_text(state, layout, theme);
+
+        for pane_rect in &layout.panes {
+            if state.active_workspace_id.is_some() {
+                self.build_pane_header_text(pane_rect, state, theme, layout);
+            }
+            self.build_empty_pane_text(state, pane_rect, theme);
+        }
+    }
+
+    fn build_sidebar_toggle_text(
+        &mut self,
+        state: &AppState,
+        layout: &WorkspaceLayout,
+        theme: &Theme,
+        cards: Option<&SidebarCards>,
+    ) {
         let s = self.scale_factor;
 
         let arrows = cards.and_then(|cards| cards.list.arrows);
@@ -104,12 +193,17 @@ impl TextRenderer {
             let name = state
                 .active_workspace()
                 .map_or("Select", |ws| ws.name.as_str());
-            let label = format!("{arrow} Workspaces · {name}{suffix}");
+            let max_w = (toggle.width - 24.0 * s).max(1.0);
+            let glyph_width = self.cell_w * CHROME_FONT_SIZE_LOGICAL / self.font_size_logical;
+            let label = truncate_right_with_ellipsis(
+                &format!("{arrow} Workspaces · {name}{suffix}"),
+                (max_w / glyph_width) as usize,
+            );
             self.push_chrome_line(ChromeLineSpec {
                 text: &label,
                 left: toggle.x + 12.0 * s,
                 top: toggle.y + (toggle.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                max_w: (toggle.width - 24.0 * s).max(1.0),
+                max_w,
                 bounds: toggle,
                 font_size_logical: CHROME_FONT_SIZE_LOGICAL,
                 line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
@@ -117,8 +211,18 @@ impl TextRenderer {
                 bold: true,
             });
         }
+    }
 
-        // Sidebar text
+    fn build_sidebar_text(
+        &mut self,
+        state: &AppState,
+        layout: &WorkspaceLayout,
+        theme: &Theme,
+        cards: Option<&SidebarCards>,
+    ) {
+        let s = self.scale_factor;
+        let arrows = cards.and_then(|cards| cards.list.arrows);
+
         if let (Some(sidebar), Some(cards)) = (layout.sidebar, cards) {
             let list = &cards.list;
             if let Some((up, down)) = arrows {
@@ -145,16 +249,19 @@ impl TextRenderer {
             }
             for (row, rect) in list.rows[list.visible.clone()].iter().zip(&list.rects) {
                 use crate::sidebar_content::SidebarRow;
+                let status_label;
                 let (text, color, bold) = match row {
                     SidebarRow::Workspace(_) => continue,
                     SidebarRow::Heading(text) => (text, theme.text_primary, true),
-                    SidebarRow::Detail(text, level) => (
-                        text,
-                        level.map_or(theme.text_muted, |level| {
-                            super::super::external_status_color(level, theme)
-                        }),
-                        false,
-                    ),
+                    SidebarRow::Detail(text, None) => (text, theme.text_muted, false),
+                    SidebarRow::Detail(text, Some(level)) => {
+                        status_label = widget_status_label(*level, text);
+                        (
+                            &status_label,
+                            super::super::external_status_color(*level, theme),
+                            false,
+                        )
+                    }
                 };
                 self.push_chrome_line(ChromeLineSpec {
                     text,
@@ -201,89 +308,106 @@ impl TextRenderer {
                     bold: true,
                 });
             }
-            if let Some(id) = state.active_workspace_id {
-                let mut top = new_wt_btn.bottom() + 12.0 * s;
-                let height = CHROME_SUB_LINE_HEIGHT_LOGICAL * s;
-                let left = new_btn.x + 4.0 * s;
-                let width = (new_wt_btn.right() - left).max(1.0);
-                if top + height * 2.0 <= sidebar.bottom() {
-                    let lines = state.recap.lines(id);
-                    for (index, text) in std::iter::once("Since you left")
-                        .chain(lines.iter().map(String::as_str))
-                        .enumerate()
-                    {
-                        if top + height > sidebar.bottom() {
-                            break;
-                        }
-                        let max_chars =
-                            (width / (CHROME_SUB_FONT_SIZE_LOGICAL * s * 0.62)) as usize;
-                        let label = truncate_right_with_ellipsis(text, max_chars);
-                        self.push_chrome_line(ChromeLineSpec {
-                            text: &label,
-                            bounds: Rect::new(left, top, width, height),
-                            left,
-                            top,
-                            max_w: width,
-                            font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
-                            line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
-                            color: if index == 0 {
-                                theme.text_primary
-                            } else {
-                                theme.text_muted
-                            },
-                            bold: index == 0,
-                        });
-                        self.recap_drawn |= index > 0;
-                        top += height;
-                    }
-                    if let Some(ws) = state.active_workspace() {
-                        top += 10. * s;
-                        let service_title =
-                            if state.connection == crate::state::ConnectionState::Connected {
-                                "Workspace services"
-                            } else {
-                                "Last known services"
-                            };
-                        for (i, label) in std::iter::once(service_title.to_owned())
-                            .chain(service_observations(ws))
-                            .enumerate()
-                        {
-                            if top + height > sidebar.bottom() {
-                                break;
-                            }
-                            self.push_chrome_line(ChromeLineSpec {
-                                text: &label,
-                                bounds: Rect::new(left, top, width, height),
-                                left,
-                                top,
-                                max_w: width,
-                                font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
-                                line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
-                                color: if i == 0 {
-                                    theme.border_focused
-                                } else {
-                                    theme.text_primary
-                                },
-                                bold: i == 0,
-                            });
-                            top += height;
-                        }
-                    }
+            self.build_sidebar_recap_text(state, theme, sidebar, cards);
+        }
+    }
+
+    fn build_sidebar_recap_text(
+        &mut self,
+        state: &AppState,
+        theme: &Theme,
+        sidebar: Rect,
+        cards: &SidebarCards,
+    ) {
+        let Some(id) = state.active_workspace_id else {
+            return;
+        };
+        let s = self.scale_factor;
+        let mut top = cards.list.new_worktree.bottom() + 12.0 * s;
+        let height = CHROME_SUB_LINE_HEIGHT_LOGICAL * s;
+        let left = cards.list.new_workspace.x + 4.0 * s;
+        let width = (cards.list.new_worktree.right() - left).max(1.0);
+        if top + height * 2.0 > sidebar.bottom() {
+            return;
+        }
+        let lines = state.recap.lines(id);
+        for (index, text) in std::iter::once("Since you left")
+            .chain(lines.iter().map(String::as_str))
+            .enumerate()
+        {
+            if top + height > sidebar.bottom() {
+                break;
+            }
+            let max_chars = (width / (CHROME_SUB_FONT_SIZE_LOGICAL * s * 0.62)) as usize;
+            let label = truncate_right_with_ellipsis(text, max_chars);
+            self.push_chrome_line(ChromeLineSpec {
+                text: &label,
+                bounds: Rect::new(left, top, width, height),
+                left,
+                top,
+                max_w: width,
+                font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
+                color: if index == 0 {
+                    theme.text_primary
+                } else {
+                    theme.text_muted
+                },
+                bold: index == 0,
+            });
+            self.recap_drawn |= index > 0;
+            top += height;
+        }
+        if let Some(ws) = state.active_workspace() {
+            top += 10. * s;
+            let service_title = if state.connection == crate::state::ConnectionState::Connected {
+                "Workspace services"
+            } else {
+                "Last known services"
+            };
+            for (i, label) in std::iter::once(service_title.to_owned())
+                .chain(service_observations(ws))
+                .enumerate()
+            {
+                if top + height > sidebar.bottom() {
+                    break;
                 }
+                self.push_chrome_line(ChromeLineSpec {
+                    text: &label,
+                    bounds: Rect::new(left, top, width, height),
+                    left,
+                    top,
+                    max_w: width,
+                    font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+                    line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
+                    color: if i == 0 {
+                        theme.border_focused
+                    } else {
+                        theme.text_primary
+                    },
+                    bold: i == 0,
+                });
+                top += height;
             }
         }
+    }
 
+    fn build_compact_recap_text(
+        &mut self,
+        state: &AppState,
+        layout: &WorkspaceLayout,
+        theme: &Theme,
+    ) {
+        let s = self.scale_factor;
         if let Some(rect) = layout.compact_recap
             && let Some(ws) = state.active_workspace()
         {
             let mut lines = vec!["Since you left".to_owned()];
             lines.extend(state.recap.lines(ws.id));
-            if !ws.containers.is_empty() || !ws.bound_ports.is_empty() {
-                lines.push(format!(
-                    "{} listening ports · {} containers",
-                    ws.bound_ports.len(),
-                    ws.containers.len()
-                ));
+            if let Some(summary) =
+                compact_service_summary(ws.bound_ports.len(), ws.containers.len(), state.connection)
+            {
+                lines.push(summary);
             }
             let step = CHROME_SUB_LINE_HEIGHT_LOGICAL * s;
             for (i, text) in lines.iter().enumerate() {
@@ -309,8 +433,11 @@ impl TextRenderer {
                 });
             }
         }
+    }
 
-        // Top banner (disconnected or toast)
+    fn build_banner_text(&mut self, state: &AppState, layout: &WorkspaceLayout, theme: &Theme) {
+        let s = self.scale_factor;
+
         if let Some(banner) = layout.banner
             && let (_, Some((msg, color))) = banner_appearance(state, theme)
             && !msg.is_empty()
@@ -327,16 +454,41 @@ impl TextRenderer {
                 bold: true,
             });
         }
+    }
 
-        // Pane headers & action pills
-        for pane_rect in &layout.panes {
-            self.build_pane_header_text(pane_rect, state, theme, layout);
+    fn build_empty_pane_text(&mut self, state: &AppState, pane_rect: &PaneRect, theme: &Theme) {
+        let s = self.scale_factor;
+        if let Some((title, hint)) = empty_terminal_message(state, pane_rect.role) {
+            let body = pane_rect.viewport;
+            let inset = 8.0 * s;
+            let mut top = body.y + inset;
+            for (text, bold) in [(title, true), (hint, false)] {
+                if top + CHROME_LINE_HEIGHT_LOGICAL * s > body.bottom() {
+                    break;
+                }
+                self.push_chrome_line(ChromeLineSpec {
+                    text,
+                    bounds: body,
+                    left: body.x + inset,
+                    top,
+                    max_w: (body.width - 2.0 * inset).max(1.0),
+                    font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+                    line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                    color: if bold {
+                        theme.text_primary
+                    } else {
+                        theme.text_muted
+                    },
+                    bold,
+                });
+                top += CHROME_LINE_HEIGHT_LOGICAL * s;
+            }
         }
     }
 
     fn build_sidebar_workspace_text(
         &mut self,
-        ws: &WorkspaceInfo,
+        ws: &WorkspaceView,
         card: &Card,
         state: &AppState,
         theme: &Theme,
@@ -391,9 +543,8 @@ impl TextRenderer {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(".");
-            let agent_status = ws
-                .panes
-                .iter()
+            let agent_status = state
+                .workspace_panes(ws)
                 .rev()
                 .find(|p| p.role == PaneRole::Agent)
                 .map(|p| match p.status {
@@ -508,7 +659,17 @@ impl TextRenderer {
         let label = pane_state
             .and_then(|pane| state.session_names.get(&pane.summary.id))
             .unwrap_or(&role_label);
-        let title = format!("{label}{cwd_suffix}{scroll_suffix}");
+        let title = if state.zoomed {
+            format!("{cwd_suffix}{scroll_suffix}")
+                .trim_start()
+                .to_owned()
+        } else {
+            format!("{label}{cwd_suffix}{scroll_suffix}")
+        };
+        let title = match pane_state {
+            Some(pane) if !state.zoomed => crate::state::terminal_title(title, pane.summary.status),
+            _ => title,
+        };
         let text_left = if let Some((_, _, last)) = layout.named_tabs.last() {
             for (id, label, rect) in &layout.named_tabs {
                 let active = Some(*id) == state.focused_pane_id();
@@ -526,11 +687,14 @@ impl TextRenderer {
                         bold: false,
                     });
                 }
+                let max_w = (rect.width - close.map_or(0., |(_, b)| b.width) - 8. * s).max(1.);
+                let glyph_width = self.cell_w * CHROME_FONT_SIZE_LOGICAL / self.font_size_logical;
+                let label = truncate_right_with_ellipsis(label, (max_w / glyph_width) as usize);
                 self.push_chrome_line(ChromeLineSpec {
-                    text: label,
+                    text: &label,
                     left: rect.x + 4. * s,
                     top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                    max_w: (rect.width - close.map_or(0., |(_, b)| b.width) - 8. * s).max(1.),
+                    max_w,
                     bounds: *rect,
                     font_size_logical: CHROME_FONT_SIZE_LOGICAL,
                     line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
@@ -610,6 +774,8 @@ impl TextRenderer {
 
         if let Some(pill) = pane_rect.action_pill {
             let (pill_label, pill_color) = match pane_rect.role {
+                PaneRole::Agent if pill.width < 105. * s => ("Preset".into(), theme.border_focused),
+                PaneRole::Runner if pill.width < 150. * s => ("Forward".into(), theme.status_err),
                 PaneRole::Agent => {
                     let preset_name = pane_state
                         .and_then(|p| p.agent_preset)
@@ -651,13 +817,133 @@ mod tests {
     use daedalus_proto::{AgentState, ExternalStatus, PaneId, StatusLevel};
 
     #[test]
+    fn chrome_draws_recap_banner_and_empty_pane_text_in_order_at_both_widths() {
+        use crate::layout::{LayoutInput, compute_layout};
+        let (device, queue) = wgpu::Device::noop(&Default::default());
+        let mut renderer = TextRenderer::new(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            1200,
+            800,
+            1.,
+            14.,
+            None,
+        );
+        let theme = Theme::dark();
+        let (mut state, _) = make_state_with_agent_row();
+        state.focused_role = PaneRole::Runner;
+        state.toast = Some((
+            "Workspace refreshed".into(),
+            false,
+            std::time::Instant::now(),
+        ));
+        for width in [1200., 430.] {
+            let layout = compute_layout(&LayoutInput {
+                window_w: width,
+                window_h: 800.,
+                scale_factor: 1.,
+                cell_w: 8.,
+                cell_h: 19.,
+                sidebar_override: None,
+                has_top_banner: true,
+                zoomed: width < 500.,
+                focused_role: state.focused_role,
+                runner_has_failure: false,
+            });
+            let cards = layout
+                .sidebar
+                .map(|rect| SidebarCards::new(&state, rect, 1., &theme, None));
+            renderer.chrome_items.clear();
+            renderer.recap_drawn = false;
+            renderer.build_chrome_items(&state, &layout, &theme, cards.as_ref());
+            let labels: Vec<_> = renderer
+                .chrome_items
+                .iter()
+                .map(|item| item.buffer.lines[0].text())
+                .collect();
+            let index = |label| {
+                labels
+                    .iter()
+                    .position(|text| *text == label)
+                    .unwrap_or_else(|| panic!("Missing {label} at {width}px in {labels:?}"))
+            };
+            assert_eq!(labels.contains(&"+ Workspace"), width > 500.);
+            assert!(index("Since you left") < index("Workspace refreshed"));
+            assert!(index("Workspace refreshed") < index("No runner terminal open"));
+            assert!(renderer.recap_drawn);
+        }
+    }
+
+    #[test]
+    fn compact_service_counts_mark_cached_observations_when_disconnected() {
+        use crate::state::ConnectionState::{Connected, Connecting, Reconnecting};
+        assert_eq!(
+            compact_service_summary(1, 1, Connected).as_deref(),
+            Some("1 listening port · 1 container")
+        );
+        for connection in [Connecting, Reconnecting] {
+            assert_eq!(
+                compact_service_summary(1, 1, connection).as_deref(),
+                Some("Last known · 1 listening port · 1 container")
+            );
+            assert_eq!(compact_service_summary(0, 0, connection), None);
+        }
+    }
+
+    #[test]
+    fn a_connection_without_a_workspace_list_waits_before_showing_creation_guidance() {
+        let mut state = AppState::new();
+        state.connection = crate::state::ConnectionState::Connected;
+        assert_eq!(empty_terminal_message(&state, PaneRole::Agent), None);
+    }
+
+    #[test]
+    fn empty_terminal_guidance_tracks_workspace_and_focused_role() {
+        let (mut state, _) = make_state_with_agent_row();
+        let id = state.focused_pane_id().unwrap();
+        assert_eq!(empty_terminal_message(&state, PaneRole::Agent), None);
+        assert_eq!(empty_terminal_message(&state, PaneRole::Runner), None);
+        state.focused_role = PaneRole::Runner;
+        assert_eq!(
+            empty_terminal_message(&state, PaneRole::Runner).unwrap().0,
+            "No runner terminal open",
+        );
+        state.active_workspace_mut().unwrap().default_panes_pending = Some(false);
+        state.remove_session(id);
+        assert_eq!(
+            empty_terminal_message(&state, PaneRole::Runner),
+            Some(("No terminals open", "Open Settings to launch a terminal.")),
+        );
+    }
+
+    #[test]
+    fn empty_terminal_guidance_waits_for_a_connected_initialized_workspace() {
+        let (mut state, _) = make_state_with_agent_row();
+        let id = state.focused_pane_id().unwrap();
+        state.remove_session(id);
+        state.active_workspace_mut().unwrap().default_panes_pending = Some(true);
+        assert_eq!(empty_terminal_message(&state, PaneRole::Agent), None);
+        state.active_workspace_mut().unwrap().default_panes_pending = Some(false);
+        state.connection = crate::state::ConnectionState::Reconnecting;
+        assert_eq!(empty_terminal_message(&state, PaneRole::Agent), None);
+        state.connection = crate::state::ConnectionState::Connected;
+        // An empty list from the daemon confirms the last workspace has closed.
+        state.set_workspaces(Vec::new());
+        assert_eq!(
+            empty_terminal_message(&state, PaneRole::Agent),
+            Some(("No workspaces open", "Choose Workspaces → + Workspace."))
+        );
+    }
+
+    #[test]
     fn recap_quotes_agent_pane_changes_and_ignores_old_frames() {
         use crate::bridge::UiEvent;
         use daedalus_proto::{Cell, GridDelta, GridRow, ServerEvent};
         let (mut state, _) = make_state_with_agent_row();
         let ws = state.active_workspace().unwrap();
         let id = ws.id;
-        let pane_id = ws.panes[0].id;
+        let pane_id = ws.panes[0];
         let event = |seq, text: &str| {
             UiEvent::ServerEvent(ServerEvent::GridDelta(GridDelta {
                 pane_id,
@@ -728,6 +1014,21 @@ mod tests {
     }
 
     #[test]
+    fn widget_rows_identify_status_level_even_when_every_publisher_label_matches() {
+        for (level, severity) in [
+            (StatusLevel::Info, "Info"),
+            (StatusLevel::Ok, "OK"),
+            (StatusLevel::Warn, "Warning"),
+            (StatusLevel::Error, "Error"),
+        ] {
+            assert_eq!(
+                widget_status_label(level, "build · check"),
+                format!("{severity} · build · check")
+            );
+        }
+    }
+
+    #[test]
     fn repository_headers_and_widget_rows_share_geometry_with_pointer_targets() {
         use crate::layout::{HitTarget, hit_test};
         use crate::sidebar_content::{SidebarContent, SidebarRow};
@@ -771,8 +1072,9 @@ mod tests {
             })
             .collect();
         assert_eq!(indices, [0, 2, 1, 3]);
-        assert_eq!(scene.rows[0], SidebarRow::Heading("/one/api".into()));
-        assert!(scene.rows.contains(&SidebarRow::Heading("/two/api".into())));
+        // Shared directory prefixes no longer consume sidebar space.
+        assert_eq!(scene.rows[0], SidebarRow::Heading("one/api".into()));
+        assert!(scene.rows.contains(&SidebarRow::Heading("two/api".into())));
         assert!(
             scene
                 .rows
@@ -832,12 +1134,15 @@ mod tests {
         }
         let ws = state.active_workspace_mut().unwrap();
         ws.git_branch = Some("main".into());
-        ws.panes[0].agent_state = Some(AgentState::WaitingForApproval);
-        let mut runner = ws.panes[0].clone();
+        let agent = ws.panes[0];
+        let summary = &mut state.panes.get_mut(&agent).unwrap().summary;
+        summary.agent_state = Some(AgentState::WaitingForApproval);
+        let mut runner = summary.clone();
         runner.id = PaneId::new();
         runner.role = PaneRole::Runner;
         runner.last_exit_code = Some(0);
-        ws.panes.push(runner);
+        state.register_pane(runner, None);
+        let ws = state.active_workspace_mut().unwrap();
         for label in ["old", "second", "last"] {
             ws.external_statuses.push(ExternalStatus {
                 source: "ci".into(),

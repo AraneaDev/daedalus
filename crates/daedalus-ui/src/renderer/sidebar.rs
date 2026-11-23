@@ -1,4 +1,4 @@
-use daedalus_proto::{AgentState, PaneRole, PaneStatus, WorkspaceInfo};
+use daedalus_proto::{AgentState, PaneRole, PaneStatus};
 
 use super::{
     agent_state_badge, external_status_color, format_docker_health, format_external_source_tag,
@@ -8,7 +8,7 @@ use super::{
 };
 use crate::layout::{Rect, SIDEBAR_ROW_LOGICAL_HEIGHT};
 use crate::sidebar_content::{SidebarContent, SidebarRow};
-use crate::state::AppState;
+use crate::state::{AppState, WorkspaceView};
 use crate::theme::{Rgba, Theme};
 use std::sync::Arc;
 
@@ -40,13 +40,7 @@ impl SidebarCards {
             if let SidebarRow::Workspace(index) = row {
                 let ws = &state.workspaces[*index];
                 indices.push(*index);
-                cards.push(Card::new(
-                    ws,
-                    *rect,
-                    state.workspace_agent_state(ws),
-                    scale,
-                    theme,
-                ));
+                cards.push(Card::new(ws, *rect, state, scale, theme));
             }
         }
         Self {
@@ -86,14 +80,9 @@ pub(super) struct Badge {
 }
 
 impl Card {
-    fn new(
-        ws: &WorkspaceInfo,
-        rect: Rect,
-        agent: Option<AgentState>,
-        s: f32,
-        theme: &Theme,
-    ) -> Self {
-        let panes = |role| ws.panes.iter().rev().find(|p| p.role == role);
+    fn new(ws: &WorkspaceView, rect: Rect, state: &AppState, s: f32, theme: &Theme) -> Self {
+        let agent = state.workspace_agent_state(ws);
+        let panes = |role| state.workspace_panes(ws).rev().find(|p| p.role == role);
         let dot = match agent {
             Some(AgentState::WaitingForApproval) => theme.status_busy,
             Some(AgentState::Error) => theme.status_err,
@@ -176,7 +165,7 @@ impl Card {
 
     fn add_identity_badges(
         &mut self,
-        ws: &WorkspaceInfo,
+        ws: &WorkspaceView,
         agent: Option<AgentState>,
         s: f32,
         theme: &Theme,

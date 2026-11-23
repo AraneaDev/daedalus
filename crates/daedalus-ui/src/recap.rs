@@ -1,10 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::bridge::UiEvent;
-use crate::state::PaneViewState;
+use crate::state::{PaneViewState, WorkspaceView};
 use daedalus_proto::{
-    ActivityEntry, ActivityKind, AgentState, GridRow, PaneId, PaneRole, PaneSummary, ServerEvent,
-    WorkspaceId, WorkspaceInfo,
+    ActivityEntry, ActivityKind, AgentState, GridRow, PaneId, PaneRole, ServerEvent, WorkspaceId,
 };
 
 const MAX_EVENTS: usize = 4;
@@ -138,16 +137,11 @@ impl Recap {
     pub fn observe(
         &mut self,
         event: &UiEvent,
-        workspaces: &[WorkspaceInfo],
+        workspaces: &[WorkspaceView],
         panes: &HashMap<PaneId, PaneViewState>,
     ) {
         let workspace = |id| workspaces.iter().find(|ws| ws.id == id);
-        let pane = |id: PaneId| -> Option<&PaneSummary> {
-            workspaces
-                .iter()
-                .flat_map(|ws| &ws.panes)
-                .find(|p| p.id == id)
-        };
+        let pane = |id: PaneId| panes.get(&id).map(|view| &view.summary);
         match event {
             UiEvent::JournalCapability(supported) => self.unsupported = !*supported,
             UiEvent::Connected => self.disconnected = false,

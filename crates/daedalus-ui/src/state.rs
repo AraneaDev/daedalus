@@ -12,6 +12,18 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::selection::Selection;
 
+/// Ordered workspace membership. Pane metadata lives in AppState::panes.
+pub type WorkspaceView = daedalus_proto::types::Workspace<PaneId>;
+
+/// Put the exit status first so it stays visible when a terminal title is clipped.
+pub fn terminal_title(label: String, status: PaneStatus) -> String {
+    match status {
+        PaneStatus::Exited { code: Some(code) } => format!("Exited {code} · {label}"),
+        PaneStatus::Exited { code: None } => format!("Exited · {label}"),
+        _ => label,
+    }
+}
+
 /// Directional focus navigation across the fixed 3-pane semantic layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FocusDirection {
@@ -247,7 +259,7 @@ pub struct CloseWorkspaceModalState {
 
 impl CloseWorkspaceModalState {
     /// Opens the modal populated with defaults for `ws`.
-    pub fn open_for_workspace(&mut self, ws: &WorkspaceInfo) {
+    pub fn open_for_workspace(&mut self, ws: &WorkspaceView) {
         self.submitting = false;
         self.open = true;
         self.workspace_id = Some(ws.id);
@@ -444,8 +456,7 @@ static NEXT_SCROLLBACK_GENERATION: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone)]
 pub struct PaneViewState {
     pub summary: PaneSummary,
-    pub cols: u16,
-    pub rows: u16,
+    grid_received: bool,
     pub cursor: CursorState,
     pub viewport_rows: Vec<GridRow>,
     pub scrollback_len: usize,
@@ -465,12 +476,9 @@ pub struct PaneViewState {
 
 impl PaneViewState {
     pub fn from_summary(summary: PaneSummary) -> Self {
-        let cols = summary.cols;
-        let rows = summary.rows;
         Self {
             summary,
-            cols,
-            rows,
+            grid_received: false,
             cursor: CursorState::default(),
             viewport_rows: Vec::new(),
             scrollback_len: 0,
@@ -507,8 +515,7 @@ impl PaneViewState {
     /// Returns true when saved history was erased since the last update.
     pub fn apply_snapshot(&mut self, snapshot: GridSnapshot) -> bool {
         let erased = self.update_history_generation(snapshot.history_generation);
-        self.cols = snapshot.cols;
-        self.rows = snapshot.rows;
+        self.grid_received = true;
         self.summary.cols = snapshot.cols;
         self.summary.rows = snapshot.rows;
         self.cursor = snapshot.cursor;
@@ -535,9 +542,8 @@ impl PaneViewState {
         if let Some(len) = delta.scrollback_len {
             self.scrollback_len = len;
         }
-        let resized = self.cols != delta.cols || self.rows != delta.rows;
-        self.cols = delta.cols;
-        self.rows = delta.rows;
+        let resized = self.summary.cols != delta.cols || self.summary.rows != delta.rows;
+        self.grid_received = true;
         self.summary.cols = delta.cols;
         self.summary.rows = delta.rows;
         self.cursor = delta.cursor;
@@ -684,7 +690,8 @@ impl FailureRecipients {
 #[derive(Debug)]
 pub struct AppState {
     pub connection: ConnectionState,
-    pub workspaces: Vec<WorkspaceInfo>,
+    pub workspace_list_loaded: bool,
+    pub workspaces: Vec<WorkspaceView>,
     pub active_workspace_id: Option<WorkspaceId>,
     pub panes: HashMap<PaneId, PaneViewState>,
     pub focused_role: PaneRole,
@@ -724,6 +731,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             connection: ConnectionState::Connecting,
+            workspace_list_loaded: false,
             workspaces: Vec::new(),
             active_workspace_id: None,
             panes: HashMap::new(),
@@ -767,6 +775,17 @@ impl AppState {
         }
     }
 
+    pub fn focus_clicked_pane(&mut self, role: PaneRole) {
+        if self
+            .search
+            .as_ref()
+            .is_some_and(|s| Some(s.pane_id) != self.pane_id_for_role(role))
+        {
+            self.close_search();
+        }
+        self.focused_role = role;
+    }
+
     pub fn close_search(&mut self) {
         self.search = None;
     }
@@ -790,7 +809,7 @@ impl AppState {
     }
 
     /// Returns an active workspace whose default panes need starting or resuming.
-    pub fn active_dormant_workspace(&self) -> Option<&WorkspaceInfo> {
+    pub fn active_dormant_workspace(&self) -> Option<&WorkspaceView> {
         self.active_workspace()
             .filter(|ws| ws.needs_default_panes() && !self.spawning_workspaces.contains(&ws.id))
     }
@@ -853,27 +872,24 @@ impl AppState {
 
     /// Cycles the active workspace forward (`delta > 0`) or backward (`delta < 0`), wrapping cleanly.
     pub fn cycle_workspace(&mut self, delta: isize) -> Option<WorkspaceId> {
-        let len = self.workspaces.len();
+        let order: Vec<_> = crate::sidebar_content::repository_groups(&self.workspaces)
+            .into_iter()
+            .flat_map(|(_, indices)| indices)
+            .map(|index| self.workspaces[index].id)
+            .collect();
+        let len = order.len();
         if len == 0 {
             return None;
         }
         let next_idx = match self
             .active_workspace_id
-            .and_then(|id| self.workspaces.iter().position(|ws| ws.id == id))
+            .and_then(|id| order.iter().position(|ws| *ws == id))
         {
-            Some(idx) => {
-                let offset = delta.rem_euclid(len as isize) as usize;
-                (idx + offset) % len
-            }
-            None => {
-                if delta >= 0 {
-                    0
-                } else {
-                    len - 1
-                }
-            }
+            Some(idx) => (idx + delta.rem_euclid(len as isize) as usize) % len,
+            None if delta < 0 => len - 1,
+            None => 0,
         };
-        let next_id = self.workspaces[next_idx].id;
+        let next_id = order[next_idx];
         self.select_workspace(next_id);
         Some(next_id)
     }
@@ -905,10 +921,13 @@ impl AppState {
             && let Some(ws) = self.active_workspace()
             && let Some(current) = self.pane_id_for_role(role)
         {
-            let mut candidates = ws.panes.iter().filter(|pane| pane.role == role);
-            let first = candidates.clone().next().map(|pane| pane.id);
-            candidates.find(|pane| pane.id == current);
-            if let Some(next) = candidates.next().map(|pane| pane.id).or(first) {
+            let next = {
+                let mut candidates = self.workspace_panes(ws).filter(|pane| pane.role == role);
+                let first = candidates.clone().next().map(|pane| pane.id);
+                candidates.find(|pane| pane.id == current);
+                candidates.next().map(|pane| pane.id).or(first)
+            };
+            if let Some(next) = next {
                 self.selected_panes.insert((ws.id, role), next);
             }
         }
@@ -916,37 +935,32 @@ impl AppState {
         self.close_search();
     }
 
-    /// Returns the `Agent` pane's current [`AgentState`] for `ws`, if any.
-    pub fn workspace_agent_state(&self, ws: &WorkspaceInfo) -> Option<AgentState> {
-        ws.panes
+    pub fn workspace_panes<'a>(
+        &'a self,
+        workspace: &'a WorkspaceView,
+    ) -> impl DoubleEndedIterator<Item = &'a PaneSummary> + Clone {
+        workspace
+            .panes
             .iter()
-            .rev()
-            .find(|pane| pane.role == PaneRole::Agent)
-            .and_then(|pane| {
-                pane.agent_state.or_else(|| {
-                    self.panes
-                        .get(&pane.id)
-                        .and_then(|view| view.summary.agent_state)
-                })
-            })
+            .filter_map(|id| self.panes.get(id).map(|pane| &pane.summary))
     }
 
-    /// Updates `agent_state` for `pane_id` in both `self.workspaces` and `self.panes`.
+    /// Returns the most recently added Agent pane's state for this workspace.
+    pub fn workspace_agent_state(&self, ws: &WorkspaceView) -> Option<AgentState> {
+        self.workspace_panes(ws)
+            .rev()
+            .find(|pane| pane.role == PaneRole::Agent)
+            .and_then(|pane| pane.agent_state)
+    }
+
     pub fn apply_agent_state(
         &mut self,
-        workspace_id: WorkspaceId,
+        _workspace_id: WorkspaceId,
         pane_id: PaneId,
         state: AgentState,
     ) {
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             pane.summary.agent_state = Some(state);
-        }
-        if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == workspace_id)
-            && let Some(summary) = ws.panes.iter_mut().find(|p| p.id == pane_id)
-        {
-            summary.agent_state = Some(state);
-        } else if let Some(summary) = self.workspace_pane_summary_mut(pane_id) {
-            summary.agent_state = Some(state);
         }
     }
 
@@ -967,7 +981,7 @@ impl AppState {
         }
     }
 
-    pub fn active_workspace(&self) -> Option<&WorkspaceInfo> {
+    pub fn active_workspace(&self) -> Option<&WorkspaceView> {
         let id = self.active_workspace_id?;
         self.workspaces.iter().find(|ws| ws.id == id)
     }
@@ -987,7 +1001,7 @@ impl AppState {
         self.action_palette.open();
     }
 
-    pub fn active_workspace_mut(&mut self) -> Option<&mut WorkspaceInfo> {
+    pub fn active_workspace_mut(&mut self) -> Option<&mut WorkspaceView> {
         let id = self.active_workspace_id?;
         self.workspaces.iter_mut().find(|ws| ws.id == id)
     }
@@ -995,15 +1009,13 @@ impl AppState {
     pub fn pane_id_for_role(&self, role: PaneRole) -> Option<PaneId> {
         let ws = self.active_workspace()?;
         if let Some(id) = self.selected_panes.get(&(ws.id, role))
-            && ws
-                .panes
-                .iter()
+            && self
+                .workspace_panes(ws)
                 .any(|pane| pane.id == *id && pane.role == role)
         {
             return Some(*id);
         }
-        ws.panes
-            .iter()
+        self.workspace_panes(ws)
             .rev()
             .find(|pane| pane.role == role)
             .map(|pane| pane.id)
@@ -1019,6 +1031,38 @@ impl AppState {
         self.panes.get_mut(&id)
     }
 
+    /// Keep role ordinals in workspace order, including panes with a custom name.
+    pub fn terminal_tabs(&self, ws: &WorkspaceView) -> Vec<(PaneId, String)> {
+        let mut totals = [0usize; 3];
+        let mut ordinals = [0usize; 3];
+        for pane in self.workspace_panes(ws) {
+            totals[pane.role as usize] += 1;
+        }
+        self.workspace_panes(ws)
+            .map(|pane| {
+                let role = pane.role as usize;
+                ordinals[role] += 1;
+                let name = self
+                    .session_names
+                    .get(&pane.id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let role_name = match pane.role {
+                            PaneRole::Agent => "Agent",
+                            PaneRole::Service => "Service",
+                            PaneRole::Runner => "Runner",
+                        };
+                        if totals[role] > 1 {
+                            format!("{role_name} {}", ordinals[role])
+                        } else {
+                            role_name.into()
+                        }
+                    });
+                (pane.id, terminal_title(name, pane.status))
+            })
+            .collect()
+    }
+
     pub fn remove_session(&mut self, id: PaneId) {
         let focused = self.focused_pane_id() == Some(id);
         self.session_names.remove(&id);
@@ -1032,17 +1076,34 @@ impl AppState {
         {
             self.close_search();
         }
+        let mut adjacent = None;
         for ws in &mut self.workspaces {
-            ws.panes.retain(|p| p.id != id);
+            if let Some(index) = ws.panes.iter().position(|pane| *pane == id) {
+                ws.panes.remove(index);
+                if focused && self.zoomed {
+                    // Keep the next tab under the same pointer; at the end, step left.
+                    adjacent = ws
+                        .panes
+                        .get(index)
+                        .or_else(|| ws.panes.last())
+                        .and_then(|id| self.panes.get(id))
+                        .map(|pane| (ws.id, pane.summary.role, pane.summary.id));
+                }
+                break;
+            }
         }
-        if focused {
+        if let Some((workspace, role, pane)) = adjacent {
+            self.select_session(workspace, role, pane);
+        } else if focused {
             self.focus_available_session();
         }
     }
 
     fn focus_available_session(&mut self) {
         if self.focused_pane_id().is_none()
-            && let Some(pane) = self.active_workspace().and_then(|ws| ws.panes.first())
+            && let Some(pane) = self
+                .active_workspace()
+                .and_then(|ws| self.workspace_panes(ws).next())
         {
             self.focused_role = pane.role;
         }
@@ -1072,9 +1133,8 @@ impl AppState {
         if !self.runner_has_failure() {
             return Err("No failure trace captured in Runner pane yet");
         }
-        let agents: Vec<_> = ws
-            .panes
-            .iter()
+        let agents: Vec<_> = self
+            .workspace_panes(ws)
             .filter(|pane| {
                 pane.role == PaneRole::Agent && !matches!(pane.status, PaneStatus::Exited { .. })
             })
@@ -1104,7 +1164,7 @@ impl AppState {
             .active_workspace()
             .filter(|ws| ws.id == choices.workspace)
             .ok_or("The source workspace has changed")?;
-        if !ws.panes.iter().any(|pane| {
+        if !self.workspace_panes(ws).any(|pane| {
             pane.role == PaneRole::Runner && pane.id == choices.runner && pane.has_failure_trace
         }) {
             return Err("The original Runner failure is no longer available");
@@ -1114,7 +1174,7 @@ impl AppState {
             .get(choices.selected)
             .copied()
             .filter(|id| {
-                ws.panes.iter().any(|pane| {
+                self.workspace_panes(ws).any(|pane| {
                     pane.id == *id
                         && pane.role == PaneRole::Agent
                         && !matches!(pane.status, PaneStatus::Exited { .. })
@@ -1123,12 +1183,14 @@ impl AppState {
             .ok_or("The selected agent is no longer available")
     }
 
-    pub fn failure_recipient_label(&self, agent: PaneId) -> String {
-        let name = self
-            .session_names
+    pub(crate) fn recipient_name(&self, agent: PaneId) -> &str {
+        self.session_names
             .get(&agent)
-            .map_or("Agent", String::as_str);
-        format!("{name} · {}", agent.short())
+            .map_or("Agent", String::as_str)
+    }
+
+    pub fn failure_recipient_label(&self, agent: PaneId) -> String {
+        format!("{} · {}", self.recipient_name(agent), agent.short())
     }
 
     pub fn runner_has_failure(&self) -> bool {
@@ -1142,16 +1204,16 @@ impl AppState {
 
     /// Replaces the workspace list while preserving cached `PaneViewState` for still-existing panes.
     pub fn set_workspaces(&mut self, workspaces: Vec<WorkspaceInfo>) {
-        let mut live_panes = HashSet::new();
-        for ws in &workspaces {
-            for summary in &ws.panes {
-                live_panes.insert(summary.id);
-                self.panes
-                    .entry(summary.id)
-                    .and_modify(|view| view.summary = summary.clone())
-                    .or_insert_with(|| PaneViewState::from_summary(summary.clone()));
-            }
-        }
+        self.workspace_list_loaded = true;
+        let previous_focus = self.focused_pane_id();
+        let workspaces: Vec<_> = workspaces
+            .into_iter()
+            .map(|ws| self.cache_workspace(ws))
+            .collect();
+        let live_panes: HashSet<_> = workspaces
+            .iter()
+            .flat_map(|ws| ws.panes.iter().copied())
+            .collect();
         self.panes.retain(|id, _| live_panes.contains(id));
         self.last_sent_sizes.retain(|id, _| live_panes.contains(id));
         if self
@@ -1179,7 +1241,11 @@ impl AppState {
         let active_still_exists = self
             .active_workspace_id
             .is_some_and(|id| self.workspaces.iter().any(|ws| ws.id == id));
+        if active_still_exists && previous_focus.is_some_and(|id| !live_panes.contains(&id)) {
+            self.focus_available_session();
+        }
         if !active_still_exists {
+            self.settings.open = false;
             self.failure_recipients = None;
             self.action_palette.close();
             self.active_workspace_id = None;
@@ -1192,12 +1258,9 @@ impl AppState {
 
     /// Inserts or updates a single workspace and synchronizes its pane summaries.
     pub fn upsert_workspace(&mut self, ws: WorkspaceInfo) {
-        for summary in &ws.panes {
-            self.panes
-                .entry(summary.id)
-                .and_modify(|view| view.summary = summary.clone())
-                .or_insert_with(|| PaneViewState::from_summary(summary.clone()));
-        }
+        let ws = self.cache_workspace(ws);
+        self.panes
+            .retain(|id, pane| pane.summary.workspace_id != ws.id || ws.panes.contains(id));
         let ws_id = ws.id;
         if let Some(existing) = self.workspaces.iter_mut().find(|item| item.id == ws_id) {
             *existing = ws;
@@ -1209,28 +1272,43 @@ impl AppState {
         }
     }
 
-    /// Registers a newly spawned pane into both its workspace summary list and `self.panes`.
+    fn cache_workspace(&mut self, workspace: WorkspaceInfo) -> WorkspaceView {
+        workspace.map_panes(|summary| self.cache_pane(summary).summary.id)
+    }
+
+    fn cache_pane(&mut self, mut summary: PaneSummary) -> &mut PaneViewState {
+        use std::collections::hash_map::Entry;
+        match self.panes.entry(summary.id) {
+            Entry::Vacant(entry) => entry.insert(PaneViewState::from_summary(summary)),
+            Entry::Occupied(entry) => {
+                let view = entry.into_mut();
+                // A list response has no grid sequence. Keep dimensions paired with the
+                // displayed grid until a sequenced snapshot or delta replaces them.
+                if view.grid_received {
+                    summary.cols = view.summary.cols;
+                    summary.rows = view.summary.rows;
+                }
+                view.summary = summary;
+                view
+            }
+        }
+    }
+
+    /// Records the new pane in workspace order and preserves an existing terminal grid.
     pub fn register_pane(&mut self, summary: PaneSummary, agent_preset: Option<AgentPreset>) {
         if let Some(ws) = self
             .workspaces
             .iter_mut()
             .find(|ws| ws.id == summary.workspace_id)
+            && !ws.panes.contains(&summary.id)
         {
-            if let Some(existing) = ws.panes.iter_mut().find(|p| p.id == summary.id) {
-                *existing = summary.clone();
-            } else {
-                ws.panes.push(summary.clone());
-            }
+            ws.panes.push(summary.id);
         }
         if agent_preset.is_some() {
             self.selected_panes
                 .insert((summary.workspace_id, summary.role), summary.id);
         }
-        let entry = self
-            .panes
-            .entry(summary.id)
-            .and_modify(|view| view.summary = summary.clone())
-            .or_insert_with(|| PaneViewState::from_summary(summary));
+        let entry = self.cache_pane(summary);
         if let Some(preset) = agent_preset {
             entry.agent_preset = Some(preset);
         }
@@ -1279,15 +1357,10 @@ impl AppState {
                 if let Some(pane) = self.panes.get_mut(&pane_id) {
                     pane.summary.status = status;
                     if cwd.is_some() {
-                        pane.summary.cwd = cwd.clone();
+                        pane.summary.cwd = cwd;
                     }
                 }
-                if let Some(summary) = self.workspace_pane_summary_mut(pane_id) {
-                    summary.status = status;
-                    if cwd.is_some() {
-                        summary.cwd = cwd;
-                    }
-                }
+
                 None
             }
             ServerEvent::CommandFinished {
@@ -1303,10 +1376,7 @@ impl AppState {
                         pane.last_failure_trace = None;
                     }
                 }
-                if let Some(summary) = self.workspace_pane_summary_mut(pane_id) {
-                    summary.last_exit_code = Some(exit_code);
-                    summary.has_failure_trace = has_failure_trace;
-                }
+
                 None
             }
             ServerEvent::PaneExited { pane_id, exit_code } => {
@@ -1317,12 +1387,7 @@ impl AppState {
                         pane.summary.last_exit_code = exit_code;
                     }
                 }
-                if let Some(summary) = self.workspace_pane_summary_mut(pane_id) {
-                    summary.status = status;
-                    if exit_code.is_some() {
-                        summary.last_exit_code = exit_code;
-                    }
-                }
+
                 None
             }
             ServerEvent::ResyncRequired { pane_id } => Some(pane_id),
@@ -1381,13 +1446,6 @@ impl AppState {
         };
         self.focused_role = next;
         next
-    }
-
-    fn workspace_pane_summary_mut(&mut self, pane_id: PaneId) -> Option<&mut PaneSummary> {
-        self.workspaces
-            .iter_mut()
-            .flat_map(|ws| ws.panes.iter_mut())
-            .find(|pane| pane.id == pane_id)
     }
 }
 
@@ -1479,6 +1537,70 @@ mod tests {
     }
 
     #[test]
+    fn terminal_tab_names_count_named_siblings_and_keep_workspace_order() {
+        let (mut ws, first, service, runner) = make_workspace_with_three_panes();
+        let mut second = make_pane_summary(ws.id, PaneRole::Agent);
+        second.status = PaneStatus::Exited { code: Some(5) };
+        let second_id = second.id;
+        ws.panes.push(second);
+        let mut state = AppState::new();
+        state.set_workspaces(vec![ws]);
+        state.session_names.insert(first, "Reviewer".into());
+        assert_eq!(
+            state.terminal_tabs(state.active_workspace().unwrap()),
+            vec![
+                (first, "Reviewer".into()),
+                (service, "Service".into()),
+                (runner, "Runner".into()),
+                (second_id, "Exited 5 · Agent 2".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn refresh_recovers_focus_when_a_terminal_closed_in_another_client() {
+        let (mut ws, agent, _, runner) = make_workspace_with_three_panes();
+        let mut state = AppState::new();
+        state.set_workspaces(vec![ws.clone()]);
+        state.select_session(ws.id, PaneRole::Runner, runner);
+        ws.panes.retain(|pane| pane.id != runner);
+        state.set_workspaces(vec![ws.clone()]);
+        assert_eq!(state.focused_pane_id(), Some(agent));
+        // An explicit visit to an empty role stays there across an unrelated refresh.
+        state.focused_role = PaneRole::Runner;
+        state.set_workspaces(vec![ws]);
+        assert_eq!(state.focused_role, PaneRole::Runner);
+    }
+
+    #[test]
+    fn removing_last_workspace_dismisses_its_settings() {
+        let (ws, _, _, _) = make_workspace_with_three_panes();
+        let mut state = AppState::new();
+        state.set_workspaces(vec![ws]);
+        state.settings.begin(Vec::new());
+        state.set_workspaces(Vec::new());
+        assert!(!state.settings.open);
+        assert!(state.active_workspace_id.is_none());
+    }
+
+    #[test]
+    fn closing_middle_tab_selects_its_right_neighbor_across_roles() {
+        let (mut ws, first, service, runner) = make_workspace_with_three_panes();
+        let extra = make_pane_summary(ws.id, PaneRole::Service);
+        let extra_id = extra.id;
+        ws.panes.push(extra);
+        let mut state = AppState::new();
+        state.set_workspaces(vec![ws.clone()]);
+        state.select_session(ws.id, PaneRole::Service, service);
+        state.remove_session(first);
+        assert_eq!(state.focused_pane_id(), Some(service));
+        state.remove_session(service);
+        assert_eq!(state.focused_pane_id(), Some(runner));
+        state.remove_session(runner);
+        assert_eq!(state.focused_pane_id(), Some(extra_id));
+    }
+
+    #[test]
     fn closing_sessions_preserves_siblings_and_handles_the_last_pane() {
         let (workspace, agent, service, runner) = make_workspace_with_three_panes();
         let id = workspace.id;
@@ -1488,10 +1610,11 @@ mod tests {
         state.toggle_search(runner);
         state.remove_session(runner);
         assert!(state.search.is_none());
-        assert_eq!(state.focused_pane_id(), Some(agent));
-        state.remove_session(agent);
+        // The final tab now steps left to its visible neighbor.
         assert_eq!(state.focused_pane_id(), Some(service));
         state.remove_session(service);
+        assert_eq!(state.focused_pane_id(), Some(agent));
+        state.remove_session(agent);
         assert_eq!(state.focused_pane_id(), None);
         assert_eq!(state.active_workspace_id, Some(id));
     }
@@ -1564,6 +1687,61 @@ mod tests {
             }],
         );
         assert_eq!(search.result_label().as_deref(), Some("(1/1)"));
+    }
+
+    #[test]
+    fn workspace_refresh_keeps_live_grid_and_selected_pane_metadata() {
+        let (mut ws, first, _, _) = make_workspace_with_three_panes();
+        let extra = make_pane_summary(ws.id, PaneRole::Agent);
+        let id = extra.id;
+        ws.panes.push(extra);
+        let mut state = AppState::new();
+        state.set_workspaces(vec![ws.clone()]);
+        state.select_session(ws.id, PaneRole::Agent, id);
+        state.apply_grid_snapshot(GridSnapshot {
+            pane_id: id,
+            seq: 0,
+            cols: 99,
+            rows: 2,
+            cursor: CursorState::default(),
+            rows_data: vec![make_row(0, 0, "ready")],
+            history_generation: 0,
+            scrollback_len: 0,
+        });
+        state.set_workspaces(vec![ws.clone()]);
+        assert_eq!(state.panes[&id].summary.cols, 99);
+
+        state.apply_server_event(ServerEvent::GridDelta(GridDelta {
+            pane_id: id,
+            seq: 1,
+            cols: 100,
+            rows: 3,
+            cursor: CursorState::default(),
+            dirty_rows: vec![make_row(1, 1, "resized")],
+            history_generation: 0,
+            scrollback_len: None,
+        }));
+        state.set_workspaces(vec![ws]);
+        state.apply_server_event(ServerEvent::PaneExited {
+            pane_id: id,
+            exit_code: Some(7),
+        });
+        let workspace = state.active_workspace().unwrap();
+        let selected = state.pane_for_role(PaneRole::Agent).unwrap();
+        let listed = state
+            .workspace_panes(workspace)
+            .find(|p| p.id == id)
+            .unwrap();
+        assert!(std::ptr::eq(listed, &selected.summary));
+        assert_eq!((listed.cols, listed.rows), (100, 3));
+        assert_eq!(row_text(&selected.viewport_rows[0]), "ready");
+        assert_eq!(row_text(&selected.viewport_rows[1]), "resized");
+        assert_eq!(
+            state.terminal_tabs(workspace).last().unwrap().1,
+            "Exited 7 · Agent 2"
+        );
+        state.focus_role_shortcut(PaneRole::Agent);
+        assert_eq!(state.focused_pane_id(), Some(first));
     }
 
     #[test]
@@ -1807,8 +1985,8 @@ mod tests {
         let reset = GridDelta {
             pane_id,
             seq: 10,
-            cols: pane.cols,
-            rows: pane.rows,
+            cols: pane.summary.cols,
+            rows: pane.summary.rows,
             cursor: pane.cursor,
             dirty_rows: vec![],
             history_generation: 1,
@@ -1840,8 +2018,8 @@ mod tests {
         let reset = GridSnapshot {
             pane_id: id,
             seq: 4,
-            cols: pane.cols,
-            rows: pane.rows,
+            cols: pane.summary.cols,
+            rows: pane.summary.rows,
             cursor: pane.cursor,
             rows_data: vec![make_row(0, 50, "live")],
             scrollback_len: 5,
@@ -1869,8 +2047,8 @@ mod tests {
         pane.apply_delta(GridDelta {
             pane_id: pane.summary.id,
             seq: 1,
-            cols: pane.cols,
-            rows: pane.rows + 1,
+            cols: pane.summary.cols,
+            rows: pane.summary.rows + 1,
             history_generation: 0,
             scrollback_len: None,
             dirty_rows: Vec::new(),
@@ -1903,10 +2081,7 @@ mod tests {
         assert!(runner.summary.has_failure_trace);
 
         let ws_runner = state
-            .active_workspace()
-            .unwrap()
-            .panes
-            .iter()
+            .workspace_panes(state.active_workspace().unwrap())
             .find(|p| p.id == runner_id)
             .unwrap();
         assert_eq!(ws_runner.last_exit_code, Some(101));
@@ -2623,6 +2798,36 @@ mod tests {
         assert_eq!(state.focused_pane_id(), Some(newest));
         state.cycle_workspace(1);
         assert_eq!(state.focused_role, PaneRole::Runner);
+    }
+
+    #[test]
+    fn clicking_a_different_pane_releases_keyboard_input_from_search() {
+        let (workspace, agent, _, _) = make_workspace_with_three_panes();
+        let mut state = AppState::new();
+        state.set_workspaces(vec![workspace]);
+        state.toggle_search(agent);
+        state.focus_clicked_pane(PaneRole::Agent);
+        assert_eq!(state.search.as_ref().unwrap().pane_id, agent);
+        state.focus_clicked_pane(PaneRole::Service);
+        assert_eq!(state.focused_role, PaneRole::Service);
+        assert!(state.search.is_none());
+    }
+
+    #[test]
+    fn workspace_shortcuts_follow_repository_groups_in_sidebar_order() {
+        let (mut primary, _, _, _) = make_workspace_with_three_panes();
+        let (mut unrelated, _, _, _) = make_workspace_with_three_panes();
+        let (mut linked, _, _, _) = make_workspace_with_three_panes();
+        primary.project.repository = Some("/one".into());
+        linked.project.repository = primary.project.repository.clone();
+        unrelated.project.repository = Some("/two".into());
+        let expected = [primary.id, linked.id, unrelated.id];
+        let mut state = AppState::new();
+        state.set_workspaces(vec![primary, unrelated, linked]);
+        assert_eq!(state.cycle_workspace(1), Some(expected[1]));
+        assert_eq!(state.cycle_workspace(1), Some(expected[2]));
+        assert_eq!(state.cycle_workspace(1), Some(expected[0]));
+        assert_eq!(state.cycle_workspace(-1), Some(expected[2]));
     }
 
     #[test]

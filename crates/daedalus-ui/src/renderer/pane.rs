@@ -6,7 +6,7 @@ use super::{
 use crate::layout::{PaneRect, Rect};
 use crate::state::{AppState, PaneViewState, SearchState};
 use crate::theme::{Rgba, Theme};
-use daedalus_proto::{CellFlags, GridRow, PaneRole};
+use daedalus_proto::{CellFlags, GridRow, PaneRole, PaneStatus};
 use std::collections::HashMap;
 
 pub(super) fn collect_pane_quads(
@@ -297,8 +297,8 @@ impl PaneGrid<'_> {
     fn cursor(&self, quads: &mut Vec<QuadInstance>, pane: &PaneViewState, is_focused: bool) {
         let vp = self.pane_rect.viewport;
         let (cell_w, cell_h) = self.cell_size;
-        // Cursor quad (hidden when cursor.visible == false or scrolled into history)
         if pane.cursor.visible
+            && !matches!(pane.summary.status, PaneStatus::Exited { .. })
             && pane.scroll_offset == 0
             && pane.cursor.col < self.pane_rect.cols
             && pane.cursor.row < self.pane_rect.rows

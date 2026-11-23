@@ -18,7 +18,6 @@ use daedalus_proto::{
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::sync::{Mutex, RwLock, broadcast};
-use tracing::warn;
 
 const DEFAULT_ROLES: [PaneRole; 3] = [PaneRole::Agent, PaneRole::Service, PaneRole::Runner];
 
@@ -740,7 +739,7 @@ impl Registry {
             .map_err(map_worktree_error)?;
         }
 
-        // Keep the workspace and its slot reserved until cleanup succeeds. If Git fails,
+        // Keep the workspace and its slot reserved until cleanup succeeds. On failure,
         // clients can inspect the remaining record and retry with the same workspace ID.
         let handles: Vec<_> = {
             let mut workspaces = self.workspaces.write().await;
@@ -753,11 +752,11 @@ impl Registry {
                 .drain(..)
                 .filter_map(|id| panes.remove(&id))
                 .collect();
-            if remove_worktree
+            if (remove_worktree || (compose_down && project.is_some()))
                 && !handles.is_empty()
                 && !matches!(ws.default_panes, DefaultPanes::Manual)
             {
-                // Git may still refuse removal. Reopen roles drained by this close while
+                // Cleanup can still fail. Reopen roles drained by this close while
                 // preserving any roles the user had already left closed.
                 let mut finished = match &ws.default_panes {
                     DefaultPanes::Pending(roles) => roles.clone(),
@@ -778,30 +777,14 @@ impl Registry {
 
         if compose_down && let Some(project) = project {
             let root_dir = root_dir.clone();
-            let project_for_task = project.clone();
-            let res = tokio::task::spawn_blocking(move || {
-                isolation::run_compose_down(&root_dir, &project_for_task)
-            })
-            .await;
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    warn!(
-                        workspace_id = %workspace_id,
-                        project = %project,
-                        error = %err,
-                        "docker compose down failed during workspace close"
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        workspace_id = %workspace_id,
-                        project = %project,
-                        error = %err,
-                        "docker compose down task panicked"
-                    );
-                }
-            }
+            tokio::task::spawn_blocking(move || isolation::run_compose_down(&root_dir, &project))
+                .await
+                .map_err(|err| ProtoError::Internal(format!(
+                    "panes stopped; workspace retained for retry after Compose teardown task failed: {err}"
+                )))?
+                .map_err(|err| ProtoError::IoError(format!(
+                    "panes stopped; workspace retained for retry after Compose teardown failed: {err}"
+                )))?;
         }
 
         if remove_worktree {

@@ -1,4 +1,5 @@
 mod accessibility;
+mod pointer;
 mod workspace_settings;
 
 use std::path::PathBuf;
@@ -12,13 +13,8 @@ use daedalus_ui::config::UiConfig;
 use daedalus_ui::input::{KeyRepeatGuard, UiAction, filter_modal_text, translate_key};
 use daedalus_ui::layout::{HitTarget, LayoutInput, WorkspaceLayout, compute_layout, hit_test};
 use daedalus_ui::links::{detect_link_in_row, detect_url_in_row, open_link};
-use daedalus_ui::renderer::{
-    GpuRenderer, RenderError, action_palette_layout, close_modal_cancel_rect,
-    close_modal_compose_rect, close_modal_confirm_rect, close_modal_force_rect,
-    close_modal_worktree_rect, close_workspace_modal_rect, picker_item_rect, picker_row_stride,
-    preset_picker_layout, search_bar_rect, worktree_button_rects, worktree_modal_rect,
-};
-use daedalus_ui::selection::{CellPos, Selection, extract_selected_text, select_word_at};
+use daedalus_ui::renderer::{GpuRenderer, RenderError, picker_row_stride};
+use daedalus_ui::selection::extract_selected_text;
 use daedalus_ui::state::{AgentPreset, AppState, ConnectionState};
 use daedalus_ui::theme::Theme;
 use tracing::{error, warn};
@@ -34,7 +30,6 @@ const INITIAL_WINDOW_WIDTH: f64 = 1440.0;
 const INITIAL_WINDOW_HEIGHT: f64 = 900.0;
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(32);
 const TOAST_TTL: Duration = Duration::from_secs(5);
-const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 const WHEEL_SCROLL_LINES: isize = 3;
 const FALLBACK_PANE_COLS: u16 = 120;
 const FALLBACK_PANE_ROWS: u16 = 36;
@@ -43,6 +38,8 @@ const FALLBACK_PANE_ROWS: u16 = 36;
 enum ScrollTarget {
     Sidebar,
     Presets,
+    Settings,
+    Recipients,
     Actions,
     Pane(PaneId),
 }
@@ -66,10 +63,8 @@ impl WheelScroll {
         }
         self.remainder += match delta {
             MouseScrollDelta::LineDelta(_, y) => match target {
-                ScrollTarget::Sidebar | ScrollTarget::Presets | ScrollTarget::Actions => {
-                    f64::from(y)
-                }
                 ScrollTarget::Pane(_) => f64::from(y) * WHEEL_SCROLL_LINES as f64,
+                _ => f64::from(y),
             },
             MouseScrollDelta::PixelDelta(pos) => pos.y / f64::from(physical_step_height.max(1.0)),
         };
@@ -138,15 +133,14 @@ struct DaedalusApp {
     renderer: Option<GpuRenderer>,
     accessibility: Option<accesskit_winit::Adapter>,
     accessibility_active: bool,
+    terminal_controls: accessibility::TerminalControls,
     last_accessibility_tree: Option<accesskit::TreeUpdate>,
     bridge: Option<DaemonBridge>,
     state: AppState,
     modifiers: ModifiersState,
     key_repeats: KeyRepeatGuard,
-    cursor_pos: (f32, f32),
+    pointer: pointer::PointerState,
     wheel_scroll: WheelScroll,
-    drag_anchor: Option<(PaneRole, PaneId, CellPos)>,
-    last_click: Option<(Instant, PaneRole, u16, u16)>,
     pending_resize_flush_at: Option<Instant>,
     clipboard: Option<arboard::Clipboard>,
 }
@@ -172,15 +166,14 @@ impl DaedalusApp {
             renderer: None,
             accessibility: None,
             accessibility_active: false,
+            terminal_controls: accessibility::TerminalControls::default(),
             last_accessibility_tree: None,
             bridge: None,
             state: AppState::new(),
             modifiers: ModifiersState::empty(),
             key_repeats: KeyRepeatGuard::default(),
-            cursor_pos: (0.0, 0.0),
+            pointer: pointer::PointerState::default(),
             wheel_scroll: WheelScroll::default(),
-            drag_anchor: None,
-            last_click: None,
             pending_resize_flush_at: None,
             clipboard: None,
         }
@@ -238,45 +231,15 @@ impl DaedalusApp {
             focused_role: self.state.focused_role,
             runner_has_failure: self.state.runner_has_failure(),
         });
+        if self.state.workspaces.is_empty() {
+            for pane in &mut layout.panes {
+                pane.action_pill = None;
+            }
+        }
         if self.state.zoomed
             && let Some(ws) = self.state.active_workspace()
         {
-            let entries: Vec<_> = ws
-                .panes
-                .iter()
-                .map(|pane| {
-                    let label = self
-                        .state
-                        .session_names
-                        .get(&pane.id)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            let mut label = match pane.role {
-                                PaneRole::Agent => "Agent",
-                                PaneRole::Service => "Service",
-                                PaneRole::Runner => "Runner",
-                            }
-                            .to_owned();
-                            if ws
-                                .panes
-                                .iter()
-                                .filter(|other| other.role == pane.role)
-                                .count()
-                                > 1
-                            {
-                                let number = 1 + ws
-                                    .panes
-                                    .iter()
-                                    .take_while(|other| other.id != pane.id)
-                                    .filter(|other| other.role == pane.role)
-                                    .count();
-                                label = format!("{label} {number}");
-                            }
-                            label
-                        });
-                    (pane.id, label)
-                })
-                .collect();
+            let entries = self.state.terminal_tabs(ws);
             layout.set_named_tabs(&entries, self.state.focused_pane_id(), scale_factor);
         }
         layout.sidebar_first = self.state.sidebar_first;
@@ -389,22 +352,26 @@ impl DaedalusApp {
         }
     }
 
+    fn clipboard_text(&mut self) -> Option<String> {
+        match self.ensure_clipboard().and_then(|cb| {
+            cb.get_text()
+                .map_err(|err| format!("Failed to read clipboard: {err}"))
+        }) {
+            Ok(text) => (!text.is_empty()).then_some(text),
+            Err(err) => {
+                self.show_toast(err, true);
+                None
+            }
+        }
+    }
+
     fn paste_clipboard_to_focused(&mut self) {
         let Some(pane_id) = self.state.focused_pane_id() else {
             return;
         };
-        let text = match self.ensure_clipboard().and_then(|cb| {
-            cb.get_text()
-                .map_err(|err| format!("Failed to read clipboard: {err}"))
-        }) {
-            Ok(text) if !text.is_empty() => text,
-            Ok(_) => return,
-            Err(err) => {
-                self.show_toast(err, true);
-                return;
-            }
+        let Some(text) = self.clipboard_text() else {
+            return;
         };
-
         if let Some(pane) = self.state.panes.get_mut(&pane_id) {
             pane.reset_scroll();
             pane.selection = None;
@@ -602,7 +569,7 @@ impl DaedalusApp {
                 pane_id,
                 generation,
                 offset_from_bottom: pane.requested_scroll_offset,
-                count: usize::from(pane.rows).max(1),
+                count: usize::from(pane.summary.rows).max(1),
             };
             self.send_command(command);
         }
@@ -680,7 +647,7 @@ impl DaedalusApp {
             {
                 pane.set_scroll_offset(pane.scroll_offset);
             } else {
-                let viewport_rows = (pane.rows as usize).max(1);
+                let viewport_rows = (pane.summary.rows as usize).max(1);
                 let live_start = pane
                     .viewport_rows
                     .last()
@@ -802,7 +769,7 @@ impl DaedalusApp {
                 if self.state.action_palette.open {
                     self.state.action_palette.close();
                 } else {
-                    self.drag_anchor = None;
+                    self.pointer.end_drag();
                     self.state.open_action_palette();
                 }
                 self.request_redraw();
@@ -865,14 +832,14 @@ impl DaedalusApp {
                 let page = self
                     .state
                     .pane_for_role(self.state.focused_role)
-                    .map_or(20, |p| (p.rows as isize).saturating_sub(1).max(1));
+                    .map_or(20, |p| (p.summary.rows as isize).saturating_sub(1).max(1));
                 self.scroll_pane(self.state.focused_role, page);
             }
             UiAction::ScrollPageDown => {
                 let page = self
                     .state
                     .pane_for_role(self.state.focused_role)
-                    .map_or(20, |p| (p.rows as isize).saturating_sub(1).max(1));
+                    .map_or(20, |p| (p.summary.rows as isize).saturating_sub(1).max(1));
                 self.scroll_pane(self.state.focused_role, -page);
             }
             UiAction::ScrollToBottom => {
@@ -944,6 +911,14 @@ impl DaedalusApp {
                 self.state.close_modal.close();
                 self.request_redraw();
             }
+            UiAction::PasteSearchQuery => {
+                if let Some(text) = self
+                    .clipboard_text()
+                    .and_then(|text| filter_modal_text(&text, true))
+                {
+                    self.handle_ui_action(UiAction::SearchText(text));
+                }
+            }
             UiAction::SearchText(text) => {
                 if let Some(ref mut search) = self.state.search {
                     search.push_text(&text);
@@ -981,175 +956,8 @@ impl DaedalusApp {
         }
     }
 
-    fn handle_left_mouse_down(&mut self) {
-        let Some(window) = self.window.as_ref() else {
-            return;
-        };
-        let Some(renderer) = self.renderer.as_ref() else {
-            return;
-        };
-        let size = window.inner_size();
-        let scale_factor = window.scale_factor() as f32;
-        let (cell_w, cell_h) = renderer.cell_size();
-        let (x, y) = self.cursor_pos;
-
-        if let Some(choices) = &mut self.state.failure_recipients {
-            let (modal, visible) = action_palette_layout(
-                size.width as f32,
-                size.height as f32,
-                scale_factor,
-                choices.agents.len(),
-                choices.selected,
-            );
-            if !modal.contains(x, y) {
-                self.state.failure_recipients = None;
-            } else if let Some((_, index)) = visible
-                .enumerate()
-                .find(|(row, _)| picker_item_rect(modal, *row, scale_factor).contains(x, y))
-            {
-                choices.selected = index;
-                if let Some(choices) = self.state.failure_recipients.take() {
-                    self.send_failure_to_recipient(choices);
-                }
-            }
-            self.request_redraw();
-            return;
-        }
-        if self.state.workspace_form.open {
-            let action = self.state.workspace_form.click(
-                x,
-                y,
-                size.width as f32,
-                size.height as f32,
-                scale_factor,
-            );
-            self.handle_workspace_form(action);
-            return;
-        }
-        if self.state.settings.open {
-            let action = self.state.settings.click(
-                x,
-                y,
-                size.width as f32,
-                size.height as f32,
-                scale_factor,
-            );
-            self.handle_settings_action(action);
-            return;
-        }
-        if self.state.action_palette.open {
-            let (modal, visible) = action_palette_layout(
-                size.width as f32,
-                size.height as f32,
-                scale_factor,
-                self.state.active_actions().len(),
-                self.state.action_palette.selected_index,
-            );
-            if !modal.contains(x, y) {
-                self.state.action_palette.close();
-                self.request_redraw();
-            } else if let Some((_, index)) = visible
-                .enumerate()
-                .find(|(row, _)| picker_item_rect(modal, *row, scale_factor).contains(x, y))
-            {
-                self.state.action_palette.selected_index = index;
-                self.confirm_workspace_action();
-            }
-            return;
-        }
-
-        if self.state.picker.open {
-            let (modal, visible) = preset_picker_layout(
-                size.width as f32,
-                size.height as f32,
-                scale_factor,
-                self.state.picker.selected_index,
-            );
-            if modal.contains(x, y) {
-                for (row, idx) in visible.enumerate() {
-                    let item = picker_item_rect(modal, row, scale_factor);
-                    if item.contains(x, y) {
-                        self.state.picker.selected_index = idx;
-                        self.apply_agent_preset(AgentPreset::ALL[idx], false);
-                        return;
-                    }
-                }
-            } else {
-                self.state.picker.close();
-                self.request_redraw();
-            }
-            return;
-        }
-
-        if self.state.worktree_modal.open {
-            let modal = worktree_modal_rect(size.width as f32, size.height as f32, scale_factor);
-            let action =
-                worktree_modal_click(modal, scale_factor, self.state.can_create_worktree(), x, y);
-            self.handle_ui_action(action);
-            return;
-        }
-
-        if self.state.close_modal.open {
-            let modal =
-                close_workspace_modal_rect(size.width as f32, size.height as f32, scale_factor);
-            let action = close_modal_click(modal, &self.state.close_modal, scale_factor, x, y);
-            self.handle_ui_action(action);
-            return;
-        }
-
-        let Some(layout) = self.compute_current_layout() else {
-            return;
-        };
-        if let Some(search) = self.state.search.as_ref()
-            && let Some(role) = self
-                .state
-                .active_workspace()
-                .and_then(|ws| ws.panes.iter().find(|p| p.id == search.pane_id))
-                .map(|p| p.role)
-            && let Some(pane_rect) = layout.pane(role)
-            && search_bar_rect(pane_rect, scale_factor).contains(x, y)
-        {
-            return;
-        }
-        let target = hit_test(
-            &layout,
-            self.state.workspaces.len(),
-            scale_factor,
-            cell_w,
-            cell_h,
-            x,
-            y,
-        );
-
+    fn activate_session(&mut self, target: HitTarget) {
         match target {
-            HitTarget::SidebarPageUp | HitTarget::SidebarPageDown => {
-                if let Some(list) = self.sidebar_list() {
-                    let page = list.visible.len() as isize;
-                    self.scroll_sidebar(if target == HitTarget::SidebarPageUp {
-                        -page
-                    } else {
-                        page
-                    });
-                }
-            }
-            HitTarget::ToggleSidebar => self.handle_ui_action(UiAction::ToggleSidebar),
-            HitTarget::SidebarWorkspace(idx) => {
-                if let Some(ws) = self.state.workspaces.get(idx) {
-                    let ws_id = ws.id;
-                    if self.state.active_workspace_id != Some(ws_id) {
-                        self.state.select_workspace(ws_id);
-                        self.state.close_search();
-                        self.ensure_active_workspace_panes();
-                        self.schedule_resize_flush();
-                        self.request_redraw();
-                    }
-                }
-            }
-            HitTarget::SidebarWorkspaceClose(idx) => {
-                if let Some(ws_id) = self.state.workspaces.get(idx).map(|ws| ws.id) {
-                    self.open_close_modal_for_workspace(ws_id);
-                }
-            }
             HitTarget::CloseSession(id) => {
                 self.send_command(UiCommand::ClosePane(id));
             }
@@ -1161,103 +969,7 @@ impl DaedalusApp {
                     self.request_redraw();
                 }
             }
-            HitTarget::SessionTab(role) => self.handle_ui_action(UiAction::FocusRole(role)),
-            HitTarget::WorkspaceSettings => self.open_workspace_settings(),
-            HitTarget::SidebarNewWorkspace => self.create_new_workspace(),
-            HitTarget::SidebarNewWorktree => self.open_worktree_modal(),
-            HitTarget::PaneHeaderAction(PaneRole::Agent) => {
-                self.state.focused_role = PaneRole::Agent;
-                self.open_agent_picker();
-            }
-            HitTarget::PaneHeaderAction(PaneRole::Runner) => {
-                self.forward_runner_failure_to_agent();
-            }
-            HitTarget::PaneHeaderAction(role) | HitTarget::PaneHeader(role) => {
-                self.state.focused_role = role;
-                self.request_redraw();
-            }
-            HitTarget::PaneViewport { role, col, row } => {
-                self.state.focused_role = role;
-                if is_link_click_modifier(self.modifiers) {
-                    self.open_clicked_link(role, col, row);
-                    self.request_redraw();
-                    return;
-                }
-                let now = Instant::now();
-                let is_double_click =
-                    self.last_click
-                        .is_some_and(|(ts, prev_role, prev_col, prev_row)| {
-                            now.duration_since(ts) <= DOUBLE_CLICK_WINDOW
-                                && prev_role == role
-                                && prev_col == col
-                                && prev_row == row
-                        });
-
-                if let Some(pane_id) = self.state.pane_id_for_role(role) {
-                    if is_double_click {
-                        self.last_click = None;
-                        self.drag_anchor = None;
-                        if let Some(pane) = self.state.panes.get_mut(&pane_id) {
-                            pane.selection = pane
-                                .visible_rows()
-                                .get(row as usize)
-                                .and_then(|grid_row| select_word_at(grid_row, col));
-                        }
-                    } else {
-                        self.last_click = Some((now, role, col, row));
-                        if let Some(pane) = self.state.panes.get_mut(&pane_id) {
-                            pane.selection = None;
-                            self.drag_anchor =
-                                pane.visible_rows().get(row as usize).map(|grid_row| {
-                                    (role, pane_id, CellPos::new(col, grid_row.abs_row))
-                                });
-                        }
-                    }
-                }
-                self.request_redraw();
-            }
-            HitTarget::None => {}
-        }
-    }
-
-    fn handle_cursor_moved(&mut self, x: f32, y: f32) {
-        self.cursor_pos = (x, y);
-
-        let Some((drag_role, drag_pane_id, anchor)) = self.drag_anchor else {
-            return;
-        };
-        let Some(renderer) = self.renderer.as_ref() else {
-            return;
-        };
-        let (cell_w, cell_h) = renderer.cell_size();
-        let Some(layout) = self.compute_current_layout() else {
-            return;
-        };
-        let Some(pane_rect) = layout.pane(drag_role) else {
-            return;
-        };
-
-        let col = if cell_w > 0.0 {
-            (((x - pane_rect.viewport.x) / cell_w).floor().max(0.0) as u16)
-                .min(pane_rect.cols.saturating_sub(1))
-        } else {
-            0
-        };
-        let row = if cell_h > 0.0 {
-            (((y - pane_rect.viewport.y) / cell_h).floor().max(0.0) as u16)
-                .min(pane_rect.rows.saturating_sub(1))
-        } else {
-            0
-        };
-
-        if let Some(pane) = self.state.panes.get_mut(&drag_pane_id)
-            && let Some(grid_row) = pane.visible_rows().get(row as usize)
-        {
-            let head = CellPos::new(col, grid_row.abs_row);
-            if head != anchor || pane.selection.is_some() {
-                pane.selection = Some(Selection::new(anchor, head));
-                self.request_redraw();
-            }
+            _ => {}
         }
     }
 
@@ -1269,13 +981,13 @@ impl DaedalusApp {
                 .map_or(1.0, |w| w.scale_factor() as f32);
             let steps =
                 self.wheel_scroll
-                    .steps(ScrollTarget::Actions, delta, picker_row_stride(dpi));
+                    .steps(ScrollTarget::Recipients, delta, picker_row_stride(dpi));
             choices.advance(steps.saturating_neg());
             self.request_redraw();
             return;
         }
         if self.state.settings.open {
-            let steps = self.wheel_scroll.steps(ScrollTarget::Actions, delta, 30.);
+            let steps = self.wheel_scroll.steps(ScrollTarget::Settings, delta, 30.);
             if steps != 0 {
                 self.state.settings.scroll(steps as f32);
                 self.request_redraw();
@@ -1327,10 +1039,9 @@ impl DaedalusApp {
             return;
         };
 
-        if layout
-            .sidebar
-            .is_some_and(|sidebar| sidebar.contains(self.cursor_pos.0, self.cursor_pos.1))
-        {
+        if layout.sidebar.is_some_and(|sidebar| {
+            sidebar.contains(self.pointer.position.0, self.pointer.position.1)
+        }) {
             let metrics = daedalus_ui::layout::LayoutMetrics::for_scale(scale_factor);
             let steps = self.wheel_scroll.steps(
                 ScrollTarget::Sidebar,
@@ -1349,8 +1060,8 @@ impl DaedalusApp {
             scale_factor,
             cell_w,
             cell_h,
-            self.cursor_pos.0,
-            self.cursor_pos.1,
+            self.pointer.position.0,
+            self.pointer.position.1,
         ) {
             HitTarget::PaneViewport { role, .. }
             | HitTarget::PaneHeader(role)
@@ -1446,10 +1157,24 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                             self.last_accessibility_tree = None;
                         }
                         accesskit_winit::WindowEvent::ActionRequested(request) => {
-                            if self.accessibility_active
-                                && let Some(action) = accessibility::action(&self.state, &request)
-                            {
-                                self.handle_ui_action(action);
+                            if self.accessibility_active {
+                                if let Some(target) =
+                                    self.terminal_controls.action(&self.state, &request)
+                                {
+                                    self.activate_session(target);
+                                } else if let Some(action) =
+                                    accessibility::settings_action(&mut self.state, &request)
+                                {
+                                    self.handle_settings_action(action);
+                                } else if let Some(action) =
+                                    accessibility::workspace_action(&mut self.state, &request)
+                                {
+                                    self.handle_workspace_form(action);
+                                } else if let Some(action) =
+                                    accessibility::action(&self.state, &request)
+                                {
+                                    self.handle_ui_action(action);
+                                }
                             }
                         }
                     }
@@ -1520,6 +1245,12 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
             UiEvent::Disconnected => {
                 self.history.connection(false);
                 self.state.connection = ConnectionState::Reconnecting;
+                self.state.workspace_list_loaded = false;
+                let form = &mut self.state.workspace_form;
+                form.finish_submission(
+                    form.session(),
+                    Some("Connection lost. Check the workspace list before retrying.".into()),
+                );
                 self.state.close_modal.submitting = false;
                 self.state.last_sent_sizes.clear();
                 self.state.spawning_workspaces.clear();
@@ -1540,13 +1271,27 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 self.ensure_active_workspace_panes();
                 self.schedule_resize_flush();
             }
-            UiEvent::ManualWorkspaceCreated(ws) => {
-                let id = ws.id;
-                self.state.upsert_workspace(ws);
-                self.state.select_workspace(id);
-                self.state.workspace_form.open = false;
-                self.open_workspace_settings();
+            UiEvent::ManualWorkspaceCreated { session, workspace } => {
+                let id = workspace.id;
+                let current = self.state.workspace_form.finish_submission(session, None);
+                if !current {
+                    self.show_toast(format!("Created workspace {}", workspace.name), false);
+                }
+                self.state.upsert_workspace(workspace);
+                if current {
+                    self.state.select_workspace(id);
+                    self.open_workspace_settings();
+                }
                 self.schedule_resize_flush();
+            }
+            UiEvent::ManualWorkspaceFailed { session, message } => {
+                if !self
+                    .state
+                    .workspace_form
+                    .finish_submission(session, Some(message.clone()))
+                {
+                    self.show_toast(format!("Workspace creation failed: {message}"), true);
+                }
             }
             UiEvent::WorkspaceCreated(ws) => {
                 let ws_id = ws.id;
@@ -1746,8 +1491,7 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 self.wheel_scroll = WheelScroll::default();
                 self.modifiers = ModifiersState::empty();
                 self.key_repeats = KeyRepeatGuard::default();
-                self.drag_anchor = None;
-                self.last_click = None;
+                self.pointer.cancel_gestures();
             }
             WindowEvent::KeyboardInput {
                 event,
@@ -1776,25 +1520,17 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                         self.request_redraw();
                         return;
                     }
-                    if self.state.workspace_form.open {
-                        if !event.repeat
-                            || matches!(
-                                event.logical_key,
-                                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace)
-                            )
-                        {
-                            self.workspace_form_key(&event.logical_key);
-                        }
-                        return;
-                    }
-                    if self.state.settings.open {
-                        if !event.repeat
-                            || matches!(
-                                event.logical_key,
-                                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace)
-                            )
-                        {
-                            self.settings_key(&event.logical_key);
+                    if self.state.workspace_form.open || self.state.settings.open {
+                        if self.key_repeats.form_press(
+                            event.physical_key,
+                            &event.logical_key,
+                            event.repeat,
+                        ) {
+                            if self.state.workspace_form.open {
+                                self.workspace_form_key(&event.logical_key);
+                            } else {
+                                self.settings_key(&event.logical_key);
+                            }
                         }
                         return;
                     }
@@ -1855,7 +1591,7 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
             } => match state {
                 ElementState::Pressed => self.handle_left_mouse_down(),
                 ElementState::Released => {
-                    self.drag_anchor = None;
+                    self.pointer.end_drag();
                 }
             },
             WindowEvent::MouseWheel { delta, phase, .. } => {
@@ -1923,11 +1659,12 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
             && let Some(window) = &self.window
         {
             let size = window.inner_size();
-            let tree = accessibility::tree(
+            let tree = accessibility::workbench_tree(
                 &self.state,
                 size.width as f32,
                 size.height as f32,
                 window.scale_factor() as f32,
+                &mut self.terminal_controls,
             );
             if self.last_accessibility_tree.as_ref() != Some(&tree) {
                 adapter.update_if_active(|| {
@@ -1963,57 +1700,6 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
-}
-
-fn worktree_modal_click(
-    modal: daedalus_ui::layout::Rect,
-    scale: f32,
-    can_create: bool,
-    x: f32,
-    y: f32,
-) -> UiAction {
-    let (cancel, create) = worktree_button_rects(modal, scale);
-    if !modal.contains(x, y) || cancel.contains(x, y) {
-        UiAction::WorktreeModalCancel
-    } else if can_create && create.contains(x, y) {
-        UiAction::WorktreeModalConfirm
-    } else {
-        UiAction::Ignore
-    }
-}
-
-fn close_modal_click(
-    modal: daedalus_ui::layout::Rect,
-    state: &daedalus_ui::state::CloseWorkspaceModalState,
-    scale: f32,
-    x: f32,
-    y: f32,
-) -> UiAction {
-    if !modal.contains(x, y) || close_modal_cancel_rect(modal, scale).contains(x, y) {
-        UiAction::CloseModalCancel
-    } else if close_modal_confirm_rect(modal, scale).contains(x, y) {
-        UiAction::CloseModalConfirm
-    } else if close_modal_compose_rect(modal, state, scale).contains(x, y) {
-        UiAction::CloseModalToggleCompose
-    } else if close_modal_worktree_rect(modal, state, scale).is_some_and(|r| r.contains(x, y)) {
-        UiAction::CloseModalToggleWorktree
-    } else if close_modal_force_rect(modal, state, scale).is_some_and(|r| r.contains(x, y)) {
-        UiAction::CloseModalToggleForce
-    } else {
-        UiAction::Ignore
-    }
-}
-
-fn is_link_click_modifier_for_platform(mods: ModifiersState, is_macos: bool) -> bool {
-    if is_macos {
-        mods.super_key() && !mods.control_key() && !mods.alt_key()
-    } else {
-        mods.control_key() && !mods.super_key() && !mods.alt_key()
-    }
-}
-
-fn is_link_click_modifier(mods: ModifiersState) -> bool {
-    is_link_click_modifier_for_platform(mods, cfg!(target_os = "macos"))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -2097,142 +1783,18 @@ mod tests {
             1
         );
 
+        // These independent dialogs must each accumulate their own first complete step.
+        for target in [
+            ScrollTarget::Settings,
+            ScrollTarget::Recipients,
+            ScrollTarget::Actions,
+        ] {
+            assert_eq!(wheel.steps(target, pixels(stride as f64 * 0.75), stride), 0);
+        }
+
         let lines = |y| MouseScrollDelta::LineDelta(0.0, y);
         assert_eq!(wheel.steps(pane, lines(0.25), 20.0), 0);
         assert_eq!(wheel.steps(pane, lines(0.25), 20.0), 1);
         assert_eq!(wheel.steps(other, lines(-1.0), 40.0), -3);
-    }
-
-    #[test]
-    fn worktree_buttons_share_rendered_targets_and_require_nonblank_input() {
-        for (w, h, dpi) in [
-            (1200.0, 800.0, 1.0),
-            (192.0, 128.0, 1.0),
-            (640.0, 224.0, 2.0),
-        ] {
-            let modal = worktree_modal_rect(w, h, dpi);
-            let (cancel, create) = worktree_button_rects(modal, dpi);
-            let field = daedalus_ui::renderer::worktree_input_rect(modal, dpi);
-            assert!(field.bottom() < cancel.y && cancel.right() < create.x);
-            assert!(create.bottom() <= modal.bottom() && create.right() <= modal.right());
-            let click = |rect: daedalus_ui::layout::Rect, state: &AppState| {
-                worktree_modal_click(
-                    modal,
-                    dpi,
-                    state.can_create_worktree(),
-                    rect.x + rect.width * 0.5,
-                    rect.y + rect.height * 0.5,
-                )
-            };
-            let mut state = AppState::new();
-            state.worktree_modal.push_text("topic");
-            assert_eq!(click(create, &state), UiAction::Ignore);
-            state.connection = ConnectionState::Connected;
-            assert_eq!(click(create, &state), UiAction::WorktreeModalConfirm);
-            assert_eq!(click(cancel, &state), UiAction::WorktreeModalCancel);
-            assert_eq!(click(field, &state), UiAction::Ignore);
-            state.worktree_modal.branch_input = "  ".into();
-            assert_eq!(click(create, &state), UiAction::Ignore);
-            assert_eq!(
-                worktree_modal_click(modal, dpi, false, 0.0, 0.0),
-                UiAction::WorktreeModalCancel
-            );
-        }
-    }
-
-    #[test]
-    fn compact_close_modal_targets_match_their_keyboard_actions() {
-        use daedalus_ui::state::CloseWorkspaceModalState;
-        use winit::keyboard::{Key, NamedKey};
-        let mut state = CloseWorkspaceModalState {
-            open: true,
-            is_dirty: true,
-            is_worktree: true,
-            remove_worktree: true,
-            ..Default::default()
-        };
-        for (width, height, scale) in [
-            (320.0, 180.0, 1.0),
-            (640.0, 360.0, 2.0),
-            (180.0, 120.0, 1.0),
-            (1000.0, 720.0, 1.0),
-        ] {
-            let modal = close_workspace_modal_rect(width, height, scale);
-            assert!(modal.right() <= width && modal.bottom() <= height);
-            let compose = close_modal_compose_rect(modal, &state, scale);
-            let worktree = close_modal_worktree_rect(modal, &state, scale).unwrap();
-            let force = close_modal_force_rect(modal, &state, scale).unwrap();
-            let cancel = close_modal_cancel_rect(modal, scale);
-            let confirm = close_modal_confirm_rect(modal, scale);
-            assert!(compose.bottom() <= worktree.y && worktree.bottom() <= force.y);
-            assert!(force.bottom() <= cancel.y && cancel.right() < confirm.x);
-            for (target, key) in [
-                (compose, Key::Character("c".into())),
-                (worktree, Key::Character("w".into())),
-                (force, Key::Character("f".into())),
-                (cancel, Key::Named(NamedKey::Escape)),
-                (confirm, Key::Named(NamedKey::Enter)),
-            ] {
-                assert!(
-                    target.width > 0.0 && target.height > 0.0 && target.bottom() <= modal.bottom()
-                );
-                let keyboard = translate_key(
-                    &key,
-                    None,
-                    ModifiersState::empty(),
-                    false,
-                    false,
-                    true,
-                    false,
-                    false,
-                );
-                assert_ne!(keyboard, UiAction::Ignore);
-                assert_eq!(
-                    close_modal_click(
-                        modal,
-                        &state,
-                        scale,
-                        target.x + target.width / 2.0,
-                        target.y + target.height / 2.0
-                    ),
-                    keyboard
-                );
-            }
-            state.toggle_worktree();
-            assert_eq!(
-                close_modal_click(modal, &state, scale, force.x + 1.0, force.y + 1.0),
-                UiAction::Ignore
-            );
-            state.toggle_worktree();
-        }
-    }
-
-    #[test]
-    fn link_click_modifier_matches_platform_convention() {
-        let ctrl = ModifiersState::CONTROL;
-        let cmd = ModifiersState::SUPER;
-
-        // Linux uses Ctrl+Click
-        assert!(is_link_click_modifier_for_platform(ctrl, false));
-        assert!(!is_link_click_modifier_for_platform(cmd, false));
-        assert!(!is_link_click_modifier_for_platform(
-            ctrl | ModifiersState::ALT,
-            false
-        ));
-
-        // macOS uses Cmd+Click
-        assert!(is_link_click_modifier_for_platform(cmd, true));
-        assert!(!is_link_click_modifier_for_platform(ctrl, true));
-        assert!(!is_link_click_modifier_for_platform(
-            cmd | ModifiersState::ALT,
-            true
-        ));
-
-        let expected_current = if cfg!(target_os = "macos") {
-            is_link_click_modifier(cmd) && !is_link_click_modifier(ctrl)
-        } else {
-            is_link_click_modifier(ctrl) && !is_link_click_modifier(cmd)
-        };
-        assert!(expected_current);
     }
 }

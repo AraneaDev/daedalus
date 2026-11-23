@@ -4,11 +4,11 @@ use daedalus_ui::{
     assignments::{self, Assignment},
     bridge::UiCommand,
     settings::SettingsAction,
-    state::AgentPreset,
+    state::{AgentPreset, WorkspaceView},
 };
 use winit::keyboard::Key;
 
-fn initial_assignments(ws: &WorkspaceInfo, default_agent: AgentPreset) -> Vec<Assignment> {
+fn initial_assignments(ws: &WorkspaceView, default_agent: AgentPreset) -> Vec<Assignment> {
     let manifest = ws.manifest.as_ref();
     let agent = manifest
         .and_then(|m| m.agent_preset.as_deref())
@@ -65,10 +65,11 @@ impl DaedalusApp {
             Action::Cancel => self.state.workspace_form.open = false,
             Action::Save { name, folder } => {
                 if self.send_command(UiCommand::CreateManualWorkspace {
+                    session: self.state.workspace_form.session(),
                     name,
                     root_dir: folder,
                 }) {
-                    self.state.workspace_form.open = false;
+                    self.state.workspace_form.start_submission();
                 } else {
                     self.state.workspace_form.error =
                         Some("Reconnect to create this workspace.".into());
@@ -117,7 +118,7 @@ impl DaedalusApp {
             self.request_redraw();
             return;
         }
-        self.restore_session_names(std::slice::from_ref(&workspace));
+        self.restore_workspace_names(workspace.id, workspace.panes.iter().copied());
         if let Some(assignment) =
             launch_id.and_then(|id| entries.into_iter().find(|entry| entry.id == id))
         {
@@ -173,23 +174,31 @@ impl DaedalusApp {
 
     pub(super) fn restore_session_names(&mut self, workspaces: &[WorkspaceInfo]) {
         for ws in workspaces {
-            match assignments::load_bindings(ws.id)
-                .and_then(|bindings| Ok((bindings, assignments::load(ws.id)?)))
-            {
-                Ok((bindings, entries)) => {
-                    for pane in &ws.panes {
-                        if let Some(entry) = bindings
-                            .get(&pane.id)
-                            .and_then(|id| entries.iter().find(|entry| entry.id == *id))
-                        {
-                            self.state.session_names.insert(pane.id, entry.name.clone());
-                        } else {
-                            self.state.session_names.remove(&pane.id);
-                        }
+            self.restore_workspace_names(ws.id, ws.panes.iter().map(|pane| pane.id));
+        }
+    }
+
+    fn restore_workspace_names(
+        &mut self,
+        workspace: WorkspaceId,
+        panes: impl Iterator<Item = PaneId>,
+    ) {
+        match assignments::load_bindings(workspace)
+            .and_then(|bindings| Ok((bindings, assignments::load(workspace)?)))
+        {
+            Ok((bindings, entries)) => {
+                for id in panes {
+                    if let Some(entry) = bindings
+                        .get(&id)
+                        .and_then(|binding| entries.iter().find(|entry| entry.id == *binding))
+                    {
+                        self.state.session_names.insert(id, entry.name.clone());
+                    } else {
+                        self.state.session_names.remove(&id);
                     }
                 }
-                Err(err) => self.show_toast(err, true),
             }
+            Err(err) => self.show_toast(err, true),
         }
     }
 

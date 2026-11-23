@@ -28,6 +28,7 @@ winit.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+wgpu = { workspace = true, features = ["noop"] }
 daedalusd = { path = "../daedalusd" }
 tempfile.workspace = true
 

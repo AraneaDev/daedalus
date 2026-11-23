@@ -2860,3 +2860,129 @@ async fn relative_workspace_root_survives_restart_from_a_different_directory() {
         daemon.kill().await.unwrap();
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_compose_teardown_preserves_worktree_for_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    let checkout = dir.path().join("checkout");
+    std::fs::create_dir(&repo).unwrap();
+    run_git(&repo, &["init"]);
+    std::fs::write(repo.join("compose.yaml"), "services: {}\n").unwrap();
+    run_git(&repo, &["add", "compose.yaml"]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "initial",
+        ],
+    );
+    run_git(
+        &repo,
+        &["worktree", "add", "--detach", checkout.to_str().unwrap()],
+    );
+    let docker = dir.path().join("docker");
+    std::fs::write(
+        &docker,
+        r#"#!/bin/sh
+test "$*" = "compose -p retry down" || exit 2
+test -f "$ALLOW_TEARDOWN" || { echo "service unavailable" >&2; exit 1; }
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let marker = dir.path().join("allow");
+    let socket = dir.path().join("daemon.sock");
+    let path = std::env::var_os("PATH").unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(dir.path().to_owned()).chain(std::env::split_paths(&path)),
+    )
+    .unwrap();
+    let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_daedalusd"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--events-socket")
+        .arg(dir.path().join("events.sock"))
+        .arg("--runtime-dir")
+        .arg(dir.path().join("runtime"))
+        .arg("--state-file")
+        .arg(dir.path().join("state.json"))
+        .env("PATH", path)
+        .env("ALLOW_TEARDOWN", &marker)
+        .env_remove("DAEDALUS_AUTH_TOKEN")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut client = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(stream) = IpcStream::connect(&socket).await {
+                break stream;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("daemon startup timed out");
+    let ResponsePayload::WorkspaceCreated(ws) = send_rpc(
+        &mut client,
+        1,
+        ClientMessage::CreateWorkspace {
+            name: "retry".into(),
+            root_dir: checkout.clone(),
+            env: HashMap::new(),
+        },
+    )
+    .await
+    else {
+        panic!("expected workspace")
+    };
+    send_rpc(
+        &mut client,
+        2,
+        ClientMessage::EnsureDefaultPane {
+            workspace_id: ws.id,
+            role: PaneRole::Runner,
+            command: Some(sleep_command()),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await;
+    let close = ClientMessage::CloseWorkspace {
+        id: ws.id,
+        compose_down: true,
+        remove_worktree: true,
+        force_remove_worktree: true,
+    };
+    let error = send_rpc_result(&mut client, 3, close.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("service unavailable"), "{error}");
+    assert!(error.contains("panes stopped"), "{error}");
+    assert!(checkout.join("compose.yaml").is_file());
+    let ResponsePayload::Workspaces(list) =
+        send_rpc(&mut client, 4, ClientMessage::ListWorkspaces).await
+    else {
+        panic!("expected workspaces")
+    };
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, ws.id);
+    assert_eq!(list[0].compose_project_name, ws.compose_project_name);
+    assert!(list[0].panes.is_empty());
+    std::fs::write(marker, "").unwrap();
+    assert_eq!(send_rpc(&mut client, 5, close).await, ResponsePayload::Ok);
+    assert!(!checkout.exists());
+    assert_eq!(
+        send_rpc(&mut client, 6, ClientMessage::ListWorkspaces).await,
+        ResponsePayload::Workspaces(vec![])
+    );
+    daemon.kill().await.unwrap();
+}

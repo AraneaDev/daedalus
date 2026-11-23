@@ -9,13 +9,13 @@ use std::sync::Arc;
 
 use daedalus_proto::{
     AgentState, ContainerHealth, ExternalStatus, GitWorkspaceStatus, PaneRole, PaneStatus,
-    PortMapping, StatusLevel, WorkspaceInfo,
+    PortMapping, StatusLevel,
 };
 use winit::window::Window;
 
 use crate::layout::{PaneRect, Rect, WorkspaceLayout, sidebar_workspace_close_rect};
 use crate::state::ConnectionState;
-use crate::state::{AgentPreset, AppState, CloseWorkspaceModalState};
+use crate::state::{AgentPreset, AppState, CloseWorkspaceModalState, WorkspaceView};
 use crate::theme::{Rgba, Theme};
 
 use self::quads::{QuadInstance, QuadPipeline, rgba_to_wgpu_clear_color};
@@ -428,7 +428,7 @@ pub fn format_external_source_tag(source: &str) -> String {
     }
 }
 
-pub(super) fn active_external_detail_preview(ws: &WorkspaceInfo) -> Option<String> {
+pub(super) fn active_external_detail_preview(ws: &WorkspaceView) -> Option<String> {
     ws.external_statuses.iter().rev().find_map(|ext| {
         let detail = ext
             .detail
@@ -440,7 +440,7 @@ pub(super) fn active_external_detail_preview(ws: &WorkspaceInfo) -> Option<Strin
     })
 }
 
-pub(super) fn workspace_branch_badge(ws: &WorkspaceInfo) -> Option<(String, bool)> {
+pub(super) fn workspace_branch_badge(ws: &WorkspaceView) -> Option<(String, bool)> {
     let is_wt = ws.slot_index > 0 || ws.git_status.is_some_and(|g| g.is_worktree);
     let mut label = match (&ws.git_branch, ws.slot_index > 0) {
         (Some(branch), true) => format!("wt{} · {branch}", ws.slot_index),
@@ -522,7 +522,7 @@ pub(super) fn sidebar_docker_pill_rect(row_rect: Rect, scale_factor: f32) -> Rec
     )
 }
 
-pub(super) fn visible_external_statuses(ws: &WorkspaceInfo) -> &[ExternalStatus] {
+pub(super) fn visible_external_statuses(ws: &WorkspaceView) -> &[ExternalStatus] {
     let start = ws.external_statuses.len().saturating_sub(2);
     &ws.external_statuses[start..]
 }
@@ -1466,6 +1466,42 @@ mod tests {
         });
 
         (state, layout)
+    }
+
+    #[test]
+    fn exited_terminals_keep_their_name_and_output_and_hide_the_input_cursor() {
+        use crate::state::terminal_title;
+        let (mut state, layout) = make_state_with_agent_row();
+        let pane_id = state.focused_pane_id().unwrap();
+        let theme = Theme::dark();
+        let has_cursor = |state: &AppState| {
+            let (quads, _) = collect_quads(state, &layout, &theme, 1200., 800., 1., (8., 19.));
+            quads
+                .iter()
+                .any(|q| q.color == theme.cursor_bg.with_alpha(0.65).to_array())
+        };
+        assert!(has_cursor(&state));
+        assert_eq!(
+            terminal_title("Reviewer".into(), PaneStatus::Idle),
+            "Reviewer"
+        );
+        let output = state.panes[&pane_id].viewport_rows.clone();
+        for (code, title) in [
+            (Some(0), "Exited 0 · Reviewer"),
+            (Some(17), "Exited 17 · Reviewer"),
+            (None, "Exited · Reviewer"),
+        ] {
+            state.apply_server_event(daedalus_proto::ServerEvent::PaneExited {
+                pane_id,
+                exit_code: code,
+            });
+            assert_eq!(
+                terminal_title("Reviewer".into(), state.panes[&pane_id].summary.status),
+                title
+            );
+            assert!(!has_cursor(&state));
+            assert_eq!(state.panes[&pane_id].viewport_rows, output);
+        }
     }
 
     #[test]

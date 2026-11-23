@@ -70,6 +70,7 @@ pub enum UiCommand {
         token: u64,
     },
     CreateManualWorkspace {
+        session: u64,
         name: String,
         root_dir: PathBuf,
     },
@@ -165,7 +166,14 @@ pub enum UiEvent {
     WorkspaceCloseFailed(Vec<WorkspaceInfo>),
     WorkspaceCloseFinished(WorkspaceId),
     WorkspaceCreated(WorkspaceInfo),
-    ManualWorkspaceCreated(WorkspaceInfo),
+    ManualWorkspaceCreated {
+        session: u64,
+        workspace: WorkspaceInfo,
+    },
+    ManualWorkspaceFailed {
+        session: u64,
+        message: String,
+    },
     WorkspacePanesEnsured {
         workspace_id: WorkspaceId,
         complete: bool,
@@ -515,13 +523,29 @@ async fn handle_command(
                 _ => sink.emit(UiEvent::ActivityReadFailed(token)),
             }
         }
-        UiCommand::CreateManualWorkspace { name, root_dir } => {
-            let response = conn
+        UiCommand::CreateManualWorkspace {
+            session,
+            name,
+            root_dir,
+        } => {
+            let event = match conn
                 .call(ClientMessage::CreateManualWorkspace { name, root_dir })
-                .await?;
-            if let ResponsePayload::WorkspaceCreated(ws) = response {
-                sink.emit(UiEvent::ManualWorkspaceCreated(ws));
-            }
+                .await
+            {
+                Ok(ResponsePayload::WorkspaceCreated(workspace)) => {
+                    UiEvent::ManualWorkspaceCreated { session, workspace }
+                }
+                Ok(_) => UiEvent::ManualWorkspaceFailed {
+                    session,
+                    message: "Unexpected reply to workspace creation.".into(),
+                },
+                Err(RpcError::Proto(error)) => UiEvent::ManualWorkspaceFailed {
+                    session,
+                    message: error.to_string(),
+                },
+                Err(RpcError::Disconnected) => return Err(RpcError::Disconnected),
+            };
+            sink.emit(event);
         }
         UiCommand::CreateWorkspace {
             name,

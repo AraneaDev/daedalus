@@ -19,7 +19,7 @@ struct Draft {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum Control {
+pub enum Control {
     Prev,
     Next,
     Add,
@@ -45,12 +45,16 @@ const ROWS: &[&[Control]] = &[
     &[Args],
     &[Cancel, Save, Launch],
 ];
+pub fn control_order() -> impl Iterator<Item = Control> {
+    ROWS.iter().flat_map(|row| row.iter().copied())
+}
+
 pub fn modal_rect(w: f32, h: f32, dpi: f32) -> Rect {
     let width = (w - 16.0 * dpi).max(1.0).min(650.0 * dpi);
     let height = (h - 16.0 * dpi).max(1.0).min(324.0 * dpi);
     Rect::new((w - width) * 0.5, (h - height) * 0.5, width, height)
 }
-pub(crate) fn controls(modal: Rect) -> impl Iterator<Item = (Control, Rect)> {
+pub fn controls(modal: Rect) -> impl Iterator<Item = (Control, Rect)> {
     ROWS.iter().enumerate().flat_map(move |(r, row)| {
         let pad = modal.width * 0.025;
         let width = (modal.width - 2.0 * pad) / row.len() as f32;
@@ -75,7 +79,9 @@ pub struct SettingsDialog {
     pub error: Option<String>,
     drafts: Vec<Draft>,
     selected: usize,
-    pub(crate) focus: Control,
+    pub focus: Control,
+    pub invalid_field: Option<Control>,
+    revision: u64,
     select_all: bool,
     // Byte offset from the end keeps the caret at the end when switching fields.
     from_end: usize,
@@ -85,6 +91,7 @@ impl SettingsDialog {
     pub fn begin(&mut self, entries: Vec<Assignment>) {
         *self = Self {
             open: true,
+            revision: self.revision.wrapping_add(1),
             drafts: entries
                 .into_iter()
                 .map(|a| Draft {
@@ -101,7 +108,7 @@ impl SettingsDialog {
         }
     }
 
-    pub(crate) fn label(&self, c: Control) -> String {
+    pub fn label(&self, c: Control) -> String {
         let draft = self.drafts.get(self.selected);
         match c {
             Name => format!("Name   {}", draft.map_or("", |d| &d.name)),
@@ -135,29 +142,39 @@ impl SettingsDialog {
         description
     }
 
-    pub(crate) fn visible_label(&self, control: Control, max_chars: usize) -> String {
-        let label = self.label(control);
-        if self.focus != control || !matches!(control, Name | Args) {
-            return label;
-        }
-        let cursor = label.len().saturating_sub(self.from_end);
-        let (left, right) = label.split_at(cursor);
-        let budget = max_chars.saturating_sub(2);
-        let start = left
-            .char_indices()
-            .rev()
-            .nth(budget)
-            .map(|(i, c)| i + c.len_utf8());
-        let left = start.map_or(left, |i| &left[i..]);
-        format!(
-            "{}{}│{}",
-            if start.is_some() { "…" } else { "" },
-            left,
-            right
-        )
+    pub(crate) fn visible_label(&self, control: Control, columns: usize) -> String {
+        let Some(draft) = self.drafts.get(self.selected) else {
+            return self.label(control);
+        };
+        let (name, text) = match control {
+            Name if self.focus == Name => ("Name", &draft.name),
+            Args if self.focus == Args => ("Argv", &draft.args),
+            _ => return self.label(control),
+        };
+        crate::renderer::text::editable_label(name, text, text.len() - self.from_end, columns)
     }
 
-    pub(crate) fn heading(&self) -> String {
+    pub(crate) fn hint(&self) -> &str {
+        if let Some(error) = &self.error {
+            error
+        } else if self.select_all && self.field_has_text() {
+            "All text selected · Type to replace"
+        } else {
+            "Tab moves focus · Enter activates"
+        }
+    }
+
+    fn field_has_text(&self) -> bool {
+        self.drafts
+            .get(self.selected)
+            .is_some_and(|d| match self.focus {
+                Name => !d.name.is_empty(),
+                Args => !d.args.is_empty(),
+                _ => false,
+            })
+    }
+
+    pub fn heading(&self) -> String {
         if self.drafts.is_empty() {
             return "Workspace assignments · No assignments".into();
         }
@@ -168,7 +185,7 @@ impl SettingsDialog {
         )
     }
 
-    pub(crate) fn enabled(&self, c: Control) -> bool {
+    pub fn enabled(&self, c: Control) -> bool {
         match c {
             Prev | Next => self.drafts.len() > 1,
             Remove | Name | Role | Args | Launch => !self.drafts.is_empty(),
@@ -199,7 +216,59 @@ impl SettingsDialog {
         }
     }
 
-    fn activate(&mut self, c: Control) -> SettingsAction {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn value(&self, control: Control) -> Option<&str> {
+        let draft = self.drafts.get(self.selected)?;
+        match control {
+            Name => Some(&draft.name),
+            Args => Some(&draft.args),
+            _ => None,
+        }
+    }
+
+    pub fn selection(&self, control: Control) -> std::ops::Range<usize> {
+        let len = self.value(control).map_or(0, str::len);
+        if self.focus != control {
+            return 0..0;
+        }
+        if self.select_all {
+            return 0..len;
+        }
+        let cursor = len.saturating_sub(self.from_end);
+        cursor..cursor
+    }
+
+    pub fn set_focus(&mut self, control: Control) {
+        if self.enabled(control) && self.focus != control {
+            self.focus = control;
+            self.from_end = 0;
+            self.select_all = matches!(control, Name | Args);
+        }
+    }
+
+    pub fn set_value(&mut self, control: Control, value: &str) {
+        if self.value(control).is_some() && !value.chars().any(char::is_control) {
+            self.set_focus(control);
+            self.select_all = true;
+            self.from_end = 0;
+            self.insert_text(value);
+        }
+    }
+
+    pub fn activate(&mut self, control: Control) -> SettingsAction {
+        let previous = (self.selected, self.drafts.len());
+        let action = self.apply_control(control);
+        if previous != (self.selected, self.drafts.len()) {
+            // Ignore queued platform actions addressed to the previous assignment.
+            self.revision = self.revision.wrapping_add(1);
+        }
+        action
+    }
+
+    fn apply_control(&mut self, c: Control) -> SettingsAction {
         if !self.enabled(c) {
             return SettingsAction::None;
         }
@@ -207,6 +276,7 @@ impl SettingsDialog {
         self.from_end = 0;
         self.select_all = false;
         self.error = None;
+        self.invalid_field = None;
         match c {
             Prev => self.selected = (self.selected + self.drafts.len() - 1) % self.drafts.len(),
             Next => self.selected = (self.selected + 1) % self.drafts.len(),
@@ -256,6 +326,7 @@ impl SettingsDialog {
                         self.selected = i;
                         self.focus = if d.name.trim().is_empty() { Name } else { Args };
                         self.select_all = true;
+                        self.invalid_field = Some(self.focus);
                         self.error = Some(
                             if self.focus == Name {
                                 "Enter an assignment name."
@@ -303,11 +374,7 @@ impl SettingsDialog {
             Key::Named(NamedKey::Escape) => return SettingsAction::Cancel,
             Key::Named(NamedKey::Enter) => return self.activate(self.focus),
             Key::Named(NamedKey::Tab) => {
-                let enabled: Vec<_> = ROWS
-                    .iter()
-                    .flat_map(|row| row.iter().copied())
-                    .filter(|&c| self.enabled(c))
-                    .collect();
+                let enabled: Vec<_> = control_order().filter(|&c| self.enabled(c)).collect();
                 let i = enabled.iter().position(|&c| c == self.focus).unwrap_or(0);
                 self.focus = enabled[(i + if mods.shift_key() {
                     enabled.len() - 1
@@ -357,6 +424,9 @@ impl SettingsDialog {
                     self.from_end = field.len() - new_caret;
                 }
                 self.select_all = false;
+            }
+            Key::Named(NamedKey::Space) if !matches!(self.focus, Name | Args) => {
+                return self.activate(self.focus);
             }
             Key::Named(NamedKey::Space) => self.insert_text(" "),
             Key::Character(s) if mods.control_key() || mods.super_key() => {
@@ -425,6 +495,27 @@ mod tests {
         };
         assert_eq!(entries[0].name, "αβ");
         assert_eq!(entries[0].id, id);
+    }
+
+    #[test]
+    fn keyboard_presets_and_long_unicode_names_keep_focus_visible() {
+        use unicode_width::UnicodeWidthStr;
+        let mut dialog = SettingsDialog::default();
+        dialog.begin(Vec::new());
+        dialog.key(&Key::Named(NamedKey::Space), ModifiersState::empty());
+        assert_eq!(dialog.focus, Name);
+        dialog.insert_text("Example 長いコマンド é");
+        dialog.activate(Name);
+        assert!(dialog.hint().contains("All text selected"));
+        let visible = dialog.visible_label(Name, 18);
+        assert!(visible.starts_with("Name   …") && visible.ends_with("é│"));
+        assert!(visible.width() <= 18);
+        dialog.key(&Key::Named(NamedKey::Home), ModifiersState::empty());
+        assert!(
+            dialog
+                .visible_label(Name, 18)
+                .starts_with("Name   │Example")
+        );
     }
 
     #[test]

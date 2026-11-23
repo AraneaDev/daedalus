@@ -1,6 +1,7 @@
 use crate::bridge::UiCommand;
 use daedalus_proto::{ActivityCursor, ActivityPage, WorkspaceId};
 use std::{
+    collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -24,6 +25,8 @@ pub struct ActivityHistory {
     pending: Option<u64>,
     acknowledged: Option<ActivityCursor>,
     staged: Option<ActivityCursor>,
+    unsaved: HashMap<WorkspaceId, ActivityCursor>,
+    retry_at: Option<Instant>,
     initial: bool,
     dirty: bool,
     next_read: Instant,
@@ -50,6 +53,8 @@ impl ActivityHistory {
             pending: None,
             acknowledged: None,
             staged: None,
+            unsaved: HashMap::new(),
+            retry_at: None,
             initial: true,
             dirty: false,
             next_read: Instant::now(),
@@ -72,6 +77,9 @@ impl ActivityHistory {
         self.staged = None;
         self.storage_gap = false;
         self.acknowledged = visible.and_then(|id| {
+            if let Some(cursor) = self.unsaved.get(&id) {
+                return Some(*cursor);
+            }
             let path = self.directory.join(format!("{id}.toml"));
             match fs::read_to_string(&path) {
                 Ok(contents) => match toml::from_str(&contents) {
@@ -99,12 +107,18 @@ impl ActivityHistory {
             self.dirty = true;
         }
     }
-    pub fn deadline(&self) -> Option<Instant> {
+    fn read_deadline(&self) -> Option<Instant> {
         (self.visible.is_some() && self.pending.is_none() && self.staged.is_none() && self.dirty)
             .then_some(self.next_read)
     }
+    pub fn deadline(&self) -> Option<Instant> {
+        self.read_deadline().into_iter().chain(self.retry_at).min()
+    }
     pub fn request(&mut self, now: Instant) -> Option<UiCommand> {
-        if self.deadline()? > now {
+        if self.retry_at.is_some_and(|deadline| now >= deadline) {
+            self.flush_cursors(now);
+        }
+        if self.read_deadline()? > now {
             return None;
         }
         self.serial += 1;
@@ -151,14 +165,26 @@ impl ActivityHistory {
         if self.acknowledged == Some(cursor) {
             return;
         }
-        let path = self.directory.join(format!("{id}.toml"));
-        let result = toml::to_string(&cursor)
-            .map_err(|e| e.to_string())
-            .and_then(|s| crate::assignments::write_atomic(&path, &s));
-        if let Err(error) = result {
-            tracing::warn!(%error,"could not persist activity cursor");
-        }
         self.acknowledged = Some(cursor);
+        self.unsaved.insert(id, cursor);
+        if self.retry_at.is_none() {
+            self.flush_cursors(Instant::now());
+        }
+    }
+
+    fn flush_cursors(&mut self, now: Instant) {
+        self.unsaved.retain(|id, cursor| {
+            let path = self.directory.join(format!("{id}.toml"));
+            let result = toml::to_string(cursor)
+                .map_err(|error| error.to_string())
+                .and_then(|text| crate::assignments::write_atomic(&path, &text));
+            if let Err(error) = result {
+                tracing::warn!(%error, "could not persist activity cursor");
+                return true;
+            }
+            false
+        });
+        self.retry_at = (!self.unsaved.is_empty()).then_some(now + Duration::from_secs(5));
     }
 }
 
@@ -235,6 +261,42 @@ mod tests {
             fresh.visit(Some(id));
             assert_eq!(read(&mut fresh).1, expected);
         }
+    }
+
+    #[test]
+    fn failed_save_retries_after_leaving_without_new_activity() {
+        let dir = tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let endpoint = Path::new("socket");
+        let id = WorkspaceId::new();
+        let mut history = ActivityHistory::new(&profile, endpoint);
+        let page = ActivityPage {
+            workspace_id: id,
+            cursor: ActivityCursor {
+                epoch: WorkspaceId::new(),
+                seq: 12,
+            },
+            entries: vec![],
+            gap: false,
+        };
+        history.connection(true);
+        history.visit(Some(id));
+        let (token, _) = read(&mut history);
+        history.received(token, &page);
+        fs::create_dir_all(history.directory.parent().unwrap()).unwrap();
+        fs::write(&history.directory, "blocked").unwrap();
+        history.presented();
+        history.visit(None);
+        let retry = history.deadline().unwrap();
+        fs::remove_file(&history.directory).unwrap();
+        assert!(history.request(retry - Duration::from_millis(1)).is_none());
+        assert!(!history.directory.exists());
+        assert!(history.request(retry).is_none());
+        assert!(history.deadline().is_none());
+        let mut fresh = ActivityHistory::new(&profile, endpoint);
+        fresh.connection(true);
+        fresh.visit(Some(id));
+        assert_eq!(read(&mut fresh).1, Some(page.cursor));
     }
 
     #[test]

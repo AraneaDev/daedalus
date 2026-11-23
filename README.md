@@ -15,8 +15,8 @@ with the 0.0.7 series. Earlier releases provide portable archives.
 | Platform | Asset | Installation |
 | --- | --- | --- |
 | Ubuntu 24.04 or compatible Debian-based Linux, x86-64 | `.deb` | Run `sudo apt install ./daedalus-<version>-amd64.deb`. Launch **Daedalus** from the applications menu. |
-| Arch Linux, x86-64 (v0.0.9 onward) | `.pkg.tar.zst` | Run `sudo pacman -U ./daedalus-<version>-1-x86_64.pkg.tar.zst`. Launch **Daedalus** from the applications menu. |
-| macOS, Apple Silicon (Intel packages start with the next release) | `*-arm64.pkg` or `*-x86_64.pkg` | Open the package, follow Installer, then open **Daedalus** from Applications. CLI tools are linked in `/usr/local/bin`. |
+| Arch Linux, x86-64 (v0.0.10 onward) | `.pkg.tar.zst` | Run `sudo pacman -U ./daedalus-<version>-1-x86_64.pkg.tar.zst`. Launch **Daedalus** from the applications menu. |
+| macOS, Apple Silicon or Intel (Intel packages start with v0.0.11) | `*-arm64.pkg` or `*-x86_64.pkg` | Open the package, follow Installer, then open **Daedalus** from Applications. CLI tools are linked in `/usr/local/bin`. |
 | Windows, x64 | `.msi` | Run the installer, then open **Daedalus** from Start. Open a new terminal to use the CLI. |
 
 Packages include the UI, daemon and control CLI. The macOS and Windows installers are unsigned. Each
@@ -37,7 +37,8 @@ immediately. To use Claude, Codex or agy, install the corresponding CLI and choo
 the agent picker. Press `Shift+Enter` in the picker to start an additional agent in this workspace.
 Docker and Compose are needed only for container workflows.
 
-Choose **+ Workspace** to enter a name and a project folder on the daemon host.
+Choose **+ Workspace** to enter a name and a project folder on the daemon host. If the daemon
+refuses the folder, the form keeps your entries and selects the folder for correction.
 The sidebar groups linked worktrees under their repository and lists tools detected in each
 workspace root. It recognizes Compose, Cargo, npm, Composer, Python, and Make. Opening a mixed
 project shows each tool and preserves the commands you set in `.daedalus.toml`.
@@ -79,12 +80,15 @@ stack vertically. For long workspace lists, scroll over the sidebar or use its p
 
 On macOS, use Cmd for the workbench shortcuts shown with Ctrl+Shift.
 
-Use the **+ Worktree** button to open a branch in its own workspace.
+Use the **+ Worktree** button to open a branch in its own workspace. If you request Compose
+teardown when closing it and Docker fails, Daedalus stops the panes and keeps the workspace and
+checkout so you can retry.
 
 ![New Git Worktree dialog with a branch name entered](docs/images/new-worktree.png)
 
-The native accessibility tree exposes the active workspace, focused pane, connection status, and
-open dialog or search context. In **New Git Worktree**, type the branch name and activate **Create**
+Screen readers can select or close individual terminal tabs, edit workspace assignments, and
+read connection status, dialog feedback and search context.
+In **New Git Worktree**, type the branch name and activate **Create**
 or **Cancel** with the pointer, keyboard, or an assistive tool. Create becomes available when a
 branch name is present and the daemon is connected.
 

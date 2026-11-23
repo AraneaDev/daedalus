@@ -109,10 +109,26 @@ pub struct PaneRect {
     pub rows: u16,
 }
 
+impl PaneRect {
+    /// The tab row shares horizontal space with an inline action. A wrapped action
+    /// sits below this row and leaves its full width available for navigation.
+    pub fn tab_strip(&self, scale: f32) -> Rect {
+        let mut strip = self.header;
+        strip.height = strip.height.min(HEADER_LOGICAL_HEIGHT * scale);
+        if let Some(pill) = self.action_pill
+            && pill.y < strip.bottom()
+        {
+            strip.width = (pill.x - strip.x).max(0.);
+        }
+        strip
+    }
+}
+
 /// Bounds shared by painting and pointer input for the focused terminal's role tabs.
 pub fn session_tabs(pane: &PaneRect, scale: f32) -> [(PaneRole, Rect); 3] {
-    let left = pane.header.x + 4.0 * scale;
-    let right = pane.action_pill.map_or(pane.header.right(), |pill| pill.x);
+    let strip = pane.tab_strip(scale);
+    let left = strip.x + 4.0 * scale;
+    let right = strip.right();
     let width = ((right - left) / 3.0).clamp(0.0, 72.0 * scale);
     [PaneRole::Agent, PaneRole::Service, PaneRole::Runner].map(|role| {
         let index = match role {
@@ -122,12 +138,7 @@ pub fn session_tabs(pane: &PaneRect, scale: f32) -> [(PaneRole, Rect); 3] {
         };
         (
             role,
-            Rect::new(
-                left + width * index,
-                pane.header.y,
-                width,
-                pane.header.height,
-            ),
+            Rect::new(left + width * index, strip.y, width, strip.height),
         )
     })
 }
@@ -172,8 +183,9 @@ impl WorkspaceLayout {
         let [pane] = self.panes.as_slice() else {
             return;
         };
-        let left = pane.header.x + 3. * scale;
-        let right = pane.action_pill.map_or(pane.header.right(), |r| r.x);
+        let strip = pane.tab_strip(scale);
+        let left = strip.x + 3. * scale;
+        let right = strip.right();
         let available = (right - left).max(0.);
         if entries.is_empty() || available < 1. {
             return;
@@ -185,31 +197,41 @@ impl WorkspaceLayout {
             .iter()
             .position(|(id, _)| Some(*id) == focused)
             .unwrap_or(0);
-        let overflow = entries.len() > capacity;
+        let overflow = entries.len() > capacity || (entries.len() >= 3 && available < 150. * scale);
         let visible = if overflow { capacity - 2 } else { capacity };
         let start = (index / visible * visible).min(entries.len() - visible);
-        let width = (available / capacity as f32).min(132. * scale);
-        let mut push = |id, label: String| {
-            let x = left + self.named_tabs.len() as f32 * width;
-            self.named_tabs.push((
-                id,
-                label,
-                Rect::new(x, pane.header.y, width, pane.header.height),
-            ));
+        let compact = overflow && available < 300. * scale;
+        let arrow_width = if compact {
+            (available / 4.).min(26. * scale)
+        } else {
+            0.
+        };
+        let width = if compact {
+            (available - 2. * arrow_width) / visible as f32
+        } else {
+            (available / capacity as f32).min(132. * scale)
+        };
+        let mut x = left;
+        let mut push = |id, label: String, w| {
+            self.named_tabs
+                .push((id, label, Rect::new(x, strip.y, w, strip.height)));
+            x += w;
         };
         if overflow {
             push(
                 entries[(start + entries.len() - 1) % entries.len()].0,
-                "‹ Prev".into(),
+                if compact { "‹" } else { "‹ Prev" }.into(),
+                if compact { arrow_width } else { width },
             );
         }
         for (id, label) in &entries[start..start + visible] {
-            push(*id, label.clone());
+            push(*id, label.clone(), width);
         }
         if overflow {
             push(
                 entries[(start + visible) % entries.len()].0,
-                "Next ›".into(),
+                if compact { "›" } else { "Next ›" }.into(),
+                if compact { arrow_width } else { width },
             );
         }
         if let Some(id) = focused
@@ -275,26 +297,33 @@ fn build_pane_rect(
     cell_w: f32,
     cell_h: f32,
     runner_has_failure: bool,
+    zoomed: bool,
 ) -> PaneRect {
-    let header_h = metrics.header_height.min(outer.height.max(0.0));
-    let header = Rect::new(outer.x, outer.y, outer.width.max(0.0), header_h);
-
     let pill_logical_w = match role {
         PaneRole::Agent => Some(AGENT_PILL_LOGICAL_WIDTH),
         PaneRole::Runner if runner_has_failure => Some(RUNNER_PILL_LOGICAL_WIDTH),
         PaneRole::Service | PaneRole::Runner => None,
     };
 
+    let narrow = zoomed && outer.width < 420. * metrics.scale_factor;
+    let wrap_action = narrow
+        && pill_logical_w.is_some()
+        && outer.width < 200. * metrics.scale_factor
+        && outer.height >= metrics.header_height * 3.;
+    let header_rows = if wrap_action { 2. } else { 1. };
+    let header_h = (metrics.header_height * header_rows).min(outer.height.max(0.0));
+    let header = Rect::new(outer.x, outer.y, outer.width.max(0.0), header_h);
     let action_pill = pill_logical_w.and_then(|logical_w| {
         let margin_x = PILL_MARGIN_X_LOGICAL * metrics.scale_factor;
         let margin_y = PILL_MARGIN_Y_LOGICAL * metrics.scale_factor;
         let max_w = (header.width - 2.0 * margin_x).max(0.0);
+        let logical_w = if narrow { 72. } else { logical_w };
         let pill_w = (logical_w * metrics.scale_factor).min(max_w);
-        let pill_h = (header.height - 2.0 * margin_y).max(0.0);
+        let pill_h = (header.height.min(metrics.header_height) - 2.0 * margin_y).max(0.0);
         if pill_w > 0.0 && pill_h > 0.0 {
             Some(Rect::new(
                 header.right() - margin_x - pill_w,
-                header.y + margin_y,
+                header.bottom() - margin_y - pill_h,
                 pill_w,
                 pill_h,
             ))
@@ -341,7 +370,7 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
                     && window_h >= 520.0 * metrics.scale_factor)),
     );
     let (sidebar, sidebar_w) = if show_sidebar {
-        let w = if input.zoomed {
+        let w = if input.zoomed && window_w >= metrics.sidebar_width + min_split_width {
             metrics.sidebar_width.min(window_w * 0.21)
         } else {
             metrics.sidebar_width.min(window_w)
@@ -408,6 +437,7 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
             input.cell_w,
             input.cell_h,
             input.runner_has_failure,
+            true,
         )]
     } else {
         let (agent_outer, service_outer, runner_outer) = if stacked {
@@ -444,6 +474,7 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
                 input.cell_w,
                 input.cell_h,
                 input.runner_has_failure,
+                false,
             ),
             build_pane_rect(
                 PaneRole::Service,
@@ -452,6 +483,7 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
                 input.cell_w,
                 input.cell_h,
                 input.runner_has_failure,
+                false,
             ),
             build_pane_rect(
                 PaneRole::Runner,
@@ -460,6 +492,7 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
                 input.cell_w,
                 input.cell_h,
                 input.runner_has_failure,
+                false,
             ),
         ]
     };
@@ -677,6 +710,9 @@ pub fn hit_test(
     }
 
     for pane in &layout.panes {
+        if workspace_count == 0 && pane.header.contains(x, y) {
+            return HitTarget::None;
+        }
         if let Some(pill) = pane.action_pill
             && pill.contains(x, y)
         {
@@ -816,8 +852,74 @@ mod tests {
             );
         }
         let next = layout.named_tabs.last().unwrap();
-        assert_eq!(next.1, "Next ›");
+        assert_eq!(next.1, "›"); // Compact paging reserves width for the selected terminal.
         assert_eq!(next.0, entries[7].0);
+    }
+
+    #[test]
+    fn empty_workbench_header_does_not_offer_terminal_actions() {
+        let input = LayoutInput {
+            zoomed: true,
+            ..default_input()
+        };
+        let layout = compute_layout(&input);
+        let pane = &layout.panes[0];
+        let pill = pane.action_pill.unwrap();
+        assert_eq!(
+            hit_test(
+                &layout,
+                0,
+                input.scale_factor,
+                input.cell_w,
+                input.cell_h,
+                pill.x + 1.,
+                pill.y + 1.
+            ),
+            HitTarget::None
+        );
+    }
+
+    #[test]
+    fn compact_headers_keep_terminal_paging_separate_from_preset_and_failure_actions() {
+        for scale in [1., 2.] {
+            for role in [PaneRole::Agent, PaneRole::Runner] {
+                let entries: Vec<_> = (0..5)
+                    .map(|n| (PaneId::new(), format!("Session {n}")))
+                    .collect();
+                let mut layout = compute_layout(&LayoutInput {
+                    window_w: 320. * scale,
+                    window_h: 568. * scale,
+                    scale_factor: scale,
+                    sidebar_override: Some(true),
+                    zoomed: true,
+                    focused_role: role,
+                    runner_has_failure: true,
+                    ..default_input()
+                });
+                layout.set_named_tabs(&entries, Some(entries[2].0), scale);
+                let pill = layout.panes[0].action_pill.unwrap();
+                let hit = |r: Rect| {
+                    hit_test(
+                        &layout,
+                        1,
+                        scale,
+                        8.,
+                        16.,
+                        r.x + r.width / 2.,
+                        r.y + r.height / 2.,
+                    )
+                };
+                assert_eq!(hit(pill), HitTarget::PaneHeaderAction(role));
+                assert_eq!(layout.named_tabs.len(), 3);
+                for (i, (id, _, rect)) in layout.named_tabs.iter().enumerate() {
+                    assert_eq!(*id, entries[i + 1].0);
+                    assert!(rect.bottom() <= pill.y);
+                    assert_eq!(hit(*rect), HitTarget::SelectSession(*id));
+                }
+                assert!(layout.named_tabs[1].2.width >= 36. * scale);
+                assert!(layout.panes[0].viewport.y >= pill.bottom());
+            }
+        }
     }
 
     #[test]
@@ -881,6 +983,45 @@ mod tests {
         assert_eq!(agent.outer.x, 0.0);
         assert_eq!(agent.outer.y, banner.bottom());
         assert_eq!(agent.outer.height, input.window_h - banner.bottom());
+    }
+
+    #[test]
+    fn opening_workspaces_in_a_narrow_focused_terminal_exposes_full_controls() {
+        for scale in [1., 2.] {
+            let input = LayoutInput {
+                window_w: 320. * scale,
+                window_h: 568. * scale,
+                zoomed: true,
+                scale_factor: scale,
+                sidebar_override: Some(true),
+                ..default_input()
+            };
+            let layout = compute_layout(&input);
+            let sidebar = layout.sidebar.unwrap();
+            assert_eq!(sidebar.width, SIDEBAR_LOGICAL_WIDTH * scale);
+            assert_eq!(layout.panes[0].outer.right(), sidebar.x);
+            let list = crate::sidebar_content::SidebarContent::plain(10, sidebar, 0, scale);
+            let settings = settings_button(layout.sidebar_toggle.unwrap(), list.arrows, scale);
+            assert_eq!(settings.width, 64. * scale);
+            for (rect, target) in [
+                (settings, HitTarget::WorkspaceSettings),
+                (list.new_workspace, HitTarget::SidebarNewWorkspace),
+                (list.new_worktree, HitTarget::SidebarNewWorktree),
+            ] {
+                assert_eq!(
+                    hit_test(
+                        &layout,
+                        10,
+                        scale,
+                        input.cell_w,
+                        input.cell_h,
+                        rect.x + rect.width / 2.,
+                        rect.y + rect.height / 2.
+                    ),
+                    target
+                );
+            }
+        }
     }
 
     #[test]

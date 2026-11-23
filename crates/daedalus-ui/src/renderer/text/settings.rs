@@ -7,6 +7,7 @@ impl TextRenderer {
         let modal = modal_rect(w, h, dpi);
         let scale = dpi.min(modal.height / 324.0).min(modal.width / 420.0);
         let dialog = &state.settings;
+        let glyph_width = self.cell_w * (14.0 * scale) / (self.font_size_logical * dpi);
         let mut line = |text: &str, rect: Rect, size: f32, color, bold| {
             let inset = 5.0 * scale;
             self.push_modal_line(ChromeLineSpec {
@@ -39,7 +40,8 @@ impl TextRenderer {
         for (c, r) in controls(modal) {
             let active = dialog.focus == c;
             let prefix = if active { "▸ " } else { "" };
-            let label = dialog.visible_label(c, (r.width / (9.0 * scale)) as usize);
+            let columns = ((r.width - 10.0 * scale) / glyph_width) as usize;
+            let label = dialog.visible_label(c, columns.saturating_sub(prefix.chars().count()));
             let color = if !dialog.enabled(c) {
                 theme.text_muted
             } else if active {
@@ -56,12 +58,8 @@ impl TextRenderer {
             theme.text_muted,
             false,
         );
-        let msg = dialog
-            .error
-            .as_deref()
-            .unwrap_or("Tab moves focus · Enter activates · Ctrl+A replaces field");
         line(
-            msg,
+            dialog.hint(),
             row(0.74, 0.09),
             12.0,
             if dialog.error.is_some() {
