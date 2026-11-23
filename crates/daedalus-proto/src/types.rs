@@ -222,6 +222,9 @@ pub struct WorkspaceInfo {
     pub slot_index: u16,
     pub injected_env: HashMap<String, String>,
     pub panes: Vec<PaneSummary>,
+    /// Whether lazy pane initialization should start or resume. Older daemons omit this.
+    #[serde(default)]
+    pub default_panes_pending: Option<bool>,
     #[serde(default)]
     pub port_offset: u16,
     #[serde(default)]
@@ -238,6 +241,12 @@ pub struct WorkspaceInfo {
     pub external_statuses: Vec<ExternalStatus>,
     #[serde(default)]
     pub manifest: Option<WorkspaceManifest>,
+}
+
+impl WorkspaceInfo {
+    pub fn needs_default_panes(&self) -> bool {
+        self.default_panes_pending.unwrap_or(self.panes.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +328,9 @@ pub struct GridSnapshot {
     pub rows_data: Vec<GridRow>,
     #[serde(default)]
     pub scrollback_len: usize,
+    /// Changes when the terminal erases its saved lines.
+    #[serde(default)]
+    pub history_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,6 +341,11 @@ pub struct GridDelta {
     pub rows: u16,
     pub cursor: CursorState,
     pub dirty_rows: Vec<GridRow>,
+    #[serde(default)]
+    pub history_generation: u64,
+    /// Older daemons omit history length in incremental updates.
+    #[serde(default)]
+    pub scrollback_len: Option<usize>,
 }
 
 /// A single substring match in a pane's scrollback/viewport history (`end_col` is exclusive).

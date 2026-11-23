@@ -2,7 +2,8 @@
 
 ## Baseline
 
-Reviewed against the 0.0.6 feature branch. These are proposed patch-sized milestones. Each can ship independently after its acceptance checks pass.
+Reviewed against the 0.0.6 feature branch. These are proposed patch-sized milestones. Each can ship
+independently after its acceptance checks pass.
 
 | Original requirement | Implementation evidence | Assessment |
 |---|---|---|
@@ -17,11 +18,35 @@ Reviewed against the 0.0.6 feature branch. These are proposed patch-sized milest
 
 ## Proposed implementation order
 
-1. **Project discovery and sidebar grouping.** Resolve the primary repository and linked worktrees in `worktree.rs`, identify Compose, Cargo, npm, Composer, Python and Make manifests in `manifest.rs`, and expose project identity and detected runtimes through additive, defaulted protocol fields. Preserve explicit manifest settings and shell fallback. Display workspaces under their owning repository with existing branch, port and runner status. Test two independent repositories with the same basename, linked worktrees, mixed manifests, a directory without Git, and reading old persisted state. Opening a project must never execute a discovered manifest as a side effect of discovery.
-2. **Native terminal backend.** Pin a tested upstream Ghostty C ABI revision and compile a minimal ownership/feed/resize probe using the headers in `crates/daedalus-vt/build.rs`. Map terminal grid, dirty rows, cursor, cell attributes, scrollback, resize/reflow and search to the existing `VtEngine` interface. Drive OSC handling once per byte stream. Run identical transcript fixtures against both backends, covering Unicode, styles, alternate screen, split OSC sequences and runner failure extraction. Add native-feature CI with the pinned library before documenting native support or changing the default backend.
-3. **Lifecycle acceptance.** Exercise closing a workspace with multiple shell children, a TERM-resistant grandchild, and a second workspace that must stay alive. Run the test under a real user systemd manager and under the process-group fallback. In a Docker-enabled job, close one workspace with and without Compose teardown and check its isolated sibling's containers and ports. If survivors are observed, fix the ownership/teardown path and retain the reproducer.
-4. **Release acceptance.** Start the packaged UI, create two worktrees, run a failing test, forward its trace to the selected agent and reconnect to the same panes. Verify agy, Claude and Codex selection plus shell fallback. Record Linux Wayland and X11 results and the exact backend tested. Keep the fixed three-pane layout and local-first architecture.
+1. **Project discovery and sidebar grouping.** Resolve the primary repository and linked worktrees
+   in `worktree.rs`, identify Compose, Cargo, npm, Composer, Python and Make manifests in
+   `manifest.rs`, and expose project identity and detected runtimes through additive, defaulted
+   protocol fields. Preserve explicit manifest settings and shell fallback. Display workspaces under
+   their owning repository with existing branch, port and runner status. Test two independent
+   repositories with the same basename, linked worktrees, mixed manifests, a directory without Git,
+   and reading old persisted state. Opening a project must never execute a discovered manifest as a
+   side effect of discovery.
+2. **Native terminal backend.** Pin a tested upstream Ghostty C ABI revision and compile a minimal
+   ownership/feed/resize probe using the headers in `crates/daedalus-vt/build.rs`. Map terminal
+   grid, dirty rows, cursor, cell attributes, scrollback, resize/reflow and search to the existing
+   `VtEngine` interface. Drive OSC handling once per byte stream. Run identical transcript fixtures
+   against both backends, covering Unicode, styles, alternate screen, split OSC sequences and runner
+   failure extraction. Add native-feature CI with the pinned library before documenting native
+   support or changing the default backend.
+3. **Lifecycle acceptance.** Exercise closing a workspace with multiple shell children, a
+   TERM-resistant grandchild, and a second workspace that must stay alive. Run the test under a real
+   user systemd manager and under the process-group fallback. In a Docker-enabled job, close one
+   workspace with and without Compose teardown and check its isolated sibling's containers and
+   ports. If survivors are observed, fix the ownership/teardown path and retain the reproducer.
+4. **Release acceptance.** Start the packaged UI, create two worktrees, run a failing test, forward
+   its trace to the selected agent and reconnect to the same panes. Verify agy, Claude and Codex
+   selection plus shell fallback. Record Linux Wayland and X11 results and the exact backend tested.
+   Keep the fixed three-pane layout and local-first architecture.
 
 ## Other commitments from the retired roadmap
 
-Track these independently of the original Linux MVP: Intel macOS packaging and Homebrew distribution, Windows package-manager manifests, native platform process/port APIs where command-line fallbacks remain, and extension schemas for custom sidebar widgets and status providers. SSH attachment and manifest actions shipped in the 0.0.6 feature series. Evaluate mTLS separately if a direct authenticated transport is needed.
+Track these independently of the original Linux MVP: Intel macOS packaging and Homebrew
+distribution, Windows package-manager manifests, native platform process/port APIs where
+command-line fallbacks remain, and extension schemas for custom sidebar widgets and status
+providers. SSH attachment and manifest actions shipped in the 0.0.6 feature series. Evaluate mTLS
+separately if a direct authenticated transport is needed.

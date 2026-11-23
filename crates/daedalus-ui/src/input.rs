@@ -1,7 +1,8 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use daedalus_proto::{FailureTrace, PaneRole, wrap_bracketed_paste};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 
 pub use crate::state::FocusDirection;
 
@@ -53,6 +54,62 @@ pub enum UiAction {
     SearchPrev,
     SearchCancel,
     Ignore,
+}
+
+/// Keeps a held shortcut consumed even when its first press closes the active modal.
+#[derive(Default)]
+pub struct KeyRepeatGuard {
+    consumed: HashSet<PhysicalKey>,
+}
+
+impl KeyRepeatGuard {
+    pub fn press(&mut self, key: PhysicalKey, repeat: bool, action: UiAction) -> UiAction {
+        if repeat && self.consumed.contains(&key) {
+            return UiAction::Ignore;
+        }
+        let one_shot = matches!(
+            action,
+            UiAction::ToggleZoom
+                | UiAction::ToggleSidebar
+                | UiAction::ToggleAgentPicker
+                | UiAction::ToggleActionPalette
+                | UiAction::ActionPaletteConfirm
+                | UiAction::ActionPaletteCancel
+                | UiAction::ToggleWorktreeModal
+                | UiAction::OpenCloseWorkspaceModal
+                | UiAction::ToggleSearch
+                | UiAction::NewWorkspace
+                | UiAction::CopySelection
+                | UiAction::PasteClipboard
+                | UiAction::ForwardFailureToAgent
+                | UiAction::PickerConfirm
+                | UiAction::PickerCancel
+                | UiAction::WorktreeModalConfirm
+                | UiAction::WorktreeModalCancel
+                | UiAction::CloseModalToggleCompose
+                | UiAction::CloseModalToggleWorktree
+                | UiAction::CloseModalToggleForce
+                | UiAction::CloseModalConfirm
+                | UiAction::CloseModalCancel
+                | UiAction::SearchCancel
+        );
+        if one_shot {
+            self.consumed.insert(key);
+            if repeat {
+                return UiAction::Ignore;
+            }
+        }
+        action
+    }
+
+    /// Consume a synthetic focus-restoration press and its repeats until release.
+    pub fn suppress(&mut self, key: PhysicalKey) {
+        self.consumed.insert(key);
+    }
+
+    pub fn release(&mut self, key: PhysicalKey) {
+        self.consumed.remove(&key);
+    }
 }
 
 /// Filters a composed text / IME slice for modal inputs, stripping control characters
@@ -542,6 +599,54 @@ mod tests {
 
     fn t_macos(key: &Key, text: Option<&str>, mods: ModifiersState) -> UiAction {
         translate_key_for_platform(key, text, mods, false, false, false, false, true)
+    }
+
+    #[test]
+    fn held_shortcuts_run_once_and_modal_confirmation_stays_consumed_until_release() {
+        use winit::keyboard::KeyCode;
+        let mut guard = KeyRepeatGuard::default();
+        let n = PhysicalKey::Code(KeyCode::KeyN);
+        assert_eq!(
+            guard.press(n, false, UiAction::NewWorkspace),
+            UiAction::NewWorkspace
+        );
+        assert_eq!(
+            guard.press(n, true, UiAction::NewWorkspace),
+            UiAction::Ignore
+        );
+        assert_eq!(
+            guard.press(n, true, UiAction::SendBytes(b"n".to_vec())),
+            UiAction::Ignore
+        );
+        let enter = PhysicalKey::Code(KeyCode::Enter);
+        assert_eq!(
+            guard.press(enter, false, UiAction::ActionPaletteConfirm),
+            UiAction::ActionPaletteConfirm
+        );
+        assert_eq!(
+            guard.press(enter, true, UiAction::SendBytes(vec![13])),
+            UiAction::Ignore
+        );
+        guard.release(enter);
+        assert_eq!(
+            guard.press(enter, false, UiAction::SendBytes(vec![13])),
+            UiAction::SendBytes(vec![13])
+        );
+        assert_eq!(
+            guard.press(enter, true, UiAction::SendBytes(vec![13])),
+            UiAction::SendBytes(vec![13])
+        );
+        let down = PhysicalKey::Code(KeyCode::ArrowDown);
+        guard.suppress(down);
+        assert_eq!(
+            guard.press(down, true, UiAction::PickerDown),
+            UiAction::Ignore
+        );
+        guard.release(down);
+        assert_eq!(
+            guard.press(down, true, UiAction::PickerDown),
+            UiAction::PickerDown
+        );
     }
 
     #[test]

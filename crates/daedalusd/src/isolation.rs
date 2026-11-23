@@ -165,7 +165,7 @@ pub fn prepare_workspace_isolation_with_extra_ports(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_yml::Value;
+    use noyalib::compat::serde_yaml::{self, Value};
     use std::net::TcpListener;
     use tempfile::tempdir;
 
@@ -431,7 +431,7 @@ services:
         );
 
         // Verify the YAML parses back with `!override` tags intact.
-        let parsed: Value = serde_yml::from_str(&yaml_text).unwrap();
+        let parsed: Value = serde_yaml::from_str(&yaml_text).unwrap();
         let web_ports = &parsed["services"]["web"]["ports"];
         assert!(matches!(
             web_ports,

@@ -8,6 +8,7 @@ use daedalus_proto::{
     GridDelta, GridRow, GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary, PortMapping,
     SearchMatch, ServerEvent, WorkspaceId, WorkspaceInfo,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::selection::Selection;
 
@@ -151,22 +152,39 @@ impl PickerState {
     }
 }
 
+fn remove_last_grapheme(text: &mut String) -> bool {
+    let Some((start, _)) = text.grapheme_indices(true).next_back() else {
+        return false;
+    };
+    text.truncate(start);
+    true
+}
+
 /// State of the centered "New Git Worktree" branch-input modal (`Ctrl+Shift+W` / `+ Worktree`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorktreeModalState {
+    session: u64,
     pub open: bool,
     pub branch_input: String,
+    show_missing_branch: bool,
 }
 
 impl WorktreeModalState {
+    pub fn session(&self) -> u64 {
+        self.session
+    }
+
     pub fn open(&mut self) {
+        self.session += 1;
         self.open = true;
         self.branch_input.clear();
+        self.show_missing_branch = false;
     }
 
     pub fn close(&mut self) {
         self.open = false;
         self.branch_input.clear();
+        self.show_missing_branch = false;
     }
 
     pub fn toggle(&mut self) {
@@ -179,20 +197,37 @@ impl WorktreeModalState {
 
     pub fn push_char(&mut self, ch: char) {
         self.branch_input.push(ch);
+        self.show_missing_branch = false;
     }
 
     pub fn push_text(&mut self, text: &str) {
         self.branch_input.push_str(text);
+        self.show_missing_branch = false;
+    }
+
+    pub fn missing_branch(&self) -> bool {
+        self.show_missing_branch
+    }
+
+    pub fn branch_for_submit(&mut self) -> Option<String> {
+        let branch = self.branch_input.trim();
+        self.show_missing_branch = branch.is_empty();
+        if self.show_missing_branch {
+            None
+        } else {
+            Some(branch.to_owned())
+        }
     }
 
     pub fn pop_char(&mut self) {
-        self.branch_input.pop();
+        remove_last_grapheme(&mut self.branch_input);
     }
 }
 
 /// State of the centered "Close Workspace" confirmation & worktree cleanup modal (`Ctrl+Shift+D` or sidebar `×`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseWorkspaceModalState {
+    pub submitting: bool,
     pub open: bool,
     pub workspace_id: Option<WorkspaceId>,
     pub workspace_name: String,
@@ -208,6 +243,7 @@ pub struct CloseWorkspaceModalState {
 impl CloseWorkspaceModalState {
     /// Opens the modal populated with defaults for `ws`.
     pub fn open_for_workspace(&mut self, ws: &WorkspaceInfo) {
+        self.submitting = false;
         self.open = true;
         self.workspace_id = Some(ws.id);
         self.workspace_name = ws.name.clone();
@@ -225,11 +261,13 @@ impl CloseWorkspaceModalState {
     }
 
     pub fn toggle_compose(&mut self) {
-        self.compose_down = !self.compose_down;
+        if !self.submitting {
+            self.compose_down = !self.compose_down;
+        }
     }
 
     pub fn toggle_worktree(&mut self) {
-        if !self.is_worktree {
+        if self.submitting || !self.is_worktree {
             return;
         }
         self.remove_worktree = !self.remove_worktree;
@@ -239,7 +277,7 @@ impl CloseWorkspaceModalState {
     }
 
     pub fn toggle_force(&mut self) {
-        if self.is_worktree && self.is_dirty && self.remove_worktree {
+        if !self.submitting && self.is_worktree && self.is_dirty && self.remove_worktree {
             self.force_remove_worktree = !self.force_remove_worktree;
         }
     }
@@ -255,6 +293,7 @@ pub struct SearchState {
     pub total_scrollback: usize,
     pub matches: Vec<SearchMatch>,
     pub current_index: usize,
+    results_received: bool,
 }
 
 static NEXT_SEARCH_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -273,24 +312,39 @@ impl SearchState {
             total_scrollback: 0,
             matches: Vec::new(),
             current_index: 0,
+            results_received: false,
         }
+    }
+
+    fn invalidate_results(&mut self) {
+        self.generation = Self::next_generation();
+        self.matches.clear();
+        self.current_index = 0;
+        self.results_received = false;
+    }
+
+    pub fn result_label(&self) -> Option<String> {
+        if self.query.is_empty() || !self.results_received {
+            return None;
+        }
+        if self.matches.is_empty() {
+            return Some("No matches".into());
+        }
+        let (current, total) = self.display_counter();
+        Some(format!("({current}/{total})"))
     }
 
     pub fn push_text(&mut self, text: &str) {
         if !text.is_empty() {
             self.query.push_str(text);
-            self.generation = Self::next_generation();
-            self.matches.clear();
-            self.current_index = 0;
+            self.invalidate_results();
         }
     }
 
     pub fn pop_char(&mut self) -> bool {
-        let popped = self.query.pop().is_some();
+        let popped = remove_last_grapheme(&mut self.query);
         if popped {
-            self.generation = Self::next_generation();
-            self.matches.clear();
-            self.current_index = 0;
+            self.invalidate_results();
         }
         popped
     }
@@ -298,6 +352,7 @@ impl SearchState {
     pub fn set_results(&mut self, total_scrollback: usize, matches: Vec<SearchMatch>) {
         self.total_scrollback = total_scrollback;
         self.matches = matches;
+        self.results_received = true;
         self.current_index = 0;
     }
 
@@ -394,6 +449,7 @@ pub struct PaneViewState {
     /// Latest scroll target, including requests awaiting a daemon reply.
     pub requested_scroll_offset: usize,
     pending_scrollback: Option<u64>,
+    history_generation: u64,
     pub scrolled_rows: Option<Vec<GridRow>>,
     pub dirty_row_indices: Vec<usize>,
     pub selection: Option<Selection>,
@@ -416,6 +472,7 @@ impl PaneViewState {
             scroll_offset: 0,
             requested_scroll_offset: 0,
             pending_scrollback: None,
+            history_generation: 0,
             scrolled_rows: None,
             dirty_row_indices: Vec::new(),
             selection: None,
@@ -425,8 +482,26 @@ impl PaneViewState {
         }
     }
 
+    fn update_history_generation(&mut self, generation: u64) -> bool {
+        if generation == self.history_generation {
+            return false;
+        }
+        self.history_generation = generation;
+        if self.scroll_offset > 0 {
+            self.selection = None;
+        }
+        self.requested_scroll_offset = 0;
+        self.scroll_offset = 0;
+        self.pending_scrollback = None;
+        self.scrolled_rows = None;
+        self.mark_all_visible_dirty();
+        true
+    }
+
     /// Replaces the cached viewport with a full `GridSnapshot` and marks all rows dirty.
-    pub fn apply_snapshot(&mut self, snapshot: GridSnapshot) {
+    /// Returns true when saved history was erased since the last update.
+    pub fn apply_snapshot(&mut self, snapshot: GridSnapshot) -> bool {
+        let erased = self.update_history_generation(snapshot.history_generation);
         self.cols = snapshot.cols;
         self.rows = snapshot.rows;
         self.summary.cols = snapshot.cols;
@@ -440,12 +515,20 @@ impl PaneViewState {
         self.pending_scrollback = None;
         self.scrolled_rows = None;
         self.mark_all_visible_dirty();
+        erased
     }
 
     /// Patches only the rows present in `delta` and records their indices for incremental shaping.
-    pub fn apply_delta(&mut self, delta: GridDelta) {
-        if self.last_seq != 0 && delta.seq <= self.last_seq {
-            return;
+    /// Returns true when saved history was erased since the last update.
+    pub fn apply_delta(&mut self, delta: GridDelta) -> bool {
+        if (self.last_seq != 0 && delta.seq <= self.last_seq)
+            || delta.history_generation < self.history_generation
+        {
+            return false;
+        }
+        let erased = self.update_history_generation(delta.history_generation);
+        if let Some(len) = delta.scrollback_len {
+            self.scrollback_len = len;
         }
         let resized = self.cols != delta.cols || self.rows != delta.rows;
         self.cols = delta.cols;
@@ -483,6 +566,7 @@ impl PaneViewState {
             self.scrolled_rows = None;
             self.mark_all_visible_dirty();
         }
+        erased
     }
 
     /// Claims a request for the desired history viewport, unless already loaded or pending.
@@ -567,15 +651,23 @@ impl PaneViewState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    Connecting,
+    Connected,
+    Reconnecting,
+}
+
 /// Top-level UI application state shared between input handling, daemon bridge events, and rendering.
 #[derive(Debug)]
 pub struct AppState {
-    pub connected: bool,
+    pub connection: ConnectionState,
     pub workspaces: Vec<WorkspaceInfo>,
     pub active_workspace_id: Option<WorkspaceId>,
     pub panes: HashMap<PaneId, PaneViewState>,
     pub focused_role: PaneRole,
-    pub sidebar_visible: bool,
+    pub sidebar_override: Option<bool>,
+    pub sidebar_first: usize,
     pub zoomed: bool,
     pub remote_host: Option<String>,
     pub action_palette: ActionPaletteState,
@@ -595,14 +687,20 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn can_create_worktree(&self) -> bool {
+        self.connection == ConnectionState::Connected
+            && !self.worktree_modal.branch_input.trim().is_empty()
+    }
+
     pub fn new() -> Self {
         Self {
-            connected: false,
+            connection: ConnectionState::Connecting,
             workspaces: Vec::new(),
             active_workspace_id: None,
             panes: HashMap::new(),
             focused_role: PaneRole::Agent,
-            sidebar_visible: true,
+            sidebar_override: None,
+            sidebar_first: 0,
             zoomed: false,
             remote_host: None,
             action_palette: ActionPaletteState::default(),
@@ -655,11 +753,10 @@ impl AppState {
         search.apply_results(generation, total_scrollback, matches)
     }
 
-    /// Returns the active workspace if it is dormant (`panes.is_empty()`) and not already
-    /// spawning its default 3 panes.
+    /// Returns an active workspace whose default panes need starting or resuming.
     pub fn active_dormant_workspace(&self) -> Option<&WorkspaceInfo> {
         self.active_workspace()
-            .filter(|ws| ws.panes.is_empty() && !self.spawning_workspaces.contains(&ws.id))
+            .filter(|ws| ws.needs_default_panes() && !self.spawning_workspaces.contains(&ws.id))
     }
 
     /// Marks `workspace_id` as having an in-flight `EnsureWorkspacePanes` request.
@@ -668,7 +765,10 @@ impl AppState {
         self.spawning_workspaces.insert(workspace_id)
     }
 
-    pub fn clear_workspace_spawning(&mut self, workspace_id: WorkspaceId) {
+    pub fn finish_workspace_spawning(&mut self, workspace_id: WorkspaceId, complete: bool) {
+        if complete && let Some(ws) = self.workspaces.iter_mut().find(|ws| ws.id == workspace_id) {
+            ws.default_panes_pending = Some(false);
+        }
         self.spawning_workspaces.remove(&workspace_id);
     }
 
@@ -938,13 +1038,38 @@ impl AppState {
         }
     }
 
+    fn invalidate_history_search(&mut self, pane_id: PaneId) {
+        if let Some(search) = &mut self.search
+            && search.pane_id == pane_id
+        {
+            search.invalidate_results();
+            search.total_scrollback = self.panes[&pane_id].scrollback_len;
+        }
+    }
+
+    /// Returns the pane to resync if newer updates arrived before the snapshot.
+    pub fn apply_grid_snapshot(&mut self, snapshot: GridSnapshot) -> Option<PaneId> {
+        let pane_id = snapshot.pane_id;
+        let pane = self.panes.get_mut(&pane_id)?;
+        if snapshot.seq < pane.last_seq || snapshot.history_generation < pane.history_generation {
+            return Some(pane_id);
+        }
+        if pane.apply_snapshot(snapshot) {
+            self.invalidate_history_search(pane_id);
+        }
+        None
+    }
+
     /// Applies a `ServerEvent` from `daedalusd`.
     /// Returns `Some(pane_id)` when `ServerEvent::ResyncRequired` requires a fresh `GetSnapshot`.
     pub fn apply_server_event(&mut self, event: ServerEvent) -> Option<PaneId> {
         match event {
             ServerEvent::GridDelta(delta) => {
-                if let Some(pane) = self.panes.get_mut(&delta.pane_id) {
-                    pane.apply_delta(delta);
+                let pane_id = delta.pane_id;
+                if let Some(pane) = self.panes.get_mut(&pane_id)
+                    && pane.apply_delta(delta)
+                {
+                    self.invalidate_history_search(pane_id);
                 }
                 None
             }
@@ -1041,11 +1166,17 @@ impl AppState {
 
     /// Moves focus directionally across the fixed 3-pane semantic layout:
     /// `Agent` (left) <-> `Service` (right-top) / `Runner` (right-bottom).
-    pub fn focus_direction(&mut self, dir: FocusDirection) -> PaneRole {
+    pub fn focus_direction(&mut self, dir: FocusDirection, stacked: bool) -> PaneRole {
         let next = match (self.focused_role, dir) {
-            (PaneRole::Agent, FocusDirection::Right) => PaneRole::Service,
+            (PaneRole::Agent, FocusDirection::Down) if stacked => PaneRole::Service,
+            (PaneRole::Service, FocusDirection::Up) if stacked => PaneRole::Agent,
+            (PaneRole::Agent, FocusDirection::Right) if !stacked => PaneRole::Service,
             (PaneRole::Service, FocusDirection::Left)
-            | (PaneRole::Runner, FocusDirection::Left) => PaneRole::Agent,
+            | (PaneRole::Runner, FocusDirection::Left)
+                if !stacked =>
+            {
+                PaneRole::Agent
+            }
             (PaneRole::Service, FocusDirection::Down) => PaneRole::Runner,
             (PaneRole::Runner, FocusDirection::Up) => PaneRole::Service,
             (role, _) => role,
@@ -1129,6 +1260,7 @@ mod tests {
         let runner = make_pane_summary(ws_id, PaneRole::Runner);
         let ids = (agent.id, service.id, runner.id);
         let ws = WorkspaceInfo {
+            default_panes_pending: None,
             id: ws_id,
             name: "demo".to_string(),
             root_dir: PathBuf::from("/tmp/repo"),
@@ -1145,6 +1277,45 @@ mod tests {
             manifest: None,
         };
         (ws, ids.0, ids.1, ids.2)
+    }
+
+    #[test]
+    fn empty_worktree_submission_keeps_the_field_open_until_corrected() {
+        let mut form = WorktreeModalState::default();
+        form.open();
+        assert!(!form.missing_branch());
+        assert_eq!(form.branch_for_submit(), None);
+        assert!(form.open && form.missing_branch());
+        form.push_text("topic");
+        assert!(!form.missing_branch());
+        assert_eq!(form.branch_for_submit().as_deref(), Some("topic"));
+        form.close();
+        form.open();
+        assert!(!form.missing_branch());
+    }
+
+    #[test]
+    fn search_reports_no_matches_only_after_the_current_reply() {
+        let mut search = SearchState::new(PaneId::new());
+        assert_eq!(search.result_label(), None);
+        search.push_text("old");
+        let previous = search.generation;
+        search.push_text("er");
+        assert!(!search.apply_results(previous, 0, vec![]));
+        assert_eq!(search.result_label(), None);
+        assert!(search.apply_results(search.generation, 0, vec![]));
+        assert_eq!(search.result_label().as_deref(), Some("No matches"));
+        search.pop_char();
+        assert_eq!(search.result_label(), None);
+        search.set_results(
+            0,
+            vec![SearchMatch {
+                abs_row: 0,
+                start_col: 1,
+                end_col: 2,
+            }],
+        );
+        assert_eq!(search.result_label().as_deref(), Some("(1/1)"));
     }
 
     #[test]
@@ -1168,6 +1339,7 @@ mod tests {
                 make_row(1, 11, "line one"),
                 make_row(2, 12, "line two"),
             ],
+            history_generation: 0,
             scrollback_len: 10,
         };
 
@@ -1188,6 +1360,8 @@ mod tests {
                 row: 1,
                 visible: true,
             },
+            history_generation: 0,
+            scrollback_len: None,
             dirty_rows: vec![make_row(1, 11, "PATCHED!")],
         };
         assert_eq!(
@@ -1216,6 +1390,8 @@ mod tests {
             cols: 10,
             rows: 2,
             cursor: CursorState::default(),
+            history_generation: 0,
+            scrollback_len: None,
             dirty_rows: vec![make_row(0, 0, "initial")],
         });
         assert_eq!(pane.last_seq, 1);
@@ -1233,6 +1409,7 @@ mod tests {
                 visible: true,
             },
             rows_data: vec![make_row(0, 10, "fresh-row"), make_row(1, 11, "row-one")],
+            history_generation: 0,
             scrollback_len: 0,
         });
         let _ = pane.take_dirty_rows();
@@ -1249,6 +1426,8 @@ mod tests {
                     row: 1,
                     visible: true,
                 },
+                history_generation: 0,
+                scrollback_len: None,
                 dirty_rows: vec![make_row(0, 10, "STALE")],
             });
             assert_eq!(pane.last_seq, 5);
@@ -1268,6 +1447,8 @@ mod tests {
                 row: 0,
                 visible: true,
             },
+            history_generation: 0,
+            scrollback_len: None,
             dirty_rows: vec![make_row(0, 10, "newer-row")],
         });
         assert_eq!(pane.last_seq, 6);
@@ -1296,6 +1477,7 @@ mod tests {
             rows: 2,
             cursor: CursorState::default(),
             rows_data: vec![make_row(0, 5, "live-0"), make_row(1, 6, "live-1")],
+            history_generation: 0,
             scrollback_len: 5,
         });
 
@@ -1351,6 +1533,86 @@ mod tests {
     }
 
     #[test]
+    fn history_reset_discards_displayed_rows_inflight_reads_and_search_results() {
+        let mut app = AppState::new();
+        let (ws, pane_id, _, _) = make_workspace_with_three_panes();
+        app.set_workspaces(vec![ws]);
+        app.toggle_search(pane_id);
+        let search = app.search.as_mut().unwrap();
+        search.push_text("hit");
+        let stale_search = search.generation;
+        search.set_results(
+            12,
+            vec![SearchMatch {
+                abs_row: 1,
+                start_col: 0,
+                end_col: 3,
+            }],
+        );
+        let pane = app.panes.get_mut(&pane_id).unwrap();
+        pane.viewport_rows = vec![make_row(0, 12, "live")];
+        pane.set_scroll_offset(4);
+        let initial = pane.begin_scrollback_request().unwrap();
+        pane.apply_scrollback(initial, 12, vec![make_row(0, 8, "old")]);
+        pane.set_scroll_offset(5);
+        let late = pane.begin_scrollback_request().unwrap();
+        let reset = GridDelta {
+            pane_id,
+            seq: 10,
+            cols: pane.cols,
+            rows: pane.rows,
+            cursor: pane.cursor,
+            dirty_rows: vec![],
+            history_generation: 1,
+            scrollback_len: Some(0),
+        };
+        app.apply_server_event(ServerEvent::GridDelta(reset));
+        let pane = app.panes.get_mut(&pane_id).unwrap();
+        pane.apply_scrollback(late, 12, vec![make_row(0, 7, "wrong")]);
+        assert_eq!(pane.requested_scroll_offset, 0);
+        assert_eq!(pane.scroll_offset, 0);
+        assert_eq!(pane.scrollback_len, 0);
+        assert_eq!(row_text(&pane.visible_rows()[0]), "live");
+        assert!(!app.apply_search_results(pane_id, stale_search, 12, vec![]));
+        assert!(app.search.as_ref().unwrap().matches.is_empty());
+    }
+
+    #[test]
+    fn resync_snapshot_invalidates_erased_history_even_if_new_lines_already_accumulated() {
+        let mut app = AppState::new();
+        let (ws, id, _, _) = make_workspace_with_three_panes();
+        app.set_workspaces(vec![ws]);
+        app.toggle_search(id);
+        let search = app.search.as_mut().unwrap();
+        search.push_text("old");
+        let generation = search.generation;
+        let pane = app.panes.get_mut(&id).unwrap();
+        pane.set_scroll_offset(2);
+        let pending = pane.begin_scrollback_request().unwrap();
+        let reset = GridSnapshot {
+            pane_id: id,
+            seq: 4,
+            cols: pane.cols,
+            rows: pane.rows,
+            cursor: pane.cursor,
+            rows_data: vec![make_row(0, 50, "live")],
+            scrollback_len: 5,
+            history_generation: 1,
+        };
+        let mut stale = reset.clone();
+        stale.history_generation = 0;
+        stale.scrollback_len = 20;
+        assert_eq!(app.apply_grid_snapshot(reset), None);
+        assert_eq!(app.apply_grid_snapshot(stale), Some(id));
+        assert!(!app.apply_search_results(id, generation, 20, vec![]));
+        let pane = app.panes.get_mut(&id).unwrap();
+        pane.apply_scrollback(pending, 20, vec![make_row(0, 1, "old")]);
+        assert_eq!(pane.scrollback_len, 5);
+        assert_eq!(pane.requested_scroll_offset, 0);
+        assert_eq!(row_text(&pane.visible_rows()[0]), "live");
+    }
+
+    #[test]
     fn resized_scrollback_requires_fresh_rows_even_at_the_same_offset() {
         let summary = make_pane_summary(WorkspaceId::new(), PaneRole::Runner);
         let mut pane = PaneViewState::from_summary(summary);
@@ -1361,6 +1623,8 @@ mod tests {
             seq: 1,
             cols: pane.cols,
             rows: pane.rows + 1,
+            history_generation: 0,
+            scrollback_len: None,
             dirty_rows: Vec::new(),
             cursor: CursorState::default(),
         });
@@ -1466,22 +1730,52 @@ mod tests {
     }
 
     #[test]
+    fn stacked_pane_focus_follows_vertical_order() {
+        let mut state = AppState::new();
+        assert_eq!(
+            state.focus_direction(FocusDirection::Down, true),
+            PaneRole::Service
+        );
+        assert_eq!(
+            state.focus_direction(FocusDirection::Down, true),
+            PaneRole::Runner
+        );
+        assert_eq!(
+            state.focus_direction(FocusDirection::Up, true),
+            PaneRole::Service
+        );
+        assert_eq!(
+            state.focus_direction(FocusDirection::Up, true),
+            PaneRole::Agent
+        );
+    }
+
+    #[test]
     fn directional_focus_navigates_three_pane_layout() {
         let mut state = AppState::new();
         assert_eq!(state.focused_role, PaneRole::Agent);
 
         assert_eq!(
-            state.focus_direction(FocusDirection::Right),
+            state.focus_direction(FocusDirection::Right, false),
             PaneRole::Service
         );
         assert_eq!(
-            state.focus_direction(FocusDirection::Down),
+            state.focus_direction(FocusDirection::Down, false),
             PaneRole::Runner
         );
-        assert_eq!(state.focus_direction(FocusDirection::Up), PaneRole::Service);
-        assert_eq!(state.focus_direction(FocusDirection::Left), PaneRole::Agent);
+        assert_eq!(
+            state.focus_direction(FocusDirection::Up, false),
+            PaneRole::Service
+        );
+        assert_eq!(
+            state.focus_direction(FocusDirection::Left, false),
+            PaneRole::Agent
+        );
         // Moving left from Agent is a no-op
-        assert_eq!(state.focus_direction(FocusDirection::Left), PaneRole::Agent);
+        assert_eq!(
+            state.focus_direction(FocusDirection::Left, false),
+            PaneRole::Agent
+        );
     }
 
     #[test]
@@ -1740,6 +2034,7 @@ mod tests {
         let mut state = AppState::new();
         let ws_id = WorkspaceId::new();
         let dormant = WorkspaceInfo {
+            default_panes_pending: None,
             id: ws_id,
             name: "dormant".to_string(),
             root_dir: PathBuf::from("/tmp/dormant"),
@@ -1765,13 +2060,23 @@ mod tests {
         assert!(state.active_dormant_workspace().is_none());
 
         // Clearing spawning flag without panes still sees it as dormant again
-        state.clear_workspace_spawning(ws_id);
+        state.finish_workspace_spawning(ws_id, false);
         assert_eq!(state.active_dormant_workspace().map(|w| w.id), Some(ws_id));
 
-        // Once a pane spawns, it is no longer dormant
+        // Legacy daemons infer completion from the first pane.
         assert!(state.mark_workspace_spawning(ws_id));
         state.register_pane(make_pane_summary(ws_id, PaneRole::Agent), None);
-        state.clear_workspace_spawning(ws_id);
+        state.finish_workspace_spawning(ws_id, false);
+        assert!(state.active_dormant_workspace().is_none());
+
+        // A newer daemon can explicitly report a partially provisioned workspace.
+        state.active_workspace_mut().unwrap().default_panes_pending = Some(true);
+        assert_eq!(state.active_dormant_workspace().map(|w| w.id), Some(ws_id));
+        state.mark_workspace_spawning(ws_id);
+        state.finish_workspace_spawning(ws_id, false);
+        assert!(state.active_dormant_workspace().is_some());
+        state.finish_workspace_spawning(ws_id, true);
+        state.active_workspace_mut().unwrap().panes.clear();
         assert!(state.active_dormant_workspace().is_none());
     }
 
@@ -1826,6 +2131,32 @@ mod tests {
     }
 
     #[test]
+    fn backspace_removes_one_grapheme_in_search_and_branch_fields() {
+        let mut search = SearchState::new(PaneId::new());
+        let mut branch = WorktreeModalState::default();
+        // Some input methods deliver a base and its combining mark separately.
+        for committed in ["e", "\u{301}", "🇳🇱", "👩🏽‍💻"] {
+            search.push_text(committed);
+            branch.push_text(committed);
+        }
+        for expected in ["e\u{301}🇳🇱", "e\u{301}", ""] {
+            let generation = search.generation;
+            search.set_results(0, Vec::new());
+            assert!(search.pop_char());
+            branch.pop_char();
+            assert_eq!(search.query, expected);
+            assert_eq!(branch.branch_input, expected);
+            assert_ne!(search.generation, generation);
+            assert!(!search.apply_results(generation, 0, Vec::new()));
+        }
+        let empty_generation = search.generation;
+        assert!(!search.pop_char());
+        branch.pop_char();
+        assert!(branch.branch_input.is_empty());
+        assert_eq!(search.generation, empty_generation);
+    }
+
+    #[test]
     fn closing_and_reopening_search_rejects_earlier_session_results() {
         let mut state = AppState::new();
         let (ws, agent_id, _, _) = make_workspace_with_three_panes();
@@ -1861,6 +2192,25 @@ mod tests {
         // Current session 2 response applies cleanly
         assert!(state.apply_search_results(agent_id, gen_session2, 10, new_match.clone()));
         assert_eq!(state.search.as_ref().unwrap().matches, new_match);
+    }
+
+    #[test]
+    fn pending_close_retains_options_until_workspace_disappears() {
+        let mut state = AppState::new();
+        let (mut workspace, _, _, _) = make_workspace_with_three_panes();
+        workspace.compose_project_name = Some("test".into());
+        let id = workspace.id;
+        state.set_workspaces(vec![workspace.clone()]);
+        assert!(state.open_close_modal_for_workspace(id));
+        state.close_modal.toggle_compose();
+        state.close_modal.submitting = true;
+        state.close_modal.toggle_compose();
+        state.set_workspaces(vec![workspace]);
+        assert!(state.close_modal.open);
+        assert!(!state.close_modal.compose_down);
+        state.set_workspaces(Vec::new());
+        assert!(!state.close_modal.open);
+        assert!(!state.close_modal.submitting);
     }
 
     #[test]

@@ -1,6 +1,12 @@
 name: Commit style
 
 on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Release pull request number
+        type: number
+        required: true
   pull_request:
     types: [opened, edited, synchronize, reopened]
 
@@ -16,15 +22,24 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Check pull request title
+      - name: Check pull request title and commits
+        shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_PR: ${{ inputs.pr }}
           PR_TITLE: ${{ github.event.pull_request.title }}
-        run: scripts/check-commit-style.sh "$PR_TITLE"
-      - name: Check commit subjects
-        env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          while IFS= read -r subject; do
-            scripts/check-commit-style.sh "$subject"
-          done < <(git log --no-merges --format=%s "$BASE_SHA..$HEAD_SHA")
+          if [[ -n "$DISPATCH_PR" ]]; then
+            pr_json=$(gh pr view "$DISPATCH_PR" --json title,baseRefOid,headRefOid)
+            PR_TITLE=$(jq -r .title <<< "$pr_json")
+            BASE_SHA=$(jq -r .baseRefOid <<< "$pr_json")
+            HEAD_SHA=$(jq -r .headRefOid <<< "$pr_json")
+            [[ "$HEAD_SHA" == "$GITHUB_SHA" ]]
+          fi
+          scripts/check-commit-style.sh "$PR_TITLE"
+          git log --no-merges --format=%s "$BASE_SHA..$HEAD_SHA" |
+            while IFS= read -r subject; do
+              scripts/check-commit-style.sh "$subject"
+            done

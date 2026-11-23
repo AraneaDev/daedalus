@@ -138,20 +138,14 @@ async fn populate_workspace_panes(
     cols: u16,
     rows: u16,
 ) -> Result<(), RpcError> {
-    let ws_id = ws.id;
-    let manifest = ws.manifest.clone();
-    sink.emit(UiEvent::WorkspaceCreated(ws));
-
-    spawn_workspace_panes(
-        conn,
-        sink,
-        ws_id,
-        requested_agent,
-        manifest.as_ref(),
-        cols,
-        rows,
-    )
-    .await
+    let workspace_id = ws.id;
+    sink.emit(UiEvent::WorkspaceCreated(ws.clone()));
+    let result = spawn_workspace_panes(conn, sink, &ws, requested_agent, cols, rows).await;
+    sink.emit(UiEvent::WorkspacePanesEnsured {
+        workspace_id,
+        complete: result.is_ok(),
+    });
+    result
 }
 
 pub(super) async fn ensure_workspace_panes(
@@ -164,70 +158,87 @@ pub(super) async fn ensure_workspace_panes(
     rows: u16,
 ) -> Result<(), RpcError> {
     let result = async {
-        let workspaces = match conn.call(ClientMessage::ListWorkspaces).await? {
-            ResponsePayload::Workspaces(ws) => ws,
-            _ => Vec::new(),
+        let ResponsePayload::Workspaces(workspaces) =
+            conn.call(ClientMessage::ListWorkspaces).await?
+        else {
+            return Err(RpcError::Proto(ProtoError::Internal(
+                "unexpected ListWorkspaces response".into(),
+            )));
         };
-        let Some(ws) = workspaces.into_iter().find(|w| w.id == workspace_id) else {
-            return Ok(());
-        };
-        if !ws.panes.is_empty() {
-            for pane in &ws.panes {
-                sink.emit(UiEvent::PaneSpawned {
-                    summary: pane.clone(),
-                    agent_preset: None,
-                });
-                if let ResponsePayload::Snapshot(snapshot) = conn
-                    .call(ClientMessage::GetSnapshot { pane_id: pane.id })
-                    .await?
-                {
-                    sink.emit(UiEvent::Snapshot(snapshot));
-                }
-            }
-            return Ok(());
-        }
-        let effective_manifest = ws.manifest.or(manifest);
-        spawn_workspace_panes(
-            conn,
-            sink,
-            workspace_id,
-            default_agent,
-            effective_manifest.as_ref(),
-            cols,
-            rows,
-        )
-        .await
+        let mut ws = workspaces
+            .into_iter()
+            .find(|ws| ws.id == workspace_id)
+            .ok_or(RpcError::Proto(ProtoError::WorkspaceNotFound(workspace_id)))?;
+        ws.manifest = ws.manifest.or(manifest);
+        spawn_workspace_panes(conn, sink, &ws, default_agent, cols, rows).await
     }
     .await;
-
-    sink.emit(UiEvent::WorkspacePanesEnsured { workspace_id });
+    sink.emit(UiEvent::WorkspacePanesEnsured {
+        workspace_id,
+        complete: result.is_ok(),
+    });
     result
+}
+
+async fn publish_pane(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+    summary: daedalus_proto::PaneSummary,
+    agent_preset: Option<AgentPreset>,
+) -> Result<(), RpcError> {
+    let pane_id = summary.id;
+    sink.emit(UiEvent::PaneSpawned {
+        summary,
+        agent_preset,
+    });
+    if let ResponsePayload::Snapshot(snapshot) =
+        conn.call(ClientMessage::GetSnapshot { pane_id }).await?
+    {
+        sink.emit(UiEvent::Snapshot(snapshot));
+    }
+    Ok(())
 }
 
 async fn spawn_workspace_panes(
     conn: &RpcConnection,
     sink: &Arc<dyn UiEventSink>,
-    ws_id: WorkspaceId,
+    ws: &WorkspaceInfo,
     requested_agent: AgentPreset,
-    manifest: Option<&WorkspaceManifest>,
     cols: u16,
     rows: u16,
 ) -> Result<(), RpcError> {
-    for (role, command, mut agent_preset) in resolve_pane_launch_specs(requested_agent, manifest) {
-        let spawn_result = conn
-            .call(ClientMessage::SpawnPane {
-                workspace_id: ws_id,
-                role,
-                command: command.clone(),
-                shell: None,
-                cols,
-                rows,
-                env: HashMap::new(),
+    // Older daemons expose only the empty/nonempty distinction and the SpawnPane RPC.
+    if !ws.needs_default_panes() {
+        for pane in &ws.panes {
+            publish_pane(conn, sink, pane.clone(), None).await?;
+        }
+        return Ok(());
+    }
+    for (role, command, mut agent_preset) in
+        resolve_pane_launch_specs(requested_agent, ws.manifest.as_ref())
+    {
+        let ensure = |command| {
+            conn.call(if ws.default_panes_pending.is_some() {
+                ClientMessage::EnsureDefaultPane {
+                    workspace_id: ws.id,
+                    role,
+                    command,
+                    cols,
+                    rows,
+                }
+            } else {
+                ClientMessage::SpawnPane {
+                    workspace_id: ws.id,
+                    role,
+                    command,
+                    shell: None,
+                    cols,
+                    rows,
+                    env: HashMap::new(),
+                }
             })
-            .await;
-
-        let summary = match spawn_result {
-            Ok(ResponsePayload::PaneSpawned(summary)) => summary,
+        };
+        let response = match ensure(command.clone()).await {
             Err(RpcError::Proto(ProtoError::SpawnFailed(err))) if command.is_some() => {
                 sink.emit(UiEvent::Toast {
                     message: format!(
@@ -238,43 +249,25 @@ async fn spawn_workspace_panes(
                 if role == PaneRole::Agent {
                     agent_preset = Some(AgentPreset::Shell);
                 }
-                match conn
-                    .call(ClientMessage::SpawnPane {
-                        workspace_id: ws_id,
-                        role,
-                        command: None,
-                        shell: None,
-                        cols,
-                        rows,
-                        env: HashMap::new(),
-                    })
-                    .await?
-                {
-                    ResponsePayload::PaneSpawned(summary) => summary,
-                    other => {
-                        warn!(role = ?role, response = ?other, "unexpected response to fallback SpawnPane");
-                        continue;
-                    }
-                }
+                ensure(None).await?
             }
-            Err(err) => return Err(err),
-            Ok(other) => {
-                warn!(role = ?role, response = ?other, "unexpected response to SpawnPane");
-                continue;
+            other => other?,
+        };
+        let summary = match response {
+            ResponsePayload::PaneSpawned(summary) => summary,
+            ResponsePayload::DefaultPaneExisting(Some(summary)) => {
+                // Another client may have chosen a different preset.
+                agent_preset = None;
+                summary
+            }
+            ResponsePayload::DefaultPaneExisting(None) => continue,
+            _ => {
+                return Err(RpcError::Proto(ProtoError::Internal(
+                    "unexpected EnsureDefaultPane response".into(),
+                )));
             }
         };
-
-        let pane_id = summary.id;
-        sink.emit(UiEvent::PaneSpawned {
-            summary,
-            agent_preset,
-        });
-
-        if let ResponsePayload::Snapshot(snapshot) =
-            conn.call(ClientMessage::GetSnapshot { pane_id }).await?
-        {
-            sink.emit(UiEvent::Snapshot(snapshot));
-        }
+        publish_pane(conn, sink, summary, agent_preset).await?;
     }
 
     Ok(())
@@ -345,8 +338,7 @@ mod tests {
         assert_eq!(workspace_name_from_dir(Path::new("")), "workspace");
     }
 
-    #[tokio::test]
-    async fn provisioning_sends_daemon_only_executable() {
+    async fn check_provisioning_request(default_panes_pending: Option<bool>) {
         let (client, mut server) = ipc_pair().await;
         let sink: Arc<dyn UiEventSink> = Arc::new(NoopSink);
         let conn = RpcConnection::new(client, sink.clone());
@@ -355,28 +347,57 @@ mod tests {
             agent_command: Some(command.clone()),
             ..Default::default()
         };
+        let ws = WorkspaceInfo {
+            id: WorkspaceId::new(),
+            name: "test".into(),
+            root_dir: PathBuf::new(),
+            slot_index: 0,
+            injected_env: HashMap::new(),
+            panes: vec![],
+            port_offset: 0,
+            compose_project_name: None,
+            git_branch: None,
+            git_status: None,
+            bound_ports: vec![],
+            containers: vec![],
+            external_statuses: vec![],
+            manifest: Some(manifest),
+            default_panes_pending,
+        };
         let request = async {
             let req = read_frame::<_, Request>(&mut server)
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(matches!(req.payload, ClientMessage::SpawnPane {
-                role: PaneRole::Agent, command: Some(argv), ..
-            } if argv == command));
+            match req.payload {
+                ClientMessage::EnsureDefaultPane {
+                    role: PaneRole::Agent,
+                    command: Some(argv),
+                    ..
+                } if default_panes_pending.is_some() => assert_eq!(argv, command),
+                ClientMessage::SpawnPane {
+                    role: PaneRole::Agent,
+                    command: Some(argv),
+                    ..
+                } if default_panes_pending.is_none() => assert_eq!(argv, command),
+                other => panic!("unexpected provisioning request {other:?}"),
+            }
             drop(server);
         };
-        let spawn = spawn_workspace_panes(
-            &conn,
-            &sink,
-            WorkspaceId::new(),
-            AgentPreset::Shell,
-            Some(&manifest),
-            80,
-            24,
-        );
+        let spawn = spawn_workspace_panes(&conn, &sink, &ws, AgentPreset::Shell, 80, 24);
         let (result, ()) = tokio::join!(spawn, request);
         assert!(matches!(result, Err(RpcError::Disconnected)));
         conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn provisioning_sends_daemon_only_executable() {
+        check_provisioning_request(Some(true)).await;
+    }
+
+    #[tokio::test]
+    async fn provisioning_uses_spawn_with_a_legacy_daemon() {
+        check_provisioning_request(None).await;
     }
 
     #[tokio::test]

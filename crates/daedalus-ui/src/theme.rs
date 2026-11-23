@@ -226,7 +226,7 @@ const TOKYO_NIGHT_THEME: Theme = Theme {
     border_unfocused: Rgba::from_rgb_u8(0x29, 0x2E, 0x42),
     border_focused: Rgba::from_rgb_u8(0x7A, 0xA2, 0xF7),
     text_primary: Rgba::from_rgb_u8(0xC0, 0xCA, 0xF5),
-    text_muted: Rgba::from_rgb_u8(0x78, 0x7C, 0x99),
+    text_muted: Rgba::from_rgb_u8(0x8D, 0x92, 0xAF),
     status_ok: Rgba::from_rgb_u8(0x9E, 0xCE, 0x6A),
     status_busy: Rgba::from_rgb_u8(0xE0, 0xAF, 0x68),
     status_err: Rgba::from_rgb_u8(0xF7, 0x76, 0x8E),
@@ -261,10 +261,10 @@ const GRUVBOX_DARK_THEME: Theme = Theme {
     border_unfocused: Rgba::from_rgb_u8(0x50, 0x49, 0x45),
     border_focused: Rgba::from_rgb_u8(0xFE, 0x80, 0x19),
     text_primary: Rgba::from_rgb_u8(0xEB, 0xDB, 0xB2),
-    text_muted: Rgba::from_rgb_u8(0xA8, 0x99, 0x84),
+    text_muted: Rgba::from_rgb_u8(0xB4, 0xA5, 0x8F),
     status_ok: Rgba::from_rgb_u8(0xB8, 0xBB, 0x26),
     status_busy: Rgba::from_rgb_u8(0xFA, 0xBD, 0x2F),
-    status_err: Rgba::from_rgb_u8(0xFB, 0x49, 0x34),
+    status_err: Rgba::from_rgb_u8(0xFF, 0x80, 0x6B),
     selection_bg: Rgba::from_rgba_u8(0x50, 0x49, 0x45, 0x99),
     cursor_bg: Rgba::from_rgb_u8(0xEB, 0xDB, 0xB2),
     picker_bg: Rgba::from_rgba_u8(0x1D, 0x20, 0x21, 0xF5),
@@ -294,12 +294,12 @@ const SOLARIZED_LIGHT_THEME: Theme = Theme {
     bg_pane: Rgba::from_rgb_u8(0xFD, 0xF6, 0xE3),
     bg_header: Rgba::from_rgb_u8(0xE6, 0xDF, 0xCB),
     border_unfocused: Rgba::from_rgb_u8(0xD3, 0xCB, 0xB8),
-    border_focused: Rgba::from_rgb_u8(0x26, 0x8B, 0xD2),
-    text_primary: Rgba::from_rgb_u8(0x58, 0x6E, 0x75),
-    text_muted: Rgba::from_rgb_u8(0x83, 0x94, 0x96),
-    status_ok: Rgba::from_rgb_u8(0x85, 0x99, 0x00),
-    status_busy: Rgba::from_rgb_u8(0xB5, 0x89, 0x00),
-    status_err: Rgba::from_rgb_u8(0xDC, 0x32, 0x2F),
+    border_focused: Rgba::from_rgb_u8(0x16, 0x63, 0x9B),
+    text_primary: Rgba::from_rgb_u8(0x40, 0x56, 0x5D),
+    text_muted: Rgba::from_rgb_u8(0x53, 0x64, 0x6A),
+    status_ok: Rgba::from_rgb_u8(0x59, 0x68, 0x00),
+    status_busy: Rgba::from_rgb_u8(0x7F, 0x5C, 0x00),
+    status_err: Rgba::from_rgb_u8(0xAD, 0x29, 0x26),
     selection_bg: Rgba::from_rgba_u8(0x26, 0x8B, 0xD2, 0x44),
     cursor_bg: Rgba::from_rgb_u8(0x58, 0x6E, 0x75),
     picker_bg: Rgba::from_rgba_u8(0xEE, 0xE8, 0xD5, 0xF5),
@@ -609,6 +609,30 @@ mod tests {
     fn assert_valid_rgba(c: Rgba) {
         for ch in c.0 {
             assert!(ch.is_finite() && (0.0..=1.0).contains(&ch));
+        }
+    }
+
+    #[test]
+    fn chrome_labels_meet_contrast_on_header_sidebar_and_badges() {
+        for preset in ThemeName::ALL {
+            let theme = Theme::from_preset(preset);
+            for (name, color) in [
+                ("primary", theme.text_primary),
+                ("muted", theme.text_muted),
+                ("focused", theme.border_focused),
+                ("ok", theme.status_ok),
+                ("busy", theme.status_busy),
+                ("error", theme.status_err),
+            ] {
+                for (surface, background) in [
+                    ("header", theme.bg_header),
+                    ("sidebar", theme.bg_sidebar),
+                    ("badge", theme.bg_pane),
+                ] {
+                    let ratio = contrast_ratio(color, background);
+                    assert!(ratio >= 4.5, "{preset} {name} on {surface}: {ratio:.2}:1");
+                }
+            }
         }
     }
 

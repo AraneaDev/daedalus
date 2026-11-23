@@ -392,6 +392,17 @@ async fn dispatch_request(
                 .spawn_pane(workspace_id, role, command, shell, cols, rows, env)
                 .await?,
         )),
+        ClientMessage::EnsureDefaultPane {
+            workspace_id,
+            role,
+            command,
+            cols,
+            rows,
+        } => {
+            registry
+                .ensure_default_pane(workspace_id, role, command, cols, rows)
+                .await
+        }
         ClientMessage::ReplaceAgentPane {
             workspace_id,
             old_pane_id,
@@ -606,6 +617,8 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorState::default(),
+            history_generation: 0,
+            scrollback_len: None,
             dirty_rows: Vec::new(),
         })
     }

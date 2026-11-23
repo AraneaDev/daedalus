@@ -75,6 +75,14 @@ pub enum ClientMessage {
         rows: u16,
         env: HashMap<String, String>,
     },
+    /// Initializes one default role exactly once per workspace lifetime.
+    EnsureDefaultPane {
+        workspace_id: WorkspaceId,
+        role: PaneRole,
+        command: Option<Vec<String>>,
+        cols: u16,
+        rows: u16,
+    },
     /// Replaces the expected Agent pane after the new process starts.
     ReplaceAgentPane {
         workspace_id: WorkspaceId,
@@ -144,6 +152,8 @@ pub enum ResponsePayload {
     Workspaces(Vec<WorkspaceInfo>),
     Worktrees(Vec<GitWorktreeInfo>),
     PaneSpawned(PaneSummary),
+    /// An ensure request reused a pane, or found a role the user left closed.
+    DefaultPaneExisting(Option<PaneSummary>),
     Snapshot(GridSnapshot),
     ScrollbackRows {
         pane_id: PaneId,

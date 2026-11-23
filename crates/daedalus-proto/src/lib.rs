@@ -314,19 +314,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_oversized_frame_header() {
-        let (mut tx, mut rx) = duplex(64);
-        use tokio::io::AsyncWriteExt;
-        let bad_len = ((MAX_FRAME_SIZE + 1) as u32).to_be_bytes();
-        tx.write_all(&bad_len).await.unwrap();
-        tx.flush().await.unwrap();
+    async fn frame_size_limit_is_inclusive_on_both_ends_of_the_wire() {
+        // MessagePack uses five header bytes for a string of this size.
+        let mut text = "x".repeat(16 * 1024 * 1024 - 5);
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &text).await.unwrap();
+        assert_eq!(
+            read_frame::<_, String>(&mut wire.as_slice()).await.unwrap(),
+            Some(text.clone())
+        );
 
-        let res: Result<Option<Request>, CodecError> = read_frame(&mut rx).await;
+        text.push('x');
+        wire.clear();
+        assert!(matches!(
+            write_frame(&mut wire, &text).await,
+            Err(CodecError::FrameTooLarge(_))
+        ));
+        assert!(wire.is_empty());
+    }
+
+    #[tokio::test]
+    async fn frame_reader_distinguishes_io_failure_from_truncated_payload() {
+        use std::io::{Error, ErrorKind};
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct BrokenReader;
+        impl AsyncRead for BrokenReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Err(Error::from(ErrorKind::ConnectionReset)))
+            }
+        }
+        assert!(matches!(read_frame::<_, String>(&mut BrokenReader).await,
+            Err(CodecError::Io(err)) if err.kind() == ErrorKind::ConnectionReset));
+        let mut truncated = &b"\x00\x00\x00\x02x"[..];
+        assert!(matches!(
+            read_frame::<_, String>(&mut truncated).await,
+            Err(CodecError::Eof)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_frame_header() {
+        let bad_len = ((MAX_FRAME_SIZE + 1) as u32).to_be_bytes();
+        let res: Result<Option<Request>, CodecError> = read_frame(&mut bad_len.as_slice()).await;
         assert!(matches!(res, Err(CodecError::FrameTooLarge(_))));
     }
 
     #[tokio::test]
-    async fn returns_none_on_clean_eof() {
+    async fn frame_reader_returns_none_on_clean_eof() {
         let (tx, mut rx) = duplex(64);
         drop(tx);
         let res: Result<Option<Request>, CodecError> = read_frame(&mut rx).await;
@@ -565,6 +606,7 @@ mod tests {
         };
 
         let ws_info = WorkspaceInfo {
+            default_panes_pending: None,
             id: ws_id,
             name: "feat-auth".to_string(),
             root_dir: PathBuf::from("/tmp/wt1"),
@@ -710,6 +752,7 @@ mod tests {
             actions: Vec::new(),
         };
         let ws_info = WorkspaceInfo {
+            default_panes_pending: None,
             id: ws_id,
             name: "manifest-ws".to_string(),
             root_dir: PathBuf::from("/tmp/manifest-ws"),
@@ -986,6 +1029,7 @@ mod tests {
         };
 
         let ws_info = WorkspaceInfo {
+            default_panes_pending: None,
             id: ws_id,
             name: "wt1".to_string(),
             root_dir: PathBuf::from("/tmp/wt1"),
@@ -1240,6 +1284,7 @@ mod tests {
             actions: vec![action.clone()],
         };
         let ws_info = WorkspaceInfo {
+            default_panes_pending: None,
             id: ws_id,
             name: "actions-ws".to_string(),
             root_dir: PathBuf::from("/tmp/actions-ws"),
