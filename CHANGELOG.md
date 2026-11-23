@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.11](https://github.com/AraneaDev/daedalus/compare/v0.0.10...v0.0.11) (2026-11-23)
+
+
+### Features
+
+* **ui:** ship the agent-first workbench and accessible terminal workflows ([#35](https://github.com/AraneaDev/daedalus/issues/35)) ([2a5a68f](https://github.com/AraneaDev/daedalus/commit/2a5a68f3bd4f89e3bfb86d70c6173c9d48ab13e6))
+
 ## [0.0.10](https://github.com/AraneaDev/daedalus/compare/v0.0.9...v0.0.10) (2026-11-23)
 
 
