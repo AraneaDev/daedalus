@@ -106,12 +106,13 @@ jobs:
           $wix = "$env:RUNNER_TEMP/wix/wix.exe"
           & $wix extension add WixToolset.UI.wixext/5.0.2
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          Add-Type -AssemblyName System.Windows.Forms
-          $license = [System.Windows.Forms.RichTextBox]::new()
-          $license.Text = Get-Content -LiteralPath LICENSE -Raw
+          $license = Get-Content -LiteralPath LICENSE -Raw
+          $paragraphs = ($license.Trim() -split '(?:\r?\n){2,}') | ForEach-Object {
+            ($_ -replace '\r?\n', ' ').Replace('\', '\\').Replace('{', '\{').Replace('}', '\}')
+          }
           $rtf = Join-Path $env:RUNNER_TEMP 'daedalus-license.rtf'
-          $license.SaveFile($rtf)
-          $license.Dispose()
+          $text = '{\rtf1\ansi\deff0{\fonttbl{\f0 Arial;}}\f0\fs18 ' + ($paragraphs -join '\par\par ') + '}'
+          [IO.File]::WriteAllText($rtf, $text, [Text.Encoding]::ASCII)
           & $wix build -arch x64 -ext WixToolset.UI.wixext -d "Version=$env:VERSION" -d "LicenseRtf=$rtf" packaging/windows.wxs -o $msi
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           if (!(Test-Path -LiteralPath $msi -PathType Leaf)) { throw "Missing package: $msi" }
@@ -128,6 +129,13 @@ jobs:
             if (!$view.Fetch()) { throw "Missing setup UI in built MSI: $query" }
             $view.Close()
           }
+          $view = $database.OpenView("SELECT ``Text`` FROM ``Control`` WHERE ``Dialog_`` = 'WelcomeEulaDlg' AND ``Control`` = 'LicenseText'")
+          $view.Execute()
+          $record = $view.Fetch()
+          if (!$record -or $record.StringData(1) -cne $text) {
+            throw "The welcome dialog does not contain the full license text."
+          }
+          $view.Close()
           foreach ($mode in '/i','/x') {
             $proc = Start-Process msiexec -ArgumentList "$mode `"$msi`" /qn /norestart" -Wait -PassThru
             if ($proc.ExitCode -ne 0) { throw "Installer exited with $($proc.ExitCode)" }
