@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.16](https://github.com/AraneaDev/daedalus/compare/v0.0.15...v0.0.16) (2026-11-24)
+
+
+### Features
+
+* extend the native workbench with terminal insights ([#46](https://github.com/AraneaDev/daedalus/issues/46)) ([d5113a9](https://github.com/AraneaDev/daedalus/commit/d5113a910b0051d9ebe2ffa5019acfa020a45798))
+
 ## [0.0.15](https://github.com/AraneaDev/daedalus/compare/v0.0.14...v0.0.15) (2026-11-24)
 
 
