@@ -122,7 +122,8 @@ Agent tabs reflect activity reported by the terminal. A background notification 
 unread until you return to it. In the UI’s `config.toml`, set `notification_ping = true` for
 notification pings, or `reduced_motion = true` for a static activity indicator.
 
-To inspect a project image, select its PNG path in terminal output and click **Preview image** or press `Ctrl+Shift+I`.
+To inspect a project image, select its PNG path in terminal output and click **Preview image**
+or press `Ctrl+Shift+I`.
 The daemon reads the file from the workspace and sends a thumbnail to the client. Click the panel
 or repeat the shortcut to close it. The preview supports regular PNG files up to 12 MiB and
 4096 × 4096 pixels on Unix daemons, including Ubuntu in WSL.
