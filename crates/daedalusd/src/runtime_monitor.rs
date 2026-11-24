@@ -198,6 +198,73 @@ mod tests {
     use super::*;
     use daedalus_proto::PortSource;
 
+    #[tokio::test]
+    async fn docker_poll_recovers_from_errors_and_uses_compose_project_filter() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let docker = Docker::connect_with_http(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            5,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        let responder = tokio::spawn(async move {
+            for (status, body) in [
+                ("500 Internal Server Error", r#"{"message":"offline"}"#),
+                ("500 Internal Server Error", r#"{"message":"offline"}"#),
+                (
+                    "200 OK",
+                    r#"[{"Id":"a","Ports":[{"PrivatePort":80,"PublicPort":8080,"Type":"tcp"}]},{"Id":"b","Labels":{"com.docker.compose.service":"web"},"Ports":[{"PrivatePort":80,"PublicPort":8080,"Type":"tcp"}],"Status":"Up (unhealthy)"}]"#,
+                ),
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut request = String::new();
+                stream.read_line(&mut request).await.unwrap();
+                assert!(
+                    request.contains("/containers/json?")
+                        && request.contains("com.docker.compose.project")
+                        && request.contains("demo"),
+                    "{request}"
+                );
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut unavailable = false;
+        for _ in 0..2 {
+            assert_eq!(
+                poll_compose_observations(&docker, "demo", &mut unavailable).await,
+                Default::default()
+            );
+            assert!(unavailable);
+        }
+        let (containers, ports) =
+            poll_compose_observations(&docker, "demo", &mut unavailable).await;
+        responder.await.unwrap();
+        assert!(!unavailable);
+        assert_eq!(containers.len(), 2);
+        assert_eq!(containers[1].name, "b");
+        assert_eq!(containers[1].health.as_deref(), Some("unhealthy"));
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].service.as_deref(), Some("web"));
+        assert_eq!(ports[0].host_port, 8080);
+    }
+
     #[test]
     fn merge_preserves_compose_then_local_order_and_git_branch() {
         let port = |host_port, source| PortMapping {

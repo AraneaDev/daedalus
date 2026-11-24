@@ -174,6 +174,30 @@ async fn cli_smoke_ping_workspace_and_pane_lifecycle() {
         .unwrap();
     assert!(wt_list.status.success());
 
+    let run_pane = |args: Vec<&str>| {
+        let mut cmd = Command::new(bin);
+        cmd.arg("--socket").arg(&sock).arg("pane").args(args);
+        async move { cmd.output().await.unwrap() }
+    };
+    let resized = run_pane(vec!["resize", &pane_id, "50", "7"]).await;
+    assert!(resized.status.success());
+    let snapshot = run_pane(vec!["snapshot", &pane_id]).await;
+    assert!(snapshot.status.success());
+    assert_eq!(String::from_utf8_lossy(&snapshot.stdout).lines().count(), 7);
+    let trace = run_pane(vec!["trace", &pane_id]).await;
+    assert!(trace.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&trace.stdout).trim(),
+        "no failure trace"
+    );
+    let closed = run_pane(vec!["close", &pane_id]).await;
+    assert!(closed.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&closed.stdout).trim(),
+        format!("closed {pane_id}")
+    );
+    assert!(!run_pane(vec!["snapshot", &pane_id]).await.status.success());
+
     let close = Command::new(bin)
         .args([
             "--socket",
@@ -1083,4 +1107,40 @@ shortcut = "Ctrl+R"
 
     let _ = shutdown_tx.send(());
     srv_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn service_plist_can_be_generated_offline_with_escaped_user_paths() {
+    let out = Command::new(env!("CARGO_BIN_EXE_daedalus-ctl"))
+        .args([
+            "--socket",
+            "/offline/demo&test.sock",
+            "service",
+            "print-launchd",
+            "--label",
+            "  demo<&>  ",
+            "--binary",
+            "/path/with spaces/daemon",
+        ])
+        .env("HOME", "/Users/test&demo")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plist = String::from_utf8(out.stdout).unwrap();
+    for value in [
+        "demo&lt;&amp;&gt;",
+        "/offline/demo&amp;test.sock",
+        "/path/with spaces/daemon",
+        "/Users/test&amp;demo/Library/Logs/daedalusd.out.log",
+    ] {
+        assert!(
+            plist.contains(&format!("<string>{value}</string>")),
+            "{plist}"
+        );
+    }
 }

@@ -487,4 +487,232 @@ mod tests {
         recap.focus(true);
         assert_eq!(recap.lines(id), ["Update gap · partial history"]);
     }
+    #[test]
+    fn activity_replay_prefers_verified_latest_agent_text_and_keeps_navigation_targets() {
+        use daedalus_proto::{ActivityCursor, ActivityEntry, ActivityKind, ActivityPage, PaneRole};
+        let (mut state, _) = crate::renderer::tests::make_state_with_agent_row();
+        let ws = state.active_workspace_id.unwrap();
+        let agent = state.focused_pane_id().unwrap();
+        let snapshot = &state.panes[&agent];
+        let output = |seq| ActivityKind::AgentOutput {
+            pane_id: agent,
+            abs_row: snapshot.viewport_rows[0].abs_row,
+            pane_seq: seq,
+            history_generation: snapshot.history_generation,
+        };
+        let mut page = ActivityPage {
+            workspace_id: ws,
+            cursor: ActivityCursor { epoch: ws, seq: 5 },
+            gap: false,
+            entries: [
+                output(0),
+                ActivityKind::Git,
+                ActivityKind::Git,
+                ActivityKind::Exit {
+                    pane_id: agent,
+                    role: PaneRole::Agent,
+                    exit_code: Some(2),
+                },
+                output(snapshot.last_seq),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, kind)| ActivityEntry {
+                seq: idx as u64 + 1,
+                at_ms: idx as u64,
+                kind,
+            })
+            .collect(),
+        };
+        state.recap.select(Some(ws));
+        state.recap.journal(&page, false, true, &state.panes);
+        let entries = state.recap.entries(ws);
+        assert_eq!(entries[0].label, "Update gap · partial history");
+        assert_eq!(entries[1].label, "Agent terminal · abc");
+        assert_eq!(entries[1].pane, Some(agent));
+        assert!(entries[2].label.contains("exited · code 2"));
+        assert_eq!(entries[2].pane, Some(agent));
+        assert_eq!(entries[3].label, "Git status changed");
+        assert_eq!(entries.len(), 4);
+        state.recap.foreground_activity(ws, 2);
+        assert_eq!(
+            state.recap.lines(ws).last().unwrap(),
+            "New activity · 2 updates"
+        );
+        page.entries.clear();
+        state.recap.focus(false);
+        let background = state.recap.lines(ws);
+        state.recap.journal(&page, false, false, &state.panes);
+        assert_eq!(state.recap.lines(ws), background);
+        state.recap.focus(true);
+        state.recap.journal(&page, true, false, &state.panes);
+        assert_eq!(state.recap.lines(ws)[0], "First visit");
+        state.recap.journal(&page, false, false, &state.panes);
+        assert_eq!(state.recap.lines(ws)[0], "No changes observed while away");
+    }
+
+    #[test]
+    fn runtime_changes_distinguish_container_health_removal_and_unchanged_status() {
+        use daedalus_proto::{
+            ContainerHealth, ExternalStatus, PortMapping, PortSource, StatusLevel,
+        };
+        let (mut state, _) = crate::renderer::tests::make_state_with_agent_row();
+        let id = state.active_workspace_id.unwrap();
+        let mut recap = Recap::default();
+        recap.select(Some(id));
+        recap.focus(false);
+        let container = ContainerHealth {
+            name: "db_1".into(),
+            service: Some("db".into()),
+            state: "running".into(),
+            health: Some("healthy".into()),
+            ports: vec![5432],
+        };
+        let runtime = |containers| UiEvent::WorkspaceRuntimeUpdated {
+            workspace_id: id,
+            containers,
+            git_status: None,
+            git_branch: Some("main".into()),
+            bound_ports: vec![PortMapping {
+                host_port: 5432,
+                container_port: None,
+                service: None,
+                source: PortSource::Docker,
+            }],
+        };
+        recap.observe(
+            &runtime(vec![container.clone()]),
+            &state.workspaces,
+            &state.panes,
+        );
+        assert_eq!(
+            recap.lines(id),
+            [
+                "db reported healthy",
+                "Ports changed · 1 bound",
+                "Git status changed"
+            ]
+        );
+        state.workspaces[0].containers.push(container);
+        recap.observe(&runtime(vec![]), &state.workspaces, &state.panes);
+        assert_eq!(recap.lines(id)[0], "db_1 left inventory");
+
+        let status = ExternalStatus {
+            source: "CI".into(),
+            level: StatusLevel::Ok,
+            label: "passed".into(),
+            detail: None,
+            updated_at_ms: 2,
+        };
+        let event = |status| {
+            UiEvent::ServerEvent(ServerEvent::ExternalStatusUpdated {
+                workspace_id: id,
+                status,
+            })
+        };
+        recap.observe(&event(status.clone()), &state.workspaces, &state.panes);
+        assert_eq!(recap.lines(id)[0], "CI reported passed");
+        state.workspaces[0].external_statuses.push(status.clone());
+        let before = recap.lines(id);
+        for repeated in [
+            status.clone(),
+            ExternalStatus {
+                label: "different".into(),
+                updated_at_ms: 1,
+                ..status.clone()
+            },
+        ] {
+            recap.observe(&event(repeated), &state.workspaces, &state.panes);
+            assert_eq!(recap.lines(id), before);
+        }
+        recap.observe(
+            &event(ExternalStatus {
+                label: String::new(),
+                updated_at_ms: 3,
+                ..status
+            }),
+            &state.workspaces,
+            &state.panes,
+        );
+        assert_eq!(recap.lines(id)[0], "CI cleared status");
+    }
+
+    #[test]
+    fn away_pane_events_retain_only_recent_changes_and_point_back_to_the_pane() {
+        let (state, _) = crate::renderer::tests::make_state_with_agent_row();
+        let workspace_id = state.active_workspace_id.unwrap();
+        let pane_id = state.focused_pane_id().unwrap();
+        let mut recap = Recap::default();
+        recap.select(Some(workspace_id));
+        recap.focus(false);
+        for (agent, label) in [
+            (AgentState::Idle, "Agent became idle"),
+            (AgentState::Thinking, "Agent started thinking"),
+            (AgentState::Error, "Agent reported an error"),
+            (
+                AgentState::WaitingForApproval,
+                "Check agent · approval signal",
+            ),
+        ] {
+            recap.observe(
+                &UiEvent::AgentStateChanged {
+                    workspace_id,
+                    pane_id,
+                    state: agent,
+                },
+                &state.workspaces,
+                &state.panes,
+            );
+            let latest = &recap.entries(workspace_id)[0];
+            assert_eq!(latest.label, label);
+            assert_eq!(latest.pane, Some(pane_id));
+        }
+        for (event, suffix) in [
+            (
+                ServerEvent::CommandFinished {
+                    pane_id,
+                    command: None,
+                    exit_code: 2,
+                    has_failure_trace: false,
+                },
+                "command · exit 2",
+            ),
+            (
+                ServerEvent::PaneExited {
+                    pane_id,
+                    exit_code: Some(1),
+                },
+                "exited · code 1",
+            ),
+            (
+                ServerEvent::PaneExited {
+                    pane_id,
+                    exit_code: None,
+                },
+                "exited",
+            ),
+        ] {
+            recap.observe(
+                &UiEvent::ServerEvent(event),
+                &state.workspaces,
+                &state.panes,
+            );
+            let entries = recap.entries(workspace_id);
+            assert!(entries[0].label.ends_with(suffix));
+            assert!(entries.iter().all(|entry| entry.pane == Some(pane_id)));
+            assert_eq!(entries.len(), MAX_EVENTS);
+        }
+        recap.observe(
+            &UiEvent::ServerEvent(ServerEvent::ResyncRequired { pane_id }),
+            &state.workspaces,
+            &state.panes,
+        );
+        assert_eq!(recap.lines(workspace_id)[0], "Update gap · partial history");
+        recap.observe(
+            &UiEvent::WorkspacesLoaded(vec![]),
+            &state.workspaces,
+            &state.panes,
+        );
+        assert_eq!(recap.lines(workspace_id), ["First visit this session"]);
+    }
 }

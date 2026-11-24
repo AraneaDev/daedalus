@@ -110,6 +110,6 @@ jobs:
         run: |
           cargo install cargo-llvm-cov --version 0.9.0 --locked
           cargo install cargo-mutants --version 27.1.0 --locked
-      - name: Install Linux GUI build headers
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Install Linux desktop test dependencies
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev xvfb xauth mesa-vulkan-drivers python3-xlib
       - run: scripts/check-test-quality.sh

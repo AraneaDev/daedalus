@@ -613,6 +613,63 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_launcher_preserves_project_command_arguments_and_launch_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let runner = dir.path().join("systemd-run");
+        let marker = dir.path().join("args");
+        std::fs::write(
+            &runner,
+            r#"#!/bin/sh
+printf '%s\n' "$@" "$CUSTOM_ENV" "$DAEDALUS_PANE_ID" > "$MARKER"
+exit 17
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ws = WorkspaceId::new();
+        let pane = PaneId::new();
+        let mut spawned = Supervisor::with_mode(IsolationMode::SystemdScope)
+            .spawn_pty(
+                ws,
+                pane,
+                PaneRole::Agent,
+                dir.path(),
+                0,
+                0,
+                &ShellLaunchSpec {
+                    program: "/bin/sh".into(),
+                    args: vec!["argument with spaces".into()],
+                    extra_env: HashMap::from([("CUSTOM_ENV".into(), "launch-specific".into())]),
+                },
+                &HashMap::from([
+                    ("MARKER".into(), marker.to_str().unwrap().into()),
+                    ("PATH".into(), dir.path().to_str().unwrap().into()),
+                    ("CUSTOM_ENV".into(), "workspace".into()),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(spawned.handle.wait_exit(), Some(17));
+        let args = std::fs::read_to_string(marker).unwrap();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                &format!("--unit=daedalus-{}-{}", ws.short(), pane.short()),
+                &format!("--working-directory={}", dir.path().display()),
+                "--",
+                "/bin/sh",
+                "argument with spaces",
+                "launch-specific",
+                &pane.to_string(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     fn is_process_alive(pid: i32) -> bool {
         if kill(Pid::from_raw(pid), None).is_err() {
             return false;

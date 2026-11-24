@@ -36,3 +36,42 @@ pub fn guide_url(tool: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_recipes_require_a_missing_tool_and_matching_host_package_manager() {
+        let mut host = SetupInspection {
+            commands: vec![],
+            available: vec!["npm".into()],
+            host: "runner".into(),
+            platform: "linux".into(),
+            dependency_install: None,
+        };
+        for (tool, package) in [
+            ("codex", "@openai/codex"),
+            ("claude", "@anthropic-ai/claude-code"),
+        ] {
+            assert_eq!(
+                install_command(tool, &host).unwrap(),
+                ["npm", "install", "-g", package]
+            );
+            host.available.push(tool.into());
+            assert!(install_command(tool, &host).is_none());
+            host.available.pop();
+        }
+        host.available = vec!["brew".into()];
+        assert!(install_command("npm", &host).is_none());
+        host.platform = "macos".into();
+        for exe in ["npm", "node"] {
+            assert_eq!(
+                install_command(exe, &host).unwrap(),
+                ["brew", "install", "node"]
+            );
+        }
+        assert!(install_command("custom", &host).is_none());
+        assert!(guide_url("custom").is_none());
+    }
+}

@@ -615,4 +615,101 @@ mod tests {
         assert!(!review.enabled(Control::Tool));
         assert!(!review.enabled(Control::Dependencies));
     }
+
+    #[test]
+    fn keyboard_edits_whole_graphemes_and_checks_the_edited_command() {
+        let mut review = SetupReview::default();
+        review.begin("demo".into(), "/repo".into(), inspection());
+        review.set_focus(Control::Command(1));
+        let named =
+            |review: &mut SetupReview, key| review.key(&Key::Named(key), ModifiersState::empty());
+        review.insert_text("a🇳🇱é終");
+        named(&mut review, NamedKey::Home);
+        named(&mut review, NamedKey::ArrowRight);
+        named(&mut review, NamedKey::Delete);
+        assert_eq!(review.command(1), "aé終");
+        named(&mut review, NamedKey::End);
+        named(&mut review, NamedKey::ArrowLeft);
+        named(&mut review, NamedKey::Backspace);
+        assert_eq!(review.command(1), "a終");
+        named(&mut review, NamedKey::Space);
+        assert_eq!(review.command(1), "a 終");
+        review.key(&Key::Character("a".into()), ModifiersState::CONTROL);
+        assert_eq!(review.selection(1), 0..review.command(1).len());
+        review.key(&Key::Character("npm".into()), ModifiersState::empty());
+        assert_eq!(review.command(1), "npm");
+        assert_eq!(named(&mut review, NamedKey::Enter), SetupAction::Check);
+        review.busy = true;
+        assert_eq!(named(&mut review, NamedKey::Escape), SetupAction::None);
+        review.busy = false;
+        assert_eq!(named(&mut review, NamedKey::Escape), SetupAction::Cancel);
+    }
+
+    #[test]
+    fn keyboard_traversal_skips_disabled_controls_and_can_activate_dependencies() {
+        let mut review = SetupReview::default();
+        review.begin("demo".into(), "/repo".into(), inspection());
+        review.set_focus(Control::Dependencies);
+        let deps = review.focus;
+        review.key(&Key::Named(NamedKey::Tab), ModifiersState::empty());
+        assert_ne!(review.focus, deps);
+        review.key(&Key::Named(NamedKey::Tab), ModifiersState::SHIFT);
+        assert_eq!(review.focus, deps);
+        assert_eq!(
+            review.key(&Key::Named(NamedKey::Space), ModifiersState::empty()),
+            SetupAction::Install(vec!["npm".into(), "ci".into()])
+        );
+        let m = modal_rect(1200., 800., 1.);
+        for (control, expected) in [
+            (Control::Back, SetupAction::Back),
+            (Control::Cancel, SetupAction::Cancel),
+            (Control::Check, SetupAction::Check),
+        ] {
+            let (_, rect) = review
+                .controls(m)
+                .into_iter()
+                .find(|(c, _)| *c == control)
+                .unwrap();
+            assert_eq!(
+                review.click(
+                    rect.x + rect.width / 2.,
+                    rect.y + rect.height / 2.,
+                    1200.,
+                    800.,
+                    1.
+                ),
+                expected
+            );
+        }
+        assert_eq!(review.click(0., 0., 1200., 800., 1.), SetupAction::None);
+    }
+
+    #[test]
+    fn missing_tools_cycle_between_installable_and_manual_choices_without_changing_commands() {
+        let mut review = SetupReview::default();
+        review.begin("demo".into(), "/repo".into(), inspection());
+        review.set_value(0, "codex");
+        review.set_value(1, "docker compose up");
+        let before = review.commands().unwrap();
+        assert!(review.detail().contains("npm install"));
+        assert_eq!(
+            review.activate(Control::Install),
+            SetupAction::Install(vec![
+                "npm".into(),
+                "install".into(),
+                "-g".into(),
+                "@openai/codex".into()
+            ])
+        );
+        let revision = review.tool_revision();
+        review.activate(Control::Tool);
+        assert_ne!(review.tool_revision(), revision);
+        assert!(!review.enabled(Control::Install));
+        assert!(review.detail().contains("daemon host"));
+        assert_eq!(
+            review.activate(Control::Guide),
+            SetupAction::Help("https://docs.docker.com/get-started/get-docker/".into())
+        );
+        assert_eq!(review.commands().unwrap(), before);
+    }
 }

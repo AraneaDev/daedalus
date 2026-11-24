@@ -1,4 +1,6 @@
 mod chrome;
+#[cfg(test)]
+mod frame_tests;
 mod modal;
 mod settings;
 mod setup_review;

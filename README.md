@@ -256,7 +256,10 @@ cargo install cargo-mutants --version 27.1.0 --locked
 scripts/check-test-quality.sh
 ```
 
-The coverage floors are 79% of lines, 80% of functions and 80% of regions across the workspace. The
+The workspace coverage floors are 92.9% for lines, 92.5% for functions, and 92.4% for regions.
+On Linux the gate
+also runs a native desktop test in Xvfb with Xauth, Mesa Vulkan, and the system Python Xlib package.
+Set `DAEDALUS_TEST_PYTHON` to use a different Python interpreter with Xlib installed. The
 mutation gate fails on surviving or timed-out mutations. Mutation results are written under
 `target/quality/`. Native Ghostty checks require the external Ghostty C library and headers.
 

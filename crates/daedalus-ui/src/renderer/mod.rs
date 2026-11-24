@@ -1092,7 +1092,7 @@ impl GpuRenderer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::layout::{LayoutInput, compute_layout, sidebar_workspace_rect};
     use crate::selection::{CellPos, Selection};
@@ -1103,7 +1103,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    pub(super) fn make_state_with_agent_row() -> (AppState, WorkspaceLayout) {
+    pub(crate) fn make_state_with_agent_row() -> (AppState, WorkspaceLayout) {
         let ws_id = WorkspaceId::new();
         let agent_id = PaneId::new();
         let ws = WorkspaceInfo {
@@ -1730,5 +1730,78 @@ mod tests {
         assert!(worktree.bottom() <= force.y);
         assert!(force.bottom() <= cancel.y);
         assert!(cancel.right() <= confirm.x);
+    }
+
+    #[test]
+    fn setup_forms_outline_the_control_with_keyboard_focus() {
+        let (mut state, layout) = make_state_with_agent_row();
+        let (w, h) = (1200., 800.);
+        let theme = Theme::dark();
+        let assert_focus = |state: &AppState, controls: Vec<(bool, Rect)>, inset: f32| {
+            let (quads, base) = collect_quads(state, &layout, &theme, w, h, 1., (8., 19.));
+            assert!(controls.iter().any(|(focused, _)| *focused));
+            for (focused, rect) in controls {
+                let expected = if focused {
+                    theme.border_focused
+                } else {
+                    theme.border_unfocused
+                };
+                let top = [rect.x + inset, rect.y + inset, rect.width - 2. * inset, 1.];
+                assert!(
+                    quads[base as usize..]
+                        .iter()
+                        .any(|q| q.rect == top && q.color == expected.to_array())
+                );
+            }
+        };
+        state.workspace_form.begin(std::path::Path::new("/repo"));
+        state.workspace_form.focus = crate::workspace_form::Control::Folder;
+        assert_focus(
+            &state,
+            crate::workspace_form::controls(crate::workspace_form::modal_rect(w, h, 1.))
+                .map(|(c, r)| (c == state.workspace_form.focus, r))
+                .collect(),
+            2.,
+        );
+        state.workspace_form.open = false;
+        state.setup_review.begin(
+            "demo".into(),
+            "/repo".into(),
+            daedalus_proto::SetupInspection {
+                commands: vec![],
+                available: vec!["sh".into()],
+                host: "local".into(),
+                platform: "linux".into(),
+                dependency_install: None,
+            },
+        );
+        state
+            .setup_review
+            .set_focus(crate::setup_review::Control::Command(1));
+        assert_focus(
+            &state,
+            state
+                .setup_review
+                .controls(crate::setup_review::modal_rect(w, h, 1.))
+                .into_iter()
+                .map(|(c, r)| (c == state.setup_review.focus, r))
+                .collect(),
+            0.,
+        );
+        state.setup_review.open = false;
+        state.settings.begin(vec![]);
+        state.settings.activate(crate::settings::Control::Claude);
+        state
+            .settings
+            .set_focus(crate::settings::Control::Executable);
+        assert_focus(
+            &state,
+            state
+                .settings
+                .controls(crate::settings::modal_rect(w, h, 1.))
+                .map(|(c, r)| (c == state.settings.focus, r))
+                .collect(),
+            2.,
+        );
     }
 }

@@ -190,6 +190,46 @@ async fn interrupted_default_initialization_resumes_from_another_client() {
     };
     assert_eq!(done[0].panes.len(), 3);
     assert!(!done[0].needs_default_panes());
+    let replace = |old_pane_id, command| ClientMessage::ReplaceAgentPane {
+        workspace_id: ws.id,
+        old_pane_id,
+        command: Some(command),
+        cols: 40,
+        rows: 8,
+    };
+    assert!(matches!(
+        send_rpc_result(&mut second, 7, replace(None, sleep_command())).await,
+        Err(ProtoError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        send_rpc_result(
+            &mut second,
+            8,
+            replace(Some(agent.id), vec!["absent-agent-82f52".into()])
+        )
+        .await,
+        Err(ProtoError::SpawnFailed(_))
+    ));
+    let PaneSpawned(replacement) =
+        send_rpc(&mut second, 9, replace(Some(agent.id), sleep_command())).await
+    else {
+        panic!("expected replacement agent")
+    };
+    assert_ne!(agent.id, replacement.id);
+    assert!(
+        matches!(send_rpc_result(&mut second, 10, ClientMessage::GetSnapshot { pane_id: agent.id }).await,
+        Err(ProtoError::PaneNotFound(id)) if id == agent.id)
+    );
+    let Workspaces(updated) = send_rpc(&mut second, 11, ClientMessage::ListWorkspaces).await else {
+        panic!("expected workspace list")
+    };
+    assert_eq!(updated[0].panes.len(), 3);
+    assert!(
+        updated[0]
+            .panes
+            .iter()
+            .any(|pane| pane.id == replacement.id)
+    );
     drop(second);
     shutdown.send(()).unwrap();
     task.await.unwrap().unwrap();
@@ -996,19 +1036,33 @@ statuses = ["build", "test"]
     )
     .await;
 
-    // 1. Write 1-line JSON status for phrourion to events.sock
+    // Malformed records and oversized lines must not prevent a later status on the same connection.
     let mut hook_stream = IpcStream::connect(&events_sock).await.unwrap();
-    let ndjson = format!(
-        "{}\n",
-        serde_json::json!({
+    let mut records = Vec::from(&b"\xff\n \ninvalid json\n"[..]);
+    for event in [
+        serde_json::json!({"label": "missing source"}),
+        serde_json::json!({"source": "missing label"}),
+        serde_json::json!({"kind": "clear"}),
+        serde_json::json!({"kind": "agent_state"}),
+        serde_json::json!({"kind": "agent_state", "state": "invalid"}),
+        serde_json::json!({"kind": "unsupported"}),
+        serde_json::json!({"source": "oversized", "root_dir": ws_dir, "label": "x".repeat(72_000)}),
+    ] {
+        records.extend(serde_json::to_vec(&event).unwrap());
+        records.push(b'\n');
+    }
+    // EOF terminates this final record without a trailing newline.
+    records.extend(
+        serde_json::to_vec(&serde_json::json!({
             "source": "phrourion",
             "root_dir": ws_dir,
             "level": "warn",
             "label": "3 dirty",
             "detail": "2 modified, 1 untracked"
-        })
+        }))
+        .unwrap(),
     );
-    hook_stream.write_all(ndjson.as_bytes()).await.unwrap();
+    hook_stream.write_all(&records).await.unwrap();
     hook_stream.shutdown().await.unwrap();
     drop(hook_stream);
 
@@ -2813,7 +2867,16 @@ async fn daemon_uses_env_token_without_passing_it_to_panes() {
     })
     .await
     .expect("pane did not write marker");
-    daemon.kill().await.unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(daemon.id().unwrap() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(10), daemon.wait())
+        .await
+        .expect("daemon should shut down after SIGTERM")
+        .unwrap();
+    assert!(status.success(), "daemon exited with {status}");
     assert_eq!(result.trim(), "absent");
 }
 

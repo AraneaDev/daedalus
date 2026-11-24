@@ -1,4 +1,4 @@
-use super::DaedalusApp;
+use super::{DaedalusApp, ViewportMetrics};
 use daedalus_proto::{PaneId, PaneRole};
 use daedalus_ui::input::UiAction;
 use daedalus_ui::layout::overlays::{
@@ -166,12 +166,15 @@ fn search_click(bar: Rect, x: f32, y: f32) -> Option<UiAction> {
 
 impl DaedalusApp {
     pub(super) fn handle_left_mouse_down(&mut self) {
-        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
-            return;
-        };
-        let size = window.inner_size();
-        let scale_factor = window.scale_factor() as f32;
-        let cell = renderer.cell_size();
+        if let Some(metrics) = self.viewport_metrics() {
+            self.click_at(metrics);
+        }
+    }
+
+    pub(super) fn click_at(&mut self, metrics: ViewportMetrics) {
+        let ViewportMetrics {
+            size, scale_factor, ..
+        } = metrics;
         match handle_overlay_click(
             &mut self.state,
             self.pointer.position,
@@ -193,15 +196,18 @@ impl DaedalusApp {
             Some(OverlayClick::ConfirmAction) => self.confirm_workspace_action(),
             Some(OverlayClick::ApplyPreset(preset)) => self.apply_agent_preset(preset, false),
             Some(OverlayClick::Action(action)) => self.handle_ui_action(action),
-            None => self.handle_viewport_click(scale_factor, cell),
+            None => self.handle_viewport_click(metrics),
         }
     }
 
-    fn handle_viewport_click(&mut self, scale_factor: f32, (cell_w, cell_h): (f32, f32)) {
+    fn handle_viewport_click(&mut self, metrics: ViewportMetrics) {
+        let ViewportMetrics {
+            scale_factor,
+            cell: (cell_w, cell_h),
+            ..
+        } = metrics;
         let (x, y) = self.pointer.position;
-        let Some(layout) = self.compute_current_layout() else {
-            return;
-        };
+        let layout = self.layout_for(metrics);
         if let Some(search) = self.state.search.as_ref()
             && let Some(role) = self
                 .state
@@ -246,13 +252,16 @@ impl DaedalusApp {
 
         match target {
             HitTarget::SidebarPageUp | HitTarget::SidebarPageDown => {
-                if let Some(list) = self.sidebar_list() {
+                if let Some(list) = &layout.sidebar_content {
                     let page = list.visible.len() as isize;
-                    self.scroll_sidebar(if target == HitTarget::SidebarPageUp {
-                        -page
-                    } else {
-                        page
-                    });
+                    self.scroll_sidebar(
+                        list,
+                        if target == HitTarget::SidebarPageUp {
+                            -page
+                        } else {
+                            page
+                        },
+                    );
                 }
             }
             HitTarget::ToggleSidebar => self.handle_ui_action(UiAction::ToggleSidebar),
@@ -316,16 +325,20 @@ impl DaedalusApp {
     pub(super) fn handle_cursor_moved(&mut self, x: f32, y: f32) {
         self.pointer.position = (x, y);
 
+        if self.pointer.drag_anchor.is_some()
+            && let Some(metrics) = self.viewport_metrics()
+        {
+            self.drag_selection(metrics);
+        }
+    }
+
+    pub(super) fn drag_selection(&mut self, metrics: ViewportMetrics) {
         let Some((drag_role, drag_pane_id, anchor)) = self.pointer.drag_anchor else {
             return;
         };
-        let Some(renderer) = self.renderer.as_ref() else {
-            return;
-        };
-        let (cell_w, cell_h) = renderer.cell_size();
-        let Some(layout) = self.compute_current_layout() else {
-            return;
-        };
+        let (x, y) = self.pointer.position;
+        let (cell_w, cell_h) = metrics.cell;
+        let layout = self.layout_for(metrics);
         let Some(pane_rect) = layout.pane(drag_role) else {
             return;
         };

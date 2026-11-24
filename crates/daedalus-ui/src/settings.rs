@@ -640,4 +640,82 @@ mod tests {
         assert_eq!(dialog.focus, Executable);
         assert!(dialog.error.is_some());
     }
+
+    #[test]
+    fn argument_pagination_tracks_focus_and_returns_to_invalid_argument_on_save() {
+        let mut dialog = SettingsDialog::default();
+        dialog.begin(vec![]);
+        dialog.activate(Codex);
+        for i in 0..=PAGE_SIZE {
+            dialog.activate(AddArgument);
+            dialog.insert_text(&format!("arg{i}"));
+        }
+        assert_eq!(dialog.focus, Argument(PAGE_SIZE));
+        let last_page = dialog.revision();
+        assert!(!dialog.enabled(NextArguments));
+        dialog.activate(PreviousArguments);
+        assert_ne!(dialog.revision(), last_page);
+        assert_eq!(dialog.focus, Argument(0));
+        assert!(dialog.control_order().any(|c| c == Argument(0)));
+        assert!(!dialog.control_order().any(|c| c == Argument(PAGE_SIZE)));
+        dialog.activate(NextArguments);
+        assert_eq!(dialog.focus, Argument(PAGE_SIZE));
+        let SettingsAction::Save(mut saved) = dialog.activate(Save) else {
+            panic!("valid arguments should save");
+        };
+        saved[0].argv[1 + PAGE_SIZE] = "bad\0argument".into();
+        dialog.begin(saved);
+        dialog.activate(Save);
+        assert_eq!(dialog.focus, Argument(PAGE_SIZE));
+        assert!(dialog.control_order().any(|c| c == Argument(PAGE_SIZE)));
+        assert!(
+            dialog
+                .accessibility_description()
+                .contains("null character")
+        );
+        dialog.activate(DropArgument(PAGE_SIZE));
+        assert_eq!(dialog.focus, Argument(PAGE_SIZE - 1));
+        let SettingsAction::Save(entries) = dialog.activate(Save) else {
+            panic!("could not save corrected arguments");
+        };
+        assert_eq!(entries[0].argv.len(), 1 + PAGE_SIZE);
+    }
+
+    #[test]
+    fn keyboard_navigation_replaces_selection_and_saves_a_changed_assignment_role() {
+        let mut dialog = SettingsDialog::default();
+        dialog.begin(vec![]);
+        let named = |dialog: &mut SettingsDialog, key| {
+            dialog.key(&Key::Named(key), ModifiersState::empty())
+        };
+        dialog.activate(Claude);
+        named(&mut dialog, NamedKey::ArrowLeft);
+        assert_eq!(dialog.selection(Name), 0..0);
+        named(&mut dialog, NamedKey::Delete);
+        assert_eq!(dialog.value(Name), Some("laude"));
+        named(&mut dialog, NamedKey::End);
+        named(&mut dialog, NamedKey::Backspace);
+        dialog.key(&Key::Character("a".into()), ModifiersState::CONTROL);
+        assert_eq!(dialog.selection(Name), 0..4);
+        dialog.key(&Key::Character("build".into()), ModifiersState::empty());
+        named(&mut dialog, NamedKey::Tab);
+        assert_eq!(dialog.focus, Role);
+        for role in [PaneRole::Service, PaneRole::Runner, PaneRole::Agent] {
+            named(&mut dialog, NamedKey::Enter);
+            assert!(dialog.label(Role).contains(&role.to_string()));
+        }
+        dialog.key(&Key::Named(NamedKey::Tab), ModifiersState::SHIFT);
+        assert_eq!(dialog.focus, Name);
+        let SettingsAction::Save(entries) =
+            dialog.key(&Key::Character("s".into()), ModifiersState::CONTROL)
+        else {
+            panic!("save shortcut was ignored");
+        };
+        assert_eq!(entries[0].name, "build");
+        assert_eq!(entries[0].argv, ["claude"]);
+        assert!(matches!(
+            named(&mut dialog, NamedKey::Escape),
+            SettingsAction::Cancel
+        ));
+    }
 }

@@ -126,6 +126,13 @@ impl UiEventSink for EventLoopProxySink {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ViewportMetrics {
+    size: winit::dpi::PhysicalSize<u32>,
+    scale_factor: f32,
+    cell: (f32, f32),
+}
+
 struct DaedalusApp {
     config: BridgeConfig,
     ui_config: UiConfig,
@@ -133,14 +140,14 @@ struct DaedalusApp {
     history: daedalus_ui::activity_history::ActivityHistory,
     focused: bool,
     occluded: bool,
-    proxy: EventLoopProxy<AppEvent>,
+    proxy: Option<EventLoopProxy<AppEvent>>,
     window: Option<Arc<Window>>,
     renderer: Option<GpuRenderer>,
     accessibility: Option<accesskit_winit::Adapter>,
     accessibility_active: bool,
     terminal_controls: accessibility::TerminalControls,
     last_accessibility_tree: Option<accesskit::TreeUpdate>,
-    bridge: Option<DaemonBridge>,
+    bridge: Option<Box<dyn Fn(UiCommand) -> bool>>,
     state: AppState,
     modifiers: ModifiersState,
     key_repeats: KeyRepeatGuard,
@@ -154,7 +161,7 @@ impl DaedalusApp {
     fn new(
         config: BridgeConfig,
         ui_config: UiConfig,
-        proxy: EventLoopProxy<AppEvent>,
+        proxy: Option<EventLoopProxy<AppEvent>>,
         profile: &std::path::Path,
     ) -> Self {
         Self {
@@ -206,7 +213,7 @@ impl DaedalusApp {
     }
 
     fn send_command(&self, cmd: UiCommand) -> bool {
-        self.bridge.as_ref().is_some_and(|bridge| bridge.send(cmd))
+        self.bridge.as_ref().is_some_and(|bridge| bridge(cmd))
     }
 
     fn schedule_resize_flush(&mut self) {
@@ -217,15 +224,29 @@ impl DaedalusApp {
         self.state.connection != ConnectionState::Connected || self.state.toast.is_some()
     }
 
-    fn compute_current_layout(&self) -> Option<WorkspaceLayout> {
+    fn viewport_metrics(&self) -> Option<ViewportMetrics> {
         let window = self.window.as_ref()?;
-        let renderer = self.renderer.as_ref()?;
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
             return None;
         }
-        let scale_factor = window.scale_factor() as f32;
-        let (cell_w, cell_h) = renderer.cell_size();
+        Some(ViewportMetrics {
+            size,
+            scale_factor: window.scale_factor() as f32,
+            cell: self.renderer.as_ref()?.cell_size(),
+        })
+    }
+
+    fn compute_current_layout(&self) -> Option<WorkspaceLayout> {
+        Some(self.layout_for(self.viewport_metrics()?))
+    }
+
+    fn layout_for(&self, metrics: ViewportMetrics) -> WorkspaceLayout {
+        let ViewportMetrics {
+            size,
+            scale_factor,
+            cell: (cell_w, cell_h),
+        } = metrics;
         let mut layout = compute_layout(&LayoutInput {
             window_w: size.width as f32,
             window_h: size.height as f32,
@@ -274,7 +295,7 @@ impl DaedalusApp {
         if self.state.active_test_workspace().is_some() {
             layout.enable_run_tests(scale_factor);
         }
-        Some(layout)
+        layout
     }
 
     fn flush_due_resizes(&mut self, force: bool) {
@@ -295,6 +316,10 @@ impl DaedalusApp {
             return;
         };
 
+        self.resize_panes(&layout);
+    }
+
+    fn resize_panes(&mut self, layout: &WorkspaceLayout) {
         let mut pending = Vec::new();
         for pane_rect in &layout.panes {
             let Some(pane_id) = self.state.pane_id_for_role(pane_rect.role) else {
@@ -483,15 +508,17 @@ impl DaedalusApp {
         }
     }
 
-    fn scroll_sidebar(&mut self, delta: isize) {
-        if let Some(list) = self.sidebar_list() {
-            self.state.sidebar_first = list
-                .visible
-                .start
-                .saturating_add_signed(delta)
-                .min(list.max_first);
-            self.request_redraw();
-        }
+    fn scroll_sidebar(
+        &mut self,
+        list: &daedalus_ui::sidebar_content::SidebarContent,
+        delta: isize,
+    ) {
+        self.state.sidebar_first = list
+            .visible
+            .start
+            .saturating_add_signed(delta)
+            .min(list.max_first);
+        self.request_redraw();
     }
 
     fn switch_workspace_by(&mut self, delta: isize) {
@@ -1004,6 +1031,100 @@ impl DaedalusApp {
         }
     }
 
+    fn key_pressed(
+        &mut self,
+        physical_key: winit::keyboard::PhysicalKey,
+        logical_key: &winit::keyboard::Key,
+        text: Option<&str>,
+        repeat: bool,
+    ) {
+        if let Some(choices) = &mut self.state.failure_recipients {
+            self.key_repeats.suppress(physical_key);
+            use winit::keyboard::{Key, NamedKey};
+            match logical_key {
+                Key::Named(NamedKey::ArrowUp) => choices.advance(-1),
+                Key::Named(NamedKey::ArrowDown) => choices.advance(1),
+                Key::Named(NamedKey::Escape) => self.state.failure_recipients = None,
+                Key::Named(NamedKey::Enter) if !repeat => {
+                    if let Some(choices) = self.state.failure_recipients.take() {
+                        self.send_failure_to_recipient(choices);
+                    }
+                }
+                _ => {}
+            }
+            self.request_redraw();
+            return;
+        }
+        if self.state.workspace_form.open
+            || self.state.settings.open
+            || self.state.setup_review.open
+        {
+            if self
+                .key_repeats
+                .form_press(physical_key, logical_key, repeat)
+            {
+                if self.state.setup_review.open {
+                    self.setup_key(logical_key);
+                } else if self.state.workspace_form.open {
+                    self.workspace_form_key(logical_key);
+                } else {
+                    self.settings_key(logical_key);
+                }
+            }
+            return;
+        }
+        if self.handle_recap_key(logical_key, repeat) {
+            self.key_repeats.suppress(physical_key);
+            return;
+        }
+        let action = translate_key(
+            logical_key,
+            text,
+            self.modifiers,
+            self.state.picker.open,
+            self.state.worktree_modal.open,
+            self.state.close_modal.open,
+            self.state.search.is_some(),
+            self.state.action_palette.open,
+        );
+        let action = self.key_repeats.press(physical_key, repeat, action);
+        self.handle_ui_action(action);
+    }
+
+    fn commit_text(&mut self, text: String) {
+        if self.state.failure_recipients.is_some() || self.state.recap.keyboard_row.is_some() {
+            return;
+        }
+        if self.state.setup_review.open {
+            self.state.setup_review.insert_text(&text);
+            self.request_redraw();
+            return;
+        }
+        if self.state.workspace_form.open {
+            self.state.workspace_form.insert_text(&text);
+            self.request_redraw();
+            return;
+        }
+        if self.state.settings.open {
+            self.state.settings.insert_text(&text);
+            self.request_redraw();
+            return;
+        }
+        if self.state.picker.open || self.state.close_modal.open || self.state.action_palette.open {
+            // Selection and confirmation modals swallow IME text.
+        } else if self.state.worktree_modal.open {
+            if let Some(cleaned) = filter_modal_text(&text, false) {
+                self.handle_ui_action(UiAction::WorktreeModalText(cleaned));
+            }
+        } else if self.state.search.is_some() {
+            if let Some(cleaned) = filter_modal_text(&text, true) {
+                self.handle_ui_action(UiAction::SearchText(cleaned));
+            }
+        } else if !text.is_empty() && !text.chars().all(char::is_control) {
+            self.handle_ui_action(UiAction::SendBytes(text.into_bytes()));
+        }
+    }
+
     fn handle_recap_key(&mut self, key: &winit::keyboard::Key, repeat: bool) -> bool {
         use winit::keyboard::{Key, NamedKey};
         if self.state.picker.open
@@ -1098,14 +1219,17 @@ impl DaedalusApp {
     }
 
     fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
+        self.scroll_at(self.viewport_metrics(), delta);
+    }
+
+    fn scroll_at(&mut self, metrics: Option<ViewportMetrics>, delta: MouseScrollDelta) {
+        let scale_factor = metrics.map_or(1., |m| m.scale_factor);
         if let Some(choices) = &mut self.state.failure_recipients {
-            let dpi = self
-                .window
-                .as_ref()
-                .map_or(1.0, |w| w.scale_factor() as f32);
-            let steps =
-                self.wheel_scroll
-                    .steps(ScrollTarget::Recipients, delta, picker_row_stride(dpi));
+            let steps = self.wheel_scroll.steps(
+                ScrollTarget::Recipients,
+                delta,
+                picker_row_stride(scale_factor),
+            );
             choices.advance(steps.saturating_neg());
             self.request_redraw();
             return;
@@ -1126,10 +1250,10 @@ impl DaedalusApp {
             self.wheel_scroll = WheelScroll::default();
             return;
         }
-        let Some(window) = self.window.as_ref() else {
+        let Some(metrics) = metrics else {
             return;
         };
-        let scale_factor = window.scale_factor() as f32;
+
         if self.state.picker.open || self.state.action_palette.open {
             let (target, count, selected) = if self.state.picker.open {
                 (
@@ -1156,17 +1280,14 @@ impl DaedalusApp {
             }
             return;
         }
-        let Some(renderer) = self.renderer.as_ref() else {
-            return;
-        };
-        let (cell_w, cell_h) = renderer.cell_size();
-        let Some(layout) = self.compute_current_layout() else {
-            return;
-        };
+        let (cell_w, cell_h) = metrics.cell;
+        let layout = self.layout_for(metrics);
 
-        if layout.sidebar.is_some_and(|sidebar| {
-            sidebar.contains(self.pointer.position.0, self.pointer.position.1)
-        }) {
+        if let Some(list) = layout.sidebar_content.as_ref()
+            && layout.sidebar.is_some_and(|sidebar| {
+                sidebar.contains(self.pointer.position.0, self.pointer.position.1)
+            })
+        {
             let metrics = daedalus_ui::layout::LayoutMetrics::for_scale(scale_factor);
             let steps = self.wheel_scroll.steps(
                 ScrollTarget::Sidebar,
@@ -1174,7 +1295,7 @@ impl DaedalusApp {
                 metrics.sidebar_row_height + metrics.sidebar_row_gap,
             );
             if steps != 0 {
-                self.scroll_sidebar(steps.saturating_neg());
+                self.scroll_sidebar(list, steps.saturating_neg());
             }
             return;
         }
@@ -1207,112 +1328,8 @@ impl DaedalusApp {
     }
 }
 
-impl ApplicationHandler<AppEvent> for DaedalusApp {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-
-        let attrs = Window::default_attributes()
-            .with_visible(false)
-            .with_title("Daedalus Workbench")
-            .with_inner_size(LogicalSize::new(
-                INITIAL_WINDOW_WIDTH,
-                INITIAL_WINDOW_HEIGHT,
-            ));
-
-        let window = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(err) => {
-                error!(error = %err, "failed to create window");
-                event_loop.exit();
-                return;
-            }
-        };
-        self.accessibility = Some(accesskit_winit::Adapter::with_event_loop_proxy(
-            event_loop,
-            &window,
-            self.proxy.clone(),
-        ));
-        window.set_ime_allowed(true);
-
-        let theme = Theme::from_preset(self.ui_config.theme);
-        let renderer = match GpuRenderer::new(
-            Arc::clone(&window),
-            theme,
-            self.ui_config.font_size,
-            self.ui_config.font_family.as_deref(),
-        ) {
-            Ok(r) => r,
-            Err(err) => {
-                error!(error = %err, "failed to initialize GPU renderer");
-                event_loop.exit();
-                return;
-            }
-        };
-
-        let sink = Arc::new(EventLoopProxySink(self.proxy.clone()));
-        let bridge = DaemonBridge::start(self.config.clone(), sink);
-
-        window.set_visible(true);
-        self.focused = window.has_focus();
-        self.state.recap.focus(self.focused);
-        window.request_redraw();
-        self.window = Some(window);
-        self.renderer = Some(renderer);
-        self.bridge = Some(bridge);
-    }
-
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
-        let event = match event {
-            AppEvent::Daemon(event) => event,
-            AppEvent::Accessibility(event) => {
-                if self
-                    .window
-                    .as_ref()
-                    .is_some_and(|window| window.id() == event.window_id)
-                {
-                    match event.window_event {
-                        accesskit_winit::WindowEvent::InitialTreeRequested => {
-                            self.accessibility_active = true;
-                            self.last_accessibility_tree = None;
-                        }
-                        accesskit_winit::WindowEvent::AccessibilityDeactivated => {
-                            self.accessibility_active = false;
-                            self.last_accessibility_tree = None;
-                        }
-                        accesskit_winit::WindowEvent::ActionRequested(request) => {
-                            if self.accessibility_active {
-                                if let Some(action) =
-                                    accessibility::setup_action(&mut self.state, &request)
-                                {
-                                    self.handle_setup_action(action);
-                                } else if let Some(target) =
-                                    self.terminal_controls.action(&self.state, &request)
-                                {
-                                    self.activate_session(target);
-                                } else if let Some(action) =
-                                    accessibility::settings_action(&mut self.state, &request)
-                                {
-                                    self.handle_settings_action(action);
-                                } else if let Some(action) =
-                                    accessibility::workspace_action(&mut self.state, &request)
-                                {
-                                    self.handle_workspace_form(action);
-                                } else if let Some(action) = accessibility::action(
-                                    &self.state,
-                                    &request,
-                                    &self.terminal_controls,
-                                ) {
-                                    self.handle_ui_action(action);
-                                }
-                            }
-                        }
-                    }
-                }
-                return;
-            }
-        };
+impl DaedalusApp {
+    fn handle_daemon_event(&mut self, event: UiEvent) {
         let previous_workspace = self.state.active_workspace_id;
         let search_generation = self.state.search.as_ref().map(|search| search.generation);
         self.state
@@ -1564,6 +1581,119 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
         self.flush_due_resizes(false);
         self.request_redraw();
     }
+}
+
+impl ApplicationHandler<AppEvent> for DaedalusApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+
+        let Some(proxy) = self.proxy.as_ref() else {
+            return;
+        };
+        let attrs = Window::default_attributes()
+            .with_visible(false)
+            .with_title("Daedalus Workbench")
+            .with_inner_size(LogicalSize::new(
+                INITIAL_WINDOW_WIDTH,
+                INITIAL_WINDOW_HEIGHT,
+            ));
+
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(err) => {
+                error!(error = %err, "failed to create window");
+                event_loop.exit();
+                return;
+            }
+        };
+        self.accessibility = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+            event_loop,
+            &window,
+            proxy.clone(),
+        ));
+        window.set_ime_allowed(true);
+
+        let theme = Theme::from_preset(self.ui_config.theme);
+        let renderer = match GpuRenderer::new(
+            Arc::clone(&window),
+            theme,
+            self.ui_config.font_size,
+            self.ui_config.font_family.as_deref(),
+        ) {
+            Ok(r) => r,
+            Err(err) => {
+                error!(error = %err, "failed to initialize GPU renderer");
+                event_loop.exit();
+                return;
+            }
+        };
+
+        let sink = Arc::new(EventLoopProxySink(proxy.clone()));
+        let bridge = DaemonBridge::start(self.config.clone(), sink);
+
+        window.set_visible(true);
+        self.focused = window.has_focus();
+        self.state.recap.focus(self.focused);
+        window.request_redraw();
+        self.window = Some(window);
+        self.renderer = Some(renderer);
+        self.bridge = Some(Box::new(move |command| bridge.send(command)));
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        let event = match event {
+            AppEvent::Daemon(event) => event,
+            AppEvent::Accessibility(event) => {
+                if self
+                    .window
+                    .as_ref()
+                    .is_some_and(|window| window.id() == event.window_id)
+                {
+                    match event.window_event {
+                        accesskit_winit::WindowEvent::InitialTreeRequested => {
+                            self.accessibility_active = true;
+                            self.last_accessibility_tree = None;
+                        }
+                        accesskit_winit::WindowEvent::AccessibilityDeactivated => {
+                            self.accessibility_active = false;
+                            self.last_accessibility_tree = None;
+                        }
+                        accesskit_winit::WindowEvent::ActionRequested(request) => {
+                            if self.accessibility_active {
+                                if let Some(action) =
+                                    accessibility::setup_action(&mut self.state, &request)
+                                {
+                                    self.handle_setup_action(action);
+                                } else if let Some(target) =
+                                    self.terminal_controls.action(&self.state, &request)
+                                {
+                                    self.activate_session(target);
+                                } else if let Some(action) =
+                                    accessibility::settings_action(&mut self.state, &request)
+                                {
+                                    self.handle_settings_action(action);
+                                } else if let Some(action) =
+                                    accessibility::workspace_action(&mut self.state, &request)
+                                {
+                                    self.handle_workspace_form(action);
+                                } else if let Some(action) = accessibility::action(
+                                    &self.state,
+                                    &request,
+                                    &self.terminal_controls,
+                                ) {
+                                    self.handle_ui_action(action);
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        };
+        self.handle_daemon_event(event);
+    }
 
     fn window_event(
         &mut self,
@@ -1577,9 +1707,7 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
         match event {
             WindowEvent::CloseRequested => {
                 // Shut down only the client bridge; leave `daedalusd` and running PTYs alive.
-                if let Some(bridge) = self.bridge.take() {
-                    bridge.shutdown();
-                }
+                self.bridge.take();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -1647,100 +1775,15 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 } else if is_synthetic {
                     self.key_repeats.suppress(event.physical_key);
                 } else {
-                    if let Some(choices) = &mut self.state.failure_recipients {
-                        self.key_repeats.suppress(event.physical_key);
-                        use winit::keyboard::{Key, NamedKey};
-                        match event.logical_key {
-                            Key::Named(NamedKey::ArrowUp) => choices.advance(-1),
-                            Key::Named(NamedKey::ArrowDown) => choices.advance(1),
-                            Key::Named(NamedKey::Escape) => self.state.failure_recipients = None,
-                            Key::Named(NamedKey::Enter) if !event.repeat => {
-                                if let Some(choices) = self.state.failure_recipients.take() {
-                                    self.send_failure_to_recipient(choices);
-                                }
-                            }
-                            _ => {}
-                        }
-                        self.request_redraw();
-                        return;
-                    }
-                    if self.state.workspace_form.open
-                        || self.state.settings.open
-                        || self.state.setup_review.open
-                    {
-                        if self.key_repeats.form_press(
-                            event.physical_key,
-                            &event.logical_key,
-                            event.repeat,
-                        ) {
-                            if self.state.setup_review.open {
-                                self.setup_key(&event.logical_key);
-                            } else if self.state.workspace_form.open {
-                                self.workspace_form_key(&event.logical_key);
-                            } else {
-                                self.settings_key(&event.logical_key);
-                            }
-                        }
-                        return;
-                    }
-                    if self.handle_recap_key(&event.logical_key, event.repeat) {
-                        self.key_repeats.suppress(event.physical_key);
-                        return;
-                    }
-                    let action = translate_key(
+                    self.key_pressed(
+                        event.physical_key,
                         &event.logical_key,
                         event.text.as_deref(),
-                        self.modifiers,
-                        self.state.picker.open,
-                        self.state.worktree_modal.open,
-                        self.state.close_modal.open,
-                        self.state.search.is_some(),
-                        self.state.action_palette.open,
+                        event.repeat,
                     );
-                    let action = self
-                        .key_repeats
-                        .press(event.physical_key, event.repeat, action);
-                    self.handle_ui_action(action);
                 }
             }
-            WindowEvent::Ime(Ime::Commit(text)) => {
-                if self.state.failure_recipients.is_some()
-                    || self.state.recap.keyboard_row.is_some()
-                {
-                    return;
-                }
-                if self.state.setup_review.open {
-                    self.state.setup_review.insert_text(&text);
-                    self.request_redraw();
-                    return;
-                }
-                if self.state.workspace_form.open {
-                    self.state.workspace_form.insert_text(&text);
-                    self.request_redraw();
-                    return;
-                }
-                if self.state.settings.open {
-                    self.state.settings.insert_text(&text);
-                    self.request_redraw();
-                    return;
-                }
-                if self.state.picker.open
-                    || self.state.close_modal.open
-                    || self.state.action_palette.open
-                {
-                    // Selection and confirmation modals swallow IME text.
-                } else if self.state.worktree_modal.open {
-                    if let Some(cleaned) = filter_modal_text(&text, false) {
-                        self.handle_ui_action(UiAction::WorktreeModalText(cleaned));
-                    }
-                } else if self.state.search.is_some() {
-                    if let Some(cleaned) = filter_modal_text(&text, true) {
-                        self.handle_ui_action(UiAction::SearchText(cleaned));
-                    }
-                } else if !text.is_empty() && !text.chars().all(char::is_control) {
-                    self.handle_ui_action(UiAction::SendBytes(text.into_bytes()));
-                }
-            }
+            WindowEvent::Ime(Ime::Commit(text)) => self.commit_text(text),
             WindowEvent::CursorMoved { position, .. } => {
                 self.handle_cursor_moved(position.x as f32, position.y as f32);
             }
@@ -1902,7 +1945,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = DaedalusApp::new(
         config,
         ui_config,
-        proxy,
+        Some(proxy),
         &args
             .config
             .unwrap_or_else(daedalus_proto::default_config_file_path),
@@ -1960,3 +2003,6 @@ mod tests {
         assert_eq!(wheel.steps(other, lines(-1.0), 40.0), -3);
     }
 }
+
+#[cfg(test)]
+mod controller_tests;
