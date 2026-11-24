@@ -25,15 +25,15 @@ use crate::theme::{self, Theme};
 
 pub const FONT_SIZE_LOGICAL: f32 = 14.0;
 pub const LINE_HEIGHT_LOGICAL: f32 = 19.0;
-const CHROME_FONT_SIZE_LOGICAL: f32 = 12.5;
-const CHROME_LINE_HEIGHT_LOGICAL: f32 = 16.0;
-const CHROME_BTN_FONT_SIZE_LOGICAL: f32 = 11.5;
-const CHROME_SUB_FONT_SIZE_LOGICAL: f32 = 11.0;
-const CHROME_SUB_LINE_HEIGHT_LOGICAL: f32 = 14.0;
-const CHROME_BADGE_FONT_SIZE_LOGICAL: f32 = 10.0;
-const CHROME_BADGE_LINE_HEIGHT_LOGICAL: f32 = 12.0;
-const MODAL_TITLE_FONT_SIZE_LOGICAL: f32 = 13.5;
-const MODAL_TITLE_LINE_HEIGHT_LOGICAL: f32 = 18.0;
+const CHROME_FONT_SIZE_LOGICAL: f32 = 14.0;
+const CHROME_LINE_HEIGHT_LOGICAL: f32 = 19.0;
+const CHROME_BTN_FONT_SIZE_LOGICAL: f32 = CHROME_FONT_SIZE_LOGICAL;
+const CHROME_SUB_FONT_SIZE_LOGICAL: f32 = 12.0;
+const CHROME_SUB_LINE_HEIGHT_LOGICAL: f32 = 16.0;
+const CHROME_BADGE_FONT_SIZE_LOGICAL: f32 = CHROME_SUB_FONT_SIZE_LOGICAL;
+const CHROME_BADGE_LINE_HEIGHT_LOGICAL: f32 = CHROME_SUB_LINE_HEIGHT_LOGICAL;
+const MODAL_TITLE_FONT_SIZE_LOGICAL: f32 = 18.0;
+const MODAL_TITLE_LINE_HEIGHT_LOGICAL: f32 = 24.0;
 
 const PREFERRED_MONO_FAMILIES: [&str; 3] = ["JetBrains Mono", "Cascadia Mono", "DejaVu Sans Mono"];
 
@@ -681,18 +681,18 @@ impl TextRenderer {
         self.atlas.trim();
     }
 
-    fn build_chrome_item(&mut self, spec: ChromeLineSpec<'_>) -> Option<ChromeTextItem> {
+    fn build_chrome_item(
+        &mut self,
+        spec: ChromeLineSpec<'_>,
+        centered: bool,
+    ) -> Option<ChromeTextItem> {
         if spec.max_w <= 1.0 || spec.bounds.width <= 0.0 || spec.bounds.height <= 0.0 {
             return None;
         }
         let s = self.scale_factor;
         let metrics = Metrics::new(spec.font_size_logical * s, spec.line_height_logical * s);
-        let family = self
-            .mono_family_name
-            .as_deref()
-            .map_or(Family::Monospace, Family::Name);
         let mut attrs = Attrs::new()
-            .family(family)
+            .family(Family::SansSerif)
             .color(spec.color.to_glyphon_color());
         if spec.bold {
             attrs = attrs.weight(Weight::BOLD);
@@ -700,6 +700,8 @@ impl TextRenderer {
 
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_wrap(Wrap::None);
+        use glyphon::cosmic_text::{Ellipsize, EllipsizeHeightLimit};
+        buffer.set_ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)));
         buffer.set_size(
             Some(spec.max_w.max(1.0)),
             Some((spec.line_height_logical * s) * 1.5),
@@ -718,23 +720,45 @@ impl TextRenderer {
             buffer.shape_until_scroll(&mut self.font_system, false);
         }
 
+        let (left, top) = if centered {
+            let width = buffer.layout_runs().next().map_or(0.0, |run| run.line_w);
+            let inset = (spec.bounds.width - width.min(spec.max_w)) * 0.5;
+            (
+                (spec.bounds.x + inset).round(),
+                (spec.bounds.y + (spec.bounds.height - metrics.line_height) * 0.5).round(),
+            )
+        } else {
+            (spec.left, spec.top)
+        };
         Some(ChromeTextItem {
             buffer,
-            left: spec.left,
-            top: spec.top,
+            left,
+            top,
             bounds: rect_to_bounds(spec.bounds),
             default_color: spec.color.to_glyphon_color(),
         })
     }
 
     fn push_chrome_line(&mut self, spec: ChromeLineSpec<'_>) {
-        if let Some(item) = self.build_chrome_item(spec) {
+        if let Some(item) = self.build_chrome_item(spec, false) {
             self.chrome_items.push(item);
         }
     }
 
+    fn push_chrome_button(&mut self, spec: ChromeLineSpec<'_>) {
+        if let Some(item) = self.build_chrome_item(spec, true) {
+            self.chrome_items.push(item);
+        }
+    }
+
+    fn push_modal_button(&mut self, spec: ChromeLineSpec<'_>) {
+        if let Some(item) = self.build_chrome_item(spec, true) {
+            self.modal_items.push(item);
+        }
+    }
+
     fn push_modal_line(&mut self, spec: ChromeLineSpec<'_>) {
-        if let Some(item) = self.build_chrome_item(spec) {
+        if let Some(item) = self.build_chrome_item(spec, false) {
             self.modal_items.push(item);
         }
     }

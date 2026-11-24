@@ -53,6 +53,32 @@ impl Frame {
 }
 
 #[test]
+fn dialog_titles_and_actions_share_their_type_scale() {
+    let mut frame = Frame::new();
+    let sizes = |frame: &mut Frame, title: &str, action: &str| {
+        frame.labels(1000.0, 570.0);
+        [title, action].map(|label| {
+            frame
+                .renderer
+                .modal_items
+                .iter()
+                .find(|item| item.buffer.lines[0].text() == label)
+                .expect("visible control")
+                .buffer
+                .metrics()
+                .font_size
+        })
+    };
+    frame.state.settings.begin(vec![]);
+    let settings = sizes(&mut frame, "Workspace assignments", "Cancel");
+    frame.state.settings.open = false;
+    frame.state.worktree_modal.open();
+    let worktree = sizes(&mut frame, "New Git Worktree", "Cancel (Esc)");
+    assert_eq!(settings, worktree);
+    assert!(settings[0] > settings[1]);
+}
+
+#[test]
 fn preset_and_action_pickers_replace_the_previous_selection_and_empty_hint() {
     let mut frame = Frame::new();
     frame.state.picker.open = true;
@@ -164,7 +190,20 @@ fn search_frame_displays_query_case_and_received_empty_result() {
 fn settings_frame_shows_selected_command_and_validation_feedback() {
     let mut frame = Frame::new();
     frame.state.settings.begin(vec![]);
-    assert!(frame.labels(1200., 800.).contains(&"▸ + Command".into()));
+    frame.labels(1200., 800.);
+    let add = frame
+        .renderer
+        .modal_items
+        .iter()
+        .find(|item| item.buffer.lines[0].text() == "+ Command")
+        .unwrap();
+    let width = add.buffer.layout_runs().next().unwrap().line_w;
+    let left_gap = add.left - add.bounds.left as f32;
+    let right_gap = add.bounds.right as f32 - add.left - width;
+    assert!(
+        (left_gap - right_gap).abs() <= 2.0,
+        "button gutters: {left_gap}, {right_gap}"
+    );
     frame.state.settings.activate(Control::Codex);
     frame.state.settings.set_focus(Control::Executable);
     frame.state.settings.set_value(Control::Executable, "");

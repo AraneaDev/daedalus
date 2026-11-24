@@ -51,9 +51,9 @@ impl TextRenderer {
         let area = form.form_area(modal);
         let scale = dpi.min(area.height / 236.0).min(modal.width / 330.0);
         let glyph_width = self.cell_w * (14.0 * scale) / (self.font_size_logical * dpi);
-        let mut line = |text: &str, rect: Rect, size: f32, color, bold| {
+        let mut line = |text: &str, rect: Rect, size: f32, color, bold, centered| {
             let inset = 4.0 * scale;
-            self.push_modal_line(ChromeLineSpec {
+            let spec = ChromeLineSpec {
                 text,
                 left: rect.x + inset,
                 top: rect.y + (rect.height - size * 1.4 * scale) / 2.0,
@@ -63,7 +63,12 @@ impl TextRenderer {
                 line_height_logical: size * 1.4 * scale / dpi,
                 color,
                 bold,
-            });
+            };
+            if centered {
+                self.push_modal_button(spec);
+            } else {
+                self.push_modal_line(spec);
+            }
         };
         let row = |y: f32, h: f32| {
             Rect::new(
@@ -74,14 +79,22 @@ impl TextRenderer {
             )
         };
         if let Some(band) = form.recent_heading(modal) {
-            line("Recent projects", band, 17.0, theme.text_primary, true);
+            line(
+                "Recent projects",
+                band,
+                super::MODAL_TITLE_FONT_SIZE_LOGICAL,
+                theme.text_primary,
+                true,
+                false,
+            );
         }
         line(
             form.heading(),
             row(0.02, 0.17),
-            17.0,
+            super::MODAL_TITLE_FONT_SIZE_LOGICAL,
             theme.text_primary,
             true,
+            false,
         );
         for (control, rect) in form.controls(modal) {
             let active = control == form.focus;
@@ -99,6 +112,10 @@ impl TextRenderer {
                     theme.text_primary
                 },
                 active,
+                matches!(
+                    control,
+                    crate::workspace_form::Control::Cancel | crate::workspace_form::Control::Save
+                ),
             );
         }
         let feedback = row(0.59, 0.16);
@@ -113,10 +130,10 @@ impl TextRenderer {
                     feedback.width,
                     height,
                 );
-                line(text, rect, 12.0, theme.status_err, false);
+                line(text, rect, 12.0, theme.status_err, false, false);
             }
         } else {
-            line(form.hint(), feedback, 12.0, theme.text_muted, false);
+            line(form.hint(), feedback, 12.0, theme.text_muted, false, false);
         }
     }
 }

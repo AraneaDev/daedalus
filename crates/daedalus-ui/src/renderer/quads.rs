@@ -19,11 +19,14 @@ var<uniform> viewport: ViewportUniform;
 struct QuadInput {
     @location(0) rect: vec4<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) style: vec3<f32>,
 };
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) rect: vec4<f32>,
+    @location(2) style: vec3<f32>,
 };
 
 @vertex
@@ -50,6 +53,8 @@ fn vs_main(
     var out: VertexOutput;
     out.position = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
     out.color = inst.color;
+    out.rect = inst.rect;
+    out.style = inst.style;
     return out;
 }
 
@@ -62,13 +67,27 @@ fn srgb_channel_to_linear(c: f32) -> f32 {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    if viewport.params.z > 0.5 {
-        let r = srgb_channel_to_linear(in.color.r);
-        let g = srgb_channel_to_linear(in.color.g);
-        let b = srgb_channel_to_linear(in.color.b);
-        return vec4<f32>(r, g, b, in.color.a);
+    var color = in.color;
+    if in.style.x > 0.0 {
+        let half_size = in.rect.zw * 0.5;
+        let radius = min(in.style.x, min(half_size.x, half_size.y));
+        let local = in.position.xy - in.rect.xy;
+        let q = abs(local - half_size) - half_size + radius;
+        let distance = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+        var coverage = clamp(0.5 - distance, 0.0, 1.0);
+        if in.style.y > 0.0 {
+            coverage *= clamp(distance + in.style.y + 0.5, 0.0, 1.0);
+        }
+        let shade = 1.0 + in.style.z * (1.0 - local.y / in.rect.w);
+        color = vec4<f32>(color.rgb * shade, color.a * coverage);
     }
-    return in.color;
+    if viewport.params.z > 0.5 {
+        let r = srgb_channel_to_linear(color.r);
+        let g = srgb_channel_to_linear(color.g);
+        let b = srgb_channel_to_linear(color.b);
+        return vec4<f32>(r, g, b, color.a);
+    }
+    return color;
 }
 "#;
 
@@ -110,6 +129,8 @@ pub struct QuadInstance {
     pub rect: [f32; 4],
     /// Normalized sRGB `[r, g, b, a]` in `[0.0, 1.0]`.
     pub color: [f32; 4],
+    // Corner radius, outline width, and top-edge highlight strength.
+    pub(super) style: [f32; 3],
 }
 
 impl QuadInstance {
@@ -117,6 +138,7 @@ impl QuadInstance {
         Self {
             rect: [rect.x, rect.y, rect.width, rect.height],
             color: color.to_array(),
+            style: [0.0; 3],
         }
     }
 
@@ -124,13 +146,20 @@ impl QuadInstance {
         Self {
             rect: [x, y, width, height],
             color: color.to_array(),
+            style: [0.0; 3],
         }
     }
 
+    pub(super) fn rounded(mut self, radius: f32, outline: f32, highlight: f32) -> Self {
+        self.style = [radius, outline, highlight];
+        self
+    }
+
     fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
+        const ATTRS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
             0 => Float32x4,
             1 => Float32x4,
+            2 => Float32x3,
         ];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
@@ -307,11 +336,11 @@ mod tests {
     use crate::theme::BG_WINDOW;
 
     #[test]
-    fn quad_instance_layout_is_32_bytes_and_bytemuck_safe() {
-        assert_eq!(std::mem::size_of::<QuadInstance>(), 32);
+    fn quad_instance_layout_is_44_bytes_and_bytemuck_safe() {
+        assert_eq!(std::mem::size_of::<QuadInstance>(), 44);
         let q = QuadInstance::new(Rect::new(10.0, 20.0, 100.0, 40.0), BG_WINDOW);
         let bytes = bytemuck::bytes_of(&q);
-        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes.len(), 44);
         let decoded: &QuadInstance = bytemuck::from_bytes(bytes);
         assert_eq!(*decoded, q);
     }

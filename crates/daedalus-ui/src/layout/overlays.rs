@@ -2,16 +2,16 @@ use super::{PaneRect, Rect};
 use crate::state::{AgentPreset, CloseWorkspaceModalState};
 
 const PICKER_MODAL_LOGICAL_WIDTH: f32 = 380.0;
-pub(crate) const PICKER_HEADER_LOGICAL_HEIGHT: f32 = 42.0;
+pub(crate) const PICKER_HEADER_LOGICAL_HEIGHT: f32 = 50.0;
 const PICKER_ITEM_LOGICAL_HEIGHT: f32 = 36.0;
 const PICKER_ITEM_LOGICAL_GAP: f32 = 4.0;
 const PICKER_PAD_LOGICAL: f32 = 12.0;
 
 const WORKTREE_MODAL_LOGICAL_WIDTH: f32 = 420.0;
-const WORKTREE_MODAL_LOGICAL_HEIGHT: f32 = 136.0;
+const WORKTREE_MODAL_LOGICAL_HEIGHT: f32 = 184.0;
 pub(crate) const WORKTREE_HEADER_LOGICAL_HEIGHT: f32 = 38.0;
 const WORKTREE_INPUT_LOGICAL_HEIGHT: f32 = 36.0;
-const WORKTREE_PAD_LOGICAL: f32 = 14.0;
+const WORKTREE_PAD_LOGICAL: f32 = 20.0;
 
 const SEARCH_BAR_LOGICAL_WIDTH: f32 = 340.0;
 const SEARCH_BAR_LOGICAL_HEIGHT: f32 = 58.0;
@@ -115,11 +115,11 @@ pub fn worktree_button_rects(modal: Rect, scale_factor: f32) -> (Rect, Rect) {
     let s = worktree_content_scale(modal, scale_factor);
     let pad = (WORKTREE_PAD_LOGICAL * s).min(modal.width * 0.1);
     let gap = (8.0 * s).min(modal.width * 0.1);
-    let width = (modal.width - 2.0 * pad - gap) * 0.5;
-    let height = 30.0 * s;
-    let y = modal.bottom() - 10.0 * s - height;
+    let width = ((modal.width - 2.0 * pad - gap) * 0.5).min(140.0 * s);
+    let height = 34.0 * s;
+    let y = modal.bottom() - 16.0 * s - height;
     (
-        Rect::new(modal.x + pad, y, width, height),
+        Rect::new(modal.right() - pad - 2.0 * width - gap, y, width, height),
         Rect::new(modal.right() - pad - width, y, width, height),
     )
 }
@@ -130,7 +130,7 @@ pub fn worktree_input_rect(modal: Rect, scale_factor: f32) -> Rect {
     let pad = (WORKTREE_PAD_LOGICAL * s).min(modal.width * 0.1);
     let x = modal.x + pad;
     let w = (modal.width - 2.0 * pad).max(0.0);
-    let y = modal.y + (WORKTREE_HEADER_LOGICAL_HEIGHT + 10.0) * s;
+    let y = modal.y + (WORKTREE_HEADER_LOGICAL_HEIGHT + 38.0) * s;
     Rect::new(x, y, w, WORKTREE_INPUT_LOGICAL_HEIGHT * s)
 }
 

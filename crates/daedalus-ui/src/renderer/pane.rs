@@ -1,7 +1,8 @@
+use super::push_rect_border;
 use super::quads::QuadInstance;
 use super::{
     agent_state_badge, emit_cell_run_quad, pane_agent_state_pill_rect, push_chrome_badge,
-    push_rect_border, status_dot_color,
+    status_dot_color,
 };
 use crate::layout::{PaneRect, Rect};
 use crate::state::{AppState, PaneViewState, SearchState};
@@ -51,11 +52,15 @@ pub(super) fn collect_pane_quads(
     }
     // Pane outer border (focused pane highlighted in accent blue)
     let border_color = if is_focused {
-        theme.border_focused
+        theme.border_focused.with_alpha(0.52)
     } else {
         theme.border_unfocused
     };
-    push_rect_border(quads, pane_rect.outer, border_w, border_color);
+    quads.push(QuadInstance::new(pane_rect.outer, border_color).rounded(
+        8.0 * scale_factor,
+        border_w,
+        0.0,
+    ));
 }
 
 fn collect_pane_chrome(
@@ -68,8 +73,14 @@ fn collect_pane_chrome(
     zoomed: bool,
 ) {
     // Pane body & header backgrounds
-    quads.push(QuadInstance::new(pane_rect.outer, theme.bg_pane));
-    quads.push(QuadInstance::new(pane_rect.header, theme.bg_header));
+    quads.push(QuadInstance::new(pane_rect.outer, theme.bg_pane).rounded(
+        8.0 * scale_factor,
+        0.0,
+        0.0,
+    ));
+    quads.push(
+        QuadInstance::new(pane_rect.header, theme.bg_header).rounded(8.0 * scale_factor, 0.0, 0.45),
+    );
 
     // Role / status dot in pane header
     let dot_color = pane_state.map_or_else(
@@ -78,13 +89,16 @@ fn collect_pane_chrome(
     );
     let dot_size = 7.0 * scale_factor;
     if !zoomed {
-        quads.push(QuadInstance::from_xywh(
-            pane_rect.header.x + 9.0 * scale_factor,
-            pane_rect.header.y + (pane_rect.header.height - dot_size) * 0.5,
-            dot_size,
-            dot_size,
-            dot_color,
-        ));
+        quads.push(
+            QuadInstance::from_xywh(
+                pane_rect.header.x + 9.0 * scale_factor,
+                pane_rect.header.y + (pane_rect.header.height - dot_size) * 0.5,
+                dot_size,
+                dot_size,
+                dot_color,
+            )
+            .rounded(dot_size * 0.5, 0.0, 0.0),
+        );
     }
 
     // Agent state badge pill (left of action_pill in Agent pane header)
@@ -94,7 +108,7 @@ fn collect_pane_chrome(
     {
         let (label, color) = agent_state_badge(agent_state, theme);
         if let Some(pill) = pane_agent_state_pill_rect(pane_rect, label, scale_factor) {
-            push_chrome_badge(quads, pill, theme, border_w, color.with_alpha(0.70));
+            super::push_status_chip(quads, pill, color);
         }
     }
 

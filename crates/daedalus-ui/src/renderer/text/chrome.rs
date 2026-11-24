@@ -236,7 +236,11 @@ impl TextRenderer {
             let max_w = (toggle.width - 24.0 * s).max(1.0);
             let glyph_width = self.cell_w * CHROME_FONT_SIZE_LOGICAL / self.font_size_logical;
             let label = truncate_right_with_ellipsis(
-                &format!("{arrow} Workspaces · {name}{suffix}"),
+                &if layout.sidebar.is_some() {
+                    format!("{arrow} Workspaces{suffix}")
+                } else {
+                    format!("{arrow} Workspaces · {name}{suffix}")
+                },
                 (max_w / glyph_width) as usize,
             );
             self.push_chrome_line(ChromeLineSpec {
@@ -321,7 +325,7 @@ impl TextRenderer {
 
             let new_btn = cards.list.new_workspace;
             if new_btn.y < sidebar.bottom() {
-                self.push_chrome_line(ChromeLineSpec {
+                self.push_chrome_button(ChromeLineSpec {
                     text: "+ Workspace",
                     left: new_btn.x + 8.0 * s,
                     top: new_btn.y + (new_btn.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
@@ -336,7 +340,7 @@ impl TextRenderer {
 
             let new_wt_btn = cards.list.new_worktree;
             if new_wt_btn.y < sidebar.bottom() {
-                self.push_chrome_line(ChromeLineSpec {
+                self.push_chrome_button(ChromeLineSpec {
                     text: "+ Worktree",
                     left: new_wt_btn.x + 8.0 * s,
                     top: new_wt_btn.y + (new_wt_btn.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
@@ -593,7 +597,7 @@ impl TextRenderer {
 
         // Compact `×` close button in top-right corner
         let close_rect = sidebar_workspace_close_rect(row_rect, s);
-        self.push_chrome_line(ChromeLineSpec {
+        self.push_chrome_button(ChromeLineSpec {
             text: "×",
             left: close_rect.x + 4.0 * s,
             top: close_rect.y + 1.0 * s,
@@ -606,7 +610,7 @@ impl TextRenderer {
         });
 
         for badge in &card.badges {
-            self.push_chrome_line(sidebar_badge_line(badge, s));
+            self.push_chrome_button(sidebar_badge_line(badge, s));
         }
         if !card.full {
             return;
@@ -632,9 +636,9 @@ impl TextRenderer {
             self.push_chrome_line(ChromeLineSpec {
                 text: &subtitle,
                 left: left_x,
-                top: row_rect.y + 24.0 * s,
+                top: row_rect.y + 34.0 * s,
                 max_w: sub_max_w,
-                bounds: Rect::new(left_x, row_rect.y + 22.0 * s, sub_max_w, 18.0 * s),
+                bounds: Rect::new(left_x, row_rect.y + 32.0 * s, sub_max_w, 18.0 * s),
                 font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
                 line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
                 color: theme.text_muted,
@@ -649,9 +653,9 @@ impl TextRenderer {
         self.push_chrome_line(ChromeLineSpec {
             text: &ports_label,
             left: ports_left,
-            top: row_rect.y + 42.0 * s,
+            top: row_rect.y + 64.0 * s,
             max_w: ports_max_w,
-            bounds: Rect::new(ports_left, row_rect.y + 40.0 * s, ports_max_w, 16.0 * s),
+            bounds: Rect::new(ports_left, row_rect.y + 64.0 * s, ports_max_w, 16.0 * s),
             font_size_logical: CHROME_BADGE_FONT_SIZE_LOGICAL,
             line_height_logical: CHROME_BADGE_LINE_HEIGHT_LOGICAL,
             color: if has_ports {
@@ -672,9 +676,9 @@ impl TextRenderer {
             self.push_chrome_line(ChromeLineSpec {
                 text: &truncated,
                 left: detail_left,
-                top: row_rect.y + 79.0 * s,
+                top: row_rect.y + 112.0 * s,
                 max_w: detail_max_w,
-                bounds: Rect::new(detail_left, row_rect.y + 77.0 * s, detail_max_w, 17.0 * s),
+                bounds: Rect::new(detail_left, row_rect.y + 110.0 * s, detail_max_w, 17.0 * s),
                 font_size_logical: CHROME_BADGE_FONT_SIZE_LOGICAL,
                 line_height_logical: CHROME_BADGE_LINE_HEIGHT_LOGICAL,
                 color: theme.text_muted,
@@ -696,15 +700,9 @@ impl TextRenderer {
         let pane_state = state.pane_for_role(pane_rect.role);
 
         let role_label = match pane_rect.role {
-            PaneRole::Agent => {
-                let preset_name = pane_state
-                    .and_then(|p| p.agent_preset)
-                    .map(|p| p.short_name())
-                    .unwrap_or("agent");
-                format!("AGENT [{preset_name}]")
-            }
-            PaneRole::Service => "SERVICE".to_string(),
-            PaneRole::Runner => "RUNNER".to_string(),
+            PaneRole::Agent => "Agent".to_owned(),
+            PaneRole::Service => "Service".to_owned(),
+            PaneRole::Runner => "Runner".to_owned(),
         };
 
         let cwd_suffix = pane_state
@@ -749,7 +747,7 @@ impl TextRenderer {
                 let active = Some(*id) == state.focused_pane_id();
                 let close = layout.close_tab.filter(|(pane, _)| pane == id);
                 if let Some((_, button)) = close {
-                    self.push_chrome_line(ChromeLineSpec {
+                    self.push_chrome_button(ChromeLineSpec {
                         text: "×",
                         left: button.x + 3. * s,
                         top: button.y + (button.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
@@ -762,17 +760,15 @@ impl TextRenderer {
                     });
                 }
                 let max_w = (rect.width - close.map_or(0., |(_, b)| b.width) - 8. * s).max(1.);
-                let glyph_width = self.cell_w * CHROME_FONT_SIZE_LOGICAL / self.font_size_logical;
-                let label = truncate_right_with_ellipsis(label, (max_w / glyph_width) as usize);
                 self.push_chrome_line(ChromeLineSpec {
-                    text: &label,
+                    text: label,
                     left: rect.x + 4. * s,
                     top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
                     max_w,
                     bounds: *rect,
                     font_size_logical: CHROME_FONT_SIZE_LOGICAL,
                     line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
-                    color: if active {
+                    color: if state.panes.get(id).is_some_and(|pane| matches!(pane.summary.status, PaneStatus::Exited { code: Some(code) } if code != 0)) { theme.status_err } else if active {
                         theme.border_focused
                     } else {
                         theme.text_muted
@@ -833,7 +829,7 @@ impl TextRenderer {
         });
 
         if let Some((pill, label, color)) = agent_badge {
-            self.push_chrome_line(ChromeLineSpec {
+            self.push_chrome_button(ChromeLineSpec {
                 text: label,
                 left: pill.x + 6.0 * s,
                 top: pill.y + (pill.height - CHROME_BADGE_LINE_HEIGHT_LOGICAL * s) * 0.5,
@@ -868,7 +864,7 @@ impl TextRenderer {
                 PaneRole::Service => (String::new(), theme.text_primary),
             };
             if !pill_label.is_empty() {
-                self.push_chrome_line(ChromeLineSpec {
+                self.push_chrome_button(ChromeLineSpec {
                     text: &pill_label,
                     left: pill.x + 8.0 * s,
                     top: pill.y + (pill.height - CHROME_SUB_LINE_HEIGHT_LOGICAL * s) * 0.5,
@@ -1305,7 +1301,7 @@ mod tests {
             assert_eq!(card.badges[0].label, "Passed");
             if full_size {
                 assert_eq!(card.badges.len(), 5);
-                assert!(card.badges[2].rect.right() < card.badges[1].rect.x);
+                assert!(card.badges[1].rect.y - card.badges[2].rect.bottom() >= 8.0);
                 assert!(card.badges[3].label.ends_with("second"));
                 assert!(card.badges[4].label.ends_with("last"));
             } else {
@@ -1321,7 +1317,12 @@ mod tests {
                 assert!(rect.bottom() <= card.rect.bottom());
                 assert!(quads.iter().any(|quad| quad.rect
                     == [rect.x, rect.y, rect.width, rect.height]
-                    && quad.color == theme.bg_pane.to_array()));
+                    && quad.color
+                        == if badge.kind == BadgeKind::Agent {
+                            badge.color.with_alpha(0.15).to_array()
+                        } else {
+                            theme.bg_pane.to_array()
+                        }));
             }
         }
     }

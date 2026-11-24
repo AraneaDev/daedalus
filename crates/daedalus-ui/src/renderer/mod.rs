@@ -36,10 +36,10 @@ pub use crate::layout::overlays::{
 /// Formats `(label, color)` for an [`AgentState`] badge.
 pub fn agent_state_badge(state: AgentState, theme: &Theme) -> (&'static str, Rgba) {
     match state {
-        AgentState::WaitingForApproval => ("APPROVAL", theme.status_busy),
-        AgentState::Thinking => ("THINKING", theme.border_focused),
-        AgentState::Idle => ("IDLE", theme.status_ok),
-        AgentState::Error => ("ERROR", theme.status_err),
+        AgentState::WaitingForApproval => ("Approval", theme.status_busy),
+        AgentState::Thinking => ("Thinking", theme.border_focused),
+        AgentState::Idle => ("Idle", theme.status_ok),
+        AgentState::Error => ("Error", theme.status_err),
     }
 }
 
@@ -57,14 +57,14 @@ pub fn pane_agent_state_pill_rect(
     let right_edge = pane_rect
         .action_pill
         .map_or(header.right() - 6.0 * s, |p| p.x - 6.0 * s);
-    let desired_w = ((label.chars().count() as f32) * 6.8 + 14.0) * s;
+    let desired_w = ((label.chars().count() as f32) * 8.0 + 16.0) * s;
     let max_w = (right_edge - header.x - 24.0 * s).max(0.0);
     let pill_w = desired_w.min(max_w);
-    let pill_h = (header.height - 6.0 * s).max(0.0);
+    let pill_h = (header.height - 6.0 * s).clamp(0.0, 20.0 * s);
     if pill_w >= 24.0 * s && pill_h > 0.0 {
         Some(Rect::new(
             right_edge - pill_w,
-            header.y + 3.0 * s,
+            header.y + (header.height - pill_h) * 0.5,
             pill_w,
             pill_h,
         ))
@@ -76,14 +76,14 @@ pub fn pane_agent_state_pill_rect(
 /// Computes the compact Agent state badge rectangle on Line 2 right side of a sidebar workspace card.
 pub fn sidebar_agent_state_pill_rect(row_rect: Rect, label: &str, scale_factor: f32) -> Rect {
     let s = sanitize_scale(scale_factor);
-    let w = ((label.chars().count() as f32) * 6.5 + 12.0) * s;
+    let w = ((label.chars().count() as f32) * 8.0 + 16.0) * s;
     let max_w = (row_rect.width - 28.0 * s).max(0.0);
     let clamped_w = w.min(max_w);
     Rect::new(
-        row_rect.right() - clamped_w - 6.0 * s,
-        row_rect.y + 24.0 * s,
+        row_rect.right() - clamped_w - 10.0 * s,
+        row_rect.y + 32.0 * s,
         clamped_w,
-        15.0 * s,
+        20.0 * s,
     )
 }
 
@@ -169,8 +169,8 @@ pub(super) fn sidebar_branch_badge_rect_with_reserve(
     let s = sanitize_scale(scale_factor);
     let left_x = row_rect.x + 22.0 * s;
     let max_w = (row_rect.right() - left_x - 8.0 * s - reserve_right).max(0.0);
-    let est_w = ((label.chars().count() as f32) * 6.8 + 12.0) * s;
-    Rect::new(left_x, row_rect.y + 24.0 * s, est_w.min(max_w), 15.0 * s)
+    let est_w = ((label.chars().count() as f32) * 7.0 + 12.0) * s;
+    Rect::new(left_x, row_rect.y + 32.0 * s, est_w.min(max_w), 22.0 * s)
 }
 
 #[cfg(test)]
@@ -218,7 +218,7 @@ pub(super) fn sidebar_docker_pill_rect(row_rect: Rect, scale_factor: f32) -> Rec
     let w = 64.0 * s;
     Rect::new(
         row_rect.right() - w - 6.0 * s,
-        row_rect.y + 42.0 * s,
+        row_rect.y + 62.0 * s,
         w,
         15.0 * s,
     )
@@ -247,7 +247,7 @@ pub(super) fn sidebar_external_badge_rect(
     let s = sanitize_scale(scale_factor);
     let left_x = row_rect.x + 10.0 * s;
     let total_w = (row_rect.right() - 8.0 * s - left_x).max(0.0);
-    let y = row_rect.y + 61.0 * s;
+    let y = row_rect.y + 90.0 * s;
     let h = 16.0 * s;
     if badge_count <= 1 {
         Rect::new(left_x, y, total_w, h)
@@ -301,8 +301,45 @@ fn push_chrome_badge(
     border_w: f32,
     accent: Rgba,
 ) {
-    quads.push(QuadInstance::new(rect, theme.bg_pane));
-    push_rect_border(quads, rect, border_w, accent);
+    push_control(
+        quads,
+        rect,
+        theme.bg_pane,
+        accent,
+        border_w,
+        rect.height * 0.5,
+    );
+}
+
+fn push_status_chip(quads: &mut Vec<QuadInstance>, rect: Rect, color: Rgba) {
+    quads.push(QuadInstance::new(rect, color.with_alpha(0.15)).rounded(
+        rect.height * 0.5,
+        0.0,
+        0.0,
+    ));
+}
+
+fn push_control(
+    quads: &mut Vec<QuadInstance>,
+    rect: Rect,
+    fill: Rgba,
+    edge: Rgba,
+    stroke: f32,
+    radius: f32,
+) {
+    quads.push(QuadInstance::new(rect, fill).rounded(radius, 0.0, 0.04));
+    quads.push(QuadInstance::new(rect, edge).rounded(radius, stroke, 0.0));
+}
+
+fn push_inner_focus(quads: &mut Vec<QuadInstance>, rect: Rect, stroke: f32, color: Rgba) {
+    let inset = 2.0 * stroke;
+    let ring = Rect::new(
+        rect.x + inset,
+        rect.y + inset,
+        (rect.width - 2.0 * inset).max(0.0),
+        (rect.height - 2.0 * inset).max(0.0),
+    );
+    quads.push(QuadInstance::new(ring, color).rounded(4.0 * stroke, stroke, 0.0));
 }
 
 fn status_dot_color(status: PaneStatus, theme: &Theme) -> Rgba {
@@ -413,6 +450,46 @@ fn collect_prepared_quads(
         pane::collect_pane_quads(&mut quads, pane_rect, state, theme, s, border_w, cell_size);
     }
 
+    if state.zoomed
+        && let [pane] = layout.panes.as_slice()
+    {
+        let selected = if layout.named_tabs.is_empty() {
+            crate::layout::session_tabs(pane, s)
+                .into_iter()
+                .find_map(|(role, rect)| (role == state.focused_role).then_some(rect))
+        } else {
+            layout
+                .named_tabs
+                .iter()
+                .find_map(|(id, _, rect)| (Some(*id) == state.focused_pane_id()).then_some(*rect))
+        };
+        if let Some(tab) = selected {
+            let surface = Rect::new(
+                tab.x + s,
+                tab.y + 2.0 * s,
+                (tab.width - 2.0 * s).max(0.0),
+                (tab.height - 4.0 * s).max(0.0),
+            );
+            quads.push(
+                QuadInstance::new(surface, theme.text_primary.with_alpha(0.08)).rounded(
+                    5.0 * s,
+                    0.0,
+                    0.0,
+                ),
+            );
+            quads.push(
+                QuadInstance::from_xywh(
+                    surface.x + 3.0 * s,
+                    tab.bottom() - 2.0 * s,
+                    (surface.width - 6.0 * s).max(0.0),
+                    2.0 * s,
+                    theme.border_focused,
+                )
+                .rounded(s, 0.0, 0.0),
+            );
+        }
+    }
+
     let base_quad_count = quads.len() as u32;
 
     collect_overlay_quads(
@@ -451,28 +528,40 @@ fn collect_sidebar_quads(
         let row_rect = card.rect;
         let is_active = state.active_workspace_id == Some(ws.id);
         if is_active {
-            quads.push(QuadInstance::new(row_rect, theme.bg_header));
+            quads.push(QuadInstance::new(row_rect, theme.bg_header).rounded(8.0 * s, 0.0, 0.38));
             // Left accent stripe
-            quads.push(QuadInstance::from_xywh(
-                row_rect.x,
-                row_rect.y,
-                3.0 * s,
-                row_rect.height,
-                theme.border_focused,
-            ));
+            quads.push(
+                QuadInstance::from_xywh(
+                    row_rect.x,
+                    row_rect.y + 6.0 * s,
+                    3.0 * s,
+                    (row_rect.height - 12.0 * s).max(0.0),
+                    theme.border_focused,
+                )
+                .rounded(1.5 * s, 0.0, 0.0),
+            );
         } else {
-            quads.push(QuadInstance::new(row_rect, theme.bg_pane.with_alpha(0.55)));
+            quads.push(
+                QuadInstance::new(row_rect, theme.bg_pane.with_alpha(0.55)).rounded(
+                    8.0 * s,
+                    0.0,
+                    0.0,
+                ),
+            );
         }
 
         // Agent status dot (highlighted in amber/error when agent_state demands attention)
         let dot_size = 7.0 * s;
-        quads.push(QuadInstance::from_xywh(
-            row_rect.x + 9.0 * s,
-            row_rect.y + 11.0 * s,
-            dot_size,
-            dot_size,
-            card.dot,
-        ));
+        quads.push(
+            QuadInstance::from_xywh(
+                row_rect.x + 9.0 * s,
+                row_rect.y + 11.0 * s,
+                dot_size,
+                dot_size,
+                card.dot,
+            )
+            .rounded(dot_size * 0.5, 0.0, 0.0),
+        );
 
         // Sidebar workspace `×` close button
         let close_rect = sidebar_workspace_close_rect(row_rect, s);
@@ -489,7 +578,13 @@ fn collect_sidebar_quads(
 
         for badge in &card.badges {
             if badge.kind == sidebar::BadgeKind::FailedRun {
-                quads.push(QuadInstance::new(badge.rect, theme.status_err));
+                quads.push(QuadInstance::new(badge.rect, theme.status_err).rounded(
+                    5.0 * s,
+                    0.0,
+                    0.0,
+                ));
+            } else if badge.kind == sidebar::BadgeKind::Agent {
+                push_status_chip(quads, badge.rect, badge.color);
             } else {
                 push_chrome_badge(quads, badge.rect, theme, border_w, badge.border);
             }
@@ -498,18 +593,25 @@ fn collect_sidebar_quads(
 
     let new_btn = cards.list.new_workspace;
     if new_btn.y < sidebar.bottom() {
-        quads.push(QuadInstance::new(new_btn, theme.bg_header));
-        push_rect_border(quads, new_btn, border_w, theme.border_unfocused);
+        push_control(
+            quads,
+            new_btn,
+            theme.bg_header,
+            theme.border_unfocused,
+            border_w,
+            6.0 * s,
+        );
     }
 
     let new_wt_btn = cards.list.new_worktree;
     if new_wt_btn.y < sidebar.bottom() {
-        quads.push(QuadInstance::new(new_wt_btn, theme.bg_header));
-        push_rect_border(
+        push_control(
             quads,
             new_wt_btn,
+            theme.bg_header,
+            theme.border_unfocused,
             border_w,
-            theme.border_focused.with_alpha(0.60),
+            6.0 * s,
         );
     }
 }
@@ -529,8 +631,18 @@ fn push_modal_frame(
         screen.1,
         Rgba::new(0.0, 0.0, 0.0, 0.55),
     ));
-    quads.push(QuadInstance::new(modal, theme.picker_bg.with_alpha(1.0)));
-    push_rect_border(quads, modal, border_w, theme.border_focused);
+    quads.push(
+        QuadInstance::new(modal, theme.picker_bg.with_alpha(1.0)).rounded(
+            10.0 * border_w,
+            0.0,
+            0.12,
+        ),
+    );
+    quads.push(QuadInstance::new(modal, theme.border_unfocused).rounded(
+        10.0 * border_w,
+        border_w,
+        0.0,
+    ));
     quads.push(QuadInstance::from_xywh(
         modal.x + border_w,
         modal.y + divider_y,
@@ -581,12 +693,29 @@ fn collect_overlay_quads(
         let modal = crate::setup_review::modal_rect(screen_w, screen_h, s);
         push_modal_frame(quads, modal, screen, theme, border_w, modal.height * 0.14);
         for (control, rect) in state.setup_review.controls(modal) {
+            if control == crate::setup_review::Control::Tool
+                && !state.setup_review.busy
+                && !state.setup_review.enabled(control)
+            {
+                continue;
+            }
             let border = if state.setup_review.focus == control {
                 theme.border_focused
             } else {
                 theme.border_unfocused
             };
-            push_chrome_badge(quads, rect, theme, border_w, border);
+            let fill = if control == crate::setup_review::Control::Open
+                && state.setup_review.enabled(control)
+            {
+                theme.border_focused
+            } else {
+                theme.bg_header
+            };
+            push_control(quads, rect, fill, border, border_w, 6.0 * s);
+            if control == crate::setup_review::Control::Open && state.setup_review.focus == control
+            {
+                push_inner_focus(quads, rect, border_w, theme.bg_window);
+            }
         }
         return;
     }
@@ -627,13 +756,15 @@ fn collect_overlay_quads(
     if state.settings.open {
         push_modal_frame(
             quads,
-            crate::settings::modal_rect(screen_w, screen_h, s),
+            state.settings.modal_rect(screen_w, screen_h, s),
             screen,
             theme,
             border_w,
-            36. * s,
+            46. * state
+                .settings
+                .content_scale(state.settings.modal_rect(screen_w, screen_h, s)),
         );
-        let modal = crate::settings::modal_rect(screen_w, screen_h, s);
+        let modal = state.settings.modal_rect(screen_w, screen_h, s);
         for (control, rect) in state.settings.controls(modal) {
             let field = Rect::new(
                 rect.x + 2. * s,
@@ -646,7 +777,18 @@ fn collect_overlay_quads(
             } else {
                 theme.border_unfocused
             };
-            push_chrome_badge(quads, field, theme, border_w, border);
+            let fill =
+                if control == crate::settings::Control::Save && state.settings.enabled(control) {
+                    theme.border_focused
+                } else if control.field_label().is_some() {
+                    theme.bg_pane
+                } else {
+                    theme.bg_header
+                };
+            push_control(quads, field, fill, border, border_w, 6.0 * s);
+            if control == crate::settings::Control::Save && state.settings.focus == control {
+                push_inner_focus(quads, field, border_w, theme.bg_window);
+            }
         }
         return;
     }
@@ -689,30 +831,43 @@ fn collect_overlay_quads(
 
         // Branch input box
         let input_rect = worktree_input_rect(modal, s);
-        quads.push(QuadInstance::new(input_rect, theme.bg_window));
-        push_rect_border(
+        push_control(
             quads,
             input_rect,
-            border_w,
+            theme.bg_window,
             if state.worktree_modal.missing_branch() {
                 theme.status_err
             } else {
                 theme.border_focused
             },
+            border_w,
+            6.0 * s,
         );
         let (cancel, create) = worktree_button_rects(modal, s);
-        push_chrome_badge(quads, cancel, theme, border_w, theme.border_unfocused);
+        push_control(
+            quads,
+            cancel,
+            theme.bg_header,
+            theme.border_unfocused,
+            border_w,
+            6.0 * s,
+        );
         let can_create = state.can_create_worktree();
-        push_chrome_badge(
+        push_control(
             quads,
             create,
-            theme,
-            border_w,
+            if can_create {
+                theme.border_focused
+            } else {
+                theme.bg_header
+            },
             if can_create {
                 theme.border_focused
             } else {
                 theme.border_unfocused
             },
+            border_w,
+            6.0 * s,
         );
     } else if state.close_modal.open {
         let modal = close_workspace_modal_rect(screen_w, screen_h, s);
@@ -1389,12 +1544,10 @@ pub(crate) mod tests {
             state.worktree_modal.branch_input = branch.into();
             let (quads, base) =
                 collect_quads(&state, &layout, &theme, 1200.0, 800.0, 1.0, (8.0, 19.0));
-            assert!(
-                quads[base as usize..]
-                    .iter()
-                    .any(|quad| quad.rect == [create.x, create.y, create.width, 1.0]
-                        && quad.color == expected.to_array())
-            );
+            assert!(quads[base as usize..].iter().any(|quad| quad.rect
+                == [create.x, create.y, create.width, create.height]
+                && quad.style[1] == 1.0
+                && quad.color == expected.to_array()));
         }
     }
 
@@ -1471,7 +1624,7 @@ pub(crate) mod tests {
         let sidebar = layout.sidebar.unwrap();
         let row_rect = sidebar_workspace_rect(sidebar, 0, 1.0);
         let branch_rect = sidebar_branch_badge_rect(row_rect, "wt1 · feat/auth", 1.0);
-        let ext_y = row_rect.y + 61.0;
+        let ext_y = row_rect.y + 90.0;
 
         // Worktree slot uses the same focused outline as the Info badge
         let info_border = theme.border_focused.with_alpha(0.65).to_array();
@@ -1634,19 +1787,19 @@ pub(crate) mod tests {
         let theme = Theme::dark();
         assert_eq!(
             agent_state_badge(AgentState::WaitingForApproval, &theme),
-            ("APPROVAL", theme.status_busy)
+            ("Approval", theme.status_busy)
         );
         assert_eq!(
             agent_state_badge(AgentState::Thinking, &theme),
-            ("THINKING", theme.border_focused)
+            ("Thinking", theme.border_focused)
         );
         assert_eq!(
             agent_state_badge(AgentState::Idle, &theme),
-            ("IDLE", theme.status_ok)
+            ("Idle", theme.status_ok)
         );
         assert_eq!(
             agent_state_badge(AgentState::Error, &theme),
-            ("ERROR", theme.status_err)
+            ("Error", theme.status_err)
         );
 
         assert_eq!(format_external_source_tag("phrourion"), "[PHR]");
@@ -1702,14 +1855,15 @@ pub(crate) mod tests {
         assert_eq!(base_count as usize, quads.len());
 
         let sidebar = sidebar_workspace_rect(layout.sidebar.unwrap(), 0, 1.0);
-        let sidebar_pill = sidebar_agent_state_pill_rect(sidebar, "APPROVAL", 1.0);
+        let mut sidebar_pill = sidebar_agent_state_pill_rect(sidebar, "Approval", 1.0);
+        sidebar_pill.y = sidebar.y + 62.0;
         let header_pill =
-            pane_agent_state_pill_rect(layout.pane(PaneRole::Agent).unwrap(), "APPROVAL", 1.0)
+            pane_agent_state_pill_rect(layout.pane(PaneRole::Agent).unwrap(), "Approval", 1.0)
                 .unwrap();
         for rect in [sidebar_pill, header_pill] {
             assert!(quads.iter().any(|quad| quad.rect
                 == [rect.x, rect.y, rect.width, rect.height]
-                && quad.color == theme.bg_pane.to_array()));
+                && quad.color == theme.status_busy.with_alpha(0.15).to_array()));
         }
 
         // Open close modal with worktree + dirty + remove_worktree enabled
@@ -1755,12 +1909,15 @@ pub(crate) mod tests {
                 } else {
                     theme.border_unfocused
                 };
-                let top = [rect.x + inset, rect.y + inset, rect.width - 2. * inset, 1.];
-                assert!(
-                    quads[base as usize..]
-                        .iter()
-                        .any(|q| q.rect == top && q.color == expected.to_array())
-                );
+                let outline = [
+                    rect.x + inset,
+                    rect.y + inset,
+                    rect.width - 2. * inset,
+                    rect.height - 2. * inset,
+                ];
+                assert!(quads[base as usize..].iter().any(|q| q.rect == outline
+                    && q.style[1] == 1.0
+                    && q.color == expected.to_array()));
             }
         };
         state.workspace_form.begin(std::path::Path::new("/repo"));
@@ -1796,6 +1953,9 @@ pub(crate) mod tests {
                 .setup_review
                 .controls(crate::setup_review::modal_rect(w, h, 1.))
                 .into_iter()
+                .filter(|(c, _)| {
+                    *c != crate::setup_review::Control::Tool || state.setup_review.enabled(*c)
+                })
                 .map(|(c, r)| (c == state.setup_review.focus, r))
                 .collect(),
             0.,
@@ -1810,7 +1970,7 @@ pub(crate) mod tests {
             &state,
             state
                 .settings
-                .controls(crate::settings::modal_rect(w, h, 1.))
+                .controls(state.settings.modal_rect(w, h, 1.))
                 .map(|(c, r)| (c == state.settings.focus, r))
                 .collect(),
             2.,

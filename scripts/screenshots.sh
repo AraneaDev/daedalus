@@ -5,7 +5,7 @@ set -euo pipefail
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 if [[ ${1:-} != --capture ]]; then
-    for tool in xvfb-run xauth xdotool import python3; do
+    for tool in xvfb-run xauth xdotool import convert python3; do
         if ! command -v "$tool" >/dev/null; then
             echo "Screenshot capture requires $tool." >&2
             exit 1
@@ -54,7 +54,7 @@ command = ["sh", "-c", "while [ ! -f .git/capture ]; do sleep .1; done; printf '
 [service]
 command = ["sh", "-c", "while [ ! -f .git/capture ]; do sleep .1; done; printf '$ python3 -m json.tool response.json\n'; python3 -m json.tool response.json; touch .git/service-ready; exec cat"]
 [runner]
-command = ["sh", "-c", "while [ ! -f .git/capture ]; do sleep .1; done; printf '$ python3 -m unittest -v\n'; python3 -B -m unittest -v && touch .git/runner-ready; exec cat"]
+command = ["sh", "-c", "while [ ! -f .git/capture ]; do sleep .1; done; printf '$ python3 -m unittest -v\n'; python3 -B -m unittest -v && touch .git/runner-ready; while [ ! -f .git/fail ]; do sleep .1; done; printf '\\033[2J\\033[H'; echo FAIL: health_check; echo Expected HTTP 200, received 503; exit 3"]
 [[actions]]
 id = "test"
 label = "Run health checks"
@@ -66,7 +66,11 @@ git add .
 git -c user.name=Example -c user.email=demo@example.invalid -c commit.gpgsign=false commit -qm 'Add health endpoint'
 echo '# Readiness probe for the service.' >> health.py
 echo 'font_family = "DejaVu Sans Mono"' > "$scratch/ui.toml"
-"$bin/daedalusd" --runtime-dir "$scratch/daemon" --state-file "$scratch/state.json" \
+# Use a deterministic host tool inventory for the environment review.
+mkdir -p "$scratch/bin"
+for tool in sh git python3 cat sleep touch uname env; do ln -s "$(command -v "$tool")" "$scratch/bin/$tool"; done
+ln -s /bin/true "$scratch/bin/npm"
+PATH="$scratch/bin" "$bin/daedalusd" --runtime-dir "$scratch/daemon" --state-file "$scratch/state.json" \
     --events-socket "$scratch/events.sock" >"$scratch/daemon.log" 2>&1 &
 daemon_pid=$!
 for ((i=0; i<100; i++)); do
@@ -82,6 +86,10 @@ for ((i=0; i<150; i++)); do
     if [[ $listing == *panes=3* ]]; then break; fi
     sleep .1
 done
+window=$(xdotool search --sync --onlyvisible --name '^Daedalus Workbench$' | head -1)
+xdotool windowsize --sync "$window" 1000 570
+xdotool windowfocus --sync "$window"
+xdotool key ctrl+shift+z
 sleep 1
 touch .git/capture
 for ((i=0; i<200; i++)); do
@@ -101,6 +109,7 @@ capture() {
     import -window "$window" -strip "$scratch/$1.png"
 }
 capture workbench
+xdotool key ctrl+shift+z
 xdotool key ctrl+shift+w
 xdotool type --delay 30 'feature/add-metrics'
 capture new-worktree
@@ -108,24 +117,51 @@ if cmp -s "$scratch/workbench.png" "$scratch/new-worktree.png"; then
     echo "The worktree dialog did not appear in the second capture." >&2
     exit 1
 fi
-xdotool key Escape ctrl+shift+s
-# Settings opens on the selected assignment's name.
+xdotool key Escape
+xdotool key ctrl+shift+s
+sleep .4
+# Add a real preset so the screenshot shows editable configuration.
+xdotool mousemove --window "$window" 734 173 click 1
 xdotool key ctrl+a
 xdotool type --delay 30 'Reviewer'
-xdotool key ctrl+s
-for ((i=0; i<50; i++)); do
-    if grep -rq 'name = "Reviewer"' "$XDG_CONFIG_HOME"; then break; fi
-    sleep .1
-done
-if ! grep -rq 'name = "Reviewer"' "$XDG_CONFIG_HOME"; then
-    echo "The named assignment was not saved." >&2
-    exit 1
-fi
-xdotool key ctrl+shift+s
 xdotool mousemove 1439 899
 capture workspace-settings
-if cmp -s "$scratch/workbench.png" "$scratch/workspace-settings.png"; then
-    echo "The workspace settings dialog did not appear." >&2
-    exit 1
-fi
-for name in workbench new-worktree workspace-settings; do install -m644 "$scratch/$name.png" "$out/$name.png"; done
+xdotool key Escape
+touch .git/fail
+sleep 1
+xdotool key ctrl+shift+r
+capture failed-run
+
+# Start the first-workspace flow from an unconfigured example repository.
+kill "$ui_pid"
+wait "$ui_pid" || true
+ui_pid=
+mkdir -p "$scratch/example/orbit"
+cd "$scratch/example/orbit"
+echo '{"scripts":{"dev":"vite","test":"vitest"}}' > package.json
+echo '{}' > package-lock.json
+echo -e '[agent]\ncommand = ["codex"]' > .daedalus.toml
+"$bin/daedalus-ui" --config "$scratch/ui.toml" --no-auto-spawn >"$scratch/review.log" 2>&1 &
+ui_pid=$!
+window=$(xdotool search --sync --onlyvisible --name '^Daedalus Workbench$' | head -1)
+xdotool windowsize --sync "$window" 1000 570
+xdotool windowfocus --sync "$window"
+sleep 1
+xdotool key Escape ctrl+shift+n
+sleep .4
+xdotool key ctrl+a
+xdotool type --delay 2 "$PWD"
+xdotool key Return
+capture environment-setup
+
+# Show each dialog at its native resolution without clipped background text.
+for entry in 'workspace-settings 650x392' 'environment-setup 700x500' 'new-worktree 420x184'; do
+    read -r name size <<< "$entry"
+    convert "$scratch/$name.png" -gravity center -crop "$size+0+0" +repage "$scratch/detail.png"
+    mv "$scratch/detail.png" "$scratch/$name.png"
+done
+convert "$scratch/failed-run.png" -crop 1000x184+0+0 +repage "$scratch/failure.png"
+mv "$scratch/failure.png" "$scratch/failed-run.png"
+for name in workbench new-worktree workspace-settings environment-setup failed-run; do
+    install -m644 "$scratch/$name.png" "$out/$name.png"
+done
