@@ -14,6 +14,12 @@ pub struct Assignment {
     pub argv: Vec<String>,
 }
 
+pub fn setup_runner(entries: &[Assignment]) -> Option<&Assignment> {
+    entries
+        .iter()
+        .find(|entry| entry.id == "setup-runner" && entry.role == PaneRole::Runner)
+}
+
 #[derive(Deserialize)]
 struct StoredAssignments {
     assignments: Vec<Assignment>,
@@ -185,6 +191,23 @@ mod tests {
             workspace_path(WorkspaceId::new()),
             workspace_path(WorkspaceId::new())
         );
+    }
+
+    #[test]
+    fn setup_runner_follows_saved_edits_and_disappears_if_reassigned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.toml");
+        let mut runner = assignment();
+        runner.id = "setup-runner".into();
+        runner.argv = vec!["cargo".into(), "test".into(), "--locked".into()];
+        save_to(&path, &[assignment(), runner.clone()]).unwrap();
+        assert_eq!(
+            setup_runner(&load_from(&path, vec![]).unwrap()),
+            Some(&runner)
+        );
+        runner.role = PaneRole::Service;
+        save_to(&path, &[runner]).unwrap();
+        assert!(setup_runner(&load_from(&path, vec![]).unwrap()).is_none());
     }
 
     #[test]

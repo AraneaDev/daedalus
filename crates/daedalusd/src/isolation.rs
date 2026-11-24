@@ -2,10 +2,10 @@ mod compose;
 mod dotenv;
 mod ports;
 
+pub(crate) use compose::find_compose_file;
 pub use compose::run_compose_down;
 use compose::{
-    ParsedPortEntry, find_compose_file, parse_compose_ports, sanitize_compose_project,
-    write_compose_override,
+    ParsedPortEntry, parse_compose_ports, sanitize_compose_project, write_compose_override,
 };
 use dotenv::{rewrite_localhost_url_port, scan_env_file};
 use ports::allocate_port_offset;

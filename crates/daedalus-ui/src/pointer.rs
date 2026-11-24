@@ -1,13 +1,13 @@
-use super::DaedalusApp;
+use super::{DaedalusApp, ViewportMetrics};
 use daedalus_proto::{PaneId, PaneRole};
 use daedalus_ui::input::UiAction;
-use daedalus_ui::layout::{HitTarget, Rect, hit_test};
-use daedalus_ui::renderer::{
+use daedalus_ui::layout::overlays::{
     action_palette_layout, close_modal_cancel_rect, close_modal_compose_rect,
     close_modal_confirm_rect, close_modal_force_rect, close_modal_worktree_rect,
     close_workspace_modal_rect, picker_item_rect, preset_picker_layout, search_bar_rect,
-    worktree_button_rects, worktree_modal_rect,
+    search_controls, worktree_button_rects, worktree_modal_rect,
 };
+use daedalus_ui::layout::{HitTarget, Rect, hit_test};
 use daedalus_ui::selection::{CellPos, Selection, select_word_at};
 use daedalus_ui::settings::SettingsAction;
 use daedalus_ui::state::{AgentPreset, AppState, PaneViewState};
@@ -60,6 +60,7 @@ enum OverlayClick {
     Consumed,
     Redraw,
     SendFailure,
+    Setup(daedalus_ui::setup_review::SetupAction),
     WorkspaceForm(WorkspaceFormAction),
     Settings(SettingsAction),
     ConfirmAction,
@@ -93,6 +94,8 @@ fn handle_overlay_click(
         } else {
             OverlayClick::Redraw
         }
+    } else if state.setup_review.open {
+        OverlayClick::Setup(state.setup_review.click(x, y, width, height, scale))
     } else if state.workspace_form.open {
         OverlayClick::WorkspaceForm(state.workspace_form.click(x, y, width, height, scale))
     } else if state.settings.open {
@@ -144,14 +147,34 @@ fn handle_overlay_click(
     Some(effect)
 }
 
+fn search_click(bar: Rect, x: f32, y: f32) -> Option<UiAction> {
+    if !bar.contains(x, y) {
+        return None;
+    }
+    let actions = [
+        UiAction::SearchPrev,
+        UiAction::SearchNext,
+        UiAction::SearchToggleCase,
+    ];
+    search_controls(bar)
+        .into_iter()
+        .zip(actions)
+        .find(|(rect, _)| rect.contains(x, y))
+        .map(|(_, action)| action)
+        .or(Some(UiAction::Ignore))
+}
+
 impl DaedalusApp {
     pub(super) fn handle_left_mouse_down(&mut self) {
-        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
-            return;
-        };
-        let size = window.inner_size();
-        let scale_factor = window.scale_factor() as f32;
-        let cell = renderer.cell_size();
+        if let Some(metrics) = self.viewport_metrics() {
+            self.click_at(metrics);
+        }
+    }
+
+    pub(super) fn click_at(&mut self, metrics: ViewportMetrics) {
+        let ViewportMetrics {
+            size, scale_factor, ..
+        } = metrics;
         match handle_overlay_click(
             &mut self.state,
             self.pointer.position,
@@ -167,20 +190,24 @@ impl DaedalusApp {
                 }
                 self.request_redraw();
             }
+            Some(OverlayClick::Setup(action)) => self.handle_setup_action(action),
             Some(OverlayClick::WorkspaceForm(action)) => self.handle_workspace_form(action),
             Some(OverlayClick::Settings(action)) => self.handle_settings_action(action),
             Some(OverlayClick::ConfirmAction) => self.confirm_workspace_action(),
             Some(OverlayClick::ApplyPreset(preset)) => self.apply_agent_preset(preset, false),
             Some(OverlayClick::Action(action)) => self.handle_ui_action(action),
-            None => self.handle_viewport_click(scale_factor, cell),
+            None => self.handle_viewport_click(metrics),
         }
     }
 
-    fn handle_viewport_click(&mut self, scale_factor: f32, (cell_w, cell_h): (f32, f32)) {
+    fn handle_viewport_click(&mut self, metrics: ViewportMetrics) {
+        let ViewportMetrics {
+            scale_factor,
+            cell: (cell_w, cell_h),
+            ..
+        } = metrics;
         let (x, y) = self.pointer.position;
-        let Some(layout) = self.compute_current_layout() else {
-            return;
-        };
+        let layout = self.layout_for(metrics);
         if let Some(search) = self.state.search.as_ref()
             && let Some(role) = self
                 .state
@@ -192,8 +219,25 @@ impl DaedalusApp {
                 })
                 .map(|p| p.role)
             && let Some(pane_rect) = layout.pane(role)
-            && search_bar_rect(pane_rect, scale_factor).contains(x, y)
         {
+            let bar = search_bar_rect(pane_rect, scale_factor);
+            if let Some(action) = search_click(bar, x, y) {
+                self.handle_ui_action(action);
+                return;
+            }
+        }
+        self.state.recap.keyboard_row = None;
+        if let Some((_, row)) = self
+            .renderer
+            .as_ref()
+            .into_iter()
+            .flat_map(|r| r.recap_targets())
+            .find(|(rect, _)| rect.contains(x, y))
+        {
+            if self.state.focus_recap_row(row) {
+                self.schedule_resize_flush();
+                self.request_redraw();
+            }
             return;
         }
         let target = hit_test(
@@ -208,16 +252,22 @@ impl DaedalusApp {
 
         match target {
             HitTarget::SidebarPageUp | HitTarget::SidebarPageDown => {
-                if let Some(list) = self.sidebar_list() {
+                if let Some(list) = &layout.sidebar_content {
                     let page = list.visible.len() as isize;
-                    self.scroll_sidebar(if target == HitTarget::SidebarPageUp {
-                        -page
-                    } else {
-                        page
-                    });
+                    self.scroll_sidebar(
+                        list,
+                        if target == HitTarget::SidebarPageUp {
+                            -page
+                        } else {
+                            page
+                        },
+                    );
                 }
             }
             HitTarget::ToggleSidebar => self.handle_ui_action(UiAction::ToggleSidebar),
+            HitTarget::SidebarFailedRun(workspace) => {
+                self.handle_ui_action(UiAction::OpenFailedRun(workspace));
+            }
             HitTarget::SidebarWorkspace(idx) => {
                 if let Some(ws) = self.state.workspaces.get(idx) {
                     let ws_id = ws.id;
@@ -239,6 +289,7 @@ impl DaedalusApp {
                 self.activate_session(target)
             }
             HitTarget::SessionTab(role) => self.handle_ui_action(UiAction::FocusRole(role)),
+            HitTarget::RunTests => self.handle_ui_action(UiAction::RunTests),
             HitTarget::WorkspaceSettings => self.open_workspace_settings(),
             HitTarget::SidebarNewWorkspace => self.create_new_workspace(),
             HitTarget::SidebarNewWorktree => self.open_worktree_modal(),
@@ -274,16 +325,20 @@ impl DaedalusApp {
     pub(super) fn handle_cursor_moved(&mut self, x: f32, y: f32) {
         self.pointer.position = (x, y);
 
+        if self.pointer.drag_anchor.is_some()
+            && let Some(metrics) = self.viewport_metrics()
+        {
+            self.drag_selection(metrics);
+        }
+    }
+
+    pub(super) fn drag_selection(&mut self, metrics: ViewportMetrics) {
         let Some((drag_role, drag_pane_id, anchor)) = self.pointer.drag_anchor else {
             return;
         };
-        let Some(renderer) = self.renderer.as_ref() else {
-            return;
-        };
-        let (cell_w, cell_h) = renderer.cell_size();
-        let Some(layout) = self.compute_current_layout() else {
-            return;
-        };
+        let (x, y) = self.pointer.position;
+        let (cell_w, cell_h) = metrics.cell;
+        let layout = self.layout_for(metrics);
         let Some(pane_rect) = layout.pane(drag_role) else {
             return;
         };
@@ -377,6 +432,19 @@ mod tests {
     use super::*;
     use daedalus_ui::{input::translate_key, state::ConnectionState};
     #[test]
+    fn search_clicks_use_the_rendered_control_regions() {
+        let bar = Rect::new(20.0, 40.0, 340.0, 58.0);
+        assert_eq!(search_click(bar, 10.0, 60.0), None);
+        assert_eq!(search_click(bar, 180.0, 54.0), Some(UiAction::Ignore));
+        assert_eq!(search_click(bar, 48.0, 84.0), Some(UiAction::SearchPrev));
+        assert_eq!(search_click(bar, 150.0, 84.0), Some(UiAction::SearchNext));
+        assert_eq!(
+            search_click(bar, 228.0, 84.0),
+            Some(UiAction::SearchToggleCase)
+        );
+    }
+
+    #[test]
     fn a_modal_consumes_even_clicks_outside_its_controls() {
         let mut state = AppState::new();
         let click = |state: &mut AppState| handle_overlay_click(state, (0., 0.), 900., 600., 1.);
@@ -458,7 +526,7 @@ mod tests {
         ] {
             let modal = worktree_modal_rect(w, h, dpi);
             let (cancel, create) = worktree_button_rects(modal, dpi);
-            let field = daedalus_ui::renderer::worktree_input_rect(modal, dpi);
+            let field = daedalus_ui::layout::overlays::worktree_input_rect(modal, dpi);
             assert!(field.bottom() < cancel.y && cancel.right() < create.x);
             assert!(create.bottom() <= modal.bottom() && create.right() <= modal.right());
             let click = |rect: daedalus_ui::layout::Rect, state: &AppState| {

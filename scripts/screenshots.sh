@@ -109,10 +109,10 @@ if cmp -s "$scratch/workbench.png" "$scratch/new-worktree.png"; then
     exit 1
 fi
 xdotool key Escape ctrl+shift+s
-# Exercise the saved assignment flow and capture a readable agent definition.
-xdotool mousemove --window "$window" 940 385 click 1
+# Settings opens on the selected assignment's name.
+xdotool key ctrl+a
 xdotool type --delay 30 'Reviewer'
-xdotool mousemove --window "$window" 720 580 click 1
+xdotool key ctrl+s
 for ((i=0; i<50; i++)); do
     if grep -rq 'name = "Reviewer"' "$XDG_CONFIG_HOME"; then break; fi
     sleep .1
@@ -122,7 +122,6 @@ if ! grep -rq 'name = "Reviewer"' "$XDG_CONFIG_HOME"; then
     exit 1
 fi
 xdotool key ctrl+shift+s
-xdotool mousemove --window "$window" 505 350 click 1
 xdotool mousemove 1439 899
 capture workspace-settings
 if cmp -s "$scratch/workbench.png" "$scratch/workspace-settings.png"; then

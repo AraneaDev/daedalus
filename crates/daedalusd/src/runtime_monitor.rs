@@ -12,7 +12,7 @@ pub use local_ports::{
 use crate::registry::Registry;
 use crate::worktree;
 use bollard::Docker;
-use daedalus_proto::{GitWorkspaceStatus, PortMapping, WorkspaceId};
+use daedalus_proto::{ContainerHealth, GitWorkspaceStatus, PortMapping, WorkspaceId};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -71,28 +71,7 @@ pub fn spawn_runtime_monitor(
                 continue;
             }
 
-            let local_targets: Vec<(WorkspaceId, Vec<u32>, PathBuf)> = targets
-                .iter()
-                .map(|t| (t.workspace_id, t.root_pids.clone(), t.root_dir.clone()))
-                .collect();
-
-            let local_probe_fut = tokio::task::spawn_blocking(move || {
-                local_targets
-                    .into_iter()
-                    .map(|(ws_id, roots, root_dir)| {
-                        let ports = discover_local_ports_for_roots(&roots);
-                        let (git_status, git_branch) =
-                            match worktree::git_workspace_status_and_branch(&root_dir) {
-                                Some((status, branch)) => (Some(status), branch),
-                                None => (None, None),
-                            };
-                        (ws_id, (ports, git_status, git_branch))
-                    })
-                    .collect::<HashMap<
-                        WorkspaceId,
-                        (Vec<PortMapping>, Option<GitWorkspaceStatus>, Option<String>),
-                    >>()
-            });
+            let local_probe_fut = probe_local_targets(&targets);
 
             let mut local_by_ws = tokio::select! {
                 biased;
@@ -123,58 +102,21 @@ pub fn spawn_runtime_monitor(
                     break;
                 }
 
-                let mut bound_ports = Vec::new();
-                let mut containers = Vec::new();
-
-                if let (Some(docker), Some(project)) = (
+                let observations = match (
                     docker_client.as_ref(),
                     target.compose_project_name.as_deref(),
                 ) {
-                    let docker_res = tokio::select! {
+                    (Some(docker), Some(project)) => tokio::select! {
                         biased;
                         _ = wait_for_shutdown(&mut shutdown) => break,
-                        res = tokio::time::timeout(
-                            DOCKER_POLL_TIMEOUT,
-                            poll_workspace_docker(docker, project),
-                        ) => res,
-                    };
-
-                    match docker_res {
-                        Ok(Ok((ws_containers, ws_docker_ports))) => {
-                            docker_unavailable_logged = false;
-                            containers = ws_containers;
-                            bound_ports.extend(ws_docker_ports);
-                        }
-                        Ok(Err(e)) => {
-                            if !docker_unavailable_logged {
-                                debug!(
-                                    error = %e,
-                                    project = %project,
-                                    "docker unavailable; skipping container health polling"
-                                );
-                                docker_unavailable_logged = true;
-                            }
-                        }
-                        Err(_) => {
-                            if !docker_unavailable_logged {
-                                debug!(
-                                    project = %project,
-                                    "docker poll timed out; skipping container health polling"
-                                );
-                                docker_unavailable_logged = true;
-                            }
-                        }
-                    }
-                }
-
-                let (git_status, git_branch) = if let Some((local_ports, git_status, git_branch)) =
-                    local_by_ws.remove(&target.workspace_id)
-                {
-                    bound_ports.extend(local_ports);
-                    (git_status, git_branch)
-                } else {
-                    (None, None)
+                        result = poll_compose_observations(docker, project, &mut docker_unavailable_logged) => result,
+                    },
+                    _ => Default::default(),
                 };
+                let (containers, bound_ports, git_status, git_branch) = merge_runtime_observations(
+                    observations,
+                    local_by_ws.remove(&target.workspace_id),
+                );
 
                 registry
                     .update_workspace_runtime(
@@ -188,4 +130,156 @@ pub fn spawn_runtime_monitor(
             }
         }
     })
+}
+
+type LocalObservation = (Vec<PortMapping>, Option<GitWorkspaceStatus>, Option<String>);
+type ComposeObservation = (Vec<ContainerHealth>, Vec<PortMapping>);
+
+fn probe_local_targets(
+    targets: &[WorkspaceMonitorTarget],
+) -> JoinHandle<HashMap<WorkspaceId, LocalObservation>> {
+    let targets: Vec<_> = targets
+        .iter()
+        .map(|t| (t.workspace_id, t.root_pids.clone(), t.root_dir.clone()))
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        targets
+            .into_iter()
+            .map(|(id, roots, dir)| {
+                let ports = discover_local_ports_for_roots(&roots);
+                let (status, branch) = match worktree::git_workspace_status_and_branch(&dir) {
+                    Some((status, branch)) => (Some(status), branch),
+                    None => (None, None),
+                };
+                (id, (ports, status, branch))
+            })
+            .collect()
+    })
+}
+
+async fn poll_compose_observations(
+    docker: &Docker,
+    project: &str,
+    unavailable_logged: &mut bool,
+) -> ComposeObservation {
+    match tokio::time::timeout(DOCKER_POLL_TIMEOUT, poll_workspace_docker(docker, project)).await {
+        Ok(Ok(result)) => {
+            *unavailable_logged = false;
+            return result;
+        }
+        Ok(Err(error)) if !*unavailable_logged => {
+            debug!(%error, %project, "docker unavailable; skipping container health polling")
+        }
+        Err(_) if !*unavailable_logged => {
+            debug!(%project, "docker poll timed out; skipping container health polling")
+        }
+        _ => {}
+    }
+    *unavailable_logged = true;
+    Default::default()
+}
+
+fn merge_runtime_observations(
+    (containers, mut ports): ComposeObservation,
+    local: Option<LocalObservation>,
+) -> (
+    Vec<ContainerHealth>,
+    Vec<PortMapping>,
+    Option<GitWorkspaceStatus>,
+    Option<String>,
+) {
+    let (local_ports, status, branch) = local.unwrap_or_default();
+    ports.extend(local_ports);
+    (containers, ports, status, branch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daedalus_proto::PortSource;
+
+    #[tokio::test]
+    async fn docker_poll_recovers_from_errors_and_uses_compose_project_filter() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let docker = Docker::connect_with_http(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            5,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        let responder = tokio::spawn(async move {
+            for (status, body) in [
+                ("500 Internal Server Error", r#"{"message":"offline"}"#),
+                ("500 Internal Server Error", r#"{"message":"offline"}"#),
+                (
+                    "200 OK",
+                    r#"[{"Id":"a","Ports":[{"PrivatePort":80,"PublicPort":8080,"Type":"tcp"}]},{"Id":"b","Labels":{"com.docker.compose.service":"web"},"Ports":[{"PrivatePort":80,"PublicPort":8080,"Type":"tcp"}],"Status":"Up (unhealthy)"}]"#,
+                ),
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut request = String::new();
+                stream.read_line(&mut request).await.unwrap();
+                assert!(
+                    request.contains("/containers/json?")
+                        && request.contains("com.docker.compose.project")
+                        && request.contains("demo"),
+                    "{request}"
+                );
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut unavailable = false;
+        for _ in 0..2 {
+            assert_eq!(
+                poll_compose_observations(&docker, "demo", &mut unavailable).await,
+                Default::default()
+            );
+            assert!(unavailable);
+        }
+        let (containers, ports) =
+            poll_compose_observations(&docker, "demo", &mut unavailable).await;
+        responder.await.unwrap();
+        assert!(!unavailable);
+        assert_eq!(containers.len(), 2);
+        assert_eq!(containers[1].name, "b");
+        assert_eq!(containers[1].health.as_deref(), Some("unhealthy"));
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].service.as_deref(), Some("web"));
+        assert_eq!(ports[0].host_port, 8080);
+    }
+
+    #[test]
+    fn merge_preserves_compose_then_local_order_and_git_branch() {
+        let port = |host_port, source| PortMapping {
+            host_port,
+            source,
+            container_port: None,
+            service: None,
+        };
+        let docker = port(8000, PortSource::Docker);
+        let local = port(3000, PortSource::LocalProcess);
+        let (_, ports, _, branch) = merge_runtime_observations(
+            (vec![], vec![docker.clone()]),
+            Some((vec![local.clone()], None, Some("dev".into()))),
+        );
+        assert_eq!(ports, [docker, local]);
+        assert_eq!(branch.as_deref(), Some("dev"));
+    }
 }

@@ -5,7 +5,7 @@ pkgdesc='Native coding-agent and worktree workbench'
 arch=('x86_64')
 url='https://github.com/AraneaDev/daedalus'
 license=('MIT')
-depends=('glibc' 'gcc-libs' 'libxkbcommon' 'libx11' 'libxcb' 'wayland' 'git')
+depends=('glibc' 'gcc-libs' 'libxkbcommon' 'libxkbcommon-x11' 'libx11' 'libxcb' 'wayland' 'git')
 options=('!strip' '!debug')
 source=('daedalus-ui' 'daedalus-ctl' 'daedalusd' 'daedalus.desktop' 'LICENSE')
 

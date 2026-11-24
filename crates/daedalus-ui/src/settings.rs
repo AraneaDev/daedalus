@@ -15,7 +15,8 @@ struct Draft {
     id: String,
     name: String,
     role: PaneRole,
-    args: String,
+    executable: String,
+    args: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -30,55 +31,43 @@ pub enum Control {
     #[default]
     Name,
     Role,
-    Args,
+    Executable,
+    Argument(usize),
+    DropArgument(usize),
+    AddArgument,
+    PreviousArguments,
+    NextArguments,
     Cancel,
     Save,
     Launch,
 }
 use Control::*;
 
-const ROWS: &[&[Control]] = &[
-    &[Prev, Next, Remove],
-    &[Add, Agy, Claude, Codex],
-    &[Name],
-    &[Role],
-    &[Args],
-    &[Cancel, Save, Launch],
-];
-pub fn control_order() -> impl Iterator<Item = Control> {
-    ROWS.iter().flat_map(|row| row.iter().copied())
+const PAGE_SIZE: usize = 3;
+
+impl Control {
+    pub fn field_label(self) -> Option<String> {
+        Some(match self {
+            Name => "Name".into(),
+            Executable => "Executable".into(),
+            Argument(i) => format!("Argument {}", i + 1),
+            _ => return None,
+        })
+    }
 }
 
 pub fn modal_rect(w: f32, h: f32, dpi: f32) -> Rect {
     let width = (w - 16.0 * dpi).max(1.0).min(650.0 * dpi);
-    let height = (h - 16.0 * dpi).max(1.0).min(324.0 * dpi);
+    let height = (h - 16.0 * dpi).max(1.0).min(480.0 * dpi);
     Rect::new((w - width) * 0.5, (h - height) * 0.5, width, height)
 }
-pub fn controls(modal: Rect) -> impl Iterator<Item = (Control, Rect)> {
-    ROWS.iter().enumerate().flat_map(move |(r, row)| {
-        let pad = modal.width * 0.025;
-        let width = (modal.width - 2.0 * pad) / row.len() as f32;
-        let y = [0.15, 0.25, 0.36, 0.46, 0.56, 0.85][r];
-        row.iter().enumerate().map(move |(i, c)| {
-            (
-                *c,
-                Rect::new(
-                    modal.x + pad + i as f32 * width,
-                    modal.y + y * modal.height,
-                    width,
-                    modal.height * 0.095,
-                ),
-            )
-        })
-    })
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct SettingsDialog {
     pub open: bool,
     pub error: Option<String>,
     drafts: Vec<Draft>,
     selected: usize,
+    argument_page: usize,
     pub focus: Control,
     pub invalid_field: Option<Control>,
     revision: u64,
@@ -88,6 +77,61 @@ pub struct SettingsDialog {
 }
 
 impl SettingsDialog {
+    fn rows(&self) -> Vec<Vec<Control>> {
+        let mut rows = vec![
+            vec![Prev, Next, Remove],
+            vec![Add, Agy, Claude, Codex],
+            vec![Name],
+            vec![Role],
+            vec![Executable],
+        ];
+        let count = self.drafts.get(self.selected).map_or(0, |d| d.args.len());
+        let start = self.argument_page * PAGE_SIZE;
+        for i in start..(start + PAGE_SIZE).min(count) {
+            rows.push(vec![Argument(i), DropArgument(i)]);
+        }
+        let mut buttons = vec![AddArgument];
+        if count > PAGE_SIZE {
+            buttons.extend([PreviousArguments, NextArguments]);
+        }
+        rows.push(buttons);
+        rows.push(vec![Cancel, Save, Launch]);
+        rows
+    }
+
+    pub fn control_order(&self) -> impl Iterator<Item = Control> + use<> {
+        self.rows().into_iter().flatten()
+    }
+
+    pub fn controls(&self, modal: Rect) -> impl Iterator<Item = (Control, Rect)> + use<> {
+        let rows = self.rows();
+        let actions_row = 10;
+        let last = rows.len() - 1;
+        rows.into_iter().enumerate().flat_map(move |(index, row)| {
+            let index = if index == last { actions_row } else { index };
+            let pad = modal.width * 0.025;
+            let width = modal.width - 2.0 * pad;
+            let top = modal.y + (0.09 + 0.082 * index as f32) * modal.height;
+            let count = row.len() as f32;
+            row.into_iter().enumerate().map(move |(i, control)| {
+                let (offset, fraction) = match control {
+                    Argument(_) => (0., 0.80),
+                    DropArgument(_) => (0.80, 0.20),
+                    _ => (i as f32 / count, 1. / count),
+                };
+                (
+                    control,
+                    Rect::new(
+                        modal.x + pad + offset * width,
+                        top,
+                        width * fraction,
+                        modal.height * 0.078,
+                    ),
+                )
+            })
+        })
+    }
+
     pub fn begin(&mut self, entries: Vec<Assignment>) {
         *self = Self {
             open: true,
@@ -98,7 +142,8 @@ impl SettingsDialog {
                     id: a.id,
                     name: a.name,
                     role: a.role,
-                    args: serde_json::to_string(&a.argv).expect("string arguments serialize"),
+                    executable: a.argv.first().cloned().unwrap_or_default(),
+                    args: a.argv.into_iter().skip(1).collect(),
                 })
                 .collect(),
             ..Default::default()
@@ -116,7 +161,15 @@ impl SettingsDialog {
                 "Pane   {}   ↻",
                 draft.map_or("—".into(), |d| d.role.to_string())
             ),
-            Args => format!("Argv   {}", draft.map_or("", |d| &d.args)),
+            Executable | Argument(_) => format!(
+                "{}   {}",
+                c.field_label().unwrap(),
+                self.value(c).unwrap_or_default()
+            ),
+            DropArgument(i) => format!("Remove {}", i + 1),
+            AddArgument => "+ Argument".into(),
+            PreviousArguments => "‹ Arguments".into(),
+            NextArguments => "Arguments ›".into(),
             Prev => "‹ Previous".into(),
             Next => "Next ›".into(),
             Remove => "Remove".into(),
@@ -132,7 +185,7 @@ impl SettingsDialog {
 
     pub fn accessibility_description(&self) -> String {
         let mut description = format!("{}. Focused: {}.", self.heading(), self.label(self.focus));
-        if self.select_all && matches!(self.focus, Name | Args) {
+        if self.select_all && self.focus.field_label().is_some() {
             description.push_str(" All text selected.");
         }
         if let Some(error) = &self.error {
@@ -143,15 +196,17 @@ impl SettingsDialog {
     }
 
     pub(crate) fn visible_label(&self, control: Control, columns: usize) -> String {
-        let Some(draft) = self.drafts.get(self.selected) else {
-            return self.label(control);
-        };
-        let (name, text) = match control {
-            Name if self.focus == Name => ("Name", &draft.name),
-            Args if self.focus == Args => ("Argv", &draft.args),
-            _ => return self.label(control),
-        };
-        crate::renderer::text::editable_label(name, text, text.len() - self.from_end, columns)
+        if control == self.focus
+            && let (Some(label), Some(text)) = (control.field_label(), self.value(control))
+        {
+            return crate::renderer::text::editable_label(
+                &label,
+                text,
+                text.len() - self.from_end,
+                columns,
+            );
+        }
+        self.label(control)
     }
 
     pub(crate) fn hint(&self) -> &str {
@@ -165,13 +220,8 @@ impl SettingsDialog {
     }
 
     fn field_has_text(&self) -> bool {
-        self.drafts
-            .get(self.selected)
-            .is_some_and(|d| match self.focus {
-                Name => !d.name.is_empty(),
-                Args => !d.args.is_empty(),
-                _ => false,
-            })
+        self.value(self.focus)
+            .is_some_and(|value| !value.is_empty())
     }
 
     pub fn heading(&self) -> String {
@@ -188,7 +238,16 @@ impl SettingsDialog {
     pub fn enabled(&self, c: Control) -> bool {
         match c {
             Prev | Next => self.drafts.len() > 1,
-            Remove | Name | Role | Args | Launch => !self.drafts.is_empty(),
+            PreviousArguments => self.argument_page > 0,
+            NextArguments => self
+                .drafts
+                .get(self.selected)
+                .is_some_and(|d| (self.argument_page + 1) * PAGE_SIZE < d.args.len()),
+            Argument(i) | DropArgument(i) => self
+                .drafts
+                .get(self.selected)
+                .is_some_and(|d| i < d.args.len()),
+            Remove | Name | Role | Executable | AddArgument | Launch => !self.drafts.is_empty(),
             _ => true,
         }
     }
@@ -197,7 +256,8 @@ impl SettingsDialog {
         let draft = self.drafts.get_mut(self.selected)?;
         match self.focus {
             Name => Some(&mut draft.name),
-            Args => Some(&mut draft.args),
+            Executable => Some(&mut draft.executable),
+            Argument(i) => draft.args.get_mut(i),
             _ => None,
         }
     }
@@ -224,7 +284,8 @@ impl SettingsDialog {
         let draft = self.drafts.get(self.selected)?;
         match control {
             Name => Some(&draft.name),
-            Args => Some(&draft.args),
+            Executable => Some(&draft.executable),
+            Argument(i) => draft.args.get(i).map(String::as_str),
             _ => None,
         }
     }
@@ -245,7 +306,7 @@ impl SettingsDialog {
         if self.enabled(control) && self.focus != control {
             self.focus = control;
             self.from_end = 0;
-            self.select_all = matches!(control, Name | Args);
+            self.select_all = control.field_label().is_some();
         }
     }
 
@@ -259,19 +320,29 @@ impl SettingsDialog {
     }
 
     pub fn activate(&mut self, control: Control) -> SettingsAction {
+        if !self.enabled(control) {
+            return SettingsAction::None;
+        }
         let previous = (self.selected, self.drafts.len());
+        let previous_page = self.argument_page;
         let action = self.apply_control(control);
         if previous != (self.selected, self.drafts.len()) {
-            // Ignore queued platform actions addressed to the previous assignment.
+            self.argument_page = match self.focus {
+                Argument(i) => i / PAGE_SIZE,
+                _ => 0,
+            };
+        }
+        if previous != (self.selected, self.drafts.len())
+            || previous_page != self.argument_page
+            || matches!(control, AddArgument | DropArgument(_))
+        {
+            // Ignore queued platform actions addressed to a previous set of rows.
             self.revision = self.revision.wrapping_add(1);
         }
         action
     }
 
     fn apply_control(&mut self, c: Control) -> SettingsAction {
-        if !self.enabled(c) {
-            return SettingsAction::None;
-        }
         self.focus = c;
         self.from_end = 0;
         self.select_all = false;
@@ -296,7 +367,8 @@ impl SettingsDialog {
                     } else {
                         PaneRole::Agent
                     },
-                    args: format!("[\"{preset}\"]"),
+                    executable: preset.into(),
+                    args: Vec::new(),
                 });
                 self.focus = Name;
                 self.select_all = true;
@@ -314,34 +386,67 @@ impl SettingsDialog {
                     PaneRole::Runner => PaneRole::Agent,
                 };
             }
-            Name | Args => self.select_all = true,
+            Name | Executable | Argument(_) => self.select_all = true,
+            AddArgument => {
+                let args = &mut self.drafts[self.selected].args;
+                let i = args.len();
+                args.push(String::new());
+                self.argument_page = i / PAGE_SIZE;
+                self.focus = Argument(i);
+            }
+            DropArgument(i) => {
+                let args = &mut self.drafts[self.selected].args;
+                args.remove(i);
+                let next = i.min(args.len().saturating_sub(1));
+                self.argument_page = next / PAGE_SIZE;
+                self.focus = if args.is_empty() {
+                    AddArgument
+                } else {
+                    Argument(next)
+                };
+            }
+            PreviousArguments | NextArguments => {
+                if c == PreviousArguments {
+                    self.argument_page -= 1;
+                } else {
+                    self.argument_page += 1;
+                }
+                self.focus = Argument(self.argument_page * PAGE_SIZE);
+                self.select_all = true;
+            }
             Cancel => return SettingsAction::Cancel,
             Save | Launch => {
                 let mut values = Vec::new();
                 for (i, d) in self.drafts.iter().enumerate() {
-                    let argv = serde_json::from_str::<Vec<String>>(&d.args);
-                    if d.name.trim().is_empty()
-                        || !matches!(&argv, Ok(v) if v.first().is_some_and(|s| !s.trim().is_empty()) && v.iter().all(|s| !s.contains('\0')))
-                    {
+                    let invalid = if d.name.trim().is_empty() {
+                        Some((Name, "Enter an assignment name."))
+                    } else if d.executable.trim().is_empty() || d.executable.contains('\0') {
+                        Some((Executable, "Enter an executable without a null character."))
+                    } else {
+                        d.args
+                            .iter()
+                            .position(|arg| arg.contains('\0'))
+                            .map(|i| (Argument(i), "Remove the null character from this argument."))
+                    };
+                    if let Some((control, message)) = invalid {
                         self.selected = i;
-                        self.focus = if d.name.trim().is_empty() { Name } else { Args };
+                        if let Argument(index) = control {
+                            self.argument_page = index / PAGE_SIZE;
+                        }
+                        self.focus = control;
                         self.select_all = true;
-                        self.invalid_field = Some(self.focus);
-                        self.error = Some(
-                            if self.focus == Name {
-                                "Enter an assignment name."
-                            } else {
-                                "Use a quoted array with an executable first."
-                            }
-                            .into(),
-                        );
+                        self.invalid_field = Some(control);
+                        self.error = Some(message.into());
                         return SettingsAction::None;
                     }
                     values.push(Assignment {
                         id: d.id.clone(),
                         name: d.name.clone(),
                         role: d.role,
-                        argv: argv.expect("validated argv"),
+                        argv: std::iter::once(&d.executable)
+                            .chain(&d.args)
+                            .cloned()
+                            .collect(),
                     });
                 }
                 return if c == Launch {
@@ -364,7 +469,7 @@ impl SettingsDialog {
     }
 
     pub fn click(&mut self, x: f32, y: f32, w: f32, h: f32, dpi: f32) -> SettingsAction {
-        controls(modal_rect(w, h, dpi))
+        self.controls(modal_rect(w, h, dpi))
             .find(|(_, r)| r.contains(x, y))
             .map_or(SettingsAction::None, |(c, _)| self.activate(c))
     }
@@ -374,14 +479,14 @@ impl SettingsDialog {
             Key::Named(NamedKey::Escape) => return SettingsAction::Cancel,
             Key::Named(NamedKey::Enter) => return self.activate(self.focus),
             Key::Named(NamedKey::Tab) => {
-                let enabled: Vec<_> = control_order().filter(|&c| self.enabled(c)).collect();
+                let enabled: Vec<_> = self.control_order().filter(|&c| self.enabled(c)).collect();
                 let i = enabled.iter().position(|&c| c == self.focus).unwrap_or(0);
                 self.focus = enabled[(i + if mods.shift_key() {
                     enabled.len() - 1
                 } else {
                     1
                 }) % enabled.len()];
-                self.select_all = matches!(self.focus, Name | Args);
+                self.select_all = self.focus.field_label().is_some();
                 self.from_end = 0;
             }
             Key::Named(
@@ -425,7 +530,7 @@ impl SettingsDialog {
                 }
                 self.select_all = false;
             }
-            Key::Named(NamedKey::Space) if !matches!(self.focus, Name | Args) => {
+            Key::Named(NamedKey::Space) if self.focus.field_label().is_none() => {
                 return self.activate(self.focus);
             }
             Key::Named(NamedKey::Space) => self.insert_text(" "),
@@ -454,8 +559,13 @@ mod tests {
         dialog.activate(Codex);
         dialog.activate(Add);
         dialog.insert_text("Test");
-        dialog.activate(Args);
-        dialog.insert_text(r#"["printf", "", "two words", "$HOME", "α"]"#);
+        dialog.activate(Executable);
+        dialog.insert_text("printf");
+        for arg in ["", "two words", "$HOME", "discard", "α"] {
+            dialog.activate(AddArgument);
+            dialog.insert_text(arg);
+        }
+        dialog.activate(DropArgument(3));
         let SettingsAction::Launch(entries, id) = dialog.activate(Launch) else {
             panic!("expected launch");
         };
@@ -477,7 +587,8 @@ mod tests {
         dialog.begin(Vec::new());
         let (w, h, dpi) = (850.0, 600.0, 1.5);
         let click = |dialog: &mut SettingsDialog, control| {
-            let (_, r) = controls(modal_rect(w, h, dpi))
+            let (_, r) = dialog
+                .controls(modal_rect(w, h, dpi))
                 .find(|(c, _)| *c == control)
                 .unwrap();
             dialog.click(r.x + r.width * 0.5, r.y + r.height * 0.5, w, h, dpi)
@@ -523,10 +634,88 @@ mod tests {
         let mut dialog = SettingsDialog::default();
         dialog.begin(Vec::new());
         dialog.activate(Claude);
-        dialog.activate(Args);
-        dialog.insert_text("[]");
+        dialog.activate(Executable);
+        dialog.insert_text("");
         assert!(matches!(dialog.activate(Launch), SettingsAction::None));
-        assert_eq!(dialog.focus, Args);
+        assert_eq!(dialog.focus, Executable);
         assert!(dialog.error.is_some());
+    }
+
+    #[test]
+    fn argument_pagination_tracks_focus_and_returns_to_invalid_argument_on_save() {
+        let mut dialog = SettingsDialog::default();
+        dialog.begin(vec![]);
+        dialog.activate(Codex);
+        for i in 0..=PAGE_SIZE {
+            dialog.activate(AddArgument);
+            dialog.insert_text(&format!("arg{i}"));
+        }
+        assert_eq!(dialog.focus, Argument(PAGE_SIZE));
+        let last_page = dialog.revision();
+        assert!(!dialog.enabled(NextArguments));
+        dialog.activate(PreviousArguments);
+        assert_ne!(dialog.revision(), last_page);
+        assert_eq!(dialog.focus, Argument(0));
+        assert!(dialog.control_order().any(|c| c == Argument(0)));
+        assert!(!dialog.control_order().any(|c| c == Argument(PAGE_SIZE)));
+        dialog.activate(NextArguments);
+        assert_eq!(dialog.focus, Argument(PAGE_SIZE));
+        let SettingsAction::Save(mut saved) = dialog.activate(Save) else {
+            panic!("valid arguments should save");
+        };
+        saved[0].argv[1 + PAGE_SIZE] = "bad\0argument".into();
+        dialog.begin(saved);
+        dialog.activate(Save);
+        assert_eq!(dialog.focus, Argument(PAGE_SIZE));
+        assert!(dialog.control_order().any(|c| c == Argument(PAGE_SIZE)));
+        assert!(
+            dialog
+                .accessibility_description()
+                .contains("null character")
+        );
+        dialog.activate(DropArgument(PAGE_SIZE));
+        assert_eq!(dialog.focus, Argument(PAGE_SIZE - 1));
+        let SettingsAction::Save(entries) = dialog.activate(Save) else {
+            panic!("could not save corrected arguments");
+        };
+        assert_eq!(entries[0].argv.len(), 1 + PAGE_SIZE);
+    }
+
+    #[test]
+    fn keyboard_navigation_replaces_selection_and_saves_a_changed_assignment_role() {
+        let mut dialog = SettingsDialog::default();
+        dialog.begin(vec![]);
+        let named = |dialog: &mut SettingsDialog, key| {
+            dialog.key(&Key::Named(key), ModifiersState::empty())
+        };
+        dialog.activate(Claude);
+        named(&mut dialog, NamedKey::ArrowLeft);
+        assert_eq!(dialog.selection(Name), 0..0);
+        named(&mut dialog, NamedKey::Delete);
+        assert_eq!(dialog.value(Name), Some("laude"));
+        named(&mut dialog, NamedKey::End);
+        named(&mut dialog, NamedKey::Backspace);
+        dialog.key(&Key::Character("a".into()), ModifiersState::CONTROL);
+        assert_eq!(dialog.selection(Name), 0..4);
+        dialog.key(&Key::Character("build".into()), ModifiersState::empty());
+        named(&mut dialog, NamedKey::Tab);
+        assert_eq!(dialog.focus, Role);
+        for role in [PaneRole::Service, PaneRole::Runner, PaneRole::Agent] {
+            named(&mut dialog, NamedKey::Enter);
+            assert!(dialog.label(Role).contains(&role.to_string()));
+        }
+        dialog.key(&Key::Named(NamedKey::Tab), ModifiersState::SHIFT);
+        assert_eq!(dialog.focus, Name);
+        let SettingsAction::Save(entries) =
+            dialog.key(&Key::Character("s".into()), ModifiersState::CONTROL)
+        else {
+            panic!("save shortcut was ignored");
+        };
+        assert_eq!(entries[0].name, "build");
+        assert_eq!(entries[0].argv, ["claude"]);
+        assert!(matches!(
+            named(&mut dialog, NamedKey::Escape),
+            SettingsAction::Cancel
+        ));
     }
 }

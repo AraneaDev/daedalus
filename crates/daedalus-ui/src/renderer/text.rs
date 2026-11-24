@@ -1,6 +1,9 @@
 mod chrome;
+#[cfg(test)]
+mod frame_tests;
 mod modal;
 mod settings;
+mod setup_review;
 mod workspace_form;
 
 use std::collections::{HashMap, HashSet};
@@ -15,6 +18,7 @@ use glyphon::{
 };
 
 use crate::config::clamp_font_size;
+use crate::layout::overlays::sanitize_scale;
 use crate::layout::{Rect, WorkspaceLayout};
 use crate::state::AppState;
 use crate::theme::{self, Theme};
@@ -32,14 +36,6 @@ const MODAL_TITLE_FONT_SIZE_LOGICAL: f32 = 13.5;
 const MODAL_TITLE_LINE_HEIGHT_LOGICAL: f32 = 18.0;
 
 const PREFERRED_MONO_FAMILIES: [&str; 3] = ["JetBrains Mono", "Cascadia Mono", "DejaVu Sans Mono"];
-
-fn sanitize_scale(scale_factor: f32) -> f32 {
-    if scale_factor.is_finite() && scale_factor > 0.0 {
-        scale_factor
-    } else {
-        1.0
-    }
-}
 
 fn rect_to_bounds(rect: Rect) -> TextBounds {
     TextBounds {
@@ -132,10 +128,10 @@ pub fn truncate_right_with_ellipsis(input: &str, columns: usize) -> String {
     format!("{}…", &input[..end])
 }
 
-fn recipient_row_label(name: &str, id: &str, columns: usize) -> String {
-    let suffix = format!(" · {id}");
+fn label_with_trailing_detail(name: &str, detail: &str, columns: usize) -> String {
+    let suffix = format!(" · {detail}");
     if columns <= suffix.width() {
-        return truncate_right_with_ellipsis(id, columns);
+        return truncate_right_with_ellipsis(detail, columns);
     }
     format!(
         "{}{suffix}",
@@ -263,6 +259,7 @@ pub struct TextRenderer {
     modal_items: Vec<ChromeTextItem>,
     pub(super) has_modal_text: bool,
     pub(super) recap_drawn: bool,
+    pub(super) recap_targets: Vec<(Rect, crate::recap::RecapEntry)>,
 }
 
 impl TextRenderer {
@@ -325,6 +322,7 @@ impl TextRenderer {
             modal_items: Vec::new(),
             has_modal_text: false,
             recap_drawn: false,
+            recap_targets: Vec::new(),
         }
     }
 
@@ -430,11 +428,26 @@ impl TextRenderer {
         screen_h: f32,
         cards: Option<&super::SidebarCards>,
     ) {
+        let visible_panes = self.update_visible_pane_buffers(state, layout, theme);
+        self.chrome_items.clear();
+        self.recap_drawn = false;
+        self.recap_targets.clear();
+        self.build_chrome_items(state, layout, theme, cards);
+
+        self.prepare_base_text_pass(device, queue, &visible_panes, theme);
+        self.prepare_overlay_text_pass(device, queue, state, layout, theme, (screen_w, screen_h));
+    }
+
+    fn update_visible_pane_buffers(
+        &mut self,
+        state: &mut AppState,
+        layout: &WorkspaceLayout,
+        theme: &Theme,
+    ) -> Vec<VisiblePaneDraw> {
         // Prune caches for closed panes.
         self.pane_buffers
             .retain(|pane_id, _| state.panes.contains_key(pane_id));
 
-        // 1. Incrementally update dirty terminal row buffers for visible panes.
         let mut visible_panes = Vec::with_capacity(layout.panes.len());
         for pane_rect in &layout.panes {
             let Some(pane_id) = state.pane_id_for_role(pane_rect.role) else {
@@ -518,16 +531,20 @@ impl TextRenderer {
             });
         }
 
-        // 2. Rebuild UI chrome text buffers (sidebar, banner, pane headers, pills).
-        self.chrome_items.clear();
-        self.recap_drawn = false;
-        self.build_chrome_items(state, layout, theme, cards);
+        visible_panes
+    }
 
-        // 3. Prepare base text pass (terminal rows + UI chrome).
+    fn prepare_base_text_pass(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        visible_panes: &[VisiblePaneDraw],
+        theme: &Theme,
+    ) {
         let default_fg = theme.text_primary.to_glyphon_color();
         let mut base_areas: Vec<TextArea<'_>> = Vec::new();
 
-        for vp in &visible_panes {
+        for vp in visible_panes {
             let Some(cached) = self.pane_buffers.get(&vp.pane_id) else {
                 continue;
             };
@@ -567,12 +584,24 @@ impl TextRenderer {
             &mut self.swash_cache,
         ) {
             self.recap_drawn = false;
+            self.recap_targets.clear();
             tracing::warn!(%err, "glyphon base text prepare failed");
         }
+    }
 
-        // 4. Rebuild & prepare overlay text pass if a modal or search bar is open.
+    fn prepare_overlay_text_pass(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        state: &AppState,
+        layout: &WorkspaceLayout,
+        theme: &Theme,
+        screen_size: (f32, f32),
+    ) {
+        let (screen_w, screen_h) = screen_size;
         self.modal_items.clear();
         let modal_open = state.failure_recipients.is_some()
+            || state.setup_review.open
             || state.workspace_form.open
             || state.settings.open
             || state.action_palette.open
@@ -583,43 +612,9 @@ impl TextRenderer {
         self.has_modal_text = modal_open;
         if modal_open {
             if let Some(choices) = &state.failure_recipients {
-                let s = self.scale_factor;
-                let (modal, visible) = super::action_palette_layout(
-                    screen_w,
-                    screen_h,
-                    s,
-                    choices.agents.len(),
-                    choices.selected,
-                );
-                self.build_picker_header(modal, theme, modal::PickerKind::Recipient);
-                for (row, index) in visible.enumerate() {
-                    let rect = super::picker_item_rect(modal, row, s);
-                    let selected = choices.selected == index;
-                    let pane = choices.agents[index];
-                    let max_w = (rect.width - 20. * s).max(1.);
-                    let glyph_width =
-                        self.cell_w * CHROME_FONT_SIZE_LOGICAL / self.font_size_logical;
-                    let label = recipient_row_label(
-                        state.recipient_name(pane),
-                        &pane.short(),
-                        (max_w / glyph_width) as usize,
-                    );
-                    self.push_modal_line(ChromeLineSpec {
-                        text: &label,
-                        left: rect.x + 10.0 * s,
-                        top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                        max_w,
-                        bounds: rect,
-                        font_size_logical: CHROME_FONT_SIZE_LOGICAL,
-                        line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
-                        color: if selected {
-                            theme.text_primary
-                        } else {
-                            theme.text_muted
-                        },
-                        bold: selected,
-                    });
-                }
+                self.build_failure_recipient_items(state, choices, theme, screen_w, screen_h);
+            } else if state.setup_review.open {
+                self.build_setup_review_items(state, theme, screen_w, screen_h);
             } else if state.workspace_form.open {
                 self.build_workspace_form_items(state, theme, screen_w, screen_h);
             } else if state.settings.open {
@@ -711,6 +706,17 @@ impl TextRenderer {
         );
         buffer.set_text(spec.text, &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(&mut self.font_system, false);
+
+        // Some fallback fonts provide unusable advances. Retry with the primary
+        // font before glyphon converts the shaped positions to integer pixels.
+        if buffer.layout_runs().flat_map(|run| run.glyphs).any(|g| {
+            let x = spec.left + g.x + g.font_size * g.x_offset;
+            let y = spec.top + g.y - g.font_size * g.y_offset;
+            !(x.abs() < i32::MAX as f32 && y.abs() < i32::MAX as f32)
+        }) {
+            buffer.set_text(spec.text, &attrs, Shaping::Basic, None);
+            buffer.shape_until_scroll(&mut self.font_system, false);
+        }
 
         Some(ChromeTextItem {
             buffer,
@@ -826,6 +832,74 @@ mod tests {
     use daedalus_proto::{Cell, Color};
 
     #[test]
+    fn prepared_frames_update_dirty_terminal_text_and_clear_a_closed_recipient_picker() {
+        use crate::renderer::tests::make_state_with_agent_row;
+        use crate::state::FailureRecipients;
+        use daedalus_proto::GridDelta;
+
+        let (device, queue) = wgpu::Device::noop(&Default::default());
+        let mut renderer = TextRenderer::new(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            1200,
+            800,
+            1.,
+            14.,
+            None,
+        );
+        let (mut state, layout) = make_state_with_agent_row();
+        let agent = state.focused_pane_id().unwrap();
+        let frame = |renderer: &mut TextRenderer, state: &mut AppState| {
+            renderer.prepare(&device, &queue, state, &layout, &Theme::dark(), 1200., 800.);
+        };
+
+        frame(&mut renderer, &mut state);
+        assert_eq!(renderer.pane_buffers[&agent].rows[0].lines[0].text(), "abc");
+        assert!(!renderer.has_modal_text);
+
+        let pane = state.panes.get_mut(&agent).unwrap();
+        let mut changed = pane.viewport_rows[0].clone();
+        changed.cells[0].text = "z".into();
+        pane.apply_delta(GridDelta {
+            pane_id: agent,
+            seq: 2,
+            cols: 20,
+            rows: 5,
+            cursor: Default::default(),
+            dirty_rows: vec![changed],
+            history_generation: 0,
+            scrollback_len: None,
+        });
+        state.session_names.insert(agent, "Reviewer".into());
+        state.failure_recipients = Some(FailureRecipients {
+            workspace: state.active_workspace_id.unwrap(),
+            runner: PaneId::new(),
+            agents: vec![agent],
+            selected: 0,
+        });
+        frame(&mut renderer, &mut state);
+        assert_eq!(renderer.pane_buffers[&agent].rows[0].lines[0].text(), "zbc");
+        assert!(renderer.has_modal_text);
+        let labels: Vec<_> = renderer
+            .modal_items
+            .iter()
+            .map(|item| item.buffer.lines[0].text())
+            .collect();
+        assert_eq!(labels.first().copied(), Some("Send failure to agent"));
+        assert_eq!(
+            labels.last().copied(),
+            Some(state.failure_recipient_label(agent).as_str())
+        );
+
+        state.failure_recipients = None;
+        frame(&mut renderer, &mut state);
+        assert!(!renderer.has_modal_text);
+        assert!(renderer.modal_items.is_empty());
+        assert_eq!(renderer.pane_buffers[&agent].rows[0].lines[0].text(), "zbc");
+    }
+
+    #[test]
     fn build_row_spans_coalesces_adjacent_cells_and_skips_wide_continuations() {
         let row = GridRow {
             row_index: 0,
@@ -935,7 +1009,7 @@ mod tests {
     #[test]
     fn compact_recipient_rows_keep_the_disambiguating_id_after_long_names() {
         for id in ["deadbeef", "cafefeed"] {
-            let label = recipient_row_label("長い同じ名前を持っているエージェント", id, 22);
+            let label = label_with_trailing_detail("長い同じ名前を持っているエージェント", id, 22);
             assert!(label.ends_with(&format!("… · {id}")));
             assert!(label.width() <= 22);
         }

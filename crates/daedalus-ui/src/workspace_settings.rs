@@ -63,18 +63,7 @@ impl DaedalusApp {
         match action {
             Action::None => {}
             Action::Cancel => self.state.workspace_form.open = false,
-            Action::Save { name, folder } => {
-                if self.send_command(UiCommand::CreateManualWorkspace {
-                    session: self.state.workspace_form.session(),
-                    name,
-                    root_dir: folder,
-                }) {
-                    self.state.workspace_form.start_submission();
-                } else {
-                    self.state.workspace_form.error =
-                        Some("Reconnect to create this workspace.".into());
-                }
-            }
+            Action::Save { name, folder } => self.inspect_setup_folder(name, folder),
         }
         self.request_redraw();
     }
@@ -121,25 +110,62 @@ impl DaedalusApp {
         self.restore_workspace_names(workspace.id, workspace.panes.iter().copied());
         if let Some(assignment) =
             launch_id.and_then(|id| entries.into_iter().find(|entry| entry.id == id))
+            && !self.launch_saved_assignment(workspace.id, assignment)
         {
-            let (cols, rows) = self
-                .compute_current_layout()
-                .and_then(|layout| layout.panes.first().map(|pane| (pane.cols, pane.rows)))
-                .unwrap_or((FALLBACK_PANE_COLS, FALLBACK_PANE_ROWS));
-            if !self.send_command(UiCommand::LaunchAssignment {
-                workspace_id: workspace.id,
-                assignment,
-                cols,
-                rows,
-            }) {
-                self.state.settings.error =
-                    Some("Settings saved. Reconnect to launch this terminal.".into());
-                self.request_redraw();
-                return;
-            }
+            self.state.settings.error =
+                Some("Settings saved. Reconnect to launch this terminal.".into());
+            self.request_redraw();
+            return;
         }
         self.state.settings.open = false;
         self.request_redraw();
+    }
+
+    pub(super) fn refresh_test_runner(&mut self, workspace: WorkspaceId) {
+        self.state.test_workspaces.remove(&workspace);
+        match assignments::load(workspace) {
+            Ok(entries) if assignments::setup_runner(&entries).is_some() => {
+                self.state.test_workspaces.insert(workspace);
+            }
+            Ok(_) => {}
+            Err(error) => self.show_toast(error, true),
+        }
+    }
+
+    pub(super) fn run_saved_tests(&mut self) {
+        let Some(workspace_id) = self.state.active_test_workspace() else {
+            self.show_toast("No test command available for this workspace", false);
+            return;
+        };
+        let entries = match assignments::load(workspace_id) {
+            Ok(entries) => entries,
+            Err(err) => {
+                self.state.test_workspaces.remove(&workspace_id);
+                self.show_toast(err, true);
+                return;
+            }
+        };
+        let Some(assignment) = assignments::setup_runner(&entries).cloned() else {
+            self.state.test_workspaces.remove(&workspace_id);
+            self.show_toast("Test command is no longer configured", false);
+            return;
+        };
+        if !self.launch_saved_assignment(workspace_id, assignment) {
+            self.show_toast("Reconnect to run tests", true);
+        }
+    }
+
+    fn launch_saved_assignment(&self, workspace_id: WorkspaceId, assignment: Assignment) -> bool {
+        let (cols, rows) = self
+            .compute_current_layout()
+            .and_then(|layout| layout.panes.first().map(|pane| (pane.cols, pane.rows)))
+            .unwrap_or((FALLBACK_PANE_COLS, FALLBACK_PANE_ROWS));
+        self.send_command(UiCommand::LaunchAssignment {
+            workspace_id,
+            assignment,
+            cols,
+            rows,
+        })
     }
 
     pub(super) fn settings_key(&mut self, key: &Key) {
@@ -183,10 +209,14 @@ impl DaedalusApp {
         workspace: WorkspaceId,
         panes: impl Iterator<Item = PaneId>,
     ) {
+        self.state.test_workspaces.remove(&workspace);
         match assignments::load_bindings(workspace)
             .and_then(|bindings| Ok((bindings, assignments::load(workspace)?)))
         {
             Ok((bindings, entries)) => {
+                if assignments::setup_runner(&entries).is_some() {
+                    self.state.test_workspaces.insert(workspace);
+                }
                 for id in panes {
                     if let Some(entry) = bindings
                         .get(&id)

@@ -74,7 +74,7 @@ impl TextRenderer {
             )
         };
         line(
-            "New workspace",
+            "Set up workspace · Choose project",
             row(0.02, 0.17),
             17.0,
             theme.text_primary,

@@ -20,6 +20,7 @@ pub(super) enum RpcError {
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<ResponsePayload, ProtoError>>>>>;
 
 pub(super) struct RpcConnection {
+    pub(super) inspect_setup_supported: bool,
     write_tx: mpsc::UnboundedSender<Request>,
     pending: PendingMap,
     next_id: AtomicU64,
@@ -115,6 +116,7 @@ impl RpcConnection {
         });
 
         Self {
+            inspect_setup_supported: false,
             write_tx,
             pending,
             next_id: AtomicU64::new(1),

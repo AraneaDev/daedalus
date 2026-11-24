@@ -77,6 +77,7 @@ async fn daemon_bridge_bootstraps_three_panes_and_forwards_runner_failure_to_age
     let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink { tx: evt_tx });
     let bridge = DaemonBridge::start(
         BridgeConfig {
+            bootstrap_explicit_dir: true,
             socket_path: sock,
             initial_dir: dir.path().to_path_buf(),
             default_agent: AgentPreset::Shell,
@@ -301,6 +302,7 @@ async fn daemon_bridge_handles_mid_session_disconnect_and_reconnects_cleanly() {
     let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink { tx: evt_tx });
     let bridge = DaemonBridge::start(
         BridgeConfig {
+            bootstrap_explicit_dir: true,
             socket_path: sock.clone(),
             initial_dir: dir.path().to_path_buf(),
             default_agent: AgentPreset::Shell,
@@ -497,6 +499,7 @@ command = ["cmd.exe", "/C", "echo", "MANIFEST_RUNNER_NEEDLE", "&", "ping", "-n",
         let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink { tx: evt_tx });
         let bridge1 = DaemonBridge::start(
             BridgeConfig {
+                bootstrap_explicit_dir: true,
                 socket_path: sock.clone(),
                 initial_dir: ws_dir.clone(),
                 default_agent: AgentPreset::Shell,
@@ -550,6 +553,7 @@ command = ["cmd.exe", "/C", "echo", "MANIFEST_RUNNER_NEEDLE", "&", "ping", "-n",
     let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink { tx: evt_tx });
     let bridge2 = DaemonBridge::start(
         BridgeConfig {
+            bootstrap_explicit_dir: true,
             socket_path: sock,
             initial_dir: ws_dir,
             default_agent: AgentPreset::Shell,
@@ -738,6 +742,7 @@ async fn daemon_bridge_delivers_agent_state_changed_and_closes_worktree_with_rem
     let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink { tx: evt_tx });
     let bridge = DaemonBridge::start(
         BridgeConfig {
+            bootstrap_explicit_dir: true,
             socket_path: sock.clone(),
             initial_dir: repo_dir.clone(),
             default_agent: AgentPreset::Shell,
@@ -925,6 +930,7 @@ command = "mkdir action-result"
     let (tx, mut rx) = mpsc::unbounded_channel();
     let bridge = DaemonBridge::start(
         BridgeConfig {
+            bootstrap_explicit_dir: true,
             socket_path,
             initial_dir: dir.path().to_owned(),
             default_agent: AgentPreset::Shell,
@@ -974,6 +980,7 @@ async fn queued_terminal_input_stays_with_its_connection() {
                     vt_backend: "builtin".into(),
                     isolation_mode: "test".into(),
                     journal_supported: false,
+                    inspect_setup_supported: false,
                 },
                 _ => ResponsePayload::Ok,
             };
@@ -996,6 +1003,7 @@ async fn queued_terminal_input_stays_with_its_connection() {
     let (tx, mut events) = mpsc::unbounded_channel();
     let bridge = DaemonBridge::start(
         BridgeConfig {
+            bootstrap_explicit_dir: true,
             socket_path: format!("tcp://{}", listener.local_addr().unwrap()).into(),
             initial_dir: ".".into(),
             default_agent: AgentPreset::Shell,
@@ -1071,6 +1079,7 @@ async fn shutdown_interrupts_unanswered_initialization_rpc() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let bridge = DaemonBridge::start(
         BridgeConfig {
+            bootstrap_explicit_dir: true,
             socket_path: format!("tcp://{}", listener.local_addr().unwrap()).into(),
             initial_dir: ".".into(),
             default_agent: AgentPreset::Shell,
@@ -1132,6 +1141,7 @@ read step
     let (tx, mut events) = mpsc::unbounded_channel();
     let bridge = DaemonBridge::start(
         BridgeConfig {
+            bootstrap_explicit_dir: true,
             socket_path,
             initial_dir: dir.path().to_owned(),
             default_agent: AgentPreset::Shell,
@@ -1270,6 +1280,7 @@ command = ["sh", "-c", "touch unexpected-manifest-launch"]
         let (tx, mut events) = mpsc::unbounded_channel();
         let bridge = DaemonBridge::start(
             BridgeConfig {
+                bootstrap_explicit_dir: true,
                 socket_path: sock,
                 initial_dir: dir.path().into(),
                 default_agent: AgentPreset::Shell,
@@ -1399,4 +1410,216 @@ command = ["sh", "-c", "touch unexpected-manifest-launch"]
             assert!(!dir.path().join(id).exists());
         }
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wizard_inspects_installs_and_launches_only_selected_roles() {
+    use daedalus_ui::assignments::{self, Assignment};
+    // The bridge uses the user's assignment directory. Isolate it without changing
+    // the environment of other tests running in this process.
+    const CHILD: &str = "DAEDALUS_TEST_SETUP_WORKSPACE";
+    let Some(project) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let dir = TempDir::new().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "wizard_inspects_installs_and_launches_only_selected_roles",
+                "--nocapture",
+            ])
+            .env(CHILD, &project)
+            .env("DAEDALUS_CONFIG", dir.path().join("config.toml"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daemon.sock");
+    let server = DaemonServer::bind_with_supervisor(
+        sock.clone(),
+        dir.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let (stop, stopped) = oneshot::channel();
+    let daemon = tokio::spawn(async move {
+        server
+            .serve(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    let config = BridgeConfig {
+        socket_path: sock,
+        initial_dir: project.clone(),
+        bootstrap_explicit_dir: false,
+        default_agent: AgentPreset::Shell,
+        auth_token: None,
+        auto_spawn_daemon: false,
+    };
+    let connect = || {
+        let (tx, events) = mpsc::unbounded_channel();
+        (
+            DaemonBridge::start(config.clone(), Arc::new(ChannelSink { tx })),
+            events,
+        )
+    };
+    let (bridge, mut events) = connect();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let UiEvent::WorkspacesLoaded(workspaces) = events.recv().await.unwrap() {
+                assert!(workspaces.is_empty());
+                break;
+            }
+        }
+        assert!(bridge.send(UiCommand::InspectSetup {
+            session: 4,
+            root_dir: project.clone(),
+            executables: vec!["sh".into()]
+        }));
+        loop {
+            if let UiEvent::SetupInspected { session, result } = events.recv().await.unwrap() {
+                assert_eq!(session, 4);
+                assert!(
+                    result
+                        .unwrap()
+                        .available
+                        .iter()
+                        .any(|executable| executable == "sh")
+                );
+                break;
+            }
+        }
+        assert!(bridge.send(UiCommand::CreateManualWorkspace {
+            session: 4,
+            name: "Wizard".into(),
+            root_dir: project.clone()
+        }));
+        let ws = loop {
+            if let UiEvent::ManualWorkspaceCreated { workspace, .. } = events.recv().await.unwrap()
+            {
+                assert!(!workspace.needs_default_panes());
+                assert!(workspace.panes.is_empty());
+                break workspace.id;
+            }
+        };
+        assert!(bridge.send(UiCommand::InstallSetupTool {
+            workspace_id: ws,
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                r#"read -r answer && [ "$answer" = resume ] && touch "$1""#.into(),
+                "fixture".into(),
+                "installed tool".into()
+            ]
+        }));
+        let installer = loop {
+            if let UiEvent::SetupInstallerStarted {
+                workspace_id,
+                pane_id,
+            } = events.recv().await.unwrap()
+            {
+                assert_eq!(workspace_id, ws);
+                break pane_id;
+            }
+        };
+
+        // Keep the daemon and its PTY alive across a fresh bridge connection.
+        tokio::task::spawn_blocking(move || bridge.shutdown())
+            .await
+            .unwrap();
+        let (bridge, mut events) = connect();
+        loop {
+            if let UiEvent::WorkspacesLoaded(workspaces) = events.recv().await.unwrap() {
+                assert_eq!(workspaces.len(), 1);
+                let workspace = &workspaces[0];
+                assert_eq!(workspace.id, ws);
+                assert_eq!(workspace.panes.len(), 1);
+                let pane = &workspace.panes[0];
+                assert_eq!(pane.id, installer);
+                assert!(!matches!(
+                    pane.status,
+                    daedalus_proto::PaneStatus::Exited { .. }
+                ));
+                break;
+            }
+        }
+        assert!(bridge.send(UiCommand::SendInput {
+            pane_id: installer,
+            data: b"resume\n".to_vec()
+        }));
+        loop {
+            if let UiEvent::ServerEvent(ServerEvent::PaneExited { pane_id, exit_code }) =
+                events.recv().await.unwrap()
+            {
+                assert_eq!(pane_id, installer);
+                assert_eq!(exit_code, Some(0));
+                break;
+            }
+        }
+        let entries = vec![
+            Assignment {
+                id: "agent".into(),
+                name: "Unavailable agent".into(),
+                role: PaneRole::Agent,
+                argv: vec!["daedalus-test-absent-agent".into()],
+            },
+            Assignment {
+                id: "serve".into(),
+                name: "Serve".into(),
+                role: PaneRole::Service,
+                argv: vec!["touch".into(), "started service".into()],
+            },
+            Assignment {
+                id: "test".into(),
+                name: "Run tests".into(),
+                role: PaneRole::Runner,
+                argv: vec!["touch".into(), "unexpected tests".into()],
+            },
+        ];
+        assert!(bridge.send(UiCommand::ApplySetup {
+            workspace_id: ws,
+            assignments: entries.clone(),
+            launch: vec!["agent".into(), "serve".into()]
+        }));
+        let mut started = Vec::new();
+        loop {
+            match events.recv().await.unwrap() {
+                UiEvent::AssignmentStarted { assignment, .. } => started.push(assignment.id),
+                UiEvent::SetupApplied {
+                    workspace_id,
+                    error,
+                } => {
+                    assert_eq!(ws, workspace_id);
+                    assert_eq!(error, None);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(started, ["serve"]);
+        assert_eq!(assignments::load(ws).unwrap(), entries);
+        while !project.join("started service").exists() || !project.join("installed tool").exists()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!project.join("unexpected tests").exists());
+        tokio::task::spawn_blocking(move || bridge.shutdown())
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("wizard setup timed out");
+    stop.send(()).unwrap();
+    daemon.await.unwrap();
 }

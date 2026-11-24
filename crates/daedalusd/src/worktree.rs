@@ -867,6 +867,53 @@ detached\r\n";
     }
 
     #[test]
+    fn create_rejects_invalid_roots_and_preserves_existing_targets_and_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert!(
+            create_worktree(&missing, "a", true, dir.path())
+                .unwrap_err()
+                .contains("not a directory")
+        );
+        assert!(
+            discover_worktrees(&missing)
+                .unwrap_err()
+                .contains("not a directory")
+        );
+        assert!(current_branch(&missing).is_none());
+        assert!(matches!(
+            validate_worktree_removal(&missing, true),
+            Err(WorktreeError::NotAWorktree(_))
+        ));
+        assert!(
+            create_worktree(dir.path(), "a", true, dir.path())
+                .unwrap_err()
+                .contains("failed to resolve git repository root")
+        );
+        let repo = init_temp_repo(dir.path(), "repo");
+        let base = dir.path().join("worktrees");
+        let target = base.join("repo").join("topic");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("user-file"), "preserved").unwrap();
+        let err = create_worktree(&repo, "topic", true, &base).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(target.join("user-file")).unwrap(),
+            "preserved"
+        );
+        let err = create_worktree(&repo, "unknown-existing-branch", false, &base).unwrap_err();
+        assert!(err.contains("git worktree add failed"), "{err}");
+        let blocked_base = dir.path().join("regular-file");
+        std::fs::write(&blocked_base, "keep").unwrap();
+        assert!(
+            create_worktree(&repo, "new", true, &blocked_base)
+                .unwrap_err()
+                .contains("failed to create worktree directory")
+        );
+        assert_eq!(discover_worktrees(&repo).unwrap().len(), 1);
+    }
+
+    #[test]
     fn creates_chained_worktree_under_primary_repo_name() {
         let root = TempDir::new().unwrap();
         let base_dir = TempDir::new().unwrap();

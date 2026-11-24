@@ -89,3 +89,81 @@ impl DaemonClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daedalus_proto::{PaneId, transport::IpcListener};
+
+    async fn connection() -> (DaemonClient, IpcStream) {
+        let mut listener = IpcListener::bind(Path::new("tcp://127.0.0.1:0"))
+            .await
+            .unwrap();
+        let endpoint = listener.local_endpoint();
+        let (client, stream) = tokio::join!(DaemonClient::connect(&endpoint), listener.accept());
+        (client.unwrap(), stream.unwrap())
+    }
+
+    #[tokio::test]
+    async fn request_matches_its_response_after_an_event_and_event_reader_skips_replies() {
+        let (mut client, mut peer) = connection().await;
+        let pane_id = PaneId::new();
+        let server = async {
+            let request: Request = read_frame(&mut peer).await.unwrap().unwrap();
+            assert!(matches!(request.payload, ClientMessage::Ping));
+            let event = ServerMessage::Event(ServerEvent::ResyncRequired { pane_id });
+            write_frame(&mut peer, &event).await.unwrap();
+            let reply = ServerMessage::Response {
+                id: request.id,
+                result: Ok(ResponsePayload::Ok),
+            };
+            write_frame(&mut peer, &reply).await.unwrap();
+            write_frame(&mut peer, &reply).await.unwrap();
+            write_frame(&mut peer, &event).await.unwrap();
+            drop(peer);
+        };
+        let consumer = async {
+            assert_eq!(
+                client.request(ClientMessage::Ping).await.unwrap(),
+                ResponsePayload::Ok
+            );
+            assert!(
+                matches!(client.next_event().await.unwrap(), Some(ServerEvent::ResyncRequired { pane_id: id }) if id == pane_id)
+            );
+            assert!(client.next_event().await.unwrap().is_none());
+        };
+        tokio::join!(server, consumer);
+    }
+
+    #[tokio::test]
+    async fn request_rejects_mismatched_response_ids_and_premature_eof() {
+        for mismatch in [true, false] {
+            let (mut client, mut peer) = connection().await;
+            let server = async {
+                let request: Request = read_frame(&mut peer).await.unwrap().unwrap();
+                if mismatch {
+                    write_frame(
+                        &mut peer,
+                        &ServerMessage::Response {
+                            id: request.id + 1,
+                            result: Ok(ResponsePayload::Ok),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                drop(peer);
+            };
+            let (_, response) = tokio::join!(server, client.request(ClientMessage::Ping));
+            let err = response.unwrap_err();
+            if mismatch {
+                assert!(err.to_string().contains("unexpected message"));
+            } else {
+                assert_eq!(
+                    err.downcast_ref::<std::io::Error>().unwrap().kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                );
+            }
+        }
+    }
+}

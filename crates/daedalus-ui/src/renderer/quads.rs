@@ -327,4 +327,59 @@ mod tests {
         assert!(clear.r < f64::from(BG_WINDOW.0[0]));
         assert_eq!(clear.a, 1.0);
     }
+
+    #[test]
+    fn pipeline_reuses_grown_instance_buffer_and_accepts_clipped_draw_ranges() {
+        let (device, queue) = wgpu::Device::noop(&Default::default());
+        for format in [
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Bgra8Unorm,
+        ] {
+            let mut pipeline = QuadPipeline::new(&device, format);
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: 16,
+                    height: 16,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            let instances = vec![
+                QuadInstance::new(Rect::new(0., 0., 4., 4.), BG_WINDOW);
+                INITIAL_INSTANCE_CAPACITY + 1
+            ];
+            for count in [instances.len(), 1, 0] {
+                pipeline.prepare(&device, &queue, 16., 16., &instances[..count]);
+                assert_eq!(pipeline.instance_count as usize, count);
+                assert_eq!(pipeline.instance_capacity, INITIAL_INSTANCE_CAPACITY * 2);
+                assert_eq!(
+                    pipeline.instance_buffer.size() as usize,
+                    pipeline.instance_capacity * std::mem::size_of::<QuadInstance>()
+                );
+                let mut encoder = device.create_command_encoder(&Default::default());
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: Default::default(),
+                        })],
+                        ..Default::default()
+                    });
+                    pipeline.render(&mut pass);
+                    pipeline.render_range(&mut pass, 1..u32::MAX);
+                    pipeline.render_range(&mut pass, u32::MAX..u32::MAX);
+                }
+                queue.submit([encoder.finish()]);
+            }
+        }
+    }
 }

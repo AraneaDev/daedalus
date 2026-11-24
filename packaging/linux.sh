@@ -21,7 +21,7 @@ Architecture: $(dpkg --print-architecture)
 Maintainer: AraneaDev <12177132+AraneaDev@users.noreply.github.com>
 Section: devel
 Priority: optional
-Depends: ${deps#shlibs:Depends=}, libxkbcommon0, libwayland-client0, libx11-6
+Depends: ${deps#shlibs:Depends=}, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6
 Description: Native coding-agent and worktree workbench
 CONTROL
 mkdir -p dist

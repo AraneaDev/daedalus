@@ -8,6 +8,7 @@ pub mod persistence;
 pub mod registry;
 pub mod runtime_monitor;
 pub mod server;
+mod setup;
 pub mod shell_integration;
 pub mod supervisor;
 pub mod worktree;

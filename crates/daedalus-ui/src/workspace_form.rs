@@ -63,6 +63,7 @@ pub struct WorkspaceForm {
     submitting: bool,
     name: String,
     folder: String,
+    committed_project: Option<(String, String)>,
     cursor: usize,
     select_all: bool,
 }
@@ -75,6 +76,21 @@ impl WorkspaceForm {
             folder: folder.to_string_lossy().into_owned(),
             ..Default::default()
         };
+    }
+
+    pub fn revisit(&mut self, folder: &Path, name: &str, created: bool) {
+        self.begin(folder);
+        self.name = name.into();
+        if created {
+            self.committed_project = Some((self.folder.clone(), name.into()));
+        }
+        self.set_focus(Control::Folder);
+    }
+
+    pub fn name_is_fixed(&self) -> bool {
+        self.committed_project
+            .as_ref()
+            .is_some_and(|(folder, _)| Path::new(folder) == Path::new(&self.folder))
     }
 
     pub fn session(&self) -> u64 {
@@ -109,7 +125,8 @@ impl WorkspaceForm {
     }
 
     pub fn enabled(&self, control: Control) -> bool {
-        !self.submitting || control == Control::Cancel
+        (!self.submitting || control == Control::Cancel)
+            && !(control == Control::Name && self.name_is_fixed())
     }
 
     pub fn value(&self, control: Control) -> Option<&str> {
@@ -131,7 +148,10 @@ impl WorkspaceForm {
     }
 
     pub fn set_value(&mut self, control: Control, value: &str) {
-        if self.submitting || self.value(control).is_none() || value.chars().any(char::is_control) {
+        if !self.enabled(control)
+            || self.value(control).is_none()
+            || value.chars().any(char::is_control)
+        {
             return;
         }
         self.set_focus(control);
@@ -162,6 +182,12 @@ impl WorkspaceForm {
         self.cursor = range.start + text.len();
         field.replace_range(range, text);
         self.select_all = false;
+        if self.focus == Control::Folder
+            && self.name_is_fixed()
+            && let Some((_, name)) = &self.committed_project
+        {
+            self.name.clone_from(name);
+        }
         self.error = None;
     }
 
@@ -172,15 +198,22 @@ impl WorkspaceForm {
     }
 
     fn submit(&mut self) -> WorkspaceFormAction {
-        if self.name.trim().is_empty() {
-            self.set_focus(Control::Name);
-            self.error = Some("Enter a workspace name.".into());
-        } else if self.folder.trim().is_empty() {
+        if self.folder.trim().is_empty() {
             self.set_focus(Control::Folder);
             self.error = Some("Enter the workspace folder.".into());
         } else {
             return WorkspaceFormAction::Save {
-                name: self.name.trim().into(),
+                name: if self.name.trim().is_empty() {
+                    self.folder
+                        .trim_end_matches(['/', '\\'])
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .filter(|name| !name.is_empty() && *name != ".")
+                        .unwrap_or("Workspace")
+                        .into()
+                } else {
+                    self.name.trim().into()
+                },
                 folder: PathBuf::from(&self.folder),
             };
         }
@@ -240,9 +273,17 @@ impl WorkspaceForm {
             },
             Key::Named(NamedKey::Tab) => {
                 let i = CONTROLS.iter().position(|c| *c == self.focus).unwrap_or(0);
-                self.set_focus(
-                    CONTROLS[(i + if mods.shift_key() { 3 } else { 1 }) % CONTROLS.len()],
-                );
+                let step = if mods.shift_key() {
+                    CONTROLS.len() - 1
+                } else {
+                    1
+                };
+                if let Some(control) = (1..=CONTROLS.len())
+                    .map(|offset| CONTROLS[(i + offset * step) % CONTROLS.len()])
+                    .find(|control| self.enabled(*control))
+                {
+                    self.set_focus(control);
+                }
             }
             Key::Named(NamedKey::Backspace) => self.replace(prev, self.cursor, ""),
             Key::Named(NamedKey::Delete) => self.replace(self.cursor, next, ""),
@@ -272,11 +313,12 @@ impl WorkspaceForm {
 
     pub(crate) fn visible_label(&self, control: Control, columns: usize) -> String {
         let (label, text) = match control {
-            Control::Name => ("Name", &self.name),
+            Control::Name if self.name_is_fixed() => ("Workspace name", &self.name),
+            Control::Name => ("Name (optional)", &self.name),
             Control::Folder => ("Folder", &self.folder),
             Control::Cancel if self.submitting => return "Dismiss".into(),
             Control::Cancel => return "Cancel".into(),
-            Control::Save => return "Create workspace".into(),
+            Control::Save => return "Review environment".into(),
         };
         if control == self.focus {
             crate::renderer::text::editable_label(label, text, self.cursor, columns)
@@ -287,7 +329,7 @@ impl WorkspaceForm {
 
     pub(crate) fn hint(&self) -> &str {
         if self.submitting {
-            "Creating workspace…"
+            "Checking project on daemon host…"
         } else if let Some(error) = &self.error {
             error
         } else if self.select_all && self.value(self.focus).is_some_and(|text| !text.is_empty()) {
@@ -301,6 +343,31 @@ impl WorkspaceForm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn returning_to_a_created_workspace_preserves_its_committed_name() {
+        let mut form = WorkspaceForm::default();
+        form.revisit(Path::new("/project"), "Existing", true);
+        assert!(!form.enabled(Control::Name));
+        form.set_value(Control::Name, "Duplicate");
+        form.key(&Key::Named(NamedKey::Tab), ModifiersState::SHIFT);
+        assert_eq!(form.focus, Control::Save);
+        assert_eq!(
+            form.activate(Control::Save),
+            WorkspaceFormAction::Save {
+                name: "Existing".into(),
+                folder: "/project".into()
+            }
+        );
+        form.set_value(Control::Folder, "/alternative");
+        form.set_value(Control::Name, "Different");
+        assert_eq!(form.value(Control::Name), Some("Different"));
+        form.set_value(Control::Folder, "/project");
+        assert_eq!(form.value(Control::Name), Some("Existing"));
+        assert!(!form.enabled(Control::Name));
+        form.revisit(Path::new("/project"), "Draft", false);
+        assert!(form.enabled(Control::Name));
+    }
 
     #[test]
     fn daemon_rejection_keeps_the_name_and_path_editable_for_retry() {
@@ -352,9 +419,11 @@ mod tests {
         let mods = ModifiersState::empty();
         assert_eq!(
             form.key(&Key::Named(NamedKey::Enter), mods),
-            WorkspaceFormAction::None
+            WorkspaceFormAction::Save {
+                name: "initial".into(),
+                folder: "/initial".into()
+            }
         );
-        assert!(form.error.is_some());
         form.insert_text("Project");
         form.key(&Key::Named(NamedKey::Tab), mods);
         form.insert_text("/chosen folder");

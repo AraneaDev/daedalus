@@ -26,7 +26,20 @@ pub(super) enum ParsedPortEntry {
 
 /// Runs `docker compose -p <compose_project_name> down` inside `root_dir` with a 15-second timeout.
 pub fn run_compose_down(root_dir: &Path, compose_project_name: &str) -> Result<(), String> {
-    let mut cmd = crate::background_command("docker");
+    compose_down(
+        crate::background_command("docker"),
+        root_dir,
+        compose_project_name,
+        COMPOSE_DOWN_TIMEOUT,
+    )
+}
+
+fn compose_down(
+    mut cmd: std::process::Command,
+    root_dir: &Path,
+    compose_project_name: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     cmd.arg("compose")
         .arg("-p")
         .arg(compose_project_name)
@@ -43,7 +56,7 @@ pub fn run_compose_down(root_dir: &Path, compose_project_name: &str) -> Result<(
     let stdout_handle = child.stdout.take().map(spawn_reader);
     let stderr_handle = child.stderr.take().map(spawn_reader);
 
-    let deadline = Instant::now() + COMPOSE_DOWN_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let mut poll_interval = Duration::from_millis(2);
 
     let status = loop {
@@ -60,7 +73,7 @@ pub fn run_compose_down(root_dir: &Path, compose_project_name: &str) -> Result<(
                     if let Some(h) = stderr_handle {
                         let _ = h.join();
                     }
-                    return Err("docker compose down timed out after 15s".to_string());
+                    return Err(format!("docker compose down timed out after {timeout:?}"));
                 }
                 let remaining = deadline.saturating_duration_since(now);
                 std::thread::sleep(poll_interval.min(remaining));
@@ -98,7 +111,7 @@ fn spawn_reader<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHan
     })
 }
 
-pub(super) fn find_compose_file(root_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_compose_file(root_dir: &Path) -> Option<PathBuf> {
     COMPOSE_FILENAMES
         .iter()
         .map(|name| root_dir.join(name))
@@ -453,4 +466,144 @@ fn format_remapped_port(
         out.push_str(proto);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_down_passes_project_and_directory_and_reports_failures() {
+        use std::process::Command;
+        let dir = tempdir().unwrap();
+        let shell = |script: &str| {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script, "docker"]);
+            command
+        };
+        compose_down(
+            shell(r#"pwd > cwd; printf '%s\n' "$@" > args"#),
+            dir.path(),
+            "project name",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("args")).unwrap(),
+            "compose\n-p\nproject name\ndown\n"
+        );
+        let cwd = std::fs::read_to_string(dir.path().join("cwd")).unwrap();
+        assert_eq!(Path::new(cwd.trim()), dir.path().canonicalize().unwrap());
+        let err = compose_down(
+            shell("echo 'engine offline' >&2; exit 17"),
+            dir.path(),
+            "test",
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("17") && err.contains("engine offline"),
+            "{err}"
+        );
+        let err = compose_down(
+            shell("exec sleep 30"),
+            dir.path(),
+            "test",
+            Duration::from_millis(30),
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out after 30ms"), "{err}");
+        assert!(
+            run_compose_down(&dir.path().join("missing"), "test")
+                .unwrap_err()
+                .contains("failed to spawn")
+        );
+    }
+
+    #[test]
+    fn invalid_compose_documents_are_skipped_and_io_errors_propagate() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("compose.yaml");
+        let env = HashMap::new();
+        assert_eq!(
+            parse_compose_ports(&path, &env).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        for yaml in [
+            "",
+            "{",
+            "true",
+            "networks: {}",
+            "services: false",
+            "services: {empty: {}, broken: 1, invalid: {ports: false}}",
+        ] {
+            std::fs::write(&path, yaml).unwrap();
+            assert!(
+                parse_compose_ports(&path, &env).unwrap().is_empty(),
+                "{yaml:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn override_remaps_interpolated_ipv6_and_long_ports_and_preserves_unresolved_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("compose.yml");
+        std::fs::write(
+            &path,
+            r#"
+services:
+  api:
+    ports: !override
+      - '[::1]:${HTTP:-80}:80/tcp'
+      - {published: '$DNS', target: '53', protocol: udp, host_ip: '127.0.0.1'}
+      - '${UNKNOWN}:90'
+      - {published: true, target: 12}
+      - 123
+  untouched: {ports: [5000]}
+"#,
+        )
+        .unwrap();
+        let env = HashMap::from([
+            ("HTTP".into(), "8000".into()),
+            ("DNS".into(), "5300".into()),
+        ]);
+        let ports = parse_compose_ports(&path, &env).unwrap();
+        let output = write_compose_override(dir.path(), &ports, 1).unwrap();
+        let saved = std::fs::read_to_string(&output).unwrap();
+        let doc: Value = serde_yaml::from_str(&saved).unwrap();
+        let services = doc
+            .as_mapping()
+            .unwrap()
+            .get("services")
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert!(services.get("untouched").is_none());
+        let api = services
+            .get("api")
+            .unwrap()
+            .as_mapping()
+            .unwrap()
+            .get("ports")
+            .unwrap();
+        let seq = untag_value(api).as_sequence().unwrap();
+        assert_eq!(seq[0].as_str(), Some("[::1]:8001:80/tcp"));
+        assert_eq!(seq[1].as_str(), Some("127.0.0.1:5301:53/udp"));
+        assert_eq!(seq[2].as_str(), Some("${UNKNOWN}:90"));
+        assert_eq!(
+            seq[3].as_mapping().unwrap().get("published"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(seq[4].as_u64(), Some(123));
+        assert_eq!(
+            write_compose_override(dir.path(), &ports, u16::MAX)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(std::fs::read_to_string(output).unwrap(), saved);
+    }
 }

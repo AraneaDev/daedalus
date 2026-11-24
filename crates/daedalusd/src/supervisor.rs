@@ -590,6 +590,29 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn parse_proc_stat_reads_state_and_group_after_the_last_paren() {
+        assert_eq!(
+            parse_proc_stat("4242 (odd) name (x)) S 1 777 777 0 -1"),
+            Some(('S', 777))
+        );
+        assert_eq!(parse_proc_stat("4242 (agent) Z 1 9 9"), Some(('Z', 9)));
+        assert_eq!(parse_proc_stat("4242 (agent) S 1 group"), None);
+        assert_eq!(parse_proc_stat("4242 (agent) S"), None);
+        assert_eq!(parse_proc_stat("no paren"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pgid_scan_finds_this_test_group_and_not_an_unused_one() {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let (_, own_group) = parse_proc_stat(&stat).unwrap();
+        assert!(pgid_has_non_zombie_proc(own_group));
+        // Linux caps PIDs at 2^22, so no process group can have this id.
+        assert!(!pgid_has_non_zombie_proc(i32::MAX));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn systemd_resolves_program_using_workspace_path_and_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
@@ -609,6 +632,63 @@ mod tests {
         assert_eq!(
             resolve_scope_executable("./bin/workspace-agent", dir.path(), None).unwrap(),
             program
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_launcher_preserves_project_command_arguments_and_launch_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let runner = dir.path().join("systemd-run");
+        let marker = dir.path().join("args");
+        std::fs::write(
+            &runner,
+            r#"#!/bin/sh
+printf '%s\n' "$@" "$CUSTOM_ENV" "$DAEDALUS_PANE_ID" > "$MARKER"
+exit 17
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ws = WorkspaceId::new();
+        let pane = PaneId::new();
+        let mut spawned = Supervisor::with_mode(IsolationMode::SystemdScope)
+            .spawn_pty(
+                ws,
+                pane,
+                PaneRole::Agent,
+                dir.path(),
+                0,
+                0,
+                &ShellLaunchSpec {
+                    program: "/bin/sh".into(),
+                    args: vec!["argument with spaces".into()],
+                    extra_env: HashMap::from([("CUSTOM_ENV".into(), "launch-specific".into())]),
+                },
+                &HashMap::from([
+                    ("MARKER".into(), marker.to_str().unwrap().into()),
+                    ("PATH".into(), dir.path().to_str().unwrap().into()),
+                    ("CUSTOM_ENV".into(), "workspace".into()),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(spawned.handle.wait_exit(), Some(17));
+        let args = std::fs::read_to_string(marker).unwrap();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                &format!("--unit=daedalus-{}-{}", ws.short(), pane.short()),
+                &format!("--working-directory={}", dir.path().display()),
+                "--",
+                "/bin/sh",
+                "argument with spaces",
+                "launch-specific",
+                &pane.to_string(),
+            ]
         );
     }
 

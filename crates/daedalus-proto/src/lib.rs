@@ -7,7 +7,10 @@ pub mod types;
 
 pub use activity::{ActivityCursor, ActivityEntry, ActivityKind, ActivityPage};
 pub use codec::{CodecError, MAX_FRAME_SIZE, read_frame, write_frame};
-pub use rpc::{ClientMessage, ProtoError, Request, ResponsePayload, ServerEvent, ServerMessage};
+pub use rpc::{
+    ClientMessage, ProtoError, Request, ResponsePayload, ServerEvent, ServerMessage,
+    SetupInspection,
+};
 pub use types::{
     AgentState, Cell, CellFlags, Color, ContainerHealth, CursorState, CustomAction, ExternalStatus,
     FailureTrace, GitWorkspaceStatus, GitWorktreeInfo, GridDelta, GridRow, GridSnapshot, PaneId,
@@ -17,6 +20,13 @@ pub use types::{
 };
 
 use std::path::{Path, PathBuf};
+
+/// Resolves built-in preset names used by project manifests and terminal launchers.
+pub fn canonical_agent_preset(name: &str) -> Option<&'static str> {
+    ["agy", "claude", "codex", "shell"]
+        .into_iter()
+        .find(|preset| name.trim().eq_ignore_ascii_case(preset))
+}
 
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 96;
 
