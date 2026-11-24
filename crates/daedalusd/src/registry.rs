@@ -1,19 +1,20 @@
 mod persistence;
+mod projects;
 mod status;
 
 use crate::isolation;
 use crate::journal::Journal;
 use crate::manifest;
 use crate::pane_actor::PaneHandle;
-use crate::persistence::{PersistedWorkspace, StateStore};
+use crate::persistence::{PersistedRecentProject, PersistedWorkspace, StateStore};
 use crate::runtime_monitor::WorkspaceMonitorTarget;
 use crate::shell_integration::ShellIntegration;
 use crate::supervisor::{IsolationMode, Supervisor};
 use crate::worktree::{self, WorktreeError};
 use daedalus_proto::{
-    AgentState, ContainerHealth, ExternalStatus, FailureTrace, GitWorkspaceStatus, GitWorktreeInfo,
-    PaneId, PaneRole, PaneSummary, PortMapping, ProtoError, ServerEvent, WorkspaceId,
-    WorkspaceInfo, WorkspaceManifest,
+    AgentState, Assignment, ContainerHealth, ExternalStatus, FailureTrace, GitWorkspaceStatus,
+    GitWorktreeInfo, PaneId, PaneRole, PaneSummary, PortMapping, ProtoError, ServerEvent,
+    WorkspaceId, WorkspaceInfo, WorkspaceManifest,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -214,6 +215,8 @@ pub struct Registry {
     persist_lock: Mutex<()>,
     unresolved_legacy_roots: RwLock<Vec<PersistedWorkspace>>,
     create_lock: Mutex<()>,
+    recent_projects: RwLock<Vec<PersistedRecentProject>>,
+    project_setups: RwLock<HashMap<PathBuf, Vec<Assignment>>>,
     worktrees_dir: std::sync::RwLock<Option<PathBuf>>,
     workspaces: RwLock<HashMap<WorkspaceId, WorkspaceRecord>>,
     panes: RwLock<HashMap<PaneId, PaneHandle>>,
@@ -243,6 +246,8 @@ impl Registry {
             persist_lock: Mutex::new(()),
             unresolved_legacy_roots: RwLock::new(Vec::new()),
             create_lock: Mutex::new(()),
+            recent_projects: RwLock::new(Vec::new()),
+            project_setups: RwLock::new(HashMap::new()),
             worktrees_dir: std::sync::RwLock::new(None),
             workspaces: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
@@ -335,10 +340,12 @@ impl Registry {
 
         let id = WorkspaceId::new();
         let record = build_workspace_record(id, name, root_dir, prepared, manual_launch);
-        let info = record.to_info(Vec::new());
+        let mut info = record.to_info(Vec::new());
+        self.record_recent_project(&info.name, &info.root_dir).await;
         self.workspaces.write().await.insert(id, record);
         drop(_create_guard);
         self.persist_state().await;
+        self.attach_project_setup(&mut info).await;
         Ok(info)
     }
 
@@ -408,7 +415,9 @@ impl Registry {
 
         let mut out = Vec::with_capacity(snapshot.len());
         for (info, handles) in snapshot {
-            out.push(Self::with_pane_summaries(info, handles).await);
+            let mut info = Self::with_pane_summaries(info, handles).await;
+            self.attach_project_setup(&mut info).await;
+            out.push(info);
         }
         out
     }
@@ -430,7 +439,9 @@ impl Registry {
             let panes = self.panes.read().await;
             ws.snapshot_handles(&panes)
         };
-        Ok(Self::with_pane_summaries(info, handles).await)
+        let mut info = Self::with_pane_summaries(info, handles).await;
+        self.attach_project_setup(&mut info).await;
+        Ok(info)
     }
 
     async fn with_pane_summaries(
@@ -704,6 +715,12 @@ impl Registry {
         remove_worktree: bool,
         force_remove_worktree: bool,
     ) -> Result<(), ProtoError> {
+        let project = {
+            let ws_map = self.workspaces.read().await;
+            ws_map
+                .get(&workspace_id)
+                .map(|ws| (ws.name.clone(), ws.root_dir.clone()))
+        };
         self.close_workspace_internal(
             workspace_id,
             compose_down,
@@ -711,7 +728,12 @@ impl Registry {
             force_remove_worktree,
             true,
         )
-        .await
+        .await?;
+        if let Some((name, root_dir)) = project {
+            self.record_recent_project(&name, &root_dir).await;
+            self.persist_state().await;
+        }
+        Ok(())
     }
 
     async fn close_workspace_internal(

@@ -16,10 +16,12 @@ impl Registry {
         };
         workspaces.extend(self.unresolved_legacy_roots.read().await.iter().cloned());
         workspaces.sort_by_key(|ws| ws.slot_index);
+        let (recent_projects, project_setups) = self.project_lists_for_persist().await;
         let state = PersistedState {
             version: STATE_VERSION,
             workspaces,
-            ..PersistedState::default()
+            recent_projects,
+            project_setups,
         };
         match tokio::task::spawn_blocking(move || store.save(&state)).await {
             Ok(Ok(())) => {}
@@ -53,6 +55,8 @@ impl Registry {
                 return 0;
             }
         };
+
+        self.load_project_lists(&mut persisted_state).await;
 
         if persisted_state.workspaces.is_empty() {
             return 0;
