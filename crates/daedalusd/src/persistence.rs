@@ -1,4 +1,4 @@
-use daedalus_proto::WorkspaceId;
+use daedalus_proto::{Assignment, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Write};
@@ -24,10 +24,27 @@ pub struct PersistedWorkspace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedRecentProject {
+    pub name: String,
+    pub root_dir: PathBuf,
+    pub last_used: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedProjectSetup {
+    pub root_dir: PathBuf,
+    pub assignments: Vec<Assignment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedState {
     pub version: u32,
     #[serde(default)]
     pub workspaces: Vec<PersistedWorkspace>,
+    #[serde(default)]
+    pub recent_projects: Vec<PersistedRecentProject>,
+    #[serde(default)]
+    pub project_setups: Vec<PersistedProjectSetup>,
 }
 
 impl Default for PersistedState {
@@ -35,6 +52,8 @@ impl Default for PersistedState {
         Self {
             version: STATE_VERSION,
             workspaces: Vec::new(),
+            recent_projects: Vec::new(),
+            project_setups: Vec::new(),
         }
     }
 }
@@ -139,6 +158,7 @@ impl StateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use daedalus_proto::{Assignment, PaneRole};
     use tempfile::tempdir;
 
     #[test]
@@ -161,6 +181,7 @@ mod tests {
                 manual_launch: false,
                 agent_preset: Some("agy".to_string()),
             }],
+            ..PersistedState::default()
         };
         store1.save(&state).unwrap();
 
@@ -253,6 +274,7 @@ mod tests {
                 manual_launch: false,
                 agent_preset: None,
             }],
+            ..PersistedState::default()
         };
         store.save(&s1).unwrap();
 
@@ -266,9 +288,67 @@ mod tests {
                 manual_launch: false,
                 agent_preset: Some("claude".to_string()),
             }],
+            ..PersistedState::default()
         };
         store.save(&s2).unwrap();
 
         assert_eq!(store.load().unwrap(), s2);
+    }
+
+    #[test]
+    fn version_one_file_without_project_fields_loads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, r#"{"version":1,"workspaces":[]}"#).unwrap();
+        let loaded = StateStore::new(path).load().unwrap();
+        assert!(loaded.recent_projects.is_empty());
+        assert!(loaded.project_setups.is_empty());
+    }
+
+    fn sample_project_state() -> PersistedState {
+        PersistedState {
+            version: STATE_VERSION,
+            workspaces: Vec::new(),
+            recent_projects: vec![PersistedRecentProject {
+                name: "alpha".to_string(),
+                root_dir: PathBuf::from("/tmp/alpha"),
+                last_used: 1_700_000_000,
+            }],
+            project_setups: vec![PersistedProjectSetup {
+                root_dir: PathBuf::from("/tmp/alpha"),
+                assignments: vec![Assignment {
+                    id: "a1".to_string(),
+                    name: "Claude".to_string(),
+                    role: PaneRole::Agent,
+                    argv: vec!["claude".to_string()],
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn project_fields_round_trip() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path().join("state.json"));
+        let state = sample_project_state();
+        store.save(&state).unwrap();
+        assert_eq!(store.load().unwrap(), state);
+    }
+
+    #[test]
+    fn new_file_loads_into_old_shape() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldState {
+            version: u32,
+            workspaces: Vec<PersistedWorkspace>,
+        }
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path().join("state.json"));
+        store.save(&sample_project_state()).unwrap();
+        let raw = fs::read_to_string(store.path()).unwrap();
+        let old: OldState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(old.version, 1);
+        assert!(old.workspaces.is_empty());
     }
 }

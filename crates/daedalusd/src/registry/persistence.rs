@@ -19,6 +19,7 @@ impl Registry {
         let state = PersistedState {
             version: STATE_VERSION,
             workspaces,
+            ..PersistedState::default()
         };
         match tokio::task::spawn_blocking(move || store.save(&state)).await {
             Ok(Ok(())) => {}
