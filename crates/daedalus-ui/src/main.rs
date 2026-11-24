@@ -15,7 +15,9 @@ use daedalus_ui::bridge::{BridgeConfig, DaemonBridge, UiCommand, UiEvent, UiEven
 use daedalus_ui::config::UiConfig;
 use daedalus_ui::input::{KeyRepeatGuard, UiAction, filter_modal_text, translate_key};
 use daedalus_ui::layout::overlays::picker_row_stride;
-use daedalus_ui::layout::{HitTarget, LayoutInput, WorkspaceLayout, compute_layout, hit_test};
+use daedalus_ui::layout::{
+    HitTarget, LayoutInput, WorkspaceLayout, compute_split_layout, hit_test,
+};
 use daedalus_ui::links::{detect_link_in_row, detect_url_in_row, open_link};
 use daedalus_ui::renderer::{GpuRenderer, RenderError};
 use daedalus_ui::selection::extract_selected_text;
@@ -245,24 +247,39 @@ impl DaedalusApp {
         Some(self.layout_for(self.viewport_metrics()?))
     }
 
-    fn layout_for(&self, metrics: ViewportMetrics) -> WorkspaceLayout {
+    fn pane_geometry(&self, metrics: ViewportMetrics) -> WorkspaceLayout {
         let ViewportMetrics {
             size,
             scale_factor,
             cell: (cell_w, cell_h),
         } = metrics;
-        let mut layout = compute_layout(&LayoutInput {
-            window_w: size.width as f32,
-            window_h: size.height as f32,
-            scale_factor,
-            cell_w,
-            cell_h,
-            sidebar_override: self.state.sidebar_override,
-            has_top_banner: self.has_top_banner(),
-            zoomed: self.state.zoomed,
-            focused_role: self.state.focused_role,
-            runner_has_failure: self.state.runner_has_failure(),
-        });
+        compute_split_layout(
+            &LayoutInput {
+                window_w: size.width as f32,
+                window_h: size.height as f32,
+                scale_factor,
+                cell_w,
+                cell_h,
+                sidebar_override: self.state.sidebar_override,
+                has_top_banner: self.has_top_banner(),
+                zoomed: self.state.zoomed,
+                focused_role: self.state.focused_role,
+                runner_has_failure: self.state.runner_has_failure(),
+            },
+            &self.pointer.splits,
+        )
+    }
+
+    fn layout_for(&self, metrics: ViewportMetrics) -> WorkspaceLayout {
+        let scale_factor = metrics.scale_factor;
+        let mut layout = self.pane_geometry(metrics);
+        if self.state.zoomed {
+            let roles: Vec<_> = [PaneRole::Service, PaneRole::Runner]
+                .into_iter()
+                .filter(|&role| self.state.pane_for_role(role).is_some())
+                .collect();
+            layout.reserve_insights(&roles, scale_factor, metrics.cell.1);
+        }
         if self.state.workspaces.is_empty() {
             for pane in &mut layout.panes {
                 pane.action_pill = None;
@@ -1231,6 +1248,18 @@ impl DaedalusApp {
 
     fn activate_session(&mut self, target: HitTarget) {
         match target {
+            HitTarget::Widget(role) => {
+                if let Some(id) = self.state.pane_id_for_role(role) {
+                    if role == PaneRole::Runner && self.state.widget_diagnostic().is_some() {
+                        if let Some(pane) = self.state.panes.get_mut(&id) {
+                            pane.show_diagnostic = !pane.show_diagnostic;
+                        }
+                        self.request_redraw();
+                    } else {
+                        self.activate_session(HitTarget::SelectSession(id));
+                    }
+                }
+            }
             HitTarget::CloseSession(id) => {
                 self.send_command(UiCommand::ClosePane(id));
             }
@@ -1665,6 +1694,20 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 INITIAL_WINDOW_WIDTH,
                 INITIAL_WINDOW_HEIGHT,
             ));
+
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            let icon = winit::window::Icon::from_rgba(
+                include_bytes!("../../../packaging/window-icon.rgba").to_vec(),
+                64,
+                64,
+            )
+            .expect("embedded 64px Daedalus window icon");
+            attrs
+                .with_window_icon(Some(icon.clone()))
+                .with_taskbar_icon(Some(icon))
+        };
 
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),

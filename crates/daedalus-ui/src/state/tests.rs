@@ -179,6 +179,7 @@ fn workspace_refresh_keeps_live_grid_and_selected_pane_metadata() {
     state.set_workspaces(vec![ws.clone()]);
     state.select_session(ws.id, PaneRole::Agent, id);
     state.apply_grid_snapshot(GridSnapshot {
+        insight: None,
         pane_id: id,
         seq: 0,
         cols: 99,
@@ -192,6 +193,7 @@ fn workspace_refresh_keeps_live_grid_and_selected_pane_metadata() {
     assert_eq!(state.panes[&id].summary.cols, 99);
 
     state.apply_server_event(ServerEvent::GridDelta(GridDelta {
+        insight: None,
         pane_id: id,
         seq: 1,
         cols: 100,
@@ -231,6 +233,7 @@ fn snapshot_and_delta_patching_tracks_dirty_rows() {
     state.set_workspaces(vec![ws]);
 
     let snapshot = GridSnapshot {
+        insight: None,
         pane_id: agent_id,
         seq: 1,
         cols: 10,
@@ -257,6 +260,7 @@ fn snapshot_and_delta_patching_tracks_dirty_rows() {
     assert!(pane.dirty_row_indices.is_empty());
 
     let delta = GridDelta {
+        insight: None,
         pane_id: agent_id,
         seq: 2,
         cols: 10,
@@ -316,6 +320,7 @@ fn history_reset_discards_displayed_rows_inflight_reads_and_search_results() {
     pane.set_scroll_offset(5);
     let late = pane.begin_scrollback_request().unwrap();
     let reset = GridDelta {
+        insight: None,
         pane_id,
         seq: 10,
         cols: pane.summary.cols,
@@ -349,6 +354,7 @@ fn resync_snapshot_invalidates_erased_history_even_if_new_lines_already_accumula
     pane.set_scroll_offset(2);
     let pending = pane.begin_scrollback_request().unwrap();
     let reset = GridSnapshot {
+        insight: None,
         pane_id: id,
         seq: 4,
         cols: pane.summary.cols,
@@ -1110,4 +1116,37 @@ fn cycle_workspace_wraps_cleanly_forward_and_backward() {
     assert_eq!(state.cycle_workspace(-1), Some(id3));
     assert_eq!(state.cycle_workspace(-1), Some(id2));
     assert_eq!(state.cycle_workspace(-1), Some(id1));
+}
+
+#[test]
+fn runner_overrides_and_failure_details_leave_agent_selected() {
+    let (mut ws, agent, _, runner) = make_workspace_with_three_panes();
+    ws.manifest = Some(daedalus_proto::WorkspaceManifest {
+        runner_widget: Some(daedalus_proto::WidgetConfig {
+            label: Some("Compiler".into()),
+            preset: Some("cargo-check".into()),
+            show_duration: Some(false),
+            show_warnings: Some(false),
+        }),
+        ..Default::default()
+    });
+    let mut state = AppState::new();
+    state.set_workspaces(vec![ws]);
+    state.panes.get_mut(&runner).unwrap().insight = Some(daedalus_proto::RunnerInsight {
+        phase: "Failed".into(),
+        elapsed_secs: 42,
+        warnings: 2,
+        diagnostic: Some("error[E0308]".into()),
+        ..Default::default()
+    });
+    assert_eq!(
+        state.focused_widget_label(PaneRole::Runner).as_deref(),
+        Some("Compiler · Failed · View failure ›")
+    );
+    state.panes.get_mut(&runner).unwrap().show_diagnostic = true;
+    assert_eq!(
+        state.focused_widget_label(PaneRole::Runner).as_deref(),
+        Some("‹  error[E0308]")
+    );
+    assert_eq!(state.focused_pane_id(), Some(agent));
 }

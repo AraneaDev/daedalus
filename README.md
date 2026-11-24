@@ -48,7 +48,7 @@ daedalus-ui --dir . --agent shell
 ```
 
 The UI starts the local daemon and opens the agent terminal. Select a named tab to switch terminals.
-Use `Ctrl+Shift+Z` for a split view. Use the shell preset to try the workbench
+Use `Ctrl+Shift+Z` for a split view, then drag the dividers to resize the panes. Use the shell preset to try the workbench
 immediately. To use Claude, Codex or agy, install the corresponding CLI and choose its preset with
 the agent picker. Press `Shift+Enter` in the picker to start an additional agent in this workspace.
 Docker and Compose are needed only for container workflows.
@@ -367,3 +367,30 @@ its acceptance tests.
 ## License
 
 MIT
+
+### Compact workbench widgets
+
+The focused agent view shows service and runner summaries below the terminal. Select a summary to open its terminal. When Cargo reports a diagnostic, **View failure** reveals it in place and keeps the agent selected. In split view the same information appears in the pane header. Recognized Codex and Claude sessions have distinct tab marks alongside their session names.
+
+![Codex and Claude tabs in the Windows workbench](docs/images/windows-agent-tabs.png)
+
+![Focused agent terminal with compact service and runner summaries](docs/images/focused-workbench.png)
+
+Configure project defaults in the daemon checkout’s `.daedalus.toml`. For example:
+
+```toml
+[runner]
+command = ["cargo", "test", "--workspace"]
+
+[runner.widget]
+preset = "cargo-test"
+label = "Workspace tests"
+show_duration = true
+show_warnings = false
+
+[service.widget]
+preset = "service"
+label = "Development server"
+```
+
+Use `cargo-check` for compiler progress and warnings, or `command` for generic command status. Direct Cargo test and check manifest commands select their preset automatically. Cargo suite summaries accumulate across crates. Final status follows command completion. The `service` preset includes an observed workspace port when available. Choose `command` for process status alone.

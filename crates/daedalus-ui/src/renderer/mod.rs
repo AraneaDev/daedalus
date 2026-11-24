@@ -490,6 +490,20 @@ fn collect_prepared_quads(
         }
     }
 
+    for (id, label, rect) in &layout.named_tabs {
+        if let Some((preset, bounds)) = agent_tab_mark(state, *id, label, *rect, s) {
+            quads.push(QuadInstance::agent_mark(bounds, preset, theme));
+        }
+    }
+    for (_, rect) in &layout.insight_rows {
+        let body = Rect::new(
+            rect.x + 2. * s,
+            rect.y + 2. * s,
+            (rect.width - 4. * s).max(0.),
+            (rect.height - 4. * s).max(0.),
+        );
+        quads.push(QuadInstance::new(body, theme.bg_sidebar).rounded(5. * s, 0., 0.));
+    }
     let base_quad_count = quads.len() as u32;
 
     collect_overlay_quads(
@@ -502,6 +516,33 @@ fn collect_prepared_quads(
         border_w,
     );
     (quads, base_quad_count)
+}
+
+fn agent_tab_mark(
+    state: &AppState,
+    id: daedalus_proto::PaneId,
+    label: &str,
+    rect: Rect,
+    scale: f32,
+) -> Option<(crate::state::AgentPreset, Rect)> {
+    let pane = state.panes.get(&id)?;
+    if pane.summary.role != PaneRole::Agent
+        || rect.width <= 60. * scale
+        || matches!(label, "‹" | "›" | "‹ Prev" | "Next ›")
+    {
+        return None;
+    }
+    let size = 15. * scale;
+    Some((
+        pane.agent_preset
+            .unwrap_or(crate::state::AgentPreset::Shell),
+        Rect::new(
+            rect.x + 6. * scale,
+            rect.y + (rect.height - size) * 0.5,
+            size,
+            size,
+        ),
+    ))
 }
 
 fn collect_sidebar_quads(
@@ -1288,6 +1329,7 @@ pub(crate) mod tests {
                 cwd: Some(PathBuf::from("/tmp/repo")),
                 last_exit_code: None,
                 has_failure_trace: false,
+                launch_preset: None,
                 agent_state: None,
             }],
             port_offset: 0,
@@ -1335,6 +1377,7 @@ pub(crate) mod tests {
 
         let pane = state.panes.get_mut(&agent_id).unwrap();
         pane.apply_snapshot(GridSnapshot {
+            insight: None,
             pane_id: agent_id,
             seq: 1,
             cols: 20,

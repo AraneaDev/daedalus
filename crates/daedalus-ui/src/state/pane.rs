@@ -24,11 +24,17 @@ pub struct PaneViewState {
     pub selection: Option<Selection>,
     pub agent_preset: Option<AgentPreset>,
     pub last_failure_trace: Option<FailureTrace>,
+    pub show_diagnostic: bool,
+    pub insight: Option<daedalus_proto::RunnerInsight>,
     pub last_seq: u64,
 }
 
 impl PaneViewState {
     pub fn from_summary(summary: PaneSummary) -> Self {
+        let preset = summary
+            .launch_preset
+            .as_deref()
+            .and_then(AgentPreset::from_cli_name);
         Self {
             summary,
             grid_received: false,
@@ -42,8 +48,10 @@ impl PaneViewState {
             scrolled_rows: None,
             dirty_row_indices: Vec::new(),
             selection: None,
-            agent_preset: None,
+            agent_preset: preset,
             last_failure_trace: None,
+            show_diagnostic: false,
+            insight: None,
             last_seq: 0,
         }
     }
@@ -69,6 +77,7 @@ impl PaneViewState {
     pub fn apply_snapshot(&mut self, snapshot: GridSnapshot) -> bool {
         let erased = self.update_history_generation(snapshot.history_generation);
         self.grid_received = true;
+        self.insight = snapshot.insight;
         self.summary.cols = snapshot.cols;
         self.summary.rows = snapshot.rows;
         self.cursor = snapshot.cursor;
@@ -91,6 +100,10 @@ impl PaneViewState {
         {
             return false;
         }
+        if delta.insight.as_ref().is_none_or(|i| i.phase != "Failed") {
+            self.show_diagnostic = false;
+        }
+        self.insight = delta.insight;
         let erased = self.update_history_generation(delta.history_generation);
         if let Some(len) = delta.scrollback_len {
             self.scrollback_len = len;
@@ -229,6 +242,7 @@ mod tests {
 
         // Initial delta when last_seq == 0 should still apply
         pane.apply_delta(GridDelta {
+            insight: None,
             pane_id: pane.summary.id,
             seq: 1,
             cols: 10,
@@ -243,6 +257,7 @@ mod tests {
 
         // Newer snapshot advances last_seq to 5
         pane.apply_snapshot(GridSnapshot {
+            insight: None,
             pane_id: pane.summary.id,
             seq: 5,
             cols: 10,
@@ -261,6 +276,7 @@ mod tests {
         // Older (seq < last_seq) and duplicate (seq == last_seq) deltas must be ignored
         for stale_seq in [4, 5] {
             pane.apply_delta(GridDelta {
+                insight: None,
                 pane_id: pane.summary.id,
                 seq: stale_seq,
                 cols: 10,
@@ -282,6 +298,7 @@ mod tests {
 
         // Newer delta (seq > last_seq) applies normally
         pane.apply_delta(GridDelta {
+            insight: None,
             pane_id: pane.summary.id,
             seq: 6,
             cols: 10,
@@ -307,6 +324,7 @@ mod tests {
         let summary = make_pane_summary(ws_id, PaneRole::Runner);
         let mut pane = PaneViewState::from_summary(summary);
         pane.apply_snapshot(GridSnapshot {
+            insight: None,
             pane_id: pane.summary.id,
             seq: 1,
             cols: 20,
@@ -375,6 +393,7 @@ mod tests {
         pane.set_scroll_offset(5);
         let original = pane.begin_scrollback_request().unwrap();
         pane.apply_delta(GridDelta {
+            insight: None,
             pane_id: pane.summary.id,
             seq: 1,
             cols: pane.summary.cols,

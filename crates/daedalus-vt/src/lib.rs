@@ -1,6 +1,7 @@
 pub mod builtin;
 #[cfg(feature = "ghostty-vt")]
 pub mod ghostty;
+mod runner;
 pub mod semantic;
 
 use daedalus_proto::{CursorState, GridDelta, GridRow, GridSnapshot, PaneId, SearchMatch};

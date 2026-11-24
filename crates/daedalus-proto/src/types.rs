@@ -129,6 +129,8 @@ pub struct PaneSummary {
     pub has_failure_trace: bool,
     #[serde(default)]
     pub agent_state: Option<AgentState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_preset: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +228,25 @@ pub struct SidebarWidget {
     pub statuses: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct WidgetConfig {
+    pub preset: Option<String>,
+    pub label: Option<String>,
+    pub show_duration: Option<bool>,
+    pub show_warnings: Option<bool>,
+}
+
+/// Last observed command, retained in the daemon's terminal snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct RunnerInsight {
+    pub phase: String,
+    pub passed: u32,
+    pub failed: u32,
+    pub warnings: u32,
+    pub elapsed_secs: u64,
+    pub diagnostic: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkspaceManifest {
     #[serde(default)]
@@ -242,6 +263,10 @@ pub struct WorkspaceManifest {
     pub status_providers: Vec<StatusProvider>,
     #[serde(default)]
     pub sidebar_widgets: Vec<SidebarWidget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_widget: Option<WidgetConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_widget: Option<WidgetConfig>,
 }
 
 /// Workspace snapshot sent over the daemon protocol.
@@ -392,6 +417,8 @@ pub struct GridSnapshot {
     /// Changes when the terminal erases its saved lines.
     #[serde(default)]
     pub history_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insight: Option<RunnerInsight>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +434,8 @@ pub struct GridDelta {
     /// Older daemons omit history length in incremental updates.
     #[serde(default)]
     pub scrollback_len: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insight: Option<RunnerInsight>,
 }
 
 /// A single substring match in a pane's scrollback/viewport history (`end_col` is exclusive).

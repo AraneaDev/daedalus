@@ -440,6 +440,7 @@ impl Grid {
             })
             .collect();
         GridSnapshot {
+            insight: None,
             pane_id,
             seq,
             cols: self.cols,
@@ -506,6 +507,7 @@ impl Grid {
         self.last_emitted_cursor = Some(cursor);
         self.last_emitted_history_generation = self.history_generation;
         Some(GridDelta {
+            insight: None,
             pane_id,
             seq,
             cols: self.cols,

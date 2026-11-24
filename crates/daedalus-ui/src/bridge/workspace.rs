@@ -289,12 +289,14 @@ fn resolve_pane_launch_specs(
         .filter(|cmd| !cmd.is_empty())
     {
         Some(cmd) => {
-            let inferred_preset = manifest_preset
-                .or_else(|| AgentPreset::from_cli_name(&cmd[0]))
-                .unwrap_or(base_preset);
+            let executable = cmd[0].rsplit(['/', '\\']).next().unwrap_or("");
+            let inferred_preset = AgentPreset::from_cli_name(
+                executable.trim_end_matches(".exe").trim_end_matches(".cmd"),
+            )
+            .or(manifest_preset);
             (Some(cmd.clone()), inferred_preset)
         }
-        None => (base_preset.command(), base_preset),
+        None => (base_preset.command(), Some(base_preset)),
     };
 
     let service_cmd = manifest
@@ -305,7 +307,7 @@ fn resolve_pane_launch_specs(
         .filter(|c| !c.is_empty());
 
     [
-        (PaneRole::Agent, agent_cmd, Some(effective_agent)),
+        (PaneRole::Agent, agent_cmd, effective_agent),
         (PaneRole::Service, service_cmd, None),
         (PaneRole::Runner, runner_cmd, None),
     ]

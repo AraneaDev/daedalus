@@ -260,6 +260,7 @@ pub struct ShellIntegration {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellLaunchSpec {
+    pub direct: bool,
     pub program: String,
     pub args: Vec<String>,
     pub extra_env: HashMap<String, String>,
@@ -308,6 +309,7 @@ impl ShellIntegration {
             && let Some((program, args)) = cmd.split_first()
         {
             return ShellLaunchSpec {
+                direct: true,
                 program: program.clone(),
                 args: args.to_vec(),
                 extra_env: HashMap::new(),
@@ -326,6 +328,7 @@ impl ShellIntegration {
 
         match base_name.as_str() {
             "bash" | "bash.exe" => ShellLaunchSpec {
+                direct: false,
                 program: shell_path,
                 args: vec![
                     "--rcfile".to_string(),
@@ -344,6 +347,7 @@ impl ShellIntegration {
                     self.zsh_dir.to_string_lossy().into_owned(),
                 );
                 ShellLaunchSpec {
+                    direct: false,
                     program: shell_path,
                     args: vec!["-i".to_string()],
                     extra_env,
@@ -359,6 +363,7 @@ impl ShellIntegration {
                     ),
                 );
                 ShellLaunchSpec {
+                    direct: false,
                     program: shell_path,
                     args: vec!["-i".to_string()],
                     extra_env,
@@ -377,12 +382,14 @@ impl ShellIntegration {
                     self.powershell_script.to_string_lossy().into_owned(),
                 ]);
                 ShellLaunchSpec {
+                    direct: false,
                     program: shell_path,
                     args,
                     extra_env: HashMap::new(),
                 }
             }
             _ => ShellLaunchSpec {
+                direct: false,
                 program: shell_path,
                 args: Vec::new(),
                 extra_env: HashMap::new(),

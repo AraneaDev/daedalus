@@ -3355,3 +3355,105 @@ async fn next_event_until(
         }
     }
 }
+
+#[tokio::test]
+async fn cargo_widget_snapshots_survive_reconnect_and_process_exit() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname='widget_fixture'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let server = DaemonServer::bind_with_supervisor(
+        socket.clone(),
+        dir.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let (shutdown, rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(async {
+        let _ = rx.await;
+    }));
+    let mut client = IpcStream::connect(&socket).await.unwrap();
+    let ResponsePayload::WorkspaceCreated(ws) = send_rpc(
+        &mut client,
+        1,
+        ClientMessage::CreateWorkspace {
+            name: "cargo".into(),
+            root_dir: project.clone(),
+            env: HashMap::new(),
+        },
+    )
+    .await
+    else {
+        panic!("expected workspace")
+    };
+    for (command, source, expected) in [
+        ("test", "#[test] fn first(){assert!(true);}", "Passed"),
+        ("check", "fn unused() {}", "Passed"),
+        ("check", "pub fn broken()->u32 { false }", "Failed"),
+    ] {
+        std::fs::write(project.join("src/lib.rs"), source).unwrap();
+        let ResponsePayload::PaneSpawned(pane) = send_rpc(
+            &mut client,
+            2,
+            ClientMessage::SpawnPane {
+                workspace_id: ws.id,
+                role: PaneRole::Runner,
+                command: Some(vec![
+                    "cargo".into(),
+                    command.into(),
+                    "--workspace".into(),
+                    "--offline".into(),
+                ]),
+                cols: 100,
+                rows: 24,
+                shell: None,
+                env: HashMap::from([(
+                    "CARGO_TARGET_DIR".into(),
+                    project.join("target").to_string_lossy().into_owned(),
+                )]),
+            },
+        )
+        .await
+        else {
+            panic!("expected runner")
+        };
+        client = IpcStream::connect(&socket).await.unwrap();
+        let insight = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let ResponsePayload::Snapshot(s) = send_rpc(
+                    &mut client,
+                    3,
+                    ClientMessage::GetSnapshot { pane_id: pane.id },
+                )
+                .await
+                else {
+                    panic!("expected snapshot")
+                };
+                if let Some(i) = s.insight
+                    && matches!(i.phase.as_str(), "Failed" | "Passed" | "Stopped")
+                {
+                    break i;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(insight.phase, expected, "{insight:?}");
+        if command == "test" {
+            assert_eq!(insight.passed, 1);
+        } else if expected == "Failed" {
+            assert!(insight.diagnostic.unwrap().contains("E0308"));
+        } else {
+            assert_eq!(insight.warnings, 1);
+        }
+    }
+    shutdown.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}

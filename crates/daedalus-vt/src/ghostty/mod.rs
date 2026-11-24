@@ -119,6 +119,7 @@ impl VtEngine for GhosttyVt {
 
     fn snapshot(&self, pane_id: PaneId, seq: u64) -> GridSnapshot {
         GridSnapshot {
+            insight: None,
             pane_id,
             seq,
             cols: self.info.cols,
@@ -180,6 +181,7 @@ impl VtEngine for GhosttyVt {
             return None;
         }
         Some(GridDelta {
+            insight: None,
             pane_id,
             seq,
             cols: new.cols,

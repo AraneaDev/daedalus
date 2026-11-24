@@ -7,7 +7,7 @@ use daedalus_ui::layout::overlays::{
     close_workspace_modal_rect, picker_item_rect, preset_picker_layout, search_bar_rect,
     search_controls, worktree_button_rects, worktree_modal_rect,
 };
-use daedalus_ui::layout::{HitTarget, Rect, hit_test};
+use daedalus_ui::layout::{Divider, HitTarget, PaneSplits, Rect, WorkspaceLayout, hit_test};
 use daedalus_ui::selection::{CellPos, Selection, select_word_at};
 use daedalus_ui::settings::SettingsAction;
 use daedalus_ui::state::{AgentPreset, AppState, PaneViewState};
@@ -17,15 +17,77 @@ use winit::keyboard::ModifiersState;
 
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
+#[derive(Clone, Copy)]
+struct DividerDrag {
+    divider: Divider,
+    origin: f32,
+    extent: f32,
+    offset: f32,
+}
+
+fn divider_at(layout: &WorkspaceLayout, x: f32, y: f32, scale: f32) -> Option<DividerDrag> {
+    let agent = layout.pane(PaneRole::Agent)?.outer;
+    let service = layout.pane(PaneRole::Service)?.outer;
+    let runner = layout.pane(PaneRole::Runner)?.outer;
+    let reach = 4. * scale;
+    let drag = |divider, origin, end, center, pointer| {
+        Some(DividerDrag {
+            divider,
+            origin,
+            extent: end - origin,
+            offset: center - pointer,
+        })
+    };
+    if layout.stacked {
+        if x < agent.x || x >= agent.right() {
+            return None;
+        }
+        for (divider, center) in [
+            (Divider::UpperRow, service.y),
+            (Divider::LowerRow, runner.y),
+        ] {
+            if (y - center).abs() <= reach {
+                return drag(divider, agent.y, runner.bottom(), center, y);
+            }
+        }
+    } else {
+        let gutter = (service.x - agent.right()) / 2.;
+        let center = agent.right() + gutter;
+        if (x - center).abs() <= reach && y >= agent.y && y <= agent.bottom() {
+            return drag(
+                Divider::Column,
+                agent.x - gutter,
+                service.right() + gutter,
+                center,
+                x,
+            );
+        }
+        let center = service.bottom() + gutter;
+        if x >= service.x && x <= service.right() && (y - center).abs() <= reach {
+            return drag(
+                Divider::RightRow,
+                service.y - gutter,
+                runner.bottom() + gutter,
+                center,
+                y,
+            );
+        }
+    }
+    None
+}
+
 #[derive(Default)]
 pub(super) struct PointerState {
     pub(super) position: (f32, f32),
+    pub(super) splits: PaneSplits,
+    divider_drag: Option<DividerDrag>,
     drag_anchor: Option<(PaneRole, PaneId, CellPos)>,
     last_click: Option<(Instant, PaneRole, u16, u16)>,
 }
 
 impl PointerState {
     pub(super) fn end_drag(&mut self) {
+        self.divider_drag = None;
         self.drag_anchor = None;
     }
 
@@ -208,6 +270,10 @@ impl DaedalusApp {
         } = metrics;
         let (x, y) = self.pointer.position;
         let layout = self.layout_for(metrics);
+        if let Some(drag) = divider_at(&layout, x, y, scale_factor) {
+            self.pointer.divider_drag = Some(drag);
+            return;
+        }
         if let Some(search) = self.state.search.as_ref()
             && let Some(role) = self
                 .state
@@ -285,7 +351,7 @@ impl DaedalusApp {
                     self.open_close_modal_for_workspace(ws_id);
                 }
             }
-            HitTarget::CloseSession(_) | HitTarget::SelectSession(_) => {
+            HitTarget::Widget(_) | HitTarget::CloseSession(_) | HitTarget::SelectSession(_) => {
                 self.activate_session(target)
             }
             HitTarget::SessionTab(role) => self.handle_ui_action(UiAction::FocusRole(role)),
@@ -324,6 +390,37 @@ impl DaedalusApp {
 
     pub(super) fn handle_cursor_moved(&mut self, x: f32, y: f32) {
         self.pointer.position = (x, y);
+        if let Some(drag) = self.pointer.divider_drag {
+            let coordinate = if drag.divider == Divider::Column {
+                x
+            } else {
+                y
+            };
+            if drag.extent > 0. {
+                self.pointer.splits.move_divider(
+                    drag.divider,
+                    (coordinate + drag.offset - drag.origin) / drag.extent,
+                );
+                self.schedule_resize_flush();
+                self.request_redraw();
+            }
+            return;
+        }
+        if self.pointer.drag_anchor.is_none()
+            && let Some(metrics) = self.viewport_metrics()
+        {
+            let handle = (!self.state.zoomed)
+                .then(|| divider_at(&self.pane_geometry(metrics), x, y, metrics.scale_factor))
+                .flatten();
+            if let Some(window) = &self.window {
+                use winit::window::CursorIcon;
+                window.set_cursor(match handle.map(|h| h.divider) {
+                    Some(Divider::Column) => CursorIcon::ColResize,
+                    Some(_) => CursorIcon::RowResize,
+                    None => CursorIcon::Default,
+                });
+            }
+        }
 
         if self.pointer.drag_anchor.is_some()
             && let Some(metrics) = self.viewport_metrics()
@@ -481,6 +578,7 @@ mod tests {
             cwd: None,
             last_exit_code: None,
             has_failure_trace: false,
+            launch_preset: None,
             agent_state: None,
         });
         pane.viewport_rows.push(GridRow {

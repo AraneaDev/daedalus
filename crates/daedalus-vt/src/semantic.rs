@@ -18,6 +18,8 @@ pub struct CommandTracker {
     last_exit_code: Option<i32>,
     last_failure_trace: Option<FailureTrace>,
     prompt_input_start: Option<(u64, u16)>,
+    runner_enabled: bool,
+    runner: Option<crate::runner::RunnerObserver>,
     active_command: Option<String>,
     command_start_abs_row: Option<u64>,
 }
@@ -32,9 +34,26 @@ impl CommandTracker {
             last_exit_code: None,
             last_failure_trace: None,
             prompt_input_start: None,
+            runner_enabled: false,
+            runner: None,
             active_command: None,
             command_start_abs_row: None,
         }
+    }
+
+    pub fn enable_runner(&mut self) {
+        self.runner_enabled = true;
+    }
+
+    pub fn start_direct_command(&mut self) {
+        self.status = PaneStatus::Busy;
+        if self.runner_enabled {
+            self.runner = Some(crate::runner::RunnerObserver::new());
+        }
+    }
+
+    pub fn runner_insight(&self) -> Option<daedalus_proto::RunnerInsight> {
+        self.runner.as_ref().map(|r| r.snapshot())
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> TrackedOutcome {
@@ -46,6 +65,9 @@ impl CommandTracker {
         // where each semantic event was emitted.
         for (i, &byte) in bytes.iter().enumerate() {
             if matches!(byte, 0x07 | 0x5c | 0x9c) {
+                if let Some(r) = &mut self.runner {
+                    r.feed(&bytes[start..=i]);
+                }
                 let events = self.engine.feed(&bytes[start..=i]);
                 self.process_events(events, &mut outcome);
                 start = i + 1;
@@ -53,6 +75,9 @@ impl CommandTracker {
         }
 
         if start < bytes.len() {
+            if let Some(r) = &mut self.runner {
+                r.feed(&bytes[start..]);
+            }
             let events = self.engine.feed(&bytes[start..]);
             self.process_events(events, &mut outcome);
         }
@@ -79,7 +104,7 @@ impl CommandTracker {
                     self.prompt_input_start = Some((self.engine.current_abs_row(), cursor.col));
                 }
                 SemanticEvent::CommandExecuted => {
-                    self.status = PaneStatus::Busy;
+                    self.start_direct_command();
                     if let Some((row, col)) = self.prompt_input_start.take() {
                         let cmd = self.engine.row_text_from(row, col);
                         self.active_command = if cmd.is_empty() { None } else { Some(cmd) };
@@ -88,6 +113,9 @@ impl CommandTracker {
                     outcome.status_changed.push((self.status, self.cwd.clone()));
                 }
                 SemanticEvent::CommandFinished { exit_code } => {
+                    if let Some(r) = &mut self.runner {
+                        r.finish(Some(exit_code));
+                    }
                     self.last_exit_code = Some(exit_code);
                     let end_row = self.engine.current_abs_row();
                     let command = self.active_command.take();
@@ -121,6 +149,9 @@ impl CommandTracker {
     }
 
     pub fn mark_exited(&mut self, code: Option<i32>) {
+        if let Some(r) = &mut self.runner {
+            r.finish(code);
+        }
         self.status = PaneStatus::Exited { code };
     }
 

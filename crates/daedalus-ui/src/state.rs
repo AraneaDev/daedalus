@@ -12,6 +12,7 @@ use unicode_segmentation::UnicodeSegmentation;
 mod dialogs;
 mod pane;
 mod search;
+mod widgets;
 
 pub use dialogs::{ActionPaletteState, CloseWorkspaceModalState, PickerState, WorktreeModalState};
 pub use pane::PaneViewState;
@@ -533,29 +534,35 @@ impl AppState {
 
     /// Keep role ordinals in workspace order, including panes with a custom name.
     pub fn terminal_tabs(&self, ws: &WorkspaceView) -> Vec<(PaneId, String)> {
-        let mut totals = [0usize; 3];
-        let mut ordinals = [0usize; 3];
+        let base_name = |pane: &PaneSummary| match pane.role {
+            PaneRole::Agent => match self.panes.get(&pane.id).and_then(|p| p.agent_preset) {
+                Some(AgentPreset::Claude) => "Claude",
+                Some(AgentPreset::Codex) => "Codex",
+                Some(AgentPreset::Agy) => "Antigravity",
+                _ => "Agent",
+            },
+            PaneRole::Service => "Service",
+            PaneRole::Runner => "Runner",
+        };
+        let mut totals = HashMap::new();
+        let mut ordinals = HashMap::new();
         for pane in self.workspace_panes(ws) {
-            totals[pane.role as usize] += 1;
+            *totals.entry(base_name(pane)).or_insert(0usize) += 1;
         }
         self.workspace_panes(ws)
             .map(|pane| {
-                let role = pane.role as usize;
-                ordinals[role] += 1;
+                let base = base_name(pane);
+                let ordinal = ordinals.entry(base).or_insert(0usize);
+                *ordinal += 1;
                 let name = self
                     .session_names
                     .get(&pane.id)
                     .cloned()
                     .unwrap_or_else(|| {
-                        let role_name = match pane.role {
-                            PaneRole::Agent => "Agent",
-                            PaneRole::Service => "Service",
-                            PaneRole::Runner => "Runner",
-                        };
-                        if totals[role] > 1 {
-                            format!("{role_name} {}", ordinals[role])
+                        if totals[base] > 1 {
+                            format!("{base} {ordinal}")
                         } else {
-                            role_name.into()
+                            base.to_owned()
                         }
                     });
                 (pane.id, terminal_title(name, pane.status))

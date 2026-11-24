@@ -117,6 +117,7 @@ fn workspace(name: &str) -> WorkspaceInfo {
             cwd: None,
             last_exit_code: None,
             has_failure_trace: false,
+            launch_preset: None,
             agent_state: None,
         })
         .collect();
@@ -297,6 +298,7 @@ fn search_rejects_stale_results_and_routes_input_and_scrollback_to_the_selected_
     w.app.activate_session(HitTarget::SelectSession(pane));
     assert_eq!(w.app.state.focused_role, PaneRole::Service);
     w.app.handle_daemon_event(UiEvent::Snapshot(GridSnapshot {
+        insight: None,
         pane_id: pane,
         seq: 1,
         cols: 80,
@@ -955,6 +957,7 @@ fn terminal_dimensions_retry_rejected_commands_and_drag_selection_uses_absolute_
     w.app.resize_panes(&layout);
     assert!(w.idle());
     w.app.handle_daemon_event(UiEvent::Snapshot(GridSnapshot {
+        insight: None,
         pane_id: pane,
         seq: 1,
         cols: agent.cols,
@@ -1117,6 +1120,7 @@ fn daemon_activity_updates_the_visible_workspace_and_invalidates_a_search_when_h
     };
     w.app
         .handle_daemon_event(UiEvent::ServerEvent(ServerEvent::GridDelta(GridDelta {
+            insight: None,
             pane_id: agent,
             seq: 1,
             cols: 80,

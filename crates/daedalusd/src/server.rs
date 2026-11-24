@@ -666,6 +666,7 @@ mod tests {
 
     fn dummy_delta(pane_id: PaneId, seq: u64) -> ServerEvent {
         ServerEvent::GridDelta(GridDelta {
+            insight: None,
             pane_id,
             seq,
             cols: 80,

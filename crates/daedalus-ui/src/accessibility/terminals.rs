@@ -20,7 +20,7 @@ impl TerminalControls {
     fn pane_base(&mut self, pane: PaneId) -> u64 {
         *self.panes.entry(pane).or_insert_with(|| {
             self.serial += 1;
-            (1 << 61) + self.serial * 4
+            (1 << 61) + self.serial * 8
         })
     }
 
@@ -36,7 +36,7 @@ impl TerminalControls {
         };
         if self.run_tests.is_none_or(|(id, _)| id != workspace) {
             self.serial += 1;
-            self.run_tests = Some((workspace, NodeId((1 << 61) + self.serial * 4)));
+            self.run_tests = Some((workspace, NodeId((1 << 61) + self.serial * 8)));
         }
         if let Some((_, node_id)) = self.run_tests {
             let mut button = named(Role::Button, "Run tests");
@@ -91,6 +91,22 @@ impl TerminalControls {
         if ws.panes.is_empty() {
             return None;
         }
+        if state.zoomed
+            && state.focused_role == daedalus_proto::PaneRole::Agent
+            && state.widget_diagnostic().is_some()
+            && let Some(runner) = state.pane_id_for_role(daedalus_proto::PaneRole::Runner)
+        {
+            let widget = NodeId(self.pane_base(runner) + 4);
+            let mut button = named(
+                Role::Button,
+                state
+                    .focused_widget_label(daedalus_proto::PaneRole::Runner)
+                    .unwrap_or_default(),
+            );
+            button.add_action(Action::Click);
+            workspace.push_child(widget);
+            nodes.push((widget, button));
+        }
         let mut tabs = named(Role::TabList, "Terminals");
         let mut close = None;
         let mut terminal = None;
@@ -99,6 +115,12 @@ impl TerminalControls {
             let base = self.pane_base(id);
             let selected = Some(id) == focused;
             let mut tab = named(Role::Tab, &label);
+            if let Some(pane) = state.panes.get(&id)
+                && state.pane_id_for_role(pane.summary.role) == Some(id)
+                && let Some(insight) = state.widget_label(pane.summary.role)
+            {
+                tab.set_description(insight);
+            }
             tab.set_selected(selected);
             tab.add_action(Action::Click);
             tab.add_action(Action::Focus);
@@ -127,6 +149,17 @@ impl TerminalControls {
     pub(crate) fn action(&self, state: &AppState, request: &ActionRequest) -> Option<HitTarget> {
         if request.target_tree != TreeId::ROOT || overlay(state).is_some() {
             return None;
+        }
+        if state
+            .pane_id_for_role(daedalus_proto::PaneRole::Runner)
+            .and_then(|id| self.panes.get(&id))
+            .is_some_and(|base| request.target_node == NodeId(base + 4))
+            && request.action == Action::Click
+            && state.zoomed
+            && state.focused_role == daedalus_proto::PaneRole::Agent
+            && state.widget_diagnostic().is_some()
+        {
+            return Some(HitTarget::Widget(daedalus_proto::PaneRole::Runner));
         }
         let ws = state.active_workspace()?;
         ws.panes.iter().copied().find_map(|pane| {

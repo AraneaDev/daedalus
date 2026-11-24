@@ -125,6 +125,8 @@ impl PaneHandle {
         let (write_tx, mut write_rx) = mpsc::channel::<WriteRequest>(128);
 
         let SpawnedPty {
+            direct,
+            launch_preset,
             master,
             mut reader,
             mut writer,
@@ -152,6 +154,8 @@ impl PaneHandle {
             .expect("failed to spawn PTY writer thread");
 
         tokio::spawn(run_pane_actor(
+            direct,
+            launch_preset,
             workspace_id,
             pane_id,
             role,
@@ -299,6 +303,7 @@ impl PaneHandle {
 }
 
 struct PaneOutput {
+    runner_frame: Option<daedalus_proto::GridDelta>,
     received_output: bool,
     journal: crate::journal::Journal,
     role: PaneRole,
@@ -331,8 +336,15 @@ impl PaneOutput {
             pane_id,
             journal,
             role,
+            runner_frame: None,
             received_output: false,
-            tracker: CommandTracker::new(pane_id, engine),
+            tracker: {
+                let mut tracker = CommandTracker::new(pane_id, engine);
+                if role == PaneRole::Runner {
+                    tracker.enable_runner();
+                }
+                tracker
+            },
             detector: (role == PaneRole::Agent).then(AgentStateDetector::new),
             seq: 0,
             dirty: false,
@@ -397,12 +409,27 @@ impl PaneOutput {
         if self.dirty {
             self.dirty = false;
             let received_output = std::mem::take(&mut self.received_output);
-            self.seq += 1;
-            if let Some(delta) = self
+            let insight = self.tracker.runner_insight();
+            let seq = self.seq + 1;
+            let grid = self
                 .tracker
                 .engine_mut()
-                .take_dirty_delta(self.pane_id, self.seq)
-            {
+                .take_dirty_delta(self.pane_id, seq);
+            let update = grid.or_else(|| {
+                self.runner_frame
+                    .as_ref()
+                    .filter(|old| old.insight != insight)
+                    .cloned()
+            });
+            if let Some(mut delta) = update {
+                self.seq = seq;
+                delta.seq = seq;
+                delta.insight = insight;
+                if self.role == PaneRole::Runner {
+                    let rows = std::mem::take(&mut delta.dirty_rows);
+                    self.runner_frame = Some(delta.clone());
+                    delta.dirty_rows = rows;
+                }
                 if received_output
                     && self.role == PaneRole::Agent
                     && let Some(row) = delta
@@ -430,8 +457,9 @@ impl PaneOutput {
     }
 
     fn finish(&mut self, exit_code: Option<i32>) {
-        self.flush_delta();
         self.tracker.mark_exited(exit_code);
+        self.dirty |= self.role == PaneRole::Runner;
+        self.flush_delta();
         if let Some(detector) = self.detector.as_mut() {
             let state = detector.observe_exit(exit_code);
             self.emit_agent_state(state);
@@ -469,6 +497,8 @@ async fn next_pty_output(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_pane_actor(
+    direct: bool,
+    launch_preset: Option<String>,
     workspace_id: WorkspaceId,
     pane_id: PaneId,
     role: PaneRole,
@@ -487,6 +517,9 @@ async fn run_pane_actor(
     let mut rows = rows.max(1);
     let mut child_exit: Option<(i32, tokio::time::Instant)> = None;
     let mut output = PaneOutput::new(workspace_id, pane_id, role, cols, rows, event_tx, journal);
+    if direct && role != PaneRole::Agent {
+        output.tracker.start_direct_command();
+    }
     let mut pty_open = true;
     let mut delta_tick = tokio::time::interval(Duration::from_millis(16));
     delta_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -523,7 +556,10 @@ async fn run_pane_actor(
             _ = delta_tick.tick(), if output.dirty => {
                 output.flush_delta();
             }
-            _ = agent_tick.tick(), if output.detector.is_some() => {
+            _ = agent_tick.tick(), if output.detector.is_some() || (role==PaneRole::Runner && pty_open) => {
+                if role==PaneRole::Runner && output.runner_frame.as_ref().is_some_and(|old|old.insight!=output.tracker.runner_insight()) {
+                    output.dirty=true;
+                }
                 if let Some(detector) = output.detector.as_mut() {
                     let state = detector.observe_tick(Instant::now());
                     output.emit_agent_state(state);
@@ -575,7 +611,9 @@ async fn run_pane_actor(
                     Some(PaneCmd::GetSnapshot { reply }) => {
                         // A snapshot and journal anchor with the same sequence must describe the same frame.
                         output.flush_delta();
-                        let _ = reply.send(output.tracker.engine().snapshot(pane_id, output.seq));
+                        let mut snapshot = output.tracker.engine().snapshot(pane_id, output.seq);
+                        snapshot.insight = output.tracker.runner_insight();
+                        let _ = reply.send(snapshot);
                     }
                     Some(PaneCmd::GetScrollback {
                         offset_from_bottom,
@@ -613,6 +651,7 @@ async fn run_pane_actor(
                             cwd: output.tracker.cwd().cloned(),
                             last_exit_code: output.tracker.last_exit_code(),
                             has_failure_trace: output.tracker.last_failure_trace().is_some(),
+                            launch_preset: launch_preset.clone(),
                             agent_state: output.detector.as_ref().map(AgentStateDetector::state),
                         };
                         let _ = reply.send(summary);

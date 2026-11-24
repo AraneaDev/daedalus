@@ -886,6 +886,7 @@ mod tests {
         let mut changed = pane.viewport_rows[0].clone();
         changed.cells[0].text = "z".into();
         pane.apply_delta(GridDelta {
+            insight: None,
             pane_id: agent,
             seq: 2,
             cols: 20,

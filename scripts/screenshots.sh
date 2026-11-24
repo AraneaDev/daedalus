@@ -53,8 +53,14 @@ cat > .daedalus.toml <<'TOML'
 command = ["sh", "-c", "while [ ! -f .git/capture ]; do sleep .1; done; printf '$ git status --short --branch\n'; git status --short --branch; printf '\n$ git diff -- health.py\n'; git --no-pager diff --color=always -- health.py; touch .git/agent-ready; exec cat"]
 [service]
 command = ["sh", "-c", "while [ ! -f .git/capture ]; do sleep .1; done; printf '$ python3 -m json.tool response.json\n'; python3 -m json.tool response.json; touch .git/service-ready; exec cat"]
+[service.widget]
+label = "Health endpoint"
 [runner]
 command = ["sh", "-c", "while [ ! -f .git/capture ]; do sleep .1; done; printf '$ python3 -m unittest -v\n'; python3 -B -m unittest -v && touch .git/runner-ready; while [ ! -f .git/fail ]; do sleep .1; done; printf '\\033[2J\\033[H'; echo FAIL: health_check; echo Expected HTTP 200, received 503; exit 3"]
+[runner.widget]
+preset = "command"
+label = "Health checks"
+show_duration = false
 [[actions]]
 id = "test"
 label = "Run health checks"
@@ -110,6 +116,7 @@ capture() {
 }
 capture workbench
 xdotool key ctrl+shift+z
+capture focused-workbench
 xdotool key ctrl+shift+w
 xdotool type --delay 30 'feature/add-metrics'
 capture new-worktree
@@ -162,6 +169,6 @@ for entry in 'workspace-settings 650x392' 'environment-setup 700x500' 'new-workt
 done
 convert "$scratch/failed-run.png" -crop 1000x184+0+0 +repage "$scratch/failure.png"
 mv "$scratch/failure.png" "$scratch/failed-run.png"
-for name in workbench new-worktree workspace-settings environment-setup failed-run; do
+for name in workbench focused-workbench new-worktree workspace-settings environment-setup failed-run; do
     install -m644 "$scratch/$name.png" "$out/$name.png"
 done

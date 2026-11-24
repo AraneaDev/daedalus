@@ -92,6 +92,12 @@ class Workbench:
         border = bytes.fromhex("42332b")
         until("dialog transition", lambda: (self.pixel(x + 20, y) == border) == visible)
 
+    def review_ready(self):
+        # During installation the terminal can temporarily occupy these coordinates.
+        # The enabled Open workspace button has a green fill in the review dialog.
+        blue, green, red = self.pixel(820, 663)
+        return green > 180 and green > red + 50 and green > blue + 30
+
     def close(self, process):
         event = protocol.event.ClientMessage(
             window=self.window,
@@ -196,13 +202,13 @@ def exercise(binaries, scratch, screen):
             # The install button disappears after the daemon rechecks the executable.
             until(
                 "install action removed",
-                lambda: ui.pixel(752, 518) == ui.pixel(384, 518),
+                lambda: ui.review_ready() and ui.pixel(752, 518) == ui.pixel(384, 518),
             )
             ui.click(710, 588)  # Install project dependencies
             until("project dependencies", lambda: (project / "node_modules").is_dir())
             until(
                 "dependency action removed",
-                lambda: ui.pixel(710, 588) == ui.pixel(384, 588),
+                lambda: ui.review_ready() and ui.pixel(710, 588) == ui.pixel(384, 588),
             )
             ui.click(922, 660)  # Open workspace
             until("agent launched", lambda: (project / "agent-started").exists())
