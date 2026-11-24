@@ -1569,21 +1569,17 @@ fn stored_setup() -> Vec<daedalus_ui::assignments::Assignment> {
     ]
 }
 
-/// A connected daemon that knows the setup of `/project` and lists it as recent.
+/// A freshly started UI: it never saw `/project` open, and the daemon lists it as recent.
 fn start_screen_with_recent(w: &mut Workbench, has_setup: bool) {
     w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
         home_dir: None,
         project_setups: true,
     });
-    let mut known = workspace("Project");
-    known.setup = Some(stored_setup());
-    // Seen while it was open on this connection; it has been closed since.
-    w.app.project_setups.absorb(std::slice::from_ref(&known));
     w.app.handle_daemon_event(UiEvent::WorkspacesLoaded(vec![]));
     w.app
         .handle_daemon_event(UiEvent::RecentProjectsLoaded(vec![
             recent_project("Project", "/project", has_setup),
-            recent_project("Unknown", "/unknown", true),
+            recent_project("Other", "/other", false),
         ]));
     assert!(matches!(
         w.commands.try_recv(),
@@ -1592,11 +1588,12 @@ fn start_screen_with_recent(w: &mut Workbench, has_setup: bool) {
     assert_eq!(w.app.state.workspace_form.recent().len(), 2);
 }
 
-#[test]
-fn reopen_with_setup_creates_and_launches_agents_only() {
+/// Reopens the first recent project and answers with the workspace the daemon created.
+fn reopen_first(
+    w: &mut Workbench,
+    setup: Option<Vec<daedalus_ui::assignments::Assignment>>,
+) -> WorkspaceInfo {
     use daedalus_ui::workspace_form::Control;
-    let mut w = Workbench::new();
-    start_screen_with_recent(&mut w, true);
     w.app.state.workspace_form.set_focus(Control::Recent(0));
     w.app.workspace_form_key(&Key::Named(NamedKey::Enter));
     let UiCommand::CreateManualWorkspace {
@@ -1613,11 +1610,21 @@ fn reopen_with_setup_creates_and_launches_agents_only() {
     );
     assert!(w.app.state.workspace_form.submitting());
     assert!(!w.app.state.setup_review.open);
-    let ws = workspace("Project");
+    let mut ws = workspace("Project");
+    ws.setup = setup;
     w.app.handle_daemon_event(UiEvent::ManualWorkspaceCreated {
         session,
         workspace: ws.clone(),
     });
+    ws
+}
+
+#[test]
+fn reopen_with_setup_creates_and_launches_agents_only() {
+    let mut w = Workbench::new();
+    start_screen_with_recent(&mut w, true);
+    // The setup only arrives on the workspace the daemon creates.
+    let ws = reopen_first(&mut w, Some(stored_setup()));
     assert!(!w.app.state.workspace_form.open);
     let UiCommand::ApplySetup {
         workspace_id,
@@ -1636,6 +1643,33 @@ fn reopen_with_setup_creates_and_launches_agents_only() {
     });
     assert_eq!(w.app.state.active_workspace_id, Some(ws.id));
     assert!(!w.app.state.setup_review.open);
+}
+
+#[test]
+fn reopen_whose_created_workspace_has_no_setup_reviews_that_workspace() {
+    let mut w = Workbench::new();
+    start_screen_with_recent(&mut w, true);
+    let ws = reopen_first(&mut w, None);
+    let UiCommand::InspectSetup {
+        session, root_dir, ..
+    } = w.command()
+    else {
+        panic!("expected the environment review")
+    };
+    assert_eq!(root_dir, std::path::Path::new("/project"));
+    w.app.handle_daemon_event(UiEvent::SetupInspected {
+        session,
+        result: Ok(inspection()),
+    });
+    assert!(w.app.state.setup_review.open);
+    assert!(!w.app.state.workspace_form.open);
+    assert_eq!(w.app.state.setup_review.name, "Project");
+    // Opening the review applies to the workspace that already exists.
+    w.app.handle_setup_action(SetupAction::Open);
+    assert!(matches!(
+        w.command(),
+        UiCommand::ApplySetup { workspace_id, .. } if workspace_id == ws.id
+    ));
 }
 
 #[test]
@@ -1693,7 +1727,8 @@ fn reopen_failures_are_reported_where_the_user_is() {
     let UiCommand::CreateManualWorkspace { session, .. } = w.command() else {
         panic!("expected workspace creation")
     };
-    let ws = workspace("Project");
+    let mut ws = workspace("Project");
+    ws.setup = Some(stored_setup());
     w.app.handle_daemon_event(UiEvent::ManualWorkspaceCreated {
         session,
         workspace: ws.clone(),

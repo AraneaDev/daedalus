@@ -10,6 +10,8 @@ use winit::keyboard::Key;
 
 enum AfterCreate {
     Install(Vec<String>),
+    /// A reopened recent project: apply the setup the daemon returns with the workspace.
+    Reopen,
     Apply {
         assignments: Vec<Assignment>,
         launch: Vec<String>,
@@ -112,37 +114,48 @@ impl DaedalusApp {
         }
     }
 
-    /// Reopens a recent project with the setup the daemon stores for its folder, or opens the
-    /// environment review when this connection has not seen that setup.
+    /// Reopens a recent project. One with a stored setup is created first and then started
+    /// from the setup the daemon returns with it; one without opens the environment review.
     pub(super) fn reopen_project(&mut self, project: daedalus_proto::RecentProject) {
-        let stored = project
-            .has_setup
-            .then(|| self.project_setups.for_folder(&project.root_dir))
-            .flatten();
-        let Some(assignments) = stored else {
+        if !project.has_setup {
             self.inspect_setup_folder(project.name, project.root_dir);
             return;
-        };
-        let launch = assignments
-            .iter()
-            .filter(|entry| entry.role == PaneRole::Agent)
-            .map(|entry| entry.id.clone())
-            .collect();
+        }
         self.setup.request = self.setup.request.wrapping_add(1);
         if self.send_command(UiCommand::CreateManualWorkspace {
             session: self.setup.request,
             name: project.name,
             root_dir: project.root_dir,
         }) {
-            self.setup.after_create = Some(AfterCreate::Apply {
-                assignments,
-                launch,
-            });
+            self.setup.after_create = Some(AfterCreate::Reopen);
             self.setup.reopen = Some(self.state.workspace_form.session());
             self.state.workspace_form.start_submission();
         } else {
             self.state.workspace_form.error = Some("Reconnect to open this project.".into());
         }
+    }
+
+    /// The reopened workspace exists: start it from its stored setup, or review it.
+    fn reopened(&mut self, ws: &WorkspaceInfo) -> Option<AfterCreate> {
+        let form = self.setup.reopen?;
+        if let Some(assignments) = ws.setup.clone() {
+            self.state.workspace_form.finish_submission(form, None);
+            let launch = assignments
+                .iter()
+                .filter(|entry| entry.role == PaneRole::Agent)
+                .map(|entry| entry.id.clone())
+                .collect();
+            return Some(AfterCreate::Apply {
+                assignments,
+                launch,
+            });
+        }
+        // The setup is gone since the list was made. The review then belongs to this
+        // workspace, so its Open applies here instead of creating the workspace again.
+        self.setup.reopen = None;
+        self.state.setup_review.folder = ws.root_dir.clone();
+        self.inspect_setup_folder(ws.name.clone(), ws.root_dir.clone());
+        None
     }
 
     pub(super) fn setup_inspected(
@@ -303,6 +316,7 @@ impl DaedalusApp {
     fn run_setup_action(&mut self, workspace_id: WorkspaceId, action: AfterCreate) {
         let cmd = match action {
             AfterCreate::Install(argv) => UiCommand::InstallSetupTool { workspace_id, argv },
+            AfterCreate::Reopen => unreachable!("resolved when the workspace is created"),
             AfterCreate::Apply {
                 assignments,
                 launch,
@@ -317,16 +331,19 @@ impl DaedalusApp {
 
     pub(super) fn setup_created(&mut self, session: u64, ws: WorkspaceInfo) {
         let id = ws.id;
-        self.state.upsert_workspace(ws);
+        self.state.upsert_workspace(ws.clone());
         if self.setup.request == session
             && let Some(action) = self.setup.after_create.take()
         {
             self.setup.workspace = Some(id);
             self.state.select_workspace(id);
-            if let Some(form) = self.setup.reopen {
-                self.state.workspace_form.finish_submission(form, None);
+            let action = match action {
+                AfterCreate::Reopen => self.reopened(&ws),
+                action => Some(action),
+            };
+            if let Some(action) = action {
+                self.run_setup_action(id, action);
             }
-            self.run_setup_action(id, action);
         }
         self.schedule_resize_flush();
     }
