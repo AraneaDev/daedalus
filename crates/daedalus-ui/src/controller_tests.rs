@@ -1423,3 +1423,43 @@ fn local_setups_are_sent_to_the_daemon_once_and_the_files_stay() {
     assert!(w.commands.try_recv().is_err());
     assert_eq!(daedalus_ui::assignments::load(ws.id).unwrap(), vec![entry]);
 }
+
+#[test]
+fn rejected_or_unsent_setup_saves_fall_back_to_the_confirmed_setup() {
+    use daedalus_ui::settings::SettingsAction;
+    let mut w = Workbench::new();
+    daemon_capabilities(&mut w, true);
+    let mut ws = workspace("Fallback");
+    let confirmed = runner_entry("Confirmed");
+    ws.setup = Some(vec![confirmed.clone()]);
+    let id = ws.id;
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+    let denied = runner_entry("Denied");
+    w.app.handle_ui_action(UiAction::WorkspaceSettings);
+    w.app
+        .handle_settings_action(SettingsAction::Save(vec![denied.clone()]));
+    assert!(matches!(w.command(), UiCommand::SaveProjectSetup { .. }));
+    w.app.handle_daemon_event(UiEvent::ProjectSetupSaveFailed {
+        workspace_id: id,
+        message: "no".into(),
+    });
+    assert_eq!(
+        w.app.project_setups.load(id).unwrap(),
+        vec![confirmed.clone()]
+    );
+    w.app.handle_ui_action(UiAction::WorkspaceSettings);
+    w.app.bridge = None;
+    w.app
+        .handle_settings_action(SettingsAction::Save(vec![denied]));
+    assert!(
+        w.app
+            .state
+            .settings
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Reconnect")
+    );
+    assert_eq!(w.app.project_setups.load(id).unwrap(), vec![confirmed]);
+}

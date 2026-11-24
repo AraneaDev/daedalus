@@ -108,6 +108,7 @@ impl DaedalusApp {
         match self.project_setups.save(workspace.id, entries.clone()) {
             Ok(Some(command)) => {
                 if !self.send_command(command) {
+                    self.project_setups.rejected(workspace.id);
                     self.state.settings.error = Some("Reconnect to save these settings.".into());
                     self.request_redraw();
                     return;
@@ -264,6 +265,18 @@ impl DaedalusApp {
             self.restore_workspace_names(id, panes.into_iter());
         }
         self.request_redraw();
+    }
+
+    pub(super) fn refresh_workspace_setup(&mut self, workspace: WorkspaceId) {
+        let panes = self
+            .state
+            .workspaces
+            .iter()
+            .find(|ws| ws.id == workspace)
+            .map(|ws| ws.panes.clone());
+        if let Some(panes) = panes {
+            self.restore_workspace_names(workspace, panes.into_iter());
+        }
     }
 
     pub(super) fn assignment_started(

@@ -14,6 +14,8 @@ pub struct ProjectSetups {
     daemon_backed: bool,
     cache: HashMap<WorkspaceId, Vec<Assignment>>,
     roots: HashMap<WorkspaceId, PathBuf>,
+    /// Last setup the daemon confirmed per project folder.
+    confirmed: HashMap<PathBuf, Vec<Assignment>>,
     migrated: HashSet<WorkspaceId>,
     migrated_roots: HashSet<PathBuf>,
 }
@@ -38,6 +40,7 @@ impl ProjectSetups {
         self.daemon_backed = on;
         self.cache.clear();
         self.roots.clear();
+        self.confirmed.clear();
         self.migrated.clear();
         self.migrated_roots.clear();
     }
@@ -46,6 +49,7 @@ impl ProjectSetups {
         for info in workspaces {
             self.roots.insert(info.id, info.root_dir.clone());
             if let Some(setup) = &info.setup {
+                self.confirmed.insert(info.root_dir.clone(), setup.clone());
                 self.cache.insert(info.id, setup.clone());
             }
         }
@@ -57,7 +61,12 @@ impl ProjectSetups {
         assignments: Vec<Assignment>,
         workspaces: &[Workspace<P>],
     ) {
-        self.absorb(workspaces);
+        // Only learn which workspace lives where: `setup` on these snapshots may be stale.
+        for info in workspaces {
+            self.roots.insert(info.id, info.root_dir.clone());
+        }
+        self.confirmed
+            .insert(root_dir.to_path_buf(), assignments.clone());
         let ids: Vec<_> = self
             .roots
             .iter()
@@ -66,6 +75,27 @@ impl ProjectSetups {
             .collect();
         for id in ids {
             self.cache.insert(id, assignments.clone());
+        }
+    }
+
+    /// The daemon did not take the last save (or it could not be sent): fall back to the last
+    /// confirmed setup of the folder, or to nothing if none was confirmed.
+    pub fn rejected(&mut self, id: WorkspaceId) {
+        let Some(root) = self.roots.get(&id).cloned() else {
+            self.cache.remove(&id);
+            return;
+        };
+        let siblings: Vec<_> = self
+            .roots
+            .iter()
+            .filter(|(_, other)| **other == root)
+            .map(|(other, _)| *other)
+            .collect();
+        for sibling in siblings {
+            match self.confirmed.get(&root) {
+                Some(setup) => self.cache.insert(sibling, setup.clone()),
+                None => self.cache.remove(&sibling),
+            };
         }
     }
 
@@ -298,5 +328,70 @@ mod tests {
                 .join(format!("assignments/{}.toml", a.id))
                 .exists()
         );
+    }
+
+    #[test]
+    fn change_event_for_one_folder_keeps_newer_setups_on_other_folders() {
+        let (_dir, mut store) = store();
+        let p = info("/p", Some(vec![entry("old-p")]));
+        let q = info("/q", Some(vec![entry("old-q")]));
+        let stale = [p.clone(), q.clone()];
+        store.set_daemon_backed(true);
+        store.absorb(&stale);
+        store.save(q.id, vec![entry("new-q")]).unwrap();
+        store.changed(Path::new("/q"), vec![entry("new-q")], &stale);
+        store.changed(Path::new("/p"), vec![entry("new-p")], &stale);
+        assert_eq!(store.load(p.id).unwrap(), vec![entry("new-p")]);
+        assert_eq!(store.load(q.id).unwrap(), vec![entry("new-q")]);
+    }
+
+    #[test]
+    fn rejected_save_reverts_to_the_confirmed_setup_for_the_whole_folder() {
+        let (_dir, mut store) = store();
+        let a = info("/p", Some(vec![entry("kept")]));
+        let b = info("/p", Some(vec![entry("kept")]));
+        let fresh = info("/q", None);
+        let all = [a.clone(), b.clone(), fresh.clone()];
+        store.set_daemon_backed(true);
+        store.absorb(&all);
+        store.save(a.id, vec![entry("denied")]).unwrap();
+        assert_eq!(store.load(b.id).unwrap(), vec![entry("denied")]);
+        store.rejected(a.id);
+        assert_eq!(store.load(a.id).unwrap(), vec![entry("kept")]);
+        assert_eq!(store.load(b.id).unwrap(), vec![entry("kept")]);
+        store.save(fresh.id, vec![entry("x")]).unwrap();
+        store.rejected(fresh.id);
+        assert_eq!(
+            store.load_or(fresh.id, vec![entry("d")]).unwrap(),
+            vec![entry("d")]
+        );
+    }
+
+    #[test]
+    fn an_echo_moves_what_a_later_rejection_falls_back_to() {
+        let (_dir, mut store) = store();
+        let a = info("/p", Some(vec![entry("one")]));
+        store.set_daemon_backed(true);
+        store.absorb(std::slice::from_ref(&a));
+        store.changed(
+            Path::new("/p"),
+            vec![entry("two")],
+            std::slice::from_ref(&a),
+        );
+        store.save(a.id, vec![entry("three")]).unwrap();
+        store.rejected(a.id);
+        assert_eq!(store.load(a.id).unwrap(), vec![entry("two")]);
+    }
+
+    #[test]
+    fn migration_that_cannot_be_sent_is_rolled_back() {
+        let (_dir, mut store) = store();
+        let ws = info("/p", None);
+        store.set_daemon_backed(false);
+        store.save(ws.id, vec![entry("a")]).unwrap();
+        store.set_daemon_backed(true);
+        assert_eq!(store.migrations(std::slice::from_ref(&ws)).len(), 1);
+        store.rejected(ws.id);
+        assert!(store.load(ws.id).unwrap().is_empty());
     }
 }

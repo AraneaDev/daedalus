@@ -1381,7 +1381,14 @@ impl DaedalusApp {
                 root_dir,
                 assignments,
             } => self.project_setup_changed(&root_dir, assignments),
-            UiEvent::ProjectSetupSaveFailed { message, .. } => self.show_toast(message, true),
+            UiEvent::ProjectSetupSaveFailed {
+                workspace_id,
+                message,
+            } => {
+                self.project_setups.rejected(workspace_id);
+                self.refresh_workspace_setup(workspace_id);
+                self.show_toast(message, true);
+            }
             UiEvent::ActivityRead { token, page } => {
                 use daedalus_ui::activity_history::PageUpdate;
                 match self.history.received(token, &page) {
@@ -1429,10 +1436,12 @@ impl DaedalusApp {
             UiEvent::WorkspacesLoaded(workspaces) => {
                 self.project_setups.absorb(&workspaces);
                 for (workspace_id, assignments) in self.project_setups.migrations(&workspaces) {
-                    self.send_command(UiCommand::SaveProjectSetup {
+                    if !self.send_command(UiCommand::SaveProjectSetup {
                         workspace_id,
                         assignments,
-                    });
+                    }) {
+                        self.project_setups.rejected(workspace_id);
+                    }
                 }
                 self.restore_session_names(&workspaces);
                 self.state.set_workspaces(workspaces);
