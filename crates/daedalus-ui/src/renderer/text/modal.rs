@@ -24,12 +24,9 @@ enum PickerKind {
 impl PickerKind {
     fn header(self, modal: Rect, theme: &Theme, s: f32) -> [ChromeLineSpec<'static>; 2] {
         let (title, hint) = match self {
-            Self::Preset => ("Agent preset", "Enter to switch · Shift+Enter to add"),
-            Self::Action => ("Workspace actions", "↑↓ to choose · Enter to run · Esc"),
-            Self::Recipient => (
-                "Send failure to agent",
-                "↑↓ to choose · Enter to send · Esc",
-            ),
+            Self::Preset => ("Agent preset", "Enter switches · Shift+Enter adds"),
+            Self::Action => ("Workspace actions", "↑↓ choose · Enter runs · Esc"),
+            Self::Recipient => ("Send failure to agent", "↑↓ choose · Enter sends · Esc"),
         };
         [
             (
@@ -42,7 +39,7 @@ impl PickerKind {
             ),
             (
                 hint,
-                23.,
+                29.,
                 CHROME_SUB_FONT_SIZE_LOGICAL,
                 CHROME_SUB_LINE_HEIGHT_LOGICAL,
                 theme.text_muted,
@@ -212,14 +209,26 @@ impl TextRenderer {
 
         self.push_modal_line(ChromeLineSpec {
             text: "New Git Worktree",
-            left: modal.x + 14.0 * s,
+            left: input_rect.x,
             top: modal.y + 10.0 * s,
             max_w: (modal.width - 28.0 * s).max(1.0),
             bounds: modal,
-            font_size_logical: MODAL_TITLE_FONT_SIZE_LOGICAL * font_scale,
-            line_height_logical: MODAL_TITLE_LINE_HEIGHT_LOGICAL * font_scale,
+            font_size_logical: super::MODAL_TITLE_FONT_SIZE_LOGICAL * font_scale,
+            line_height_logical: super::MODAL_TITLE_LINE_HEIGHT_LOGICAL * font_scale,
             color: theme.text_primary,
             bold: true,
+        });
+
+        self.push_modal_line(ChromeLineSpec {
+            text: "Branch name",
+            left: input_rect.x,
+            top: input_rect.y - 22.0 * s,
+            max_w: input_rect.width,
+            bounds: modal,
+            font_size_logical: super::CHROME_SUB_FONT_SIZE_LOGICAL * font_scale,
+            line_height_logical: super::MODAL_TITLE_FONT_SIZE_LOGICAL * font_scale,
+            color: theme.text_muted,
+            bold: false,
         });
 
         let text_top = input_rect.y + (input_rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5;
@@ -278,7 +287,7 @@ impl TextRenderer {
 
         let (cancel, create) = worktree_button_rects(modal, dpi);
         let enabled = state.can_create_worktree();
-        let hints_fit = create.width >= 128.0 * s;
+        let hints_fit = create.width >= 110.0 * s;
         for (rect, label, color) in [
             (
                 cancel,
@@ -295,13 +304,13 @@ impl TextRenderer {
                     "Create"
                 },
                 if enabled {
-                    theme.border_focused
+                    theme.bg_window
                 } else {
                     theme.text_muted
                 },
             ),
         ] {
-            self.push_modal_line(ChromeLineSpec {
+            self.push_modal_button(ChromeLineSpec {
                 text: label,
                 left: rect.x + 8.0 * s,
                 top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
@@ -438,7 +447,7 @@ impl TextRenderer {
 
         let button_pad = if metrics.compact { 5.0 } else { 12.0 } * s;
         let cancel_rect = close_modal_cancel_rect(modal, dpi);
-        self.push_modal_line(ChromeLineSpec {
+        self.push_modal_button(ChromeLineSpec {
             text: if metrics.compact {
                 "Cancel (Esc)"
             } else {
@@ -455,7 +464,7 @@ impl TextRenderer {
         });
 
         let confirm_rect = close_modal_confirm_rect(modal, dpi);
-        self.push_modal_line(ChromeLineSpec {
+        self.push_modal_button(ChromeLineSpec {
             text: if cm.submitting {
                 "Closing…"
             } else if metrics.compact {
@@ -530,7 +539,7 @@ impl TextRenderer {
             (case, case_label, true, search.case_sensitive),
         ] {
             let pad = (6.0 * s).min(rect.width * 0.1);
-            self.push_modal_line(ChromeLineSpec {
+            self.push_modal_button(ChromeLineSpec {
                 text: label,
                 left: rect.x + pad,
                 top: rect.y + (rect.height - CHROME_SUB_LINE_HEIGHT_LOGICAL * s) * 0.5,

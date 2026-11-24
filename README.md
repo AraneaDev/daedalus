@@ -4,7 +4,7 @@ Daedalus is a native workbench for running a coding agent, a development service
 side. Each Git worktree has its own panes, ports, and Compose project. A persistent daemon owns the
 processes, so you can close the window and reconnect later.
 
-![Focused agent terminal showing a Git diff, with service and runner tabs](docs/images/workbench.png)
+![Split workbench showing an agent reviewing a Git diff, service output, and a test run](docs/images/workbench.png)
 
 ## Install
 
@@ -65,7 +65,7 @@ stays a single argument.
 **Save** records the assignments in your local Daedalus configuration. **Save & launch** also opens
 the selected assignment in its own terminal. Switching workspaces restores your selected terminal.
 
-![Native workspace settings with named agents and commands](docs/images/workspace-settings.png)
+![Workspace assignments showing a Codex agent named Reviewer](docs/images/workspace-settings.png)
 
 **Since you left** shows observed agent activity, command exits and changes in service status.
 Select a pane event to open the terminal that produced it while that terminal is available.

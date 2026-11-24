@@ -486,7 +486,7 @@ pub(super) fn workbench_tree(
                 &state.settings,
                 &mut node,
                 &mut nodes,
-                daedalus_ui::settings::modal_rect(width, height, scale),
+                state.settings.modal_rect(width, height, scale),
             );
         } else if id == NEW_WORKSPACE {
             focus = workspace_fields(

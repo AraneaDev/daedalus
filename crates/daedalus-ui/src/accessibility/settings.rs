@@ -162,7 +162,7 @@ mod tests {
             assert_eq!(update.focus, control_id(&state.settings, Control::Add));
             for (control, r) in state
                 .settings
-                .controls(daedalus_ui::settings::modal_rect(w, h, scale))
+                .controls(state.settings.modal_rect(w, h, scale))
             {
                 let node_id = control_id(&state.settings, control);
                 let n = &update.nodes.iter().find(|(i, _)| *i == node_id).unwrap().1;

@@ -235,7 +235,7 @@ impl SetupReview {
             rows.push((Control::Command(i), region(m, 0.035, y, 0.70, 0.068)));
             rows.push((Control::Launch(i), region(m, 0.753, y, 0.212, 0.068)));
         }
-        rows.push((Control::Agent, region(m, 0.69, 0.153, 0.275, 0.056)));
+        rows.push((Control::Agent, region(m, 0.753, 0.153, 0.212, 0.056)));
         if self.tool().is_some() {
             rows.push((Control::Tool, region(m, 0.035, 0.615, 0.38, 0.071)));
             if self.install().is_some() {

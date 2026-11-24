@@ -252,7 +252,7 @@ impl WorkspaceLayout {
             let tab_width = if !overflow && Some(*id) == focused {
                 let spare = (available - width * capacity as f32).max(0.);
                 // Leave space for the close control and keep long assignment names bounded.
-                let desired = (unicode_width::UnicodeWidthStr::width(label.as_str()) as f32 * 8.
+                let desired = (unicode_width::UnicodeWidthStr::width(label.as_str()) as f32 * 9.
                     + 32.)
                     .min(240.)
                     * scale;
@@ -348,15 +348,21 @@ fn build_pane_rect(
         && outer.width < 200. * metrics.scale_factor
         && outer.height >= metrics.header_height * 3.;
     let header_rows = if wrap_action { 2. } else { 1. };
-    let header_h = (metrics.header_height * header_rows).min(outer.height.max(0.0));
+    let header_row_height = if !zoomed && outer.height >= 200.0 * metrics.scale_factor {
+        36.0 * metrics.scale_factor
+    } else {
+        metrics.header_height
+    };
+    let header_h = (header_row_height * header_rows).min(outer.height.max(0.0));
     let header = Rect::new(outer.x, outer.y, outer.width.max(0.0), header_h);
     let action_pill = pill_logical_w.and_then(|logical_w| {
         let margin_x = PILL_MARGIN_X_LOGICAL * metrics.scale_factor;
-        let margin_y = PILL_MARGIN_Y_LOGICAL * metrics.scale_factor;
+        let margin_y = PILL_MARGIN_Y_LOGICAL * metrics.scale_factor
+            + (header_row_height - metrics.header_height) * 0.5;
         let max_w = (header.width - 2.0 * margin_x).max(0.0);
         let logical_w = if narrow { 72. } else { logical_w };
         let pill_w = (logical_w * metrics.scale_factor).min(max_w);
-        let pill_h = (header.height.min(metrics.header_height) - 2.0 * margin_y).max(0.0);
+        let pill_h = (header.height.min(header_row_height) - 2.0 * margin_y).max(0.0);
         if pill_w > 0.0 && pill_h > 0.0 {
             Some(Rect::new(
                 header.right() - margin_x - pill_w,
@@ -407,11 +413,18 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
                     && window_h >= 520.0 * metrics.scale_factor)),
     );
     let (sidebar, sidebar_w) = if show_sidebar {
-        let w = if input.zoomed && window_w >= metrics.sidebar_width + min_split_width {
-            metrics.sidebar_width.min(window_w * 0.21)
-        } else {
-            metrics.sidebar_width.min(window_w)
-        };
+        let mut w = metrics.sidebar_width.min(window_w);
+        if input.zoomed && input.sidebar_override.is_none() {
+            let banner = if input.has_top_banner {
+                metrics.banner_height
+            } else {
+                0.0
+            };
+            let terminal_h =
+                (window_h - banner - metrics.header_height - 2.0 * metrics.viewport_pad).max(1.0);
+            let required_width = (window_w * window_h * (2.0 / 3.0) / terminal_h).ceil();
+            w = w.min((window_w - required_width - 2.0 * metrics.viewport_pad).max(0.0));
+        }
         (
             Some(Rect::new(
                 if input.zoomed { window_w - w } else { 0. },
@@ -498,9 +511,12 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
             let top_h = canvas_h * 0.5;
             let bot_h = (canvas_h - top_h).max(0.0);
 
-            let agent_outer = Rect::new(canvas_x, canvas_y, agent_w, canvas_h);
-            let service_outer = Rect::new(canvas_x + agent_w, canvas_y, right_w, top_h);
-            let runner_outer = Rect::new(canvas_x + agent_w, canvas_y + top_h, right_w, bot_h);
+            let gutter = (4.0 * metrics.scale_factor).min(canvas_h * 0.02);
+            let inset =
+                |x, y, w, h| Rect::new(x + gutter, y + gutter, w - 2.0 * gutter, h - 2.0 * gutter);
+            let agent_outer = inset(canvas_x, canvas_y, agent_w, canvas_h);
+            let service_outer = inset(canvas_x + agent_w, canvas_y, right_w, top_h);
+            let runner_outer = inset(canvas_x + agent_w, canvas_y + top_h, right_w, bot_h);
 
             (agent_outer, service_outer, runner_outer)
         };
@@ -855,19 +871,12 @@ mod tests {
         assert!(layout.banner.is_none());
         assert_eq!(layout.panes.len(), 3);
 
-        // Remaining canvas is 1000 x 800
-        let canvas_area = 1000.0 * 800.0;
         let agent = layout.pane(PaneRole::Agent).unwrap();
         let service = layout.pane(PaneRole::Service).unwrap();
         let runner = layout.pane(PaneRole::Runner).unwrap();
-
-        assert!((agent.outer.area() / canvas_area - 0.55).abs() < 1e-5);
-        assert!((service.outer.area() / canvas_area - 0.225).abs() < 1e-5);
-        assert!((runner.outer.area() / canvas_area - 0.225).abs() < 1e-5);
-
-        assert_eq!(agent.outer, Rect::new(240.0, 0.0, 550.0, 800.0));
-        assert_eq!(service.outer, Rect::new(790.0, 0.0, 450.0, 400.0));
-        assert_eq!(runner.outer, Rect::new(790.0, 400.0, 450.0, 400.0));
+        assert_eq!(agent.outer, Rect::new(244.0, 4.0, 542.0, 792.0));
+        assert_eq!(service.outer, Rect::new(794.0, 4.0, 442.0, 392.0));
+        assert_eq!(runner.outer, Rect::new(794.0, 404.0, 442.0, 392.0));
 
         // Agent always gets preset action pill; Service never; Runner only on failure
         assert_eq!(agent.action_pill.unwrap().width, 116.0);
@@ -1089,9 +1098,9 @@ mod tests {
         assert_eq!(banner, Rect::new(0.0, toggle.bottom(), 2480.0, 48.0));
 
         let agent = layout.pane(PaneRole::Agent).unwrap();
-        assert_eq!(agent.outer.x, 0.0);
-        assert_eq!(agent.outer.y, banner.bottom());
-        assert_eq!(agent.outer.height, input.window_h - banner.bottom());
+        assert_eq!(agent.outer.x, 8.0);
+        assert_eq!(agent.outer.y, banner.bottom() + 8.0);
+        assert_eq!(agent.outer.bottom(), input.window_h - 8.0);
     }
 
     #[test]
@@ -1157,12 +1166,13 @@ mod tests {
                     HitTarget::ToggleSidebar
                 );
                 let agent = layout.pane(PaneRole::Agent).unwrap();
+                let gutter = if width == 320.0 { 0.0 } else { 4.0 * scale };
                 if visible {
-                    assert_eq!(agent.outer.y, 0.0);
-                    assert_eq!(agent.outer.x, header.right());
+                    assert_eq!(agent.outer.y, gutter);
+                    assert_eq!(agent.outer.x, header.right() + gutter);
                 } else {
-                    assert_eq!(agent.outer.y, header.bottom());
-                    assert_eq!(agent.outer.x, 0.0);
+                    assert_eq!(agent.outer.y, header.bottom() + gutter);
+                    assert_eq!(agent.outer.x, gutter);
                 }
             }
         }

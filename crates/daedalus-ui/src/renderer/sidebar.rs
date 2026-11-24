@@ -6,7 +6,7 @@ use super::{
     sidebar_docker_pill_rect, sidebar_external_badge_rect, status_dot_color,
     visible_external_statuses, workspace_branch_badge,
 };
-use crate::layout::{Rect, SIDEBAR_ROW_LOGICAL_HEIGHT, sidebar_failed_run_rect};
+use crate::layout::{Rect, sidebar_failed_run_rect};
 use crate::sidebar_content::{SidebarContent, SidebarRow};
 use crate::state::{AppState, WorkspaceView};
 use crate::theme::{Rgba, Theme};
@@ -96,7 +96,7 @@ impl Card {
         let mut card = Self {
             rect,
             dot,
-            full: rect.height >= SIDEBAR_ROW_LOGICAL_HEIGHT * s,
+            full: rect.height >= crate::sidebar_content::workspace_card_height(ws) * s,
             title_width: (rect.right() - left - 24.0 * s).max(1.0),
             subtitle_width: None,
             ports_width: (rect.width - 18.0 * s).max(1.0),
@@ -185,8 +185,13 @@ impl Card {
         let mut reserve = 0.0;
         if let Some(agent) = agent {
             let (label, color) = agent_state_badge(agent, theme);
-            let rect = sidebar_agent_state_pill_rect(self.rect, label, s);
-            reserve = rect.width + 6.0 * s;
+            let mut rect = sidebar_agent_state_pill_rect(self.rect, label, s);
+            if ws.containers.is_empty() {
+                rect.y = self.rect.y + 62.0 * s;
+                self.ports_width = (rect.x - self.rect.x - 14.0 * s).max(1.0);
+            } else {
+                reserve = rect.width + 12.0 * s;
+            }
             let alpha = if agent == AgentState::WaitingForApproval {
                 0.90
             } else {
@@ -203,6 +208,8 @@ impl Card {
         }
         if let Some((label, worktree)) = workspace_branch_badge(ws) {
             let rect = sidebar_branch_badge_rect_with_reserve(self.rect, &label, reserve, s);
+            let columns = ((rect.width - 10.0 * s) / (7.0 * s)).max(1.0) as usize;
+            let label = super::text::truncate_left_with_ellipsis(&label, columns);
             let (color, border) = if worktree {
                 (theme.border_focused, theme.border_focused.with_alpha(0.65))
             } else {

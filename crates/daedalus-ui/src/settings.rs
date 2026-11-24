@@ -56,11 +56,6 @@ impl Control {
     }
 }
 
-pub fn modal_rect(w: f32, h: f32, dpi: f32) -> Rect {
-    let width = (w - 16.0 * dpi).max(1.0).min(650.0 * dpi);
-    let height = (h - 16.0 * dpi).max(1.0).min(480.0 * dpi);
-    Rect::new((w - width) * 0.5, (h - height) * 0.5, width, height)
-}
 #[derive(Clone, Debug, Default)]
 pub struct SettingsDialog {
     pub open: bool,
@@ -77,6 +72,20 @@ pub struct SettingsDialog {
 }
 
 impl SettingsDialog {
+    fn logical_height(&self) -> f32 {
+        112.0 + self.rows().len() as f32 * 40.0
+    }
+
+    pub fn modal_rect(&self, w: f32, h: f32, dpi: f32) -> Rect {
+        let width = (w - 16.0 * dpi).max(1.0).min(650.0 * dpi);
+        let height = (h - 16.0 * dpi).max(1.0).min(self.logical_height() * dpi);
+        Rect::new((w - width) * 0.5, (h - height) * 0.5, width, height)
+    }
+
+    pub(crate) fn content_scale(&self, modal: Rect) -> f32 {
+        modal.height / self.logical_height()
+    }
+
     fn rows(&self) -> Vec<Vec<Control>> {
         let mut rows = vec![
             vec![Prev, Next, Remove],
@@ -105,16 +114,29 @@ impl SettingsDialog {
 
     pub fn controls(&self, modal: Rect) -> impl Iterator<Item = (Control, Rect)> + use<> {
         let rows = self.rows();
-        let actions_row = 10;
+        let unit = self.content_scale(modal);
         let last = rows.len() - 1;
         rows.into_iter().enumerate().flat_map(move |(index, row)| {
-            let index = if index == last { actions_row } else { index };
             let pad = modal.width * 0.025;
             let width = modal.width - 2.0 * pad;
-            let top = modal.y + (0.09 + 0.082 * index as f32) * modal.height;
+            let top = if index == last {
+                modal.bottom() - 52.0 * unit
+            } else {
+                modal.y + (52.0 + 40.0 * index as f32) * unit
+            };
             let count = row.len() as f32;
             row.into_iter().enumerate().map(move |(i, control)| {
+                // Keep navigation together and separate destructive and commit actions.
+                // The equal-width fallback leaves room for labels on narrow screens.
+                let roomy = width >= 500.0 * unit;
                 let (offset, fraction) = match control {
+                    Prev if roomy => (0., 0.17),
+                    Next if roomy => (0.17, 0.15),
+                    Remove if roomy => (0.84, 0.16),
+                    Cancel if roomy => (0., 0.17),
+                    Save if roomy => (0.58, 0.17),
+                    Launch if roomy => (0.75, 0.25),
+                    AddArgument if roomy && count == 1.0 => (0., 0.24),
                     Argument(_) => (0., 0.80),
                     DropArgument(_) => (0.80, 0.20),
                     _ => (i as f32 / count, 1. / count),
@@ -125,7 +147,7 @@ impl SettingsDialog {
                         modal.x + pad + offset * width,
                         top,
                         width * fraction,
-                        modal.height * 0.078,
+                        36.0 * unit,
                     ),
                 )
             })
@@ -224,15 +246,16 @@ impl SettingsDialog {
             .is_some_and(|value| !value.is_empty())
     }
 
-    pub fn heading(&self) -> String {
+    pub(crate) fn position_label(&self) -> String {
         if self.drafts.is_empty() {
-            return "Workspace assignments · No assignments".into();
+            "No assignments".into()
+        } else {
+            format!("{} of {}", self.selected + 1, self.drafts.len())
         }
-        format!(
-            "Workspace assignments · {} of {}",
-            self.selected + 1,
-            self.drafts.len()
-        )
+    }
+
+    pub fn heading(&self) -> String {
+        format!("Workspace assignments · {}", self.position_label())
     }
 
     pub fn enabled(&self, c: Control) -> bool {
@@ -469,7 +492,7 @@ impl SettingsDialog {
     }
 
     pub fn click(&mut self, x: f32, y: f32, w: f32, h: f32, dpi: f32) -> SettingsAction {
-        self.controls(modal_rect(w, h, dpi))
+        self.controls(self.modal_rect(w, h, dpi))
             .find(|(_, r)| r.contains(x, y))
             .map_or(SettingsAction::None, |(c, _)| self.activate(c))
     }
@@ -588,7 +611,7 @@ mod tests {
         let (w, h, dpi) = (850.0, 600.0, 1.5);
         let click = |dialog: &mut SettingsDialog, control| {
             let (_, r) = dialog
-                .controls(modal_rect(w, h, dpi))
+                .controls(dialog.modal_rect(w, h, dpi))
                 .find(|(c, _)| *c == control)
                 .unwrap();
             dialog.click(r.x + r.width * 0.5, r.y + r.height * 0.5, w, h, dpi)

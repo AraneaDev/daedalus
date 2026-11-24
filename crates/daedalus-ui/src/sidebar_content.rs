@@ -16,12 +16,22 @@ pub enum SidebarRow {
 }
 
 impl SidebarRow {
-    fn height(&self, scale: f32) -> f32 {
+    fn height(&self, workspaces: &[WorkspaceView], scale: f32) -> f32 {
         (match self {
-            Self::Workspace(_) => SIDEBAR_ROW_LOGICAL_HEIGHT,
+            Self::Workspace(i) => workspaces
+                .get(*i)
+                .map_or(SIDEBAR_ROW_LOGICAL_HEIGHT, workspace_card_height),
             Self::Heading(_) => 20.,
             Self::Detail(..) => 16.,
         }) * scale
+    }
+}
+
+pub(crate) fn workspace_card_height(ws: &WorkspaceView) -> f32 {
+    if ws.external_statuses.is_empty() {
+        90.0
+    } else {
+        134.0
     }
 }
 
@@ -112,7 +122,10 @@ impl SidebarContent {
         let mut rows = Vec::new();
         for (repo, indices) in groups {
             if let Some(repo) = repo {
-                rows.push(SidebarRow::Heading(repository_label(repo, &suffix_counts)));
+                let label = repository_label(repo, &suffix_counts);
+                if workspaces.len() > 1 || workspaces[indices[0]].name != label {
+                    rows.push(SidebarRow::Heading(label));
+                }
             } else if has_repository {
                 rows.push(SidebarRow::Heading("Other workspaces".into()));
             }
@@ -122,19 +135,26 @@ impl SidebarContent {
                 rows.extend(workspace_details(ws));
             }
         }
-        Self::layout(rows, sidebar, first, scale)
+        Self::layout(rows, workspaces, sidebar, first, scale)
     }
 
     pub fn plain(count: usize, sidebar: Rect, first: usize, scale: f32) -> Self {
         Self::layout(
             (0..count).map(SidebarRow::Workspace).collect(),
+            &[],
             sidebar,
             first,
             scale,
         )
     }
 
-    fn layout(rows: Vec<SidebarRow>, sidebar: Rect, first: usize, scale: f32) -> Self {
+    fn layout(
+        rows: Vec<SidebarRow>,
+        workspaces: &[WorkspaceView],
+        sidebar: Rect,
+        first: usize,
+        scale: f32,
+    ) -> Self {
         let m = LayoutMetrics::for_scale(scale);
         let scale = m.scale_factor;
         let top = sidebar.y + m.sidebar_header_height + m.sidebar_pad;
@@ -143,7 +163,7 @@ impl SidebarContent {
         let mut last_page_height = 0.;
         let mut max_first = rows.len();
         for row in rows.iter().rev() {
-            let step = row.height(scale) + m.sidebar_row_gap;
+            let step = row.height(workspaces, scale) + m.sidebar_row_gap;
             if last_page_height > 0. && last_page_height + step > available {
                 break;
             }
@@ -154,7 +174,7 @@ impl SidebarContent {
         let mut y = top;
         let mut rects = Vec::new();
         for row in &rows[first..] {
-            let h = row.height(scale);
+            let h = row.height(workspaces, scale);
             if y + h + m.sidebar_row_gap > limit
                 && (!rects.is_empty() || available < m.header_height.min(h))
             {
