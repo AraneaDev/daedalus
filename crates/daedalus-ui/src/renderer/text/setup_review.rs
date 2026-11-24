@@ -104,3 +104,83 @@ impl TextRenderer {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::renderer::tests::make_state_with_agent_row;
+    use crate::setup_review::SetupAction;
+    use daedalus_proto::{PaneRole, SetupInspection};
+
+    #[test]
+    fn windows_review_displays_launch_arguments_and_routes_clicks_at_rendered_bounds() {
+        let (device, queue) = wgpu::Device::noop(&Default::default());
+        let mut renderer = TextRenderer::new(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            1200,
+            800,
+            1.,
+            14.,
+            None,
+        );
+        let (mut state, layout) = make_state_with_agent_row();
+        let executable = r"C:\Dev Tools\agent.exe";
+        let argv = vec![executable.into(), r"C:\My Work\".into()];
+        state.setup_review.begin(
+            "Orbit".into(),
+            r"C:\My Work".into(),
+            SetupInspection {
+                host: "win-dev".into(),
+                platform: "windows".into(),
+                commands: vec![(PaneRole::Agent, argv.clone())],
+                available: vec![executable.into()],
+                dependency_install: None,
+            },
+        );
+        let frame = |renderer: &mut TextRenderer, state: &mut AppState| {
+            renderer.prepare(&device, &queue, state, &layout, &Theme::dark(), 1200., 800.);
+        };
+        frame(&mut renderer, &mut state);
+        let line = |text| {
+            renderer
+                .modal_items
+                .iter()
+                .find(|item| item.buffer.lines[0].text() == text)
+                .unwrap()
+        };
+        line(r#""C:\Dev Tools\agent.exe" "C:\My Work\\""#);
+        assert_eq!(
+            state.setup_review.commands().unwrap(),
+            [(PaneRole::Agent, argv, true)]
+        );
+
+        let click = |state: &mut AppState, label| {
+            let b = line(label).bounds;
+            state.setup_review.click(
+                (b.left + b.right) as f32 / 2.,
+                (b.top + b.bottom) as f32 / 2.,
+                1200.,
+                800.,
+                1.,
+            )
+        };
+        assert_eq!(click(&mut state, "Open workspace"), SetupAction::Open);
+        assert_eq!(click(&mut state, "Back"), SetupAction::Back);
+        state.setup_review.open = false;
+        state
+            .workspace_form
+            .revisit(&state.setup_review.folder, &state.setup_review.name, true);
+        frame(&mut renderer, &mut state);
+        let labels: Vec<_> = renderer
+            .modal_items
+            .iter()
+            .map(|item| item.buffer.lines[0].text())
+            .collect();
+        assert!(labels.contains(&"Set up workspace · Choose project"));
+        assert!(labels.iter().any(|text| text.contains(r"C:\My Work")));
+        assert!(!labels.contains(&"Open workspace"));
+        assert!(state.workspace_form.name_is_fixed());
+    }
+}

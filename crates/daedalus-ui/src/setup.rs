@@ -4,7 +4,6 @@ use daedalus_ui::{
     assignments::Assignment,
     links::{DetectedLink, open_link},
     setup_review::SetupAction,
-    workspace_form::Control,
 };
 use std::path::PathBuf;
 use winit::keyboard::Key;
@@ -25,9 +24,46 @@ pub(super) struct SetupFlow {
     workspace: Option<WorkspaceId>,
     after_create: Option<AfterCreate>,
     installer: Option<PaneId>,
+    reconciling_installer: bool,
     editing_folder: bool,
     awaiting_mutation: bool,
     installer_result: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InstallerRecovery {
+    Resume(WorkspaceId, PaneId),
+    Finished(PaneId, Option<i32>),
+}
+
+impl SetupFlow {
+    fn wait_for_installer_snapshot(&mut self) -> bool {
+        self.reconciling_installer = self.installer.is_some();
+        self.reconciling_installer
+    }
+
+    fn reconnected_installer(
+        &mut self,
+        status: impl FnOnce(WorkspaceId, PaneId) -> Option<PaneStatus>,
+    ) -> Option<InstallerRecovery> {
+        if !std::mem::take(&mut self.reconciling_installer) {
+            return None;
+        }
+        let (workspace, pane) = self.workspace.zip(self.installer)?;
+        Some(match status(workspace, pane) {
+            Some(PaneStatus::Exited { code }) => InstallerRecovery::Finished(pane, code),
+            None => InstallerRecovery::Finished(pane, None),
+            Some(_) => InstallerRecovery::Resume(workspace, pane),
+        })
+    }
+
+    fn finish_installer(&mut self, pane: PaneId) -> bool {
+        if self.reconciling_installer || self.installer != Some(pane) {
+            return false;
+        }
+        self.installer = None;
+        true
+    }
 }
 
 impl DaedalusApp {
@@ -90,8 +126,7 @@ impl DaedalusApp {
                 return;
             }
             if let Ok(info) = result {
-                if self.state.setup_review.folder != folder || self.state.setup_review.name != name
-                {
+                if self.state.setup_review.folder != folder {
                     self.setup.workspace = None;
                 }
                 if self.setup.editing_folder && self.state.setup_review.folder == folder {
@@ -142,11 +177,11 @@ impl DaedalusApp {
             SetupAction::Back => {
                 self.setup.editing_folder = true;
                 review.open = false;
-                self.state.workspace_form.begin(&review.folder);
-                self.state
-                    .workspace_form
-                    .set_value(Control::Name, &review.name);
-                self.state.workspace_form.set_focus(Control::Folder);
+                self.state.workspace_form.revisit(
+                    &review.folder,
+                    &review.name,
+                    self.setup.workspace.is_some(),
+                );
             }
             SetupAction::Help(url) => {
                 if let Err(e) = open_link(&DetectedLink::Url(url), None) {
@@ -207,7 +242,7 @@ impl DaedalusApp {
     }
 
     fn prepare_setup(&mut self, action: AfterCreate) {
-        if self.state.setup_review.busy {
+        if self.state.setup_review.busy || self.setup.installer.is_some() {
             return;
         }
         if let Some(id) = self
@@ -313,11 +348,29 @@ impl DaedalusApp {
         self.schedule_resize_flush();
     }
 
+    pub(super) fn reconcile_setup_installer(&mut self) {
+        let recovery = self.setup.reconnected_installer(|workspace, pane| {
+            self.state
+                .panes
+                .get(&pane)
+                .filter(|p| p.summary.workspace_id == workspace)
+                .map(|p| p.summary.status)
+        });
+        match recovery {
+            Some(InstallerRecovery::Resume(workspace, pane)) => {
+                self.setup_installer_started(workspace, pane)
+            }
+            Some(InstallerRecovery::Finished(pane, code)) => {
+                self.setup_installer_finished(pane, code)
+            }
+            None => {}
+        }
+    }
+
     pub(super) fn setup_installer_finished(&mut self, pane: PaneId, code: Option<i32>) {
-        if self.setup.installer != Some(pane) {
+        if !self.setup.finish_installer(pane) {
             return;
         }
-        self.setup.installer = None;
         self.setup.installer_result = Some(match code {
             Some(0) => "Installer finished. Tool availability refreshed.".into(),
             Some(code) => format!("Installer exited {code}. See Setup installer for its output."),
@@ -340,12 +393,58 @@ impl DaedalusApp {
             self.show_toast("Connection lost during setup. Check the workspace list and Settings before retrying.", true);
             return;
         }
-        let installing = self.setup.installer.take().is_some();
-        if self.state.setup_review.open || installing {
+        if self.setup.wait_for_installer_snapshot() {
+            self.state.setup_review.open = false;
+            self.state.setup_review.busy = true;
+            return;
+        }
+        if self.state.setup_review.open {
             self.state.setup_review.open = true;
             self.state.setup_review.busy = false;
             self.state.setup_review.feedback =
                 "Connection lost. Check the workspace and tools after reconnecting.".into();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installer_reconnect_resumes_or_completes_exactly_once() {
+        let workspace = WorkspaceId::new();
+        let pane = PaneId::new();
+        for (status, expected) in [
+            (
+                Some(PaneStatus::Busy),
+                InstallerRecovery::Resume(workspace, pane),
+            ),
+            (
+                Some(PaneStatus::Exited { code: Some(7) }),
+                InstallerRecovery::Finished(pane, Some(7)),
+            ),
+            (None, InstallerRecovery::Finished(pane, None)),
+        ] {
+            let mut setup = SetupFlow {
+                workspace: Some(workspace),
+                installer: Some(pane),
+                ..Default::default()
+            };
+            assert!(setup.wait_for_installer_snapshot());
+            assert_eq!(setup.installer, Some(pane));
+            assert!(!setup.finish_installer(pane));
+            assert_eq!(
+                setup.reconnected_installer(|w, p| {
+                    assert_eq!((w, p), (workspace, pane));
+                    status
+                }),
+                Some(expected)
+            );
+            assert_eq!(setup.reconnected_installer(|_, _| unreachable!()), None);
+            assert!(!setup.finish_installer(PaneId::new()));
+            assert!(setup.finish_installer(pane));
+            assert!(!setup.finish_installer(pane));
         }
     }
 }

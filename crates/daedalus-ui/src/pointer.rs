@@ -1,13 +1,13 @@
 use super::DaedalusApp;
 use daedalus_proto::{PaneId, PaneRole};
 use daedalus_ui::input::UiAction;
-use daedalus_ui::layout::{HitTarget, Rect, hit_test};
-use daedalus_ui::renderer::{
+use daedalus_ui::layout::overlays::{
     action_palette_layout, close_modal_cancel_rect, close_modal_compose_rect,
     close_modal_confirm_rect, close_modal_force_rect, close_modal_worktree_rect,
     close_workspace_modal_rect, picker_item_rect, preset_picker_layout, search_bar_rect,
     search_controls, worktree_button_rects, worktree_modal_rect,
 };
+use daedalus_ui::layout::{HitTarget, Rect, hit_test};
 use daedalus_ui::selection::{CellPos, Selection, select_word_at};
 use daedalus_ui::settings::SettingsAction;
 use daedalus_ui::state::{AgentPreset, AppState, PaneViewState};
@@ -513,7 +513,7 @@ mod tests {
         ] {
             let modal = worktree_modal_rect(w, h, dpi);
             let (cancel, create) = worktree_button_rects(modal, dpi);
-            let field = daedalus_ui::renderer::worktree_input_rect(modal, dpi);
+            let field = daedalus_ui::layout::overlays::worktree_input_rect(modal, dpi);
             assert!(field.bottom() < cancel.y && cancel.right() < create.x);
             assert!(create.bottom() <= modal.bottom() && create.right() <= modal.right());
             let click = |rect: daedalus_ui::layout::Rect, state: &AppState| {

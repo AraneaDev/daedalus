@@ -25,13 +25,21 @@ asset has a sibling SHA-256 checksum. Compare the downloaded file with its check
 
 ## First workspace
 
-Launch **Daedalus** to set up your first workspace. Choose a project folder on the daemon host and select **Review environment**. Daedalus reads the repository configuration and suggests commands for the coding agent, development server, and tests. Review the commands and choose **Open workspace**. Only the agent starts by default. Use **Run tests** when you are ready.
+Launch **Daedalus** to set up your first workspace. Choose a project folder on the daemon host and
+select **Review environment**. Daedalus reads the repository configuration and suggests commands
+for the coding agent, development server, and tests. Review the commands and choose **Open
+workspace**. Only the agent starts by default. Use **Run tests** when you are ready.
 
 ![Environment review with a missing coding agent, an installation command, and on-demand development server and tests](docs/images/environment-setup.png)
 
-The review shows which executables the daemon can find. **Install here** shows the installer command and runs it in a setup terminal on that host. When it exits, the review checks again without discarding your command edits. For supported tools you can also open the official installation guide and select **Check again**. A locked npm project without installed dependencies offers a separate `npm ci` action.
+The review shows which executables the daemon can find. **Install here** shows the installer
+command and runs it in a setup terminal on that host. When it exits, the review checks again
+without discarding your command edits. For supported tools you can also open the official
+installation guide and select **Check again**. A locked npm project without installed dependencies
+offers a separate `npm ci` action.
 
-You can skip setup and reopen it from **+ Workspace**. To use the existing direct-start flow from a terminal in a repository, run:
+You can skip setup and reopen it from **+ Workspace**. To use the existing direct-start flow from
+a terminal in a repository, run:
 
 ```sh
 daedalus-ui --dir . --agent shell

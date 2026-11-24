@@ -14,9 +14,10 @@ use daedalus_proto::{PaneId, PaneRole, WorkspaceId, default_socket_path, wrap_br
 use daedalus_ui::bridge::{BridgeConfig, DaemonBridge, UiCommand, UiEvent, UiEventSink};
 use daedalus_ui::config::UiConfig;
 use daedalus_ui::input::{KeyRepeatGuard, UiAction, filter_modal_text, translate_key};
+use daedalus_ui::layout::overlays::picker_row_stride;
 use daedalus_ui::layout::{HitTarget, LayoutInput, WorkspaceLayout, compute_layout, hit_test};
 use daedalus_ui::links::{detect_link_in_row, detect_url_in_row, open_link};
-use daedalus_ui::renderer::{GpuRenderer, RenderError, picker_row_stride};
+use daedalus_ui::renderer::{GpuRenderer, RenderError};
 use daedalus_ui::selection::extract_selected_text;
 use daedalus_ui::state::{AgentPreset, AppState, ConnectionState};
 use daedalus_ui::theme::Theme;
@@ -1399,6 +1400,7 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
             UiEvent::WorkspacesLoaded(workspaces) => {
                 self.restore_session_names(&workspaces);
                 self.state.set_workspaces(workspaces);
+                self.reconcile_setup_installer();
                 self.offer_first_workspace();
                 self.ensure_active_workspace_panes();
                 self.schedule_resize_flush();

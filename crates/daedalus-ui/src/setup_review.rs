@@ -1,5 +1,7 @@
+mod command_line;
 use crate::layout::Rect;
 use crate::setup_tools::{guide_url, install_command};
+use command_line::CommandLine;
 use daedalus_proto::{PaneRole, SetupInspection};
 use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
@@ -80,7 +82,7 @@ impl SetupReview {
                 .commands
                 .iter()
                 .find(|(r, _)| *r == role)
-                .map(|(_, cmd)| shell_words::join(cmd))
+                .map(|(_, cmd)| CommandLine::for_platform(&inspection.platform).format(cmd))
                 .unwrap_or_else(|| {
                     if role == PaneRole::Agent {
                         AGENTS
@@ -141,10 +143,18 @@ impl SetupReview {
         self.caret
     }
 
+    fn command_line(&self) -> CommandLine {
+        self.inspection.as_ref().map_or(CommandLine::Posix, |host| {
+            CommandLine::for_platform(&host.platform)
+        })
+    }
+
     pub fn commands(&self) -> Result<Vec<(PaneRole, Vec<String>, bool)>, String> {
         let mut result = vec![];
         for (i, role) in ROLES.into_iter().enumerate() {
-            let argv = shell_words::split(&self.fields[i])
+            let argv = self
+                .command_line()
+                .parse(&self.fields[i])
                 .map_err(|_| format!("Close the quote in the {} command.", role_label(i)))?;
             if argv.is_empty() {
                 continue;
@@ -160,7 +170,9 @@ impl SetupReview {
     pub fn executables(&self) -> Vec<String> {
         let mut tools = vec![];
         for field in &self.fields {
-            if let Some(exe) = shell_words::split(field)
+            if let Some(exe) = self
+                .command_line()
+                .parse(field)
                 .ok()
                 .and_then(|args| args.into_iter().next())
                 && !tools.contains(&exe)
@@ -196,7 +208,7 @@ impl SetupReview {
     }
     pub fn detail(&self) -> String {
         if let Some(command) = self.install() {
-            return format!("Install command   {}", shell_words::join(command));
+            return format!("Install command   {}", self.command_line().format(&command));
         }
         if self.tool().is_some() {
             return "Install on the daemon host, then choose Check again.".into();
@@ -205,7 +217,7 @@ impl SetupReview {
     }
 
     pub fn status(&self, index: usize) -> &'static str {
-        match shell_words::split(self.command(index)) {
+        match self.command_line().parse(self.command(index)) {
             Err(_) => "Incomplete command",
             Ok(args) if args.is_empty() => "Optional",
             Ok(args) if self.available(&args[0]) => "Installed",
@@ -275,7 +287,7 @@ impl SetupReview {
             Control::Dependencies => format!(
                 "Install project dependencies   {}",
                 self.dependency_install()
-                    .map(shell_words::join)
+                    .map(|argv| self.command_line().format(argv))
                     .unwrap_or_default()
             ),
             Control::Back => "Back".into(),
@@ -358,7 +370,7 @@ impl SetupReview {
                         .iter()
                         .find(|(role, _)| *role == PaneRole::Agent)
                 {
-                    choices.push(shell_words::join(command));
+                    choices.push(self.command_line().format(command));
                 }
                 for agent in AGENTS.into_iter().chain(
                     ["sh", "cmd"]
@@ -513,6 +525,26 @@ mod tests {
             platform: "linux".into(),
             dependency_install: Some(vec!["npm".into(), "ci".into()]),
         }
+    }
+
+    #[test]
+    fn windows_daemon_paths_survive_edit_probe_and_launch() {
+        let mut host = inspection();
+        host.platform = "windows".into();
+        let exe = r"C:\Tools\agent.exe";
+        host.available.push(exe.into());
+        let mut review = SetupReview::default();
+        review.begin("App".into(), "C:\\App".into(), host);
+        review.set_value(
+            0,
+            r#"C:\Tools\agent.exe --out "C:\work tree\logs" C:\tmp\data"#,
+        );
+        assert_eq!(review.status(0), "Installed");
+        assert!(review.executables().contains(&exe.to_string()));
+        assert_eq!(
+            review.commands().unwrap()[0].1,
+            [exe, "--out", r"C:\work tree\logs", r"C:\tmp\data"]
+        );
     }
 
     #[test]

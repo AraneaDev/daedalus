@@ -1459,18 +1459,22 @@ async fn wizard_inspects_installs_and_launches_only_selected_roles() {
             .await
             .unwrap();
     });
-    let (tx, mut events) = mpsc::unbounded_channel();
-    let bridge = DaemonBridge::start(
-        BridgeConfig {
-            socket_path: sock,
-            initial_dir: project.clone(),
-            bootstrap_explicit_dir: false,
-            default_agent: AgentPreset::Shell,
-            auth_token: None,
-            auto_spawn_daemon: false,
-        },
-        Arc::new(ChannelSink { tx }),
-    );
+    let config = BridgeConfig {
+        socket_path: sock,
+        initial_dir: project.clone(),
+        bootstrap_explicit_dir: false,
+        default_agent: AgentPreset::Shell,
+        auth_token: None,
+        auto_spawn_daemon: false,
+    };
+    let connect = || {
+        let (tx, events) = mpsc::unbounded_channel();
+        (
+            DaemonBridge::start(config.clone(), Arc::new(ChannelSink { tx })),
+            events,
+        )
+    };
+    let (bridge, mut events) = connect();
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let UiEvent::WorkspacesLoaded(workspaces) = events.recv().await.unwrap() {
@@ -1511,13 +1515,55 @@ async fn wizard_inspects_installs_and_launches_only_selected_roles() {
         };
         assert!(bridge.send(UiCommand::InstallSetupTool {
             workspace_id: ws,
-            argv: vec!["touch".into(), "installed tool".into()]
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                r#"read -r answer && [ "$answer" = resume ] && touch "$1""#.into(),
+                "fixture".into(),
+                "installed tool".into()
+            ]
         }));
-        loop {
-            if let UiEvent::SetupInstallerStarted { workspace_id, .. } =
-                events.recv().await.unwrap()
+        let installer = loop {
+            if let UiEvent::SetupInstallerStarted {
+                workspace_id,
+                pane_id,
+            } = events.recv().await.unwrap()
             {
                 assert_eq!(workspace_id, ws);
+                break pane_id;
+            }
+        };
+
+        // Keep the daemon and its PTY alive across a fresh bridge connection.
+        tokio::task::spawn_blocking(move || bridge.shutdown())
+            .await
+            .unwrap();
+        let (bridge, mut events) = connect();
+        loop {
+            if let UiEvent::WorkspacesLoaded(workspaces) = events.recv().await.unwrap() {
+                assert_eq!(workspaces.len(), 1);
+                let workspace = &workspaces[0];
+                assert_eq!(workspace.id, ws);
+                assert_eq!(workspace.panes.len(), 1);
+                let pane = &workspace.panes[0];
+                assert_eq!(pane.id, installer);
+                assert!(!matches!(
+                    pane.status,
+                    daedalus_proto::PaneStatus::Exited { .. }
+                ));
+                break;
+            }
+        }
+        assert!(bridge.send(UiCommand::SendInput {
+            pane_id: installer,
+            data: b"resume\n".to_vec()
+        }));
+        loop {
+            if let UiEvent::ServerEvent(ServerEvent::PaneExited { pane_id, exit_code }) =
+                events.recv().await.unwrap()
+            {
+                assert_eq!(pane_id, installer);
+                assert_eq!(exit_code, Some(0));
                 break;
             }
         }
@@ -1568,12 +1614,12 @@ async fn wizard_inspects_installs_and_launches_only_selected_roles() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(!project.join("unexpected tests").exists());
+        tokio::task::spawn_blocking(move || bridge.shutdown())
+            .await
+            .unwrap();
     })
     .await
     .expect("wizard setup timed out");
-    tokio::task::spawn_blocking(move || bridge.shutdown())
-        .await
-        .unwrap();
     stop.send(()).unwrap();
     daemon.await.unwrap();
 }

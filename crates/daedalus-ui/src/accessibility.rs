@@ -12,7 +12,9 @@ use accesskit::{
 use daedalus_proto::{AgentState, PaneRole, PaneStatus};
 use daedalus_ui::input::{UiAction, filter_modal_text};
 use daedalus_ui::layout::Rect;
-use daedalus_ui::renderer::{worktree_button_rects, worktree_input_rect, worktree_modal_rect};
+use daedalus_ui::layout::overlays::{
+    worktree_button_rects, worktree_input_rect, worktree_modal_rect,
+};
 use daedalus_ui::state::{AppState, ConnectionState};
 use daedalus_ui::workspace_form::{self, Control, WorkspaceForm, WorkspaceFormAction};
 use unicode_segmentation::UnicodeSegmentation;
@@ -192,6 +194,8 @@ fn overlay(state: &AppState) -> Option<(NodeId, Node)> {
             "Set up workspace · Choose project",
             if state.workspace_form.submitting() {
                 "Checking project on the daemon host. Escape dismisses this dialog.".into()
+            } else if state.workspace_form.name_is_fixed() {
+                "This folder uses the existing workspace name. Enter reviews the environment. Escape cancels.".into()
             } else {
                 "Enter a project folder. The workspace name defaults to the folder name. Enter reviews the environment. Escape cancels.".into()
             },
@@ -341,6 +345,7 @@ fn workspace_fields(
         let offset = field_offset(control);
         let id = form_node(form, offset);
         let label = match control {
+            Control::Name if form.name_is_fixed() => "Workspace name",
             Control::Name => "Name (optional)",
             Control::Folder => "Folder",
             Control::Cancel if form.submitting() => "Dismiss",

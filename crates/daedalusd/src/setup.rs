@@ -67,11 +67,13 @@ fn suggestions(root: &Path, manifest: WorkspaceManifest) -> Vec<(PaneRole, Vec<S
     };
     let agent = manifest.agent_command.or_else(|| {
         let preset = manifest.agent_preset?;
-        match preset.as_str() {
-            "shell" => Some(argv(&[if cfg!(windows) { "cmd" } else { "sh" }])),
-            "codex" | "agy" | "claude" => Some(vec![preset]),
-            _ => None,
-        }
+        let canonical = daedalus_proto::canonical_agent_preset(&preset)?;
+        let program = match canonical {
+            "shell" if cfg!(windows) => "cmd",
+            "shell" => "sh",
+            other => other,
+        };
+        Some(argv(&[program]))
     });
     let service = manifest.service_command.or_else(|| {
         if script("dev") {
@@ -163,6 +165,26 @@ pub(crate) fn inspect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inspection_resolves_mixed_case_manifest_presets() {
+        let dir = tempfile::tempdir().unwrap();
+        for (preset, expected) in [
+            ("aGy", "agy"),
+            ("ClAuDe", "claude"),
+            ("CODEX", "codex"),
+            ("ShElL", if cfg!(windows) { "cmd" } else { "sh" }),
+        ] {
+            let manifest = WorkspaceManifest {
+                agent_preset: Some(preset.into()),
+                ..Default::default()
+            };
+            assert!(
+                suggestions(dir.path(), manifest).contains(&(PaneRole::Agent, argv(&[expected])))
+            );
+        }
+        assert_eq!(daedalus_proto::canonical_agent_preset("custom"), None);
+    }
 
     #[test]
     fn review_prefers_manifest_preserves_argv_and_only_suggests_present_scripts() {

@@ -3,26 +3,26 @@ use super::{
     AppState, CHROME_BTN_FONT_SIZE_LOGICAL, CHROME_FONT_SIZE_LOGICAL, CHROME_LINE_HEIGHT_LOGICAL,
     CHROME_SUB_FONT_SIZE_LOGICAL, CHROME_SUB_LINE_HEIGHT_LOGICAL, ChromeLineSpec,
     MODAL_TITLE_FONT_SIZE_LOGICAL, MODAL_TITLE_LINE_HEIGHT_LOGICAL, Rect, Theme, WorkspaceLayout,
-    truncate_left_with_ellipsis,
+    label_with_trailing_detail, truncate_left_with_ellipsis,
 };
-use crate::renderer::{
+use crate::layout::overlays::{
     action_palette_layout, close_modal_cancel_rect, close_modal_compose_rect,
     close_modal_confirm_rect, close_modal_dirty_banner_rect, close_modal_force_rect,
     close_modal_metrics, close_modal_worktree_rect, close_workspace_modal_rect, picker_item_rect,
     preset_picker_layout, search_bar_rect, search_controls, worktree_button_rects,
     worktree_content_scale, worktree_input_rect, worktree_modal_rect,
 };
-use crate::state::{AgentPreset, SearchState};
+use crate::state::{AgentPreset, FailureRecipients, SearchState};
 use crate::theme;
 
-pub(super) enum PickerKind {
+enum PickerKind {
     Preset,
     Action,
     Recipient,
 }
 
 impl PickerKind {
-    pub(super) fn header(self, modal: Rect, theme: &Theme, s: f32) -> [ChromeLineSpec<'static>; 2] {
+    fn header(self, modal: Rect, theme: &Theme, s: f32) -> [ChromeLineSpec<'static>; 2] {
         let (title, hint) = match self {
             Self::Preset => ("Agent preset", "Enter to switch · Shift+Enter to add"),
             Self::Action => ("Workspace actions", "↑↓ to choose · Enter to run · Esc"),
@@ -64,9 +64,55 @@ impl PickerKind {
 }
 
 impl TextRenderer {
-    pub(super) fn build_picker_header(&mut self, modal: Rect, theme: &Theme, kind: PickerKind) {
+    fn build_picker_header(&mut self, modal: Rect, theme: &Theme, kind: PickerKind) {
         for line in kind.header(modal, theme, self.scale_factor) {
             self.push_modal_line(line);
+        }
+    }
+
+    pub(super) fn build_failure_recipient_items(
+        &mut self,
+        state: &AppState,
+        choices: &FailureRecipients,
+        theme: &Theme,
+        screen_w: f32,
+        screen_h: f32,
+    ) {
+        let s = self.scale_factor;
+        let (modal, visible) = action_palette_layout(
+            screen_w,
+            screen_h,
+            s,
+            choices.agents.len(),
+            choices.selected,
+        );
+        self.build_picker_header(modal, theme, PickerKind::Recipient);
+        for (row, index) in visible.enumerate() {
+            let rect = picker_item_rect(modal, row, s);
+            let selected = choices.selected == index;
+            let pane = choices.agents[index];
+            let max_w = (rect.width - 20. * s).max(1.);
+            let glyph_width = self.cell_w * CHROME_FONT_SIZE_LOGICAL / self.font_size_logical;
+            let label = label_with_trailing_detail(
+                state.recipient_name(pane),
+                &pane.short(),
+                (max_w / glyph_width) as usize,
+            );
+            self.push_modal_line(ChromeLineSpec {
+                text: &label,
+                left: rect.x + 10.0 * s,
+                top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                max_w,
+                bounds: rect,
+                font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                color: if selected {
+                    theme.text_primary
+                } else {
+                    theme.text_muted
+                },
+                bold: selected,
+            });
         }
     }
 

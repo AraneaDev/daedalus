@@ -21,6 +21,13 @@ pub use types::{
 
 use std::path::{Path, PathBuf};
 
+/// Resolves built-in preset names used by project manifests and terminal launchers.
+pub fn canonical_agent_preset(name: &str) -> Option<&'static str> {
+    ["agy", "claude", "codex", "shell"]
+        .into_iter()
+        .find(|preset| name.trim().eq_ignore_ascii_case(preset))
+}
+
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 96;
 
 #[cfg(any(not(unix), test))]

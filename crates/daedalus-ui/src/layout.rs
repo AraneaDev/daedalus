@@ -1,3 +1,5 @@
+pub mod overlays;
+
 use daedalus_proto::{PaneId, PaneRole, WorkspaceId};
 
 pub const SIDEBAR_LOGICAL_WIDTH: f32 = 240.0;
