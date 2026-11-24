@@ -166,16 +166,21 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let reg = registry_at(tmp.path(), tmp.path().join("state.json"));
         let a = open(&reg, "a", &folder(tmp.path(), "a")).await;
-        let _b = open(&reg, "b", &folder(tmp.path(), "b")).await;
+        let b = open(&reg, "b", &folder(tmp.path(), "b")).await;
+        // While both are open nothing is listed.
+        assert!(reg.recent_projects().await.is_empty());
+
+        // Create recorded a then b, so b is ahead until the closes reorder them.
+        reg.close_workspace(b.id, false, false, false)
+            .await
+            .unwrap();
         reg.close_workspace(a.id, false, false, false)
             .await
             .unwrap();
 
         let recent = reg.recent_projects().await;
-        assert_eq!(recent.len(), 1);
-        assert_eq!(recent[0].name, "a");
-        assert_eq!(recent[0].root_dir, a.root_dir);
-        assert!(!recent[0].has_setup);
+        let names: Vec<&str> = recent.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
         assert!(recent[0].last_used > 0);
     }
 
