@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.0.15](https://github.com/AraneaDev/daedalus/compare/v0.0.14...v0.0.15) (2026-11-24)
+
+
+### Features
+
+* refresh native workbench typography and layout ([#45](https://github.com/AraneaDev/daedalus/issues/45)) ([9a8e04d](https://github.com/AraneaDev/daedalus/commit/9a8e04d32713b5466cb3f4a07ca37ae96ff99c3a))
+* remember recent projects and share project setup across clients ([#43](https://github.com/AraneaDev/daedalus/issues/43)) ([746d014](https://github.com/AraneaDev/daedalus/commit/746d0146f87353604e1fd450ea0be1f10f194e33))
+
 ## [0.0.14](https://github.com/AraneaDev/daedalus/compare/v0.0.13...v0.0.14) (2026-11-24)
 
 
