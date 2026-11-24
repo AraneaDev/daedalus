@@ -3281,20 +3281,19 @@ async fn project_setup_events_only_reach_opted_in_clients() {
     .await;
     assert_eq!(resp, ResponsePayload::Ok);
 
-    let msg = tokio::time::timeout(
-        Duration::from_secs(3),
-        read_frame::<_, ServerMessage>(&mut opted_in),
+    // Pane output (a shell banner on Windows) may arrive first; skip it.
+    let msg = next_event_until(
+        &mut opted_in,
+        "opted-in client got no setup event",
+        |event| matches!(event, ServerEvent::ProjectSetupChanged { .. }),
     )
-    .await
-    .expect("opted-in client got no event")
-    .unwrap()
-    .unwrap();
+    .await;
     assert_eq!(
         msg,
-        ServerMessage::Event(ServerEvent::ProjectSetupChanged {
+        ServerEvent::ProjectSetupChanged {
             root_dir: proj.clone(),
             assignments,
-        })
+        }
     );
 
     let resp = send_rpc(
@@ -3311,25 +3310,40 @@ async fn project_setup_events_only_reach_opted_in_clients() {
     assert_eq!(resp, ResponsePayload::Ok);
 
     for client in [&mut global_old, &mut scoped_old] {
-        // The first event this client sees must be the pane event; the setup event was
-        // broadcast earlier and must have been withheld.
-        let msg = tokio::time::timeout(
-            Duration::from_secs(3),
-            read_frame::<_, ServerMessage>(client),
-        )
-        .await
-        .expect("subscribed client got no pane event")
-        .unwrap()
-        .unwrap();
-        assert!(
-            matches!(
-                msg,
-                ServerMessage::Event(ServerEvent::AgentStateChanged { .. })
-            ),
-            "non-opted-in client must not see ProjectSetupChanged, got {msg:?}"
-        );
+        // The setup event was broadcast before this agent-state event, so a client that
+        // did not opt in must reach the agent-state event without ever seeing it.
+        next_event_until(client, "subscribed client got no pane event", |event| {
+            assert!(
+                !matches!(event, ServerEvent::ProjectSetupChanged { .. }),
+                "non-opted-in client must not see ProjectSetupChanged, got {event:?}"
+            );
+            matches!(event, ServerEvent::AgentStateChanged { .. })
+        })
+        .await;
     }
 
     let _ = shutdown_tx.send(());
     handle.await.unwrap();
+}
+
+/// Reads events until `wanted` accepts one, within three seconds overall. Responses and
+/// events `wanted` rejects (such as pane output) are skipped.
+async fn next_event_until(
+    client: &mut IpcStream,
+    timeout_message: &str,
+    mut wanted: impl FnMut(&ServerEvent) -> bool,
+) -> ServerEvent {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, read_frame::<_, ServerMessage>(client))
+            .await
+            .expect(timeout_message)
+            .unwrap()
+            .unwrap();
+        if let ServerMessage::Event(event) = msg
+            && wanted(&event)
+        {
+            return event;
+        }
+    }
 }
