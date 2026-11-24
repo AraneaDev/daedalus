@@ -38,8 +38,10 @@ without discarding your command edits. For supported tools you can also open the
 installation guide and select **Check again**. A locked npm project without installed dependencies
 offers a separate `npm ci` action.
 
-You can skip setup and reopen it from **+ Workspace**. To use the existing direct-start flow from
-a terminal in a repository, run:
+You can skip setup and reopen it from **+ Workspace**. The start screen lists your recent projects
+above the form for a new one. Choosing a project that already has a saved setup opens its workspace
+and starts only its agent. A project without one goes through the environment review. To use the
+existing direct-start flow from a terminal in a repository, run:
 
 ```sh
 daedalus-ui --dir . --agent shell
@@ -172,8 +174,12 @@ project toolchain on the daemon host. The client needs only Daedalus.
 
 Clients find the daemon through `--socket` or `DAEDALUS_SOCKET`, and send a token through
 `--auth-token` or `DAEDALUS_AUTH_TOKEN`. When the socket points elsewhere, the UI does not start a
-local daemon. Folder paths you enter belong to the daemon host, such as `/home/you/project`. Pass
-`--dir` to open the UI on a project there.
+local daemon. Folder paths you enter belong to the daemon host, such as `/home/you/project`. The
+folder the UI suggests is the home directory of the daemon host, not the working directory of the
+client. Pass `--dir` to open the UI on a project there.
+
+The daemon keeps the recent projects and each project's setup, so every client of that daemon
+shares them. Set a project up from one machine and the other clients reopen it as it is.
 
 ### Keep the daemon running
 
