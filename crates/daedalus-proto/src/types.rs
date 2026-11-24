@@ -129,6 +129,8 @@ pub struct PaneSummary {
     pub has_failure_trace: bool,
     #[serde(default)]
     pub agent_state: Option<AgentState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_preset: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +228,25 @@ pub struct SidebarWidget {
     pub statuses: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct WidgetConfig {
+    pub preset: Option<String>,
+    pub label: Option<String>,
+    pub show_duration: Option<bool>,
+    pub show_warnings: Option<bool>,
+}
+
+/// Last observed command, retained in the daemon's terminal snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct RunnerInsight {
+    pub phase: String,
+    pub passed: u32,
+    pub failed: u32,
+    pub warnings: u32,
+    pub elapsed_secs: u64,
+    pub diagnostic: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkspaceManifest {
     #[serde(default)]
@@ -242,6 +263,10 @@ pub struct WorkspaceManifest {
     pub status_providers: Vec<StatusProvider>,
     #[serde(default)]
     pub sidebar_widgets: Vec<SidebarWidget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_widget: Option<WidgetConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_widget: Option<WidgetConfig>,
 }
 
 /// Workspace snapshot sent over the daemon protocol.
@@ -366,7 +391,25 @@ impl Default for Cell {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Half-open cell range of an OSC 8 hyperlink on one physical terminal row.
+pub struct LinkSpan {
+    pub start: u16,
+    pub end: u16,
+    pub url: String,
+}
+
+impl LinkSpan {
+    /// Bound retained memory and snapshot payloads independently of terminal output.
+    pub const MAX_PER_ROW: usize = 16;
+    pub const MAX_URI_BYTES: usize = 2048;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GridRow {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<LinkSpan>,
+    #[serde(default)]
+    pub wraps: bool,
     pub row_index: u16,
     pub abs_row: u64,
     pub cells: Vec<Cell>,
@@ -377,6 +420,12 @@ pub struct CursorState {
     pub col: u16,
     pub row: u16,
     pub visible: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalActivity {
+    pub title: String,
+    pub attention_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,6 +441,10 @@ pub struct GridSnapshot {
     /// Changes when the terminal erases its saved lines.
     #[serde(default)]
     pub history_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insight: Option<RunnerInsight>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<TerminalActivity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +460,10 @@ pub struct GridDelta {
     /// Older daemons omit history length in incremental updates.
     #[serde(default)]
     pub scrollback_len: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insight: Option<RunnerInsight>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<TerminalActivity>,
 }
 
 /// A single substring match in a pane's scrollback/viewport history (`end_col` is exclusive).

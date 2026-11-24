@@ -1243,6 +1243,7 @@ async fn workspace_recent_reports_unsupported_daemon() {
                     journal_supported: false,
                     inspect_setup_supported: false,
                     project_setup_supported: false,
+                    image_preview_supported: false,
                     home_dir: None,
                     recent_projects_supported: false,
                 }),

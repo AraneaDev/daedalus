@@ -117,6 +117,7 @@ fn workspace(name: &str) -> WorkspaceInfo {
             cwd: None,
             last_exit_code: None,
             has_failure_trace: false,
+            launch_preset: None,
             agent_state: None,
         })
         .collect();
@@ -297,6 +298,8 @@ fn search_rejects_stale_results_and_routes_input_and_scrollback_to_the_selected_
     w.app.activate_session(HitTarget::SelectSession(pane));
     assert_eq!(w.app.state.focused_role, PaneRole::Service);
     w.app.handle_daemon_event(UiEvent::Snapshot(GridSnapshot {
+        activity: None,
+        insight: None,
         pane_id: pane,
         seq: 1,
         cols: 80,
@@ -304,6 +307,8 @@ fn search_rejects_stale_results_and_routes_input_and_scrollback_to_the_selected_
         cursor: Default::default(),
         rows_data: (0..24)
             .map(|n| GridRow {
+                links: Vec::new(),
+                wraps: false,
                 row_index: n,
                 abs_row: 100 + u64::from(n),
                 cells: vec![],
@@ -701,6 +706,50 @@ fn disconnected_state_clears_pending_commands_and_keeps_actionable_feedback_visi
 }
 
 #[test]
+fn clicked_links_follow_the_scrollback_view_and_remote_host_boundary() {
+    use daedalus_proto::{Cell, GridRow};
+    use daedalus_ui::links::DetectedLink;
+    let mut w = Workbench::new();
+    let mut ws = workspace("links");
+    ws.root_dir = w.root.path().into();
+    let id = ws.panes[0].id;
+    let role = ws.panes[0].role;
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+    let row = |text: &str| GridRow {
+        row_index: 0,
+        abs_row: 0,
+        wraps: false,
+        links: vec![],
+        cells: text
+            .chars()
+            .map(|ch| Cell {
+                text: ch.to_string(),
+                ..Default::default()
+            })
+            .collect(),
+    };
+    let path = w.root.path().join("source.rs");
+    std::fs::write(&path, "").unwrap();
+    let pane = w.app.state.panes.get_mut(&id).unwrap();
+    pane.viewport_rows = vec![row("source.rs:42")];
+    assert!(matches!(
+        w.app.clicked_link(role, 0, 0),
+        Some(DetectedLink::File { line: Some(42), .. })
+    ));
+    w.app.state.remote_host = Some("build-host".into());
+    assert!(w.app.clicked_link(role, 0, 0).is_none());
+    let pane = w.app.state.panes.get_mut(&id).unwrap();
+    pane.scroll_offset = 10;
+    pane.scrolled_rows = Some(vec![row("https://scrollback.example")]);
+    assert_eq!(
+        w.app.clicked_link(role, 4, 0),
+        Some(DetectedLink::Url("https://scrollback.example".into()))
+    );
+    assert!(w.app.clicked_link(role, 0, 10).is_none());
+}
+
+#[test]
 fn pointer_routes_header_sidebar_and_overlay_clicks_using_the_rendered_layout() {
     use daedalus_ui::layout::{
         Rect,
@@ -955,6 +1004,8 @@ fn terminal_dimensions_retry_rejected_commands_and_drag_selection_uses_absolute_
     w.app.resize_panes(&layout);
     assert!(w.idle());
     w.app.handle_daemon_event(UiEvent::Snapshot(GridSnapshot {
+        activity: None,
+        insight: None,
         pane_id: pane,
         seq: 1,
         cols: agent.cols,
@@ -964,6 +1015,8 @@ fn terminal_dimensions_retry_rejected_commands_and_drag_selection_uses_absolute_
         scrollback_len: 50,
         rows_data: (0..agent.rows)
             .map(|row| GridRow {
+                links: Vec::new(),
+                wraps: false,
                 row_index: row,
                 abs_row: 50 + u64::from(row),
                 cells: vec![],
@@ -1117,12 +1170,16 @@ fn daemon_activity_updates_the_visible_workspace_and_invalidates_a_search_when_h
     };
     w.app
         .handle_daemon_event(UiEvent::ServerEvent(ServerEvent::GridDelta(GridDelta {
+            activity: None,
+            insight: None,
             pane_id: agent,
             seq: 1,
             cols: 80,
             rows: 24,
             cursor: Default::default(),
             dirty_rows: vec![GridRow {
+                links: Vec::new(),
+                wraps: false,
                 row_index: 0,
                 abs_row: 0,
                 cells: vec![],
@@ -1882,4 +1939,223 @@ fn recent_list_is_cleared_when_the_daemon_has_no_recent_projects() {
         recent_projects: false,
     });
     assert!(w.app.state.workspace_form.recent().is_empty());
+}
+
+#[test]
+fn draggable_gutters_resize_terminal_cells_without_changing_focus() {
+    let mut w = Workbench::new();
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![workspace("pairing")]));
+    w.app.state.zoomed = false;
+    let focus = w.app.state.focused_pane_id();
+    for (width, first, second, vertical) in [
+        (1440, PaneRole::Agent, PaneRole::Service, true),
+        (1440, PaneRole::Service, PaneRole::Runner, false),
+        (480, PaneRole::Agent, PaneRole::Service, false),
+        (480, PaneRole::Service, PaneRole::Runner, false),
+    ] {
+        let metrics = ViewportMetrics {
+            size: (width, 900).into(),
+            scale_factor: 1.,
+            cell: (8., 16.),
+        };
+        let layout = w.app.layout_for(metrics);
+        let a = *layout.pane(first).unwrap();
+        let b = layout.pane(second).unwrap().outer;
+        let (x, y) = if vertical {
+            ((a.outer.right() + b.x) * 0.5, b.y + b.height * 0.5)
+        } else {
+            (b.x + b.width * 0.5, (a.outer.bottom() + b.y) * 0.5)
+        };
+        w.app.handle_cursor_moved(x, y);
+        w.app.click_at(metrics);
+        if vertical {
+            w.app.handle_cursor_moved(x + 60., y);
+        } else {
+            w.app.handle_cursor_moved(x, y + 50.);
+        }
+        let changed = *w.app.layout_for(metrics).pane(first).unwrap();
+        assert!(if vertical {
+            changed.cols > a.cols
+        } else {
+            changed.rows > a.rows
+        });
+        w.app.pointer.end_drag();
+        w.app.handle_cursor_moved(x, y);
+        assert_eq!(w.app.layout_for(metrics).pane(first).unwrap(), &changed);
+        assert_eq!(w.app.state.focused_pane_id(), focus);
+    }
+}
+
+#[test]
+fn selected_png_preview_preserves_terminal_focus_selection_and_scroll() {
+    use daedalus_proto::{Cell, GridRow, rpc::ImagePreview};
+    use daedalus_ui::selection::{CellPos, Selection};
+    let mut w = Workbench::new();
+    let ws = workspace("Preview");
+    let pane = ws.panes[0].id;
+    let workspace_id = ws.id;
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+    w.app.handle_ui_action(UiAction::PreviewImage);
+    assert!(w.idle());
+    let selection = Selection::new(CellPos::new(0, 3), CellPos::new(8, 3));
+    let view = w.app.state.panes.get_mut(&pane).unwrap();
+    view.scroll_offset = 4;
+    view.requested_scroll_offset = 4;
+    view.selection = Some(selection);
+    view.scrolled_rows = Some(vec![GridRow {
+        row_index: 0,
+        abs_row: 3,
+        wraps: false,
+        links: vec![],
+        cells: "image.png"
+            .chars()
+            .map(|c| Cell {
+                text: c.to_string(),
+                ..Default::default()
+            })
+            .collect(),
+    }]);
+    let metrics = ViewportMetrics {
+        size: (1200, 700).into(),
+        scale_factor: 1.,
+        cell: (8., 16.),
+    };
+    let button = w
+        .app
+        .layout_for(metrics)
+        .preview_button(&w.app.state, 1.)
+        .unwrap();
+    w.app.pointer.position = (button.x + 1., button.y + 1.);
+    w.app.click_at(metrics);
+    assert!(
+        matches!(w.command(), UiCommand::PreviewImage {workspace_id: ws, pane_id, path} if ws == workspace_id && pane_id == pane && path == "image.png")
+    );
+    let image = ImagePreview {
+        width: 3,
+        height: 1,
+        rgba: vec![255, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255],
+    };
+    w.app.handle_daemon_event(UiEvent::ImagePreview {
+        pane_id: PaneId::new(),
+        image: image.clone(),
+    });
+    assert!(w.app.state.image_preview.is_none());
+    w.app.handle_daemon_event(UiEvent::ImagePreview {
+        pane_id: pane,
+        image,
+    });
+    for width in [320, 1440] {
+        let metrics = ViewportMetrics {
+            size: (width, 700).into(),
+            scale_factor: 1.,
+            cell: (8., 16.),
+        };
+        let layout = w.app.layout_for(metrics);
+        let panel = layout.preview_panel(&w.app.state, 1.).unwrap();
+        let view = layout.pane(PaneRole::Agent).unwrap().viewport;
+        assert!(panel.x > view.x && panel.right() <= view.right() + 0.01);
+        let (quads, base) = daedalus_ui::renderer::collect_quads(
+            &w.app.state,
+            &layout,
+            &daedalus_ui::theme::Theme::dark(),
+            width as f32,
+            700.,
+            1.,
+            (8., 16.),
+        );
+        assert!(
+            quads[base as usize..]
+                .iter()
+                .any(|q| q.color == [1., 0., 0., 1.])
+        );
+        w.app.pointer.position = (panel.x + 1., panel.y + 1.);
+        w.app
+            .scroll_at(Some(metrics), MouseScrollDelta::LineDelta(0., -1.));
+    }
+    w.app.handle_ui_action(UiAction::PreviewImage);
+    assert!(w.app.state.image_preview.is_none());
+    assert_eq!(w.app.state.focused_pane_id(), Some(pane));
+    let view = &w.app.state.panes[&pane];
+    assert_eq!(
+        (
+            view.scroll_offset,
+            view.requested_scroll_offset,
+            view.selection
+        ),
+        (4, 4, Some(selection))
+    );
+    assert!(w.idle());
+}
+
+#[test]
+fn terminal_activity_restores_title_and_only_marks_new_background_attention() {
+    use daedalus_proto::{GridDelta, GridSnapshot, ServerEvent, types::TerminalActivity};
+    let mut w = Workbench::new();
+    let ws = workspace("Attention");
+    let agent = ws.panes[0].id;
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+    w.app.state.session_names.insert(agent, "Reviewer".into());
+    let activity = |seq, title: &str| {
+        Some(TerminalActivity {
+            title: title.into(),
+            attention_seq: seq,
+        })
+    };
+    let snapshot = GridSnapshot {
+        pane_id: agent,
+        seq: 1,
+        cols: 80,
+        rows: 24,
+        cursor: Default::default(),
+        rows_data: vec![],
+        history_generation: 0,
+        scrollback_len: 0,
+        insight: None,
+        activity: activity(3, "◐ Claude Code"),
+    };
+    w.app
+        .handle_daemon_event(UiEvent::Snapshot(snapshot.clone()));
+    assert_eq!(w.app.state.panes[&agent].tab_indicator(false), Some('◐'));
+    assert_eq!(w.app.state.panes[&agent].tab_indicator(true), Some('•'));
+    assert_eq!(w.app.state.session_names[&agent], "Reviewer");
+    let delta = |seq, attention| {
+        UiEvent::ServerEvent(ServerEvent::GridDelta(GridDelta {
+            pane_id: agent,
+            seq,
+            activity: activity(attention, "✳ Claude Code"),
+            cols: 80,
+            rows: 24,
+            cursor: Default::default(),
+            dirty_rows: vec![],
+            history_generation: 0,
+            scrollback_len: None,
+            insight: None,
+        }))
+    };
+    w.app.ui_config.notification_ping = true;
+    w.app
+        .state
+        .panes
+        .get_mut(&agent)
+        .unwrap()
+        .summary
+        .agent_state = Some(daedalus_proto::AgentState::Thinking);
+    w.app.handle_daemon_event(delta(2, 4));
+    assert_eq!(w.app.state.panes[&agent].tab_indicator(false), Some('●'));
+    w.app.focused = true;
+    w.app.sync_history_visit();
+    assert_eq!(w.app.state.panes[&agent].tab_indicator(false), None);
+    w.app.focused = false;
+    w.app.handle_daemon_event(delta(2, 4));
+    w.app.handle_daemon_event(delta(3, 4));
+    assert!(!w.app.state.panes[&agent].unread_attention);
+    w.app.handle_daemon_event(UiEvent::Snapshot(GridSnapshot {
+        seq: 6,
+        activity: activity(6, "codex"),
+        ..snapshot
+    }));
+    assert!(!w.app.state.panes[&agent].unread_attention);
 }

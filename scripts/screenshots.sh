@@ -50,11 +50,17 @@ class HealthTests(unittest.TestCase):
 PY
 cat > .daedalus.toml <<'TOML'
 [agent]
-command = ["sh", "-c", "while [ ! -f .git/capture ]; do sleep .1; done; printf '$ git status --short --branch\n'; git status --short --branch; printf '\n$ git diff -- health.py\n'; git --no-pager diff --color=always -- health.py; touch .git/agent-ready; exec cat"]
+command = ["sh", "-c", "while [ ! -f .git/capture ]; do sleep .1; done; printf '$ git status --short --branch\n'; git status --short --branch; printf '\n$ git diff -- health.py\n'; git --no-pager diff --color=always -- health.py; touch .git/agent-ready; while [ ! -f .git/preview ]; do sleep .1; done; printf '\\033[2J\\033[HProbe report written to:\nhealth-report.png\n'; exec cat"]
 [service]
 command = ["sh", "-c", "while [ ! -f .git/capture ]; do sleep .1; done; printf '$ python3 -m json.tool response.json\n'; python3 -m json.tool response.json; touch .git/service-ready; exec cat"]
+[service.widget]
+label = "Health endpoint"
 [runner]
 command = ["sh", "-c", "while [ ! -f .git/capture ]; do sleep .1; done; printf '$ python3 -m unittest -v\n'; python3 -B -m unittest -v && touch .git/runner-ready; while [ ! -f .git/fail ]; do sleep .1; done; printf '\\033[2J\\033[H'; echo FAIL: health_check; echo Expected HTTP 200, received 503; exit 3"]
+[runner.widget]
+preset = "command"
+label = "Health checks"
+show_duration = false
 [[actions]]
 id = "test"
 label = "Run health checks"
@@ -110,6 +116,27 @@ capture() {
 }
 capture workbench
 xdotool key ctrl+shift+z
+capture focused-workbench
+# Use a small project artifact to exercise daemon-side PNG preview end to end.
+convert -size 240x128 xc:'#17242c' -fill '#afc9c1' -font DejaVu-Sans -pointsize 13 \
+    -annotate +14+23 'Health probe latency' -stroke '#355059' -strokewidth 1 \
+    -draw 'line 14,49 225,49 line 14,76 225,76 line 14,103 225,103' \
+    -stroke '#f3ab65' -strokewidth 3 -fill none \
+    -draw 'polyline 14,86 38,86 58,67 77,81 94,63 113,77 134,55 153,74 175,61 199,74 225,67' \
+    PNG32:health-report.png
+touch .git/preview
+sleep .4
+xdotool mousemove --window "$window" 9 59 mousedown 1 mousemove --window "$window" 175 59 mouseup 1
+xdotool key ctrl+shift+i
+xdotool mousemove 1439 899
+capture image-preview
+# Check the actual plot stroke so a closed panel or path selection fails the capture.
+if ! convert "$scratch/image-preview.png" -crop 320x220+435+20 +repage -format %c histogram:info:- | \
+    awk 'toupper($0) ~ /#F3AB65/ && $1 + 0 >= 100 { found = 1 } END { exit !found }'; then
+    echo 'The image preview did not display the health report chart.' >&2
+    exit 1
+fi
+xdotool key ctrl+shift+i
 xdotool key ctrl+shift+w
 xdotool type --delay 30 'feature/add-metrics'
 capture new-worktree
@@ -162,6 +189,6 @@ for entry in 'workspace-settings 650x392' 'environment-setup 700x500' 'new-workt
 done
 convert "$scratch/failed-run.png" -crop 1000x184+0+0 +repage "$scratch/failure.png"
 mv "$scratch/failure.png" "$scratch/failed-run.png"
-for name in workbench new-worktree workspace-settings environment-setup failed-run; do
+for name in workbench focused-workbench image-preview new-worktree workspace-settings environment-setup failed-run; do
     install -m644 "$scratch/$name.png" "$out/$name.png"
 done

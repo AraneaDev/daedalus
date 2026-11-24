@@ -977,6 +977,7 @@ dependencies = [
  "clap",
  "daedalus-proto",
  "daedalus-vt",
+ "image",
  "libproc",
  "nix 0.32.0",
  "noyalib",

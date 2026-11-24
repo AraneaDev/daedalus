@@ -42,6 +42,8 @@ pub struct ProcessHandle {
 }
 
 pub struct SpawnedPty {
+    pub direct: bool,
+    pub launch_preset: Option<String>,
     pub master: Box<dyn MasterPty + Send>,
     pub reader: Box<dyn Read + Send>,
     pub writer: Box<dyn Write + Send>,
@@ -174,7 +176,18 @@ impl Supervisor {
             .take_writer()
             .map_err(|e| format!("take master writer failed: {e}"))?;
 
+        let program = launch.program.rsplit(['/', '\\']).next().unwrap_or("");
+        let launch_preset = (role == PaneRole::Agent)
+            .then(|| {
+                daedalus_proto::canonical_agent_preset(
+                    program.trim_end_matches(".exe").trim_end_matches(".cmd"),
+                )
+            })
+            .flatten()
+            .map(str::to_owned);
         Ok(SpawnedPty {
+            direct: launch.direct,
+            launch_preset,
             master: pair.master,
             reader,
             writer,
@@ -662,6 +675,7 @@ exit 17
                 0,
                 0,
                 &ShellLaunchSpec {
+                    direct: false,
                     program: "/bin/sh".into(),
                     args: vec!["argument with spaces".into()],
                     extra_env: HashMap::from([("CUSTOM_ENV".into(), "launch-specific".into())]),
@@ -715,6 +729,7 @@ exit 17
         let dir = TempDir::new().unwrap();
         let supervisor = Supervisor::with_mode(IsolationMode::PgidFallback);
         let launch = ShellLaunchSpec {
+            direct: false,
             program: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), script.to_string()],
             extra_env: HashMap::new(),

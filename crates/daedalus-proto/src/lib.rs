@@ -16,9 +16,9 @@ pub use rpc::{
 pub use types::{
     AgentState, Cell, CellFlags, Color, ContainerHealth, CursorState, CustomAction, ExternalStatus,
     FailureTrace, GitWorkspaceStatus, GitWorktreeInfo, GridDelta, GridRow, GridSnapshot, PaneId,
-    PaneRole, PaneStatus, PaneSummary, PortMapping, PortSource, ProjectInfo, SearchMatch,
-    SidebarWidget, StatusLevel, StatusProvider, WorkspaceId, WorkspaceInfo, WorkspaceManifest,
-    wrap_bracketed_paste,
+    PaneRole, PaneStatus, PaneSummary, PortMapping, PortSource, ProjectInfo, RunnerInsight,
+    SearchMatch, SidebarWidget, StatusLevel, StatusProvider, WidgetConfig, WorkspaceId,
+    WorkspaceInfo, WorkspaceManifest, wrap_bracketed_paste,
 };
 
 use std::path::{Path, PathBuf};
@@ -1046,6 +1046,7 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp/wt1")),
             last_exit_code: None,
             has_failure_trace: false,
+            launch_preset: None,
             agent_state: Some(AgentState::Thinking),
         };
 

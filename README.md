@@ -48,10 +48,10 @@ daedalus-ui --dir . --agent shell
 ```
 
 The UI starts the local daemon and opens the agent terminal. Select a named tab to switch terminals.
-Use `Ctrl+Shift+Z` for a split view. Use the shell preset to try the workbench
-immediately. To use Claude, Codex or agy, install the corresponding CLI and choose its preset with
-the agent picker. Press `Shift+Enter` in the picker to start an additional agent in this workspace.
-Docker and Compose are needed only for container workflows.
+Use `Ctrl+Shift+Z` for a split view, then drag the dividers to resize the panes. Use the shell
+preset to try the workbench immediately. To use Claude, Codex or agy, install the corresponding CLI
+and choose its preset with the agent picker. Press `Shift+Enter` in the picker to start an
+additional agent in this workspace. Docker and Compose are needed only for container workflows.
 
 Choose **+ Workspace** to enter a name and a project folder on the daemon host. If the daemon
 refuses the folder, the form keeps your entries and selects the folder for correction.
@@ -79,6 +79,57 @@ failing workspaces in sidebar order.
 
 ![Failed run button on the orbit worktree and the selected runner showing its failed health check](docs/images/failed-run.png)
 
+## Compact workbench widgets
+
+The focused agent view shows service and runner summaries below the terminal. Select a summary to
+open its terminal. When Cargo reports a diagnostic, **View failure** reveals it in place and keeps
+the agent selected. In split view the same information appears in the pane header. Recognized Codex
+and Claude sessions have distinct tab marks alongside their session names.
+
+![Codex and Claude tabs in the Windows workbench](docs/images/windows-agent-tabs.png)
+
+![Focused agent terminal with compact service and runner summaries](docs/images/focused-workbench.png)
+
+Configure project defaults in the daemon checkout’s `.daedalus.toml`. For example:
+
+```toml
+[runner]
+command = ["cargo", "test", "--workspace"]
+
+[runner.widget]
+preset = "cargo-test"
+label = "Workspace tests"
+show_duration = true
+show_warnings = false
+
+[service.widget]
+preset = "service"
+label = "Development server"
+```
+
+Use `cargo-check` for compiler progress and warnings, or `command` for generic command status.
+Direct Cargo test and check manifest commands select their preset automatically. Cargo suite
+summaries accumulate across crates. Final status follows command completion. The `service` preset
+includes an observed workspace port when available. Choose `command` for process status alone.
+
+## Terminal links, activity and image previews
+
+Hover over an HTTP or HTTPS link to see its destination. Ctrl-click opens the destination in the
+default browser on the computer running the UI. Use Cmd-click on macOS. This works for printed
+URLs and labeled terminal hyperlinks (OSC 8), including output from WSL.
+
+Agent tabs reflect activity reported by the terminal. A background notification marks the tab
+unread until you return to it. In the UI’s `config.toml`, set `notification_ping = true` for
+notification pings, or `reduced_motion = true` for a static activity indicator.
+
+To inspect a project image, select its PNG path in terminal output and click **Preview image**
+or press `Ctrl+Shift+I`.
+The daemon reads the file from the workspace and sends a thumbnail to the client. Click the panel
+or repeat the shortcut to close it. The preview supports regular PNG files up to 12 MiB and
+4096 × 4096 pixels on Unix daemons, including Ubuntu in WSL.
+
+![Terminal preview of the selected health report PNG](docs/images/image-preview.png)
+
 ## Keybindings (`daedalus-ui`)
 
 | Shortcut | Action |
@@ -98,6 +149,7 @@ failing workspaces in sidebar order.
 | `Ctrl+Shift+R` | Open a failed runner. Repeat to visit the next failing workspace. |
 | `Ctrl+Shift+E` | Forward latest `Runner` failure trace to `Agent` (bracketed paste) |
 | `Ctrl+Shift+C` / `V` | Copy selection / Bracketed-paste clipboard |
+| `Ctrl+Shift+I` | Preview the selected workspace PNG path, or close its preview. |
 | `Ctrl+Shift+F` | Search the focused pane. Enter advances, Shift+Enter goes back, and Esc closes search. The search bar also has previous and next controls and a match-case toggle (F4). |
 | `Shift+PageUp` / `PageDown` / `End` | Scrollback navigation |
 
@@ -243,8 +295,9 @@ Windows reaches `127.0.0.1` inside WSL through localhost forwarding, which is on
 mirrored networking mode. The distribution must be running. With `vmIdleTimeout=-1` in
 `.wslconfig` it stays up. Otherwise, open a WSL terminal first.
 
-In the setup screen, type the WSL path of your project, such as `/home/you/project`. Clicking a
-file path in a terminal does not open it on Windows. Web links work.
+In the setup screen, type the WSL path of your project, such as `/home/you/project`. Ctrl-click
+a web link to open it in your Windows browser. Select a project PNG path and press `Ctrl+Shift+I` to
+preview it in the Windows workbench.
 
 ### A remote host over SSH
 

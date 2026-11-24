@@ -163,6 +163,7 @@ pub struct LayoutInput {
 /// Computed rectangles for the sidebar, optional top banner, and visible semantic panes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceLayout {
+    pub insight_rows: Vec<(PaneRole, Rect)>,
     pub compact_recap: Option<Rect>,
     pub close_tab: Option<(PaneId, Rect)>,
     pub named_tabs: Vec<(PaneId, String, Rect)>,
@@ -178,6 +179,76 @@ pub struct WorkspaceLayout {
 }
 
 impl WorkspaceLayout {
+    pub fn preview_button(&self, state: &crate::state::AppState, scale: f32) -> Option<Rect> {
+        if state.search.is_some() || self.preview_panel(state, scale).is_some() {
+            return None;
+        }
+        state.selected_png_path()?;
+        let view = self.pane(state.focused_role)?.viewport;
+        let width = (114. * scale).min(view.width);
+        Some(Rect::new(
+            view.right() - width,
+            view.y,
+            width,
+            (23. * scale).min(view.height),
+        ))
+    }
+
+    pub fn preview_panel(&self, state: &crate::state::AppState, scale: f32) -> Option<Rect> {
+        let (id, image) = state.image_preview.as_ref()?;
+        if state.focused_pane_id() != Some(*id) || state.search.is_some() {
+            return None;
+        }
+        let view = self.pane(state.focused_role)?.viewport;
+        let width = (320. * scale).min(view.width * 0.45);
+        let height =
+            (width - 8. * scale).max(0.) * image.height as f32 / image.width as f32 + 28. * scale;
+        Some(Rect::new(
+            view.right() - width,
+            view.y,
+            width,
+            height.min(view.height),
+        ))
+    }
+
+    pub fn reserve_insights(&mut self, roles: &[PaneRole], scale: f32, cell_h: f32) {
+        let [pane] = self.panes.as_mut_slice() else {
+            return;
+        };
+        if roles.is_empty() || pane.role != PaneRole::Agent {
+            return;
+        }
+        let height = (28. * scale).min(pane.viewport.height * 0.1);
+        if height < 18. * scale {
+            return;
+        }
+        let stacked = pane.outer.width < 580. * scale;
+        let total = if stacked {
+            height * roles.len() as f32
+        } else {
+            height
+        };
+        pane.outer.height -= total;
+        pane.viewport.height -= total;
+        pane.rows = (pane.viewport.height / cell_h.max(1.)).floor().max(1.) as u16;
+        let width = if stacked {
+            pane.outer.width
+        } else {
+            pane.outer.width / roles.len() as f32
+        };
+        for (i, &role) in roles.iter().enumerate() {
+            let (dx, dy) = if stacked {
+                (0., i as f32 * height)
+            } else {
+                (i as f32 * width, 0.)
+            };
+            self.insight_rows.push((
+                role,
+                Rect::new(pane.outer.x + dx, pane.outer.bottom() + dy, width, height),
+            ));
+        }
+    }
+
     pub fn enable_run_tests(&mut self, scale: f32) {
         let Some(header) = self.sidebar_toggle else {
             return;
@@ -299,6 +370,7 @@ pub enum HitTarget {
     SidebarNewWorkspace,
     SidebarNewWorktree,
     RunTests,
+    Widget(PaneRole),
     SessionTab(PaneRole),
     SelectSession(PaneId),
     CloseSession(PaneId),
@@ -401,6 +473,48 @@ fn build_pane_rect(
 
 /// Pure geometry solver for Daedalus's fixed 3-pane semantic workspace layout.
 pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
+    compute_split_layout(input, &PaneSplits::default())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Divider {
+    Column,
+    RightRow,
+    UpperRow,
+    LowerRow,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PaneSplits {
+    column: f32,
+    right_row: f32,
+    upper: f32,
+    lower: f32,
+}
+
+impl Default for PaneSplits {
+    fn default() -> Self {
+        Self {
+            column: AGENT_WIDTH_RATIO,
+            right_row: 0.5,
+            upper: 0.5,
+            lower: 0.75,
+        }
+    }
+}
+
+impl PaneSplits {
+    pub fn move_divider(&mut self, divider: Divider, fraction: f32) {
+        match divider {
+            Divider::Column => self.column = fraction.clamp(0.15, 0.85),
+            Divider::RightRow => self.right_row = fraction.clamp(0.15, 0.85),
+            Divider::UpperRow => self.upper = fraction.clamp(0.1, self.lower - 0.1),
+            Divider::LowerRow => self.lower = fraction.clamp(self.upper + 0.1, 0.9),
+        }
+    }
+}
+
+pub fn compute_split_layout(input: &LayoutInput, splits: &PaneSplits) -> WorkspaceLayout {
     let metrics = LayoutMetrics::for_scale(input.scale_factor);
     let window_w = input.window_w.max(0.0);
     let window_h = input.window_h.max(0.0);
@@ -493,8 +607,12 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
         let (agent_outer, service_outer, runner_outer) = if stacked {
             // Reserve a readable terminal row for each role when the window is short.
             let one_row = metrics.header_height + 2. * metrics.viewport_pad + input.cell_h.max(0.);
-            let service_h = (canvas_h * 0.25).max(one_row.min(canvas_h / 3.));
-            let agent_h = canvas_h - 2. * service_h;
+            let minimum = one_row.min(canvas_h / 3.);
+            let lower = (canvas_h * splits.lower)
+                .max(2. * minimum)
+                .min(canvas_h - minimum);
+            let agent_h = (canvas_h * splits.upper).max(minimum).min(lower - minimum);
+            let service_h = lower - agent_h;
             (
                 Rect::new(canvas_x, canvas_y, canvas_w, agent_h),
                 Rect::new(canvas_x, canvas_y + agent_h, canvas_w, service_h),
@@ -506,9 +624,9 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
                 ),
             )
         } else {
-            let agent_w = canvas_w * AGENT_WIDTH_RATIO;
+            let agent_w = canvas_w * splits.column;
             let right_w = (canvas_w - agent_w).max(0.0);
-            let top_h = canvas_h * 0.5;
+            let top_h = canvas_h * splits.right_row;
             let bot_h = (canvas_h - top_h).max(0.0);
 
             let gutter = (4.0 * metrics.scale_factor).min(canvas_h * 0.02);
@@ -553,6 +671,7 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
     };
 
     WorkspaceLayout {
+        insight_rows: Vec::new(),
         compact_recap,
         close_tab: None,
         named_tabs: Vec::new(),
@@ -724,6 +843,9 @@ pub fn hit_test(
     y: f32,
 ) -> HitTarget {
     use crate::sidebar_content::{SidebarContent, SidebarRow};
+    if let Some((role, _)) = layout.insight_rows.iter().find(|(_, r)| r.contains(x, y)) {
+        return HitTarget::Widget(*role);
+    }
     let fallback = layout
         .sidebar
         .filter(|_| layout.sidebar_content.is_none())
@@ -882,6 +1004,27 @@ mod tests {
         assert_eq!(agent.action_pill.unwrap().width, 116.0);
         assert!(service.action_pill.is_none());
         assert!(runner.action_pill.is_none());
+    }
+
+    #[test]
+    fn resizing_updates_terminal_rectangles_in_both_layouts() {
+        let mut input = default_input();
+        let mut splits = PaneSplits::default();
+        splits.move_divider(Divider::Column, 0.7);
+        splits.move_divider(Divider::RightRow, 0.625);
+        let wide = compute_split_layout(&input, &splits);
+        assert_eq!(wide.pane(PaneRole::Agent).unwrap().outer.width, 692.);
+        assert_eq!(wide.pane(PaneRole::Runner).unwrap().outer.y, 504.);
+
+        input.window_w = 320.;
+        splits.move_divider(Divider::UpperRow, 0.35);
+        splits.move_divider(Divider::LowerRow, 0.8);
+        let narrow = compute_split_layout(&input, &splits);
+        let agent = narrow.pane(PaneRole::Agent).unwrap().outer;
+        let runner = narrow.pane(PaneRole::Runner).unwrap().outer;
+        let height = runner.bottom() - agent.y;
+        assert!((agent.height - height * 0.35).abs() < 0.01);
+        assert!((runner.height - height * 0.2).abs() < 0.01);
     }
 
     #[test]

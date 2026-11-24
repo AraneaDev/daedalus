@@ -15,8 +15,10 @@ use daedalus_ui::bridge::{BridgeConfig, DaemonBridge, UiCommand, UiEvent, UiEven
 use daedalus_ui::config::UiConfig;
 use daedalus_ui::input::{KeyRepeatGuard, UiAction, filter_modal_text, translate_key};
 use daedalus_ui::layout::overlays::picker_row_stride;
-use daedalus_ui::layout::{HitTarget, LayoutInput, WorkspaceLayout, compute_layout, hit_test};
-use daedalus_ui::links::{detect_link_in_row, detect_url_in_row, open_link};
+use daedalus_ui::layout::{
+    HitTarget, LayoutInput, WorkspaceLayout, compute_split_layout, hit_test,
+};
+use daedalus_ui::links::{browser_link_at, detect_link_in_row, open_link};
 use daedalus_ui::renderer::{GpuRenderer, RenderError};
 use daedalus_ui::selection::extract_selected_text;
 use daedalus_ui::state::{AgentPreset, AppState, ConnectionState};
@@ -159,6 +161,34 @@ struct DaedalusApp {
     clipboard: Option<arboard::Clipboard>,
 }
 
+/// Sound is delegated to the desktop and respects the user's system sound settings.
+fn play_notification_ping() {
+    #[cfg(target_os = "linux")]
+    let command = ("canberra-gtk-play", &["--id", "message-new-instant"][..]);
+    #[cfg(target_os = "macos")]
+    let command = ("afplay", &["/System/Library/Sounds/Ping.aiff"][..]);
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn MessageBeep(kind: u32) -> i32;
+        }
+        // SAFETY: MessageBeep takes a predefined sound identifier and no pointers.
+        unsafe {
+            MessageBeep(0x40);
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    std::thread::spawn(move || {
+        if let Err(error) = std::process::Command::new(command.0)
+            .args(command.1)
+            .status()
+        {
+            tracing::debug!(%error, "notification sound unavailable");
+        }
+    });
+}
+
 impl DaedalusApp {
     fn new(
         config: BridgeConfig,
@@ -166,6 +196,8 @@ impl DaedalusApp {
         proxy: Option<EventLoopProxy<AppEvent>>,
         profile: &std::path::Path,
     ) -> Self {
+        let mut state = AppState::new();
+        state.reduced_motion = ui_config.reduced_motion;
         Self {
             project_setups: Default::default(),
             daemon_home: None,
@@ -186,7 +218,7 @@ impl DaedalusApp {
             terminal_controls: accessibility::TerminalControls::default(),
             last_accessibility_tree: None,
             bridge: None,
-            state: AppState::new(),
+            state,
             modifiers: ModifiersState::empty(),
             key_repeats: KeyRepeatGuard::default(),
             pointer: pointer::PointerState::default(),
@@ -206,6 +238,12 @@ impl DaedalusApp {
             && !self.state.close_modal.open
             && !self.state.picker.open
             && !self.state.action_palette.open;
+        if visible
+            && let Some(id) = self.state.focused_pane_id()
+            && let Some(pane) = self.state.panes.get_mut(&id)
+        {
+            pane.unread_attention = false;
+        }
         self.history
             .visit(self.state.active_workspace_id.filter(|_| visible));
     }
@@ -245,24 +283,39 @@ impl DaedalusApp {
         Some(self.layout_for(self.viewport_metrics()?))
     }
 
-    fn layout_for(&self, metrics: ViewportMetrics) -> WorkspaceLayout {
+    fn pane_geometry(&self, metrics: ViewportMetrics) -> WorkspaceLayout {
         let ViewportMetrics {
             size,
             scale_factor,
             cell: (cell_w, cell_h),
         } = metrics;
-        let mut layout = compute_layout(&LayoutInput {
-            window_w: size.width as f32,
-            window_h: size.height as f32,
-            scale_factor,
-            cell_w,
-            cell_h,
-            sidebar_override: self.state.sidebar_override,
-            has_top_banner: self.has_top_banner(),
-            zoomed: self.state.zoomed,
-            focused_role: self.state.focused_role,
-            runner_has_failure: self.state.runner_has_failure(),
-        });
+        compute_split_layout(
+            &LayoutInput {
+                window_w: size.width as f32,
+                window_h: size.height as f32,
+                scale_factor,
+                cell_w,
+                cell_h,
+                sidebar_override: self.state.sidebar_override,
+                has_top_banner: self.has_top_banner(),
+                zoomed: self.state.zoomed,
+                focused_role: self.state.focused_role,
+                runner_has_failure: self.state.runner_has_failure(),
+            },
+            &self.pointer.splits,
+        )
+    }
+
+    fn layout_for(&self, metrics: ViewportMetrics) -> WorkspaceLayout {
+        let scale_factor = metrics.scale_factor;
+        let mut layout = self.pane_geometry(metrics);
+        if self.state.zoomed {
+            let roles: Vec<_> = [PaneRole::Service, PaneRole::Runner]
+                .into_iter()
+                .filter(|&role| self.state.pane_for_role(role).is_some())
+                .collect();
+            layout.reserve_insights(&roles, scale_factor, metrics.cell.1);
+        }
         if self.state.workspaces.is_empty() {
             for pane in &mut layout.panes {
                 pane.action_pill = None;
@@ -378,6 +431,37 @@ impl DaedalusApp {
             self.clipboard = Some(cb);
         }
         Ok(self.clipboard.as_mut().expect("clipboard initialized"))
+    }
+
+    fn preview_image(&mut self) {
+        let Some(pane_id) = self.state.focused_pane_id() else {
+            return;
+        };
+        if self
+            .state
+            .image_preview
+            .as_ref()
+            .is_some_and(|(id, _)| *id == pane_id)
+        {
+            self.state.image_preview = None;
+            self.request_redraw();
+            return;
+        }
+        let Some(pane) = self.state.panes.get(&pane_id) else {
+            return;
+        };
+        let Some(path) = self.state.selected_png_path() else {
+            self.show_toast(
+                "Select a workspace PNG path in the terminal to preview it",
+                false,
+            );
+            return;
+        };
+        self.send_command(UiCommand::PreviewImage {
+            workspace_id: pane.summary.workspace_id,
+            pane_id,
+            path,
+        });
     }
 
     fn copy_focused_selection(&mut self) {
@@ -775,27 +859,30 @@ impl DaedalusApp {
         }
     }
 
-    fn open_clicked_link(&mut self, role: PaneRole, col: u16, row: u16) {
-        let link = {
-            let Some(pane) = self.state.pane_for_role(role) else {
-                return;
-            };
-            let Some(grid_row) = pane.visible_rows().get(row as usize) else {
-                return;
-            };
+    fn clicked_link(
+        &self,
+        role: PaneRole,
+        col: u16,
+        row: u16,
+    ) -> Option<daedalus_ui::links::DetectedLink> {
+        let pane = self.state.pane_for_role(role)?;
+        let rows = pane.visible_rows();
+        browser_link_at(rows, row as usize, col as usize).or_else(|| {
+            if self.state.remote_host.is_some() {
+                return None;
+            }
             let cwd = pane.summary.cwd.as_deref();
-            let root_dir = self
+            let root = self
                 .state
                 .active_workspace()
                 .map(|ws| ws.root_dir.as_path());
-            if self.state.remote_host.is_some() {
-                detect_url_in_row(grid_row, col as usize)
-            } else {
-                detect_link_in_row(grid_row, col as usize, cwd, root_dir)
-            }
-        };
+            detect_link_in_row(rows.get(row as usize)?, col as usize, cwd, root)
+                .filter(|link| matches!(link, daedalus_ui::links::DetectedLink::File { .. }))
+        })
+    }
 
-        let Some(link) = link else {
+    fn open_clicked_link(&mut self, role: PaneRole, col: u16, row: u16) {
+        let Some(link) = self.clicked_link(role, col, row) else {
             return;
         };
 
@@ -918,6 +1005,7 @@ impl DaedalusApp {
             }
             UiAction::SwitchWorkspaceNext => self.switch_workspace_by(1),
             UiAction::SwitchWorkspacePrev => self.switch_workspace_by(-1),
+            UiAction::PreviewImage => self.preview_image(),
             UiAction::CopySelection => self.copy_focused_selection(),
             UiAction::PasteClipboard => self.paste_clipboard_to_focused(),
             UiAction::ForwardFailureToAgent => self.forward_runner_failure_to_agent(),
@@ -1231,6 +1319,18 @@ impl DaedalusApp {
 
     fn activate_session(&mut self, target: HitTarget) {
         match target {
+            HitTarget::Widget(role) => {
+                if let Some(id) = self.state.pane_id_for_role(role) {
+                    if role == PaneRole::Runner && self.state.widget_diagnostic().is_some() {
+                        if let Some(pane) = self.state.panes.get_mut(&id) {
+                            pane.show_diagnostic = !pane.show_diagnostic;
+                        }
+                        self.request_redraw();
+                    } else {
+                        self.activate_session(HitTarget::SelectSession(id));
+                    }
+                }
+            }
             HitTarget::CloseSession(id) => {
                 self.send_command(UiCommand::ClosePane(id));
             }
@@ -1311,6 +1411,12 @@ impl DaedalusApp {
         let (cell_w, cell_h) = metrics.cell;
         let layout = self.layout_for(metrics);
 
+        if layout
+            .preview_panel(&self.state, scale_factor)
+            .is_some_and(|rect| rect.contains(self.pointer.position.0, self.pointer.position.1))
+        {
+            return;
+        }
         if let Some(list) = layout.sidebar_content.as_ref()
             && layout.sidebar.is_some_and(|sidebar| {
                 sidebar.contains(self.pointer.position.0, self.pointer.position.1)
@@ -1397,6 +1503,11 @@ impl DaedalusApp {
         }
         self.sync_history_visit();
         match event {
+            UiEvent::ImagePreview { pane_id, image } => {
+                if self.state.focused_pane_id() == Some(pane_id) && image.valid() {
+                    self.state.image_preview = Some((pane_id, image));
+                }
+            }
             UiEvent::JournalCapability(supported) => self.history.connection(supported),
             UiEvent::DaemonCapabilities {
                 home_dir,
@@ -1614,10 +1725,37 @@ impl DaedalusApp {
                     daedalus_proto::ServerEvent::ResyncRequired { pane_id } => Some(*pane_id),
                     _ => None,
                 };
+                let watch_attention = match &server_event {
+                    daedalus_proto::ServerEvent::GridDelta(delta)
+                        if self.ui_config.notification_ping
+                            && self
+                                .state
+                                .panes
+                                .get(&delta.pane_id)
+                                .is_some_and(|p| !p.unread_attention) =>
+                    {
+                        Some(delta.pane_id)
+                    }
+                    _ => None,
+                };
                 if let Some(resync_pane_id) = self.state.apply_server_event(server_event) {
                     self.send_command(UiCommand::RequestSnapshot {
                         pane_id: resync_pane_id,
                     });
+                }
+                self.sync_history_visit();
+                if let Some(id) = watch_attention
+                    && self
+                        .state
+                        .panes
+                        .get(&id)
+                        .is_some_and(|p| p.unread_attention)
+                    && let Some(window) = &self.window
+                {
+                    play_notification_ping();
+                    window.request_user_attention(Some(
+                        winit::window::UserAttentionType::Informational,
+                    ));
                 }
                 if let Some((id, code)) = ended {
                     self.setup_installer_finished(id, code);
@@ -1665,6 +1803,20 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 INITIAL_WINDOW_WIDTH,
                 INITIAL_WINDOW_HEIGHT,
             ));
+
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            let icon = winit::window::Icon::from_rgba(
+                include_bytes!("../../../packaging/window-icon.rgba").to_vec(),
+                64,
+                64,
+            )
+            .expect("embedded 64px Daedalus window icon");
+            attrs
+                .with_window_icon(Some(icon.clone()))
+                .with_taskbar_icon(Some(icon))
+        };
 
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
@@ -1850,6 +2002,7 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 }
             }
             WindowEvent::Ime(Ime::Commit(text)) => self.commit_text(text),
+            WindowEvent::CursorLeft { .. } => self.update_link_hover(None),
             WindowEvent::CursorMoved { position, .. } => {
                 self.handle_cursor_moved(position.x as f32, position.y as f32);
             }

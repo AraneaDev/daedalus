@@ -12,6 +12,7 @@ use unicode_segmentation::UnicodeSegmentation;
 mod dialogs;
 mod pane;
 mod search;
+mod widgets;
 
 pub use dialogs::{ActionPaletteState, CloseWorkspaceModalState, PickerState, WorktreeModalState};
 pub use pane::PaneViewState;
@@ -129,6 +130,7 @@ pub struct AppState {
     pub focused_role: PaneRole,
     workspace_focus: HashMap<WorkspaceId, PaneRole>,
     selected_panes: HashMap<(WorkspaceId, PaneRole), PaneId>,
+    pub image_preview: Option<(PaneId, daedalus_proto::rpc::ImagePreview)>,
     pub sidebar_override: Option<bool>,
     pub sidebar_first: usize,
     pub zoomed: bool,
@@ -139,6 +141,7 @@ pub struct AppState {
     pub settings: crate::settings::SettingsDialog,
     pub recap: crate::recap::Recap,
     pub test_workspaces: HashSet<WorkspaceId>,
+    pub reduced_motion: bool,
     pub session_names: HashMap<PaneId, String>,
     pub action_palette: ActionPaletteState,
     pub picker: PickerState,
@@ -157,6 +160,34 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn selected_png_path(&self) -> Option<String> {
+        let pane = self.panes.get(&self.focused_pane_id()?)?;
+        let selection = pane.selection?;
+        if selection.anchor.abs_row != selection.head.abs_row {
+            return None;
+        }
+        let text = crate::selection::extract_selected_text(pane.visible_rows(), &selection);
+        let path = text.trim();
+        (path.len() <= 4096
+            && !path.chars().any(char::is_control)
+            && std::path::Path::new(path)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("png")))
+        .then(|| path.to_owned())
+    }
+
+    pub fn has_input_overlay(&self) -> bool {
+        self.failure_recipients.is_some()
+            || self.setup_review.open
+            || self.workspace_form.open
+            || self.settings.open
+            || self.action_palette.open
+            || self.picker.open
+            || self.worktree_modal.open
+            || self.close_modal.open
+            || self.search.is_some()
+    }
+
     pub fn can_create_worktree(&self) -> bool {
         self.connection == ConnectionState::Connected
             && !self.worktree_modal.branch_input.trim().is_empty()
@@ -170,6 +201,7 @@ impl AppState {
             active_workspace_id: None,
             panes: HashMap::new(),
             focused_role: PaneRole::Agent,
+            image_preview: None,
             sidebar_override: None,
             sidebar_first: 0,
             workspace_focus: HashMap::new(),
@@ -182,6 +214,7 @@ impl AppState {
             settings: Default::default(),
             recap: Default::default(),
             test_workspaces: HashSet::new(),
+            reduced_motion: false,
             session_names: HashMap::new(),
             action_palette: ActionPaletteState::default(),
             picker: PickerState::default(),
@@ -533,29 +566,35 @@ impl AppState {
 
     /// Keep role ordinals in workspace order, including panes with a custom name.
     pub fn terminal_tabs(&self, ws: &WorkspaceView) -> Vec<(PaneId, String)> {
-        let mut totals = [0usize; 3];
-        let mut ordinals = [0usize; 3];
+        let base_name = |pane: &PaneSummary| match pane.role {
+            PaneRole::Agent => match self.panes.get(&pane.id).and_then(|p| p.agent_preset) {
+                Some(AgentPreset::Claude) => "Claude",
+                Some(AgentPreset::Codex) => "Codex",
+                Some(AgentPreset::Agy) => "Antigravity",
+                _ => "Agent",
+            },
+            PaneRole::Service => "Service",
+            PaneRole::Runner => "Runner",
+        };
+        let mut totals = HashMap::new();
+        let mut ordinals = HashMap::new();
         for pane in self.workspace_panes(ws) {
-            totals[pane.role as usize] += 1;
+            *totals.entry(base_name(pane)).or_insert(0usize) += 1;
         }
         self.workspace_panes(ws)
             .map(|pane| {
-                let role = pane.role as usize;
-                ordinals[role] += 1;
+                let base = base_name(pane);
+                let ordinal = ordinals.entry(base).or_insert(0usize);
+                *ordinal += 1;
                 let name = self
                     .session_names
                     .get(&pane.id)
                     .cloned()
                     .unwrap_or_else(|| {
-                        let role_name = match pane.role {
-                            PaneRole::Agent => "Agent",
-                            PaneRole::Service => "Service",
-                            PaneRole::Runner => "Runner",
-                        };
-                        if totals[role] > 1 {
-                            format!("{role_name} {}", ordinals[role])
+                        if totals[base] > 1 {
+                            format!("{base} {ordinal}")
                         } else {
-                            role_name.into()
+                            base.to_owned()
                         }
                     });
                 (pane.id, terminal_title(name, pane.status))

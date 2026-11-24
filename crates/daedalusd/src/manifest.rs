@@ -60,6 +60,7 @@ struct RawAgentSection {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawCommandSection {
+    widget: Option<toml::Value>,
     #[serde(default)]
     command: Option<Vec<String>>,
 }
@@ -68,6 +69,28 @@ struct RawCommandSection {
 struct RawPortsSection {
     #[serde(default)]
     extra: Vec<u16>,
+}
+
+fn parse_widget(raw: Option<toml::Value>, role: PaneRole) -> Option<daedalus_proto::WidgetConfig> {
+    let config: daedalus_proto::WidgetConfig = match raw?.try_into() {
+        Ok(config) => config,
+        Err(error) => {
+            warn!(%error,?role,"invalid widget configuration");
+            return None;
+        }
+    };
+    if let Some(preset) = config.preset.as_deref() {
+        let valid = match role {
+            PaneRole::Runner => matches!(preset, "cargo-test" | "cargo-check" | "command"),
+            PaneRole::Service => matches!(preset, "service" | "command"),
+            _ => false,
+        };
+        if !valid {
+            warn!(preset, ?role, "unknown widget preset");
+            return None;
+        }
+    }
+    Some(config)
 }
 
 fn normalize_command(command: Option<Vec<String>>) -> Option<Vec<String>> {
@@ -204,6 +227,8 @@ pub fn parse_project_manifest(contents: &str) -> Result<LoadedManifest, toml::de
         workspace_manifest: WorkspaceManifest {
             agent_preset: normalize_preset(agent.preset),
             agent_command: normalize_command(agent.command),
+            service_widget: parse_widget(service.widget, PaneRole::Service),
+            runner_widget: parse_widget(runner.widget, PaneRole::Runner),
             service_command: normalize_command(service.command),
             runner_command: normalize_command(runner.command),
             actions,
@@ -251,6 +276,16 @@ pub fn load_project_manifest(root_dir: &Path) -> Option<LoadedManifest> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn invalid_widget_does_not_discard_runner_command() {
+        for setting in ["preset = 'unknown'", "show_duration = 'no'"] {
+            let raw = format!("[runner]\ncommand = ['cargo','test']\n[runner.widget]\n{setting}");
+            let manifest = parse_project_manifest(&raw).unwrap().workspace_manifest;
+            assert_eq!(manifest.runner_command.unwrap(), ["cargo", "test"]);
+            assert!(manifest.runner_widget.is_none());
+        }
+    }
 
     #[test]
     fn project_tools_are_discovered_without_running_manifests() {

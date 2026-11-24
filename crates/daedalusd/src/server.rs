@@ -316,6 +316,7 @@ async fn dispatch_request(
                 inspect_setup_supported: true,
                 recent_projects_supported: true,
                 project_setup_supported: true,
+                image_preview_supported: cfg!(unix),
                 home_dir: std::env::home_dir(),
             })
         }
@@ -515,6 +516,9 @@ async fn dispatch_request(
             f.project_setup_events = project_setup_events;
             Ok(ResponsePayload::Ok)
         }
+        ClientMessage::PreviewImage { workspace_id, path } => Ok(ResponsePayload::ImagePreview(
+            registry.preview_image(workspace_id, path).await?,
+        )),
         ClientMessage::ListRecentProjects => Ok(ResponsePayload::RecentProjects(
             registry.recent_projects().await,
         )),
@@ -666,6 +670,8 @@ mod tests {
 
     fn dummy_delta(pane_id: PaneId, seq: u64) -> ServerEvent {
         ServerEvent::GridDelta(GridDelta {
+            activity: None,
+            insight: None,
             pane_id,
             seq,
             cols: 80,

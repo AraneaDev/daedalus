@@ -933,6 +933,24 @@ impl Registry {
 
     /// Executes a custom action from the workspace's `.daedalus.toml` `[[actions]]` manifest
     /// by sending its command to the first pane matching `action.target`.
+    pub async fn preview_image(
+        &self,
+        id: WorkspaceId,
+        path: String,
+    ) -> Result<daedalus_proto::rpc::ImagePreview, ProtoError> {
+        let root = self
+            .workspaces
+            .read()
+            .await
+            .get(&id)
+            .ok_or(ProtoError::WorkspaceNotFound(id))?
+            .canonical_root_dir
+            .clone();
+        tokio::task::spawn_blocking(move || crate::preview::load(&root, &path))
+            .await
+            .map_err(|e| ProtoError::Internal(e.to_string()))?
+    }
+
     pub async fn run_workspace_action(
         &self,
         workspace_id: WorkspaceId,

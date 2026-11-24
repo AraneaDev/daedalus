@@ -65,10 +65,32 @@ fn srgb_channel_to_linear(c: f32) -> f32 {
     return pow((c + 0.055) / 1.055, 2.4);
 }
 
+fn stroke(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
+    let axis = b-a;
+    return length(p-a-axis*clamp(dot(p-a,axis)/dot(axis,axis),0.0,1.0));
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var color = in.color;
-    if in.style.x > 0.0 {
+    if in.style.x < 0.0 {
+        // Agent marks use normalized strokes, independent of OS symbol fonts.
+        let p=(in.position.xy-in.rect.xy)/in.rect.zw*2.0-1.0;
+        var d=1.0;
+        if in.style.x == -1.0 {
+            for(var k=0; k<6; k=k+1) {
+                let a=f32(k)*0.523599 + 0.1;
+                let axis=vec2<f32>(cos(a),sin(a))*0.81;
+                d=min(d,stroke(p,-axis,axis));
+            }
+        } else if in.style.x == -3.0 {
+            d=min(stroke(p,vec2(-0.75,0.51),vec2(0.0,-0.63)),stroke(p,vec2(0.0,-0.63),vec2(0.75,0.51)));
+        } else {
+            d=min(stroke(p,vec2(-0.72,-0.42),vec2(-0.24,0.0)),stroke(p,vec2(-0.24,0.0),vec2(-0.72,0.42)));
+            if in.style.x == -2.0 { d=min(d,stroke(p,vec2(0.08,0.48),vec2(0.76,0.48))); }
+        }
+        color.a*=clamp((0.115-d)*in.rect.z*0.5+0.5,0.0,1.0);
+    } else if in.style.x > 0.0 {
         let half_size = in.rect.zw * 0.5;
         let radius = min(in.style.x, min(half_size.x, half_size.y));
         let local = in.position.xy - in.rect.xy;
@@ -148,6 +170,23 @@ impl QuadInstance {
             color: color.to_array(),
             style: [0.0; 3],
         }
+    }
+
+    pub(super) fn agent_mark(
+        bounds: Rect,
+        preset: crate::state::AgentPreset,
+        theme: &crate::theme::Theme,
+    ) -> Self {
+        use crate::state::AgentPreset;
+        let (shape, color) = match preset {
+            AgentPreset::Claude => (-1., theme.status_busy),
+            AgentPreset::Codex => (-2., theme.border_focused),
+            AgentPreset::Agy => (-3., theme.text_primary),
+            AgentPreset::Shell => (-4., theme.text_muted),
+        };
+        let mut mark = Self::new(bounds, color);
+        mark.style[0] = shape;
+        mark
     }
 
     pub(super) fn rounded(mut self, radius: f32, outline: f32, highlight: f32) -> Self {

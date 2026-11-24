@@ -1,6 +1,7 @@
 pub mod builtin;
 #[cfg(feature = "ghostty-vt")]
 pub mod ghostty;
+mod runner;
 pub mod semantic;
 
 use daedalus_proto::{CursorState, GridDelta, GridRow, GridSnapshot, PaneId, SearchMatch};
@@ -29,12 +30,38 @@ impl Default for VtConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticEvent {
+    Title(String),
+    Attention,
     TerminalReply(Vec<u8>),
     CwdChanged(PathBuf),
     PromptStart,
     CommandInputStart,
     CommandExecuted,
     CommandFinished { exit_code: i32 },
+}
+
+fn terminal_title(fields: &[&[u8]]) -> String {
+    let mut bytes = Vec::with_capacity(256);
+    for (i, field) in fields.iter().enumerate() {
+        if bytes.len() == 256 {
+            break;
+        }
+        if i != 0 {
+            bytes.push(b';');
+        }
+        bytes.extend_from_slice(&field[..field.len().min(256 - bytes.len())]);
+    }
+    let mut result = String::new();
+    for ch in String::from_utf8_lossy(&bytes)
+        .chars()
+        .filter(|ch| !ch.is_control())
+    {
+        if result.len() + ch.len_utf8() > 256 {
+            break;
+        }
+        result.push(ch);
+    }
+    result
 }
 
 pub trait VtEngine: Send {
@@ -67,6 +94,74 @@ pub fn create_vt_engine(config: VtConfig) -> Box<dyn VtEngine> {
 mod tests {
     use super::*;
     use daedalus_proto::{CellFlags, Color};
+
+    #[test]
+    fn hyperlink_limits_and_resize_do_not_leave_stale_targets() {
+        use daedalus_proto::types::LinkSpan;
+        let pane = PaneId::new();
+        let mut vt = BuiltinVt::new(VtConfig {
+            cols: 80,
+            rows: 3,
+            scrollback_limit: 3,
+        });
+        for n in 0..30 {
+            vt.feed(format!("\x1b]8;;https://host/{n}\x07x").as_bytes());
+        }
+        let row = &vt.snapshot(pane, 0).rows_data[0];
+        assert_eq!(row.links.len(), LinkSpan::MAX_PER_ROW);
+        vt.feed(
+            format!(
+                "\r\n\x1b]8;;https://host/{}\x07x",
+                "a".repeat(LinkSpan::MAX_URI_BYTES)
+            )
+            .as_bytes(),
+        );
+        assert!(vt.snapshot(pane, 1).rows_data[1].links.is_empty());
+        vt.resize(4, 3);
+        assert!(
+            vt.snapshot(pane, 2).rows_data[0]
+                .links
+                .iter()
+                .all(|s| s.end <= 4)
+        );
+        vt.feed(b"\x1b[1;1H\x1b[2K");
+        assert!(vt.snapshot(pane, 3).rows_data[0].links.is_empty());
+    }
+
+    #[test]
+    fn hyperlink_wrap_scrollback_and_overwrite() {
+        let config = VtConfig {
+            cols: 8,
+            rows: 2,
+            scrollback_limit: 8,
+        };
+        fn exercise(mut vt: Box<dyn VtEngine>) {
+            let pane = PaneId::new();
+            vt.feed(b"\x1b]8;id=42;https://host/a;b\x1b\\123456789\x1b]8;;\x07!");
+            let before = vt.snapshot(pane, 0);
+            assert!(before.rows_data[0].wraps);
+            assert_eq!(before.rows_data[0].links[0].url, "https://host/a;b");
+            assert_eq!(before.rows_data[1].links[0].end, 1);
+            vt.feed(b"\x1b[1;4Hx");
+            let edited = vt.take_dirty_delta(pane, 1).unwrap();
+            let links = &edited.dirty_rows[0].links;
+            assert!(links.iter().any(|span| (span.start, span.end) == (0, 3)));
+            assert!(links.iter().any(|span| (span.start, span.end) == (4, 8)));
+            vt.feed(b"\x1b[2;1H\r\n");
+            let saved = vt.scrollback_window(1, 2);
+            assert_eq!(saved[0].links, *links);
+            vt.feed(b"\x1b[2J");
+            assert!(
+                vt.snapshot(pane, 2)
+                    .rows_data
+                    .iter()
+                    .all(|r| r.links.is_empty())
+            );
+        }
+        exercise(Box::new(BuiltinVt::new(config)));
+        #[cfg(feature = "ghostty-vt")]
+        exercise(Box::new(ghostty::GhosttyVt::new(config)));
+    }
 
     #[test]
     fn erase_line_modes_include_the_cursor_and_preserve_unaffected_cells() {

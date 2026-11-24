@@ -422,6 +422,8 @@ mod tests {
     #[test]
     fn recognizable_prompts_and_echoed_commands_do_not_become_quotes() {
         let row = |text: &str| GridRow {
+            links: Vec::new(),
+            wraps: false,
             row_index: 0,
             abs_row: 1,
             cells: vec![daedalus_proto::Cell {

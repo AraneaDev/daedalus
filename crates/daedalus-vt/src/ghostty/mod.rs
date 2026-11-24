@@ -51,7 +51,10 @@ impl GhosttyVt {
     }
 
     fn row(&self, y: usize, index: usize) -> GridRow {
+        let (wraps, links) = self.terminal.row_links(y as u32, self.info.cols);
         GridRow {
+            links,
+            wraps,
             row_index: index as u16,
             abs_row: self.base() + y as u64,
             cells: (0..self.info.cols)
@@ -119,6 +122,8 @@ impl VtEngine for GhosttyVt {
 
     fn snapshot(&self, pane_id: PaneId, seq: u64) -> GridSnapshot {
         GridSnapshot {
+            activity: None,
+            insight: None,
             pane_id,
             seq,
             cols: self.info.cols,
@@ -180,6 +185,8 @@ impl VtEngine for GhosttyVt {
             return None;
         }
         Some(GridDelta {
+            activity: None,
+            insight: None,
             pane_id,
             seq,
             cols: new.cols,

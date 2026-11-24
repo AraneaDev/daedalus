@@ -6,6 +6,8 @@ use std::{collections::HashMap, path::PathBuf};
 
 pub(super) fn make_row(row_index: u16, abs_row: u64, text: &str) -> GridRow {
     GridRow {
+        links: Vec::new(),
+        wraps: false,
         row_index,
         abs_row,
         cells: text
@@ -36,6 +38,7 @@ pub(super) fn make_pane_summary(ws_id: WorkspaceId, role: PaneRole) -> PaneSumma
         cwd: Some(PathBuf::from("/tmp/repo")),
         last_exit_code: None,
         has_failure_trace: false,
+        launch_preset: None,
         agent_state: None,
     }
 }

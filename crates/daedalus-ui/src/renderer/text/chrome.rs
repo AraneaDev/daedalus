@@ -167,6 +167,26 @@ impl TextRenderer {
         self.build_sidebar_text(state, layout, theme, cards);
         self.build_compact_recap_text(state, layout, theme);
         self.build_banner_text(state, layout, theme);
+        let s = self.scale_factor;
+        for &(role, rect) in &layout.insight_rows {
+            if let Some(text) = state.focused_widget_label(role) {
+                self.push_chrome_line(ChromeLineSpec {
+                    text: &text,
+                    left: rect.x + 10. * s,
+                    top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                    bounds: rect,
+                    max_w: (rect.width - 18. * s).max(1.),
+                    font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+                    line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                    color: if role == PaneRole::Runner && state.widget_diagnostic().is_some() {
+                        theme.status_err
+                    } else {
+                        theme.text_muted
+                    },
+                    bold: false,
+                });
+            }
+        }
 
         for pane_rect in &layout.panes {
             if state.active_workspace_id.is_some() {
@@ -736,7 +756,9 @@ impl TextRenderer {
                 .trim_start()
                 .to_owned()
         } else {
-            format!("{label}{cwd_suffix}{scroll_suffix}")
+            state
+                .widget_label(pane_rect.role)
+                .unwrap_or_else(|| format!("{label}{cwd_suffix}{scroll_suffix}"))
         };
         let title = match pane_state {
             Some(pane) if !state.zoomed => crate::state::terminal_title(title, pane.summary.status),
@@ -759,10 +781,36 @@ impl TextRenderer {
                         bold: false,
                     });
                 }
-                let max_w = (rect.width - close.map_or(0., |(_, b)| b.width) - 8. * s).max(1.);
+                let mark = super::super::agent_tab_mark(state, *id, label, *rect, s);
+                let mut inset = if mark.is_some() { 22. * s } else { 0. };
+                if mark.is_some()
+                    || (!matches!(label.as_str(), "‹" | "›" | "‹ Prev" | "Next ›")
+                        && state.panes.get(id).is_some_and(|p| p.unread_attention))
+                {
+                    if let Some(indicator) = state
+                        .panes
+                        .get(id)
+                        .and_then(|p| p.tab_indicator(state.reduced_motion))
+                    {
+                        self.push_chrome_line(ChromeLineSpec {
+                            text: &indicator.to_string(),
+                            left: rect.x + inset + 2. * s,
+                            top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                            max_w: 14. * s,
+                            bounds: *rect,
+                            font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+                            line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                            color: theme.border_focused,
+                            bold: true,
+                        });
+                    }
+                    inset += 14. * s;
+                }
+                let max_w =
+                    (rect.width - inset - close.map_or(0., |(_, b)| b.width) - 8. * s).max(1.);
                 self.push_chrome_line(ChromeLineSpec {
                     text: label,
-                    left: rect.x + 4. * s,
+                    left: rect.x + inset + 4. * s,
                     top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
                     max_w,
                     bounds: *rect,
@@ -847,11 +895,11 @@ impl TextRenderer {
                 PaneRole::Agent if pill.width < 105. * s => ("Preset".into(), theme.border_focused),
                 PaneRole::Runner if pill.width < 150. * s => ("Forward".into(), theme.status_err),
                 PaneRole::Agent => {
-                    let preset_name = pane_state
-                        .and_then(|p| p.agent_preset)
-                        .map(|p| p.short_name())
-                        .unwrap_or("preset");
-                    (format!("Preset: {preset_name}"), theme.border_focused)
+                    let preset_label = pane_state.and_then(|p| p.agent_preset).map_or_else(
+                        || "Choose preset".into(),
+                        |p| format!("Preset: {}", p.short_name()),
+                    );
+                    (preset_label, theme.border_focused)
                 }
                 PaneRole::Runner => (
                     if cfg!(target_os = "macos") {
@@ -1016,12 +1064,16 @@ mod tests {
         let pane_id = ws.panes[0];
         let event = |seq, text: &str| {
             UiEvent::ServerEvent(ServerEvent::GridDelta(GridDelta {
+                activity: None,
+                insight: None,
                 pane_id,
                 seq,
                 cols: 20,
                 rows: 5,
                 cursor: Default::default(),
                 dirty_rows: vec![GridRow {
+                    links: Vec::new(),
+                    wraps: false,
                     row_index: 0,
                     abs_row: 0,
                     cells: vec![Cell {

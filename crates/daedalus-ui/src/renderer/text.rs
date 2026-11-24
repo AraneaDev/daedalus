@@ -600,15 +600,15 @@ impl TextRenderer {
     ) {
         let (screen_w, screen_h) = screen_size;
         self.modal_items.clear();
-        let modal_open = state.failure_recipients.is_some()
-            || state.setup_review.open
-            || state.workspace_form.open
-            || state.settings.open
-            || state.action_palette.open
-            || state.picker.open
-            || state.worktree_modal.open
-            || state.close_modal.open
-            || state.search.is_some();
+        let preview = layout
+            .preview_panel(state, self.scale_factor)
+            .map(|rect| (rect, "×  Image preview"))
+            .or_else(|| {
+                layout
+                    .preview_button(state, self.scale_factor)
+                    .map(|rect| (rect, "Preview image"))
+            });
+        let modal_open = state.has_input_overlay() || preview.is_some();
         self.has_modal_text = modal_open;
         if modal_open {
             if let Some(choices) = &state.failure_recipients {
@@ -627,6 +627,18 @@ impl TextRenderer {
                 self.build_close_modal_items(state, theme, screen_w, screen_h);
             } else if let Some(ref search) = state.search {
                 self.build_search_bar_items(search, state, layout, theme);
+            } else if let Some((panel, label)) = preview {
+                self.push_modal_line(ChromeLineSpec {
+                    text: label,
+                    left: panel.x + 5. * self.scale_factor,
+                    top: panel.y + 2. * self.scale_factor,
+                    bounds: panel,
+                    max_w: panel.width,
+                    font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+                    line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
+                    color: theme.text_primary,
+                    bold: true,
+                });
             }
             let modal_areas: Vec<TextArea<'_>> = self
                 .modal_items
@@ -886,6 +898,8 @@ mod tests {
         let mut changed = pane.viewport_rows[0].clone();
         changed.cells[0].text = "z".into();
         pane.apply_delta(GridDelta {
+            activity: None,
+            insight: None,
             pane_id: agent,
             seq: 2,
             cols: 20,
@@ -926,6 +940,8 @@ mod tests {
     #[test]
     fn build_row_spans_coalesces_adjacent_cells_and_skips_wide_continuations() {
         let row = GridRow {
+            links: Vec::new(),
+            wraps: false,
             row_index: 0,
             abs_row: 0,
             cells: vec![

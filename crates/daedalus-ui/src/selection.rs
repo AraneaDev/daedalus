@@ -207,6 +207,8 @@ mod tests {
             cells.push(Cell::default());
         }
         GridRow {
+            links: Vec::new(),
+            wraps: false,
             row_index,
             abs_row,
             cells,
