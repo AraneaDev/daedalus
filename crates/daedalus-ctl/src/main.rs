@@ -364,7 +364,7 @@ fn resolve_daedalusd_binary(explicit: Option<PathBuf>, current_exe: Option<&Path
 
 fn default_launchd_log_dir(home: Option<&str>) -> PathBuf {
     match home.map(str::trim).filter(|h| !h.is_empty()) {
-        Some(h) => PathBuf::from(h).join("Library").join("Logs"),
+        Some(h) => PathBuf::from(format!("{}/Library/Logs", h.trim_end_matches('/'))),
         None => std::env::temp_dir(),
     }
 }

@@ -112,4 +112,8 @@ jobs:
           cargo install cargo-mutants --version 27.1.0 --locked
       - name: Install Linux desktop test dependencies
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev xvfb xauth libxkbcommon-x11-0 mesa-vulkan-drivers python3-xlib
+      - name: Install coverage baseline toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component llvm-tools-preview
       - run: scripts/check-test-quality.sh
+        env:
+          RUSTUP_TOOLCHAIN: 1.94.1

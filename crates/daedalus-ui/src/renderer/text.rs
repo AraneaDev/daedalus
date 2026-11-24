@@ -707,6 +707,17 @@ impl TextRenderer {
         buffer.set_text(spec.text, &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
+        // Some fallback fonts provide unusable advances. Retry with the primary
+        // font before glyphon converts the shaped positions to integer pixels.
+        if buffer.layout_runs().flat_map(|run| run.glyphs).any(|g| {
+            let x = spec.left + g.x + g.font_size * g.x_offset;
+            let y = spec.top + g.y - g.font_size * g.y_offset;
+            !(x.abs() < i32::MAX as f32 && y.abs() < i32::MAX as f32)
+        }) {
+            buffer.set_text(spec.text, &attrs, Shaping::Basic, None);
+            buffer.shape_until_scroll(&mut self.font_system, false);
+        }
+
         Some(ChromeTextItem {
             buffer,
             left: spec.left,

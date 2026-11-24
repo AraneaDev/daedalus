@@ -250,10 +250,10 @@ To measure workspace coverage and test whether the suite detects changes to fram
 decoding and terminal erasure, run:
 
 ```sh
-rustup component add llvm-tools-preview
+rustup toolchain install 1.94.1 --profile minimal --component llvm-tools-preview
 cargo install cargo-llvm-cov --version 0.9.0 --locked
 cargo install cargo-mutants --version 27.1.0 --locked
-scripts/check-test-quality.sh
+RUSTUP_TOOLCHAIN=1.94.1 scripts/check-test-quality.sh
 ```
 
 The workspace coverage floors are 92.9% for lines, 92.5% for functions, and 92.4% for regions.
