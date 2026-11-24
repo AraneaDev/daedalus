@@ -1219,8 +1219,11 @@ async fn workspace_recent_lists_closed_project() {
 
 #[tokio::test]
 async fn workspace_recent_reports_unsupported_daemon() {
+    // The file-level protocol imports are Unix-only; this mock speaks TCP on every platform.
     use daedalus_proto::transport::IpcListener;
-    use daedalus_proto::{Request, ServerMessage};
+    use daedalus_proto::{
+        ClientMessage, Request, ResponsePayload, ServerMessage, read_frame, write_frame,
+    };
     let mut listener = IpcListener::bind(std::path::Path::new("tcp://127.0.0.1:0"))
         .await
         .unwrap();
