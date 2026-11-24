@@ -1161,12 +1161,14 @@ async fn workspace_recent_lists_closed_project_and_rejects_old_daemon() {
             })
             .await;
     });
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let dir_path = dir.path().to_path_buf();
+    let body = tokio::spawn(async move {
         let bin = env!("CARGO_BIN_EXE_daedalus-ctl");
         let run = |args: Vec<String>| {
             let sock = sock.clone();
             async move {
                 Command::new(bin)
+                    .kill_on_drop(true)
                     .arg("--socket")
                     .arg(sock)
                     .args(args)
@@ -1183,7 +1185,7 @@ async fn workspace_recent_lists_closed_project_and_rejects_old_daemon() {
             "No recent projects.\n"
         );
 
-        let project_dir = dir.path().join("proj");
+        let project_dir = dir_path.join("proj");
         std::fs::create_dir(&project_dir).unwrap();
         let create = run(vec![
             "workspace".into(),
@@ -1206,12 +1208,13 @@ async fn workspace_recent_lists_closed_project_and_rejects_old_daemon() {
         assert_eq!(fields[0], "recent-demo");
         assert!(fields[1].ends_with("proj"), "{out}");
         assert_eq!(fields[2].len(), "YYYY-MM-DD HH:MM".len(), "{out}");
-    })
-    .await
-    .expect("workspace recent e2e timed out");
-
+    });
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), body).await;
     let _ = shutdown_tx.send(());
-    let _ = srv_handle.await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), srv_handle).await;
+    result
+        .expect("workspace recent e2e timed out")
+        .expect("workspace recent e2e body panicked");
 }
 
 #[tokio::test]
@@ -1247,6 +1250,7 @@ async fn workspace_recent_reports_unsupported_daemon() {
     });
     let output = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let output = Command::new(env!("CARGO_BIN_EXE_daedalus-ctl"))
+            .kill_on_drop(true)
             .arg("--socket")
             .arg(endpoint)
             .args(["workspace", "recent"])
