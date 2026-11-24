@@ -2,6 +2,7 @@
 
 mod accessibility;
 mod pointer;
+mod setup;
 mod workspace_settings;
 
 use std::path::PathBuf;
@@ -127,6 +128,7 @@ impl UiEventSink for EventLoopProxySink {
 struct DaedalusApp {
     config: BridgeConfig,
     ui_config: UiConfig,
+    setup: setup::SetupFlow,
     history: daedalus_ui::activity_history::ActivityHistory,
     focused: bool,
     occluded: bool,
@@ -155,6 +157,7 @@ impl DaedalusApp {
         profile: &std::path::Path,
     ) -> Self {
         Self {
+            setup: Default::default(),
             history: daedalus_ui::activity_history::ActivityHistory::new(
                 profile,
                 &config.socket_path,
@@ -184,6 +187,7 @@ impl DaedalusApp {
     fn sync_history_visit(&mut self) {
         let visible = self.focused
             && !self.occluded
+            && !self.state.setup_review.open
             && !self.state.settings.open
             && !self.state.workspace_form.open
             && !self.state.worktree_modal.open
@@ -245,16 +249,30 @@ impl DaedalusApp {
             layout.set_named_tabs(&entries, self.state.focused_pane_id(), scale_factor);
         }
         layout.sidebar_first = self.state.sidebar_first;
-        layout.sidebar_content = layout.sidebar.map(|sidebar| {
-            std::sync::Arc::new(
-                daedalus_ui::sidebar_content::SidebarContent::for_workspaces(
-                    &self.state.workspaces,
-                    sidebar,
-                    self.state.sidebar_first,
-                    scale_factor,
-                ),
-            )
-        });
+        if let Some(sidebar) = layout.sidebar {
+            use daedalus_ui::sidebar_content::{SidebarContent, SidebarRow};
+            let list = SidebarContent::for_workspaces(
+                &self.state.workspaces,
+                sidebar,
+                self.state.sidebar_first,
+                scale_factor,
+            );
+            for (row, rect) in list.rows[list.visible.clone()].iter().zip(&list.rects) {
+                if let SidebarRow::Workspace(index) = row {
+                    let ws = &self.state.workspaces[*index];
+                    if self.state.failed_runner(ws).is_some() {
+                        layout.failed_run_buttons.push((
+                            ws.id,
+                            daedalus_ui::layout::sidebar_failed_run_rect(*rect, scale_factor),
+                        ));
+                    }
+                }
+            }
+            layout.sidebar_content = Some(Arc::new(list));
+        }
+        if self.state.active_test_workspace().is_some() {
+            layout.enable_run_tests(scale_factor);
+        }
         Some(layout)
     }
 
@@ -384,7 +402,18 @@ impl DaedalusApp {
     }
 
     fn create_new_workspace(&mut self) {
+        if self.setup_installer_is_running() {
+            self.show_toast(
+                "Finish or close the setup terminal before starting another workspace.",
+                false,
+            );
+            return;
+        }
+        self.reset_setup_draft();
         self.state.workspace_form.begin(&self.config.initial_dir);
+        self.state
+            .workspace_form
+            .set_focus(daedalus_ui::workspace_form::Control::Folder);
         self.state.close_search();
         self.request_redraw();
     }
@@ -820,8 +849,17 @@ impl DaedalusApp {
                     self.request_redraw();
                 }
             }
+            UiAction::RunTests => self.run_saved_tests(),
             UiAction::WorkspaceSettings => self.open_workspace_settings(),
             UiAction::NewWorkspace => self.create_new_workspace(),
+            UiAction::OpenFailedRun(workspace) => self.open_failed_run(workspace),
+            UiAction::OpenNextFailedRun => {
+                if let Some(workspace) = self.state.next_failed_workspace() {
+                    self.open_failed_run(workspace);
+                } else {
+                    self.show_toast("No failed runs in open workspaces", false);
+                }
+            }
             UiAction::SwitchWorkspaceNext => self.switch_workspace_by(1),
             UiAction::SwitchWorkspacePrev => self.switch_workspace_by(-1),
             UiAction::CopySelection => self.copy_focused_selection(),
@@ -936,6 +974,13 @@ impl DaedalusApp {
                     self.request_redraw();
                 }
             }
+            UiAction::SearchToggleCase => {
+                if let Some(ref mut search) = self.state.search {
+                    search.toggle_case();
+                    self.run_pane_search();
+                    self.request_redraw();
+                }
+            }
             UiAction::SearchNext => {
                 if let Some(ref mut search) = self.state.search {
                     search.step_next();
@@ -956,6 +1001,82 @@ impl DaedalusApp {
             }
             UiAction::Ignore => {}
         }
+    }
+
+    fn handle_recap_key(&mut self, key: &winit::keyboard::Key, repeat: bool) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+        if self.state.picker.open
+            || self.state.worktree_modal.open
+            || self.state.close_modal.open
+            || self.state.search.is_some()
+            || self.state.action_palette.open
+        {
+            return false;
+        }
+        let open = daedalus_ui::input::is_primary_shift_char(
+            key,
+            self.modifiers,
+            "y",
+            cfg!(target_os = "macos"),
+        );
+        if !open && self.state.recap.keyboard_row.is_none() {
+            return false;
+        }
+        let targets = self
+            .renderer
+            .as_ref()
+            .map_or(&[][..], |r| r.recap_targets());
+        let selected = self
+            .state
+            .recap
+            .keyboard_row
+            .as_ref()
+            .and_then(|current| targets.iter().position(|(_, row)| row == current));
+        if !repeat {
+            self.state.recap.keyboard_row = match key {
+                _ if open => targets.first().map(|(_, row)| row.clone()),
+                Key::Named(NamedKey::ArrowDown | NamedKey::ArrowUp) if !targets.is_empty() => {
+                    let index = selected.unwrap_or(0);
+                    let next = if matches!(key, Key::Named(NamedKey::ArrowUp)) {
+                        index.checked_sub(1).unwrap_or(targets.len() - 1)
+                    } else {
+                        (index + 1) % targets.len()
+                    };
+                    Some(targets[next].1.clone())
+                }
+                Key::Named(NamedKey::Enter) => {
+                    if let Some(index) = selected {
+                        let row = targets[index].1.clone();
+                        if self.state.focus_recap_row(&row) {
+                            self.schedule_resize_flush();
+                        }
+                    }
+                    None
+                }
+                Key::Named(NamedKey::Escape) => None,
+                _ => self.state.recap.keyboard_row.take(),
+            };
+            self.request_redraw();
+        }
+        true
+    }
+
+    fn open_failed_run(&mut self, workspace: WorkspaceId) {
+        let Some(pane) = self
+            .state
+            .workspaces
+            .iter()
+            .find(|ws| ws.id == workspace)
+            .and_then(|ws| self.state.failed_runner(ws))
+        else {
+            return;
+        };
+        self.state.select_workspace(workspace);
+        self.state.select_session(workspace, PaneRole::Runner, pane);
+        self.state.recap.keyboard_row = None;
+        self.reveal_active_workspace();
+        self.schedule_resize_flush();
+        self.request_redraw();
     }
 
     fn activate_session(&mut self, target: HitTarget) {
@@ -997,6 +1118,7 @@ impl DaedalusApp {
             return;
         }
         if self.state.workspace_form.open
+            || self.state.setup_review.open
             || self.state.worktree_modal.open
             || self.state.close_modal.open
         {
@@ -1160,7 +1282,11 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                         }
                         accesskit_winit::WindowEvent::ActionRequested(request) => {
                             if self.accessibility_active {
-                                if let Some(target) =
+                                if let Some(action) =
+                                    accessibility::setup_action(&mut self.state, &request)
+                                {
+                                    self.handle_setup_action(action);
+                                } else if let Some(target) =
                                     self.terminal_controls.action(&self.state, &request)
                                 {
                                     self.activate_session(target);
@@ -1172,9 +1298,11 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                                     accessibility::workspace_action(&mut self.state, &request)
                                 {
                                     self.handle_workspace_form(action);
-                                } else if let Some(action) =
-                                    accessibility::action(&self.state, &request)
-                                {
+                                } else if let Some(action) = accessibility::action(
+                                    &self.state,
+                                    &request,
+                                    &self.terminal_controls,
+                                ) {
                                     self.handle_ui_action(action);
                                 }
                             }
@@ -1245,6 +1373,7 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 self.schedule_resize_flush();
             }
             UiEvent::Disconnected => {
+                self.setup_disconnected();
                 self.history.connection(false);
                 self.state.connection = ConnectionState::Reconnecting;
                 self.state.workspace_list_loaded = false;
@@ -1270,30 +1399,31 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
             UiEvent::WorkspacesLoaded(workspaces) => {
                 self.restore_session_names(&workspaces);
                 self.state.set_workspaces(workspaces);
+                self.offer_first_workspace();
                 self.ensure_active_workspace_panes();
                 self.schedule_resize_flush();
             }
+            UiEvent::SetupInspected { session, result } => self.setup_inspected(session, result),
+            UiEvent::SetupInstallerStarted {
+                workspace_id,
+                pane_id,
+            } => self.setup_installer_started(workspace_id, pane_id),
+            UiEvent::SetupInstallerFinished(pane, code) => {
+                self.setup_installer_finished(pane, code)
+            }
+            UiEvent::SetupInstallerFailed {
+                workspace_id,
+                message,
+            } => self.setup_failed(workspace_id, message),
+            UiEvent::SetupApplied {
+                workspace_id,
+                error,
+            } => self.setup_applied(workspace_id, error),
             UiEvent::ManualWorkspaceCreated { session, workspace } => {
-                let id = workspace.id;
-                let current = self.state.workspace_form.finish_submission(session, None);
-                if !current {
-                    self.show_toast(format!("Created workspace {}", workspace.name), false);
-                }
-                self.state.upsert_workspace(workspace);
-                if current {
-                    self.state.select_workspace(id);
-                    self.open_workspace_settings();
-                }
-                self.schedule_resize_flush();
+                self.setup_created(session, workspace);
             }
             UiEvent::ManualWorkspaceFailed { session, message } => {
-                if !self
-                    .state
-                    .workspace_form
-                    .finish_submission(session, Some(message.clone()))
-                {
-                    self.show_toast(format!("Workspace creation failed: {message}"), true);
-                }
+                self.setup_creation_failed(session, message)
             }
             UiEvent::WorkspaceCreated(ws) => {
                 let ws_id = ws.id;
@@ -1321,6 +1451,7 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 assignment,
             } => self.assignment_started(workspace_id, pane_id, assignment),
             UiEvent::PaneClosed { pane_id } => {
+                self.setup_installer_finished(pane_id, None);
                 self.state.remove_session(pane_id);
                 self.schedule_resize_flush();
             }
@@ -1378,6 +1509,12 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 );
             }
             UiEvent::ServerEvent(server_event) => {
+                let ended = match &server_event {
+                    daedalus_proto::ServerEvent::PaneExited { pane_id, exit_code } => {
+                        Some((*pane_id, *exit_code))
+                    }
+                    _ => None,
+                };
                 let changed_pane = match &server_event {
                     daedalus_proto::ServerEvent::GridDelta(delta)
                         if !delta.dirty_rows.is_empty()
@@ -1396,6 +1533,9 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                     self.send_command(UiCommand::RequestSnapshot {
                         pane_id: resync_pane_id,
                     });
+                }
+                if let Some((id, code)) = ended {
+                    self.setup_installer_finished(id, code);
                 }
                 if let Some(pane_id) = changed_pane {
                     self.request_scrollback_if_needed(pane_id);
@@ -1522,18 +1662,27 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                         self.request_redraw();
                         return;
                     }
-                    if self.state.workspace_form.open || self.state.settings.open {
+                    if self.state.workspace_form.open
+                        || self.state.settings.open
+                        || self.state.setup_review.open
+                    {
                         if self.key_repeats.form_press(
                             event.physical_key,
                             &event.logical_key,
                             event.repeat,
                         ) {
-                            if self.state.workspace_form.open {
+                            if self.state.setup_review.open {
+                                self.setup_key(&event.logical_key);
+                            } else if self.state.workspace_form.open {
                                 self.workspace_form_key(&event.logical_key);
                             } else {
                                 self.settings_key(&event.logical_key);
                             }
                         }
+                        return;
+                    }
+                    if self.handle_recap_key(&event.logical_key, event.repeat) {
+                        self.key_repeats.suppress(event.physical_key);
                         return;
                     }
                     let action = translate_key(
@@ -1553,7 +1702,14 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 }
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                if self.state.failure_recipients.is_some() {
+                if self.state.failure_recipients.is_some()
+                    || self.state.recap.keyboard_row.is_some()
+                {
+                    return;
+                }
+                if self.state.setup_review.open {
+                    self.state.setup_review.insert_text(&text);
+                    self.request_redraw();
                     return;
                 }
                 if self.state.workspace_form.open {
@@ -1721,6 +1877,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(daedalus_proto::remote::SshTarget::parse)
         .transpose()?
         .map(|target| target.host);
+    let bootstrap_explicit_dir = args.dir.is_some();
     let initial_dir = args.dir.unwrap_or_else(|| {
         if remote_host.is_some() {
             PathBuf::from(".")
@@ -1730,6 +1887,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let config = BridgeConfig {
+        bootstrap_explicit_dir,
         socket_path,
         auth_token: args.auth_token,
         initial_dir,

@@ -1,5 +1,6 @@
 mod launch;
 mod rpc;
+mod setup;
 mod workspace;
 
 use std::path::PathBuf;
@@ -42,6 +43,7 @@ pub struct BridgeConfig {
     pub socket_path: PathBuf,
     pub auth_token: Option<String>,
     pub initial_dir: PathBuf,
+    pub bootstrap_explicit_dir: bool,
     pub default_agent: AgentPreset,
     pub auto_spawn_daemon: bool,
 }
@@ -51,6 +53,7 @@ impl std::fmt::Debug for BridgeConfig {
         f.debug_struct("BridgeConfig")
             .field("socket_path", &self.socket_path)
             .field("initial_dir", &self.initial_dir)
+            .field("bootstrap_explicit_dir", &self.bootstrap_explicit_dir)
             .field("default_agent", &self.default_agent)
             .field("auto_spawn_daemon", &self.auto_spawn_daemon)
             .field(
@@ -64,6 +67,20 @@ impl std::fmt::Debug for BridgeConfig {
 /// Commands sent from the UI thread to `DaemonBridge`.
 #[derive(Debug, Clone)]
 pub enum UiCommand {
+    InspectSetup {
+        session: u64,
+        root_dir: PathBuf,
+        executables: Vec<String>,
+    },
+    ApplySetup {
+        workspace_id: WorkspaceId,
+        assignments: Vec<crate::assignments::Assignment>,
+        launch: Vec<String>,
+    },
+    InstallSetupTool {
+        workspace_id: WorkspaceId,
+        argv: Vec<String>,
+    },
     ReadActivity {
         workspace_id: WorkspaceId,
         cursor: Option<daedalus_proto::ActivityCursor>,
@@ -154,6 +171,23 @@ pub enum UiCommand {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum UiEvent {
+    SetupInspected {
+        session: u64,
+        result: Result<daedalus_proto::SetupInspection, String>,
+    },
+    SetupApplied {
+        workspace_id: WorkspaceId,
+        error: Option<String>,
+    },
+    SetupInstallerStarted {
+        workspace_id: WorkspaceId,
+        pane_id: PaneId,
+    },
+    SetupInstallerFinished(PaneId, Option<i32>),
+    SetupInstallerFailed {
+        workspace_id: WorkspaceId,
+        message: String,
+    },
     JournalCapability(bool),
     ActivityRead {
         token: u64,
@@ -316,9 +350,15 @@ async fn run_bridge(
                 // A queue belongs to exactly one connection. Dropping the connection
                 // also invalidates commands accepted just before its loss.
                 let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-                let initialized =
-                    initialize_session(&conn, &config, &sink, &mut bootstrapped, &session, cmd_tx)
-                        .await;
+                let initialized = initialize_session(
+                    &mut conn,
+                    &config,
+                    &sink,
+                    &mut bootstrapped,
+                    &session,
+                    cmd_tx,
+                )
+                .await;
                 match initialized {
                     Ok(()) => {
                         session_loop(&mut conn, &sink, &mut cmd_rx).await;
@@ -381,7 +421,7 @@ async fn run_bridge(
 }
 
 async fn initialize_session(
-    conn: &RpcConnection,
+    conn: &mut RpcConnection,
     config: &BridgeConfig,
     sink: &Arc<dyn UiEventSink>,
     bootstrapped: &mut bool,
@@ -400,26 +440,34 @@ async fn initialize_session(
             )));
         }
     }
-    let journal = matches!(
-        conn.call(ClientMessage::Ping).await?,
-        ResponsePayload::Pong {
-            journal_supported: true,
-            ..
-        }
-    );
+    let ResponsePayload::Pong {
+        journal_supported,
+        inspect_setup_supported,
+        ..
+    } = conn.call(ClientMessage::Ping).await?
+    else {
+        return Err(RpcError::Proto(ProtoError::InvalidRequest(
+            "Unexpected response to daemon handshake.".into(),
+        )));
+    };
+    conn.inspect_setup_supported = inspect_setup_supported;
     let _ = conn
         .call(ClientMessage::Subscribe { pane_ids: None })
         .await?;
     session.send_replace(Some(cmd_tx));
     sink.emit(UiEvent::Connected);
-    sink.emit(UiEvent::JournalCapability(journal));
+    sink.emit(UiEvent::JournalCapability(journal_supported));
 
     let workspaces = match conn.call(ClientMessage::ListWorkspaces).await? {
         ResponsePayload::Workspaces(ws) => ws,
-        _ => Vec::new(),
+        _ => {
+            return Err(RpcError::Proto(ProtoError::Internal(
+                "Unexpected workspace list response.".into(),
+            )));
+        }
     };
 
-    if workspaces.is_empty() && !*bootstrapped {
+    if workspaces.is_empty() && !*bootstrapped && config.bootstrap_explicit_dir {
         let name = workspace_name_from_dir(&config.initial_dir);
         create_and_populate_workspace(
             conn,
@@ -504,6 +552,23 @@ async fn handle_command(
     cmd: UiCommand,
 ) -> Result<(), RpcError> {
     match cmd {
+        UiCommand::InspectSetup {
+            session,
+            root_dir,
+            executables,
+        } => {
+            setup::inspect(conn, sink, session, root_dir, executables).await?;
+        }
+        UiCommand::ApplySetup {
+            workspace_id,
+            assignments,
+            launch,
+        } => {
+            setup::apply(conn, sink, workspace_id, assignments, launch).await?;
+        }
+        UiCommand::InstallSetupTool { workspace_id, argv } => {
+            setup::install(conn, sink, workspace_id, argv).await?;
+        }
         UiCommand::ReadActivity {
             workspace_id,
             cursor,
@@ -617,45 +682,7 @@ async fn handle_command(
             cols,
             rows,
         } => {
-            let preset = (assignment.role == daedalus_proto::PaneRole::Agent)
-                .then(|| {
-                    assignment
-                        .argv
-                        .first()
-                        .and_then(|program| AgentPreset::from_cli_name(program))
-                })
-                .flatten();
-            let response = conn
-                .call(ClientMessage::SpawnPane {
-                    workspace_id,
-                    role: assignment.role,
-                    command: (!assignment.argv.is_empty()).then(|| assignment.argv.clone()),
-                    cols,
-                    rows,
-                    shell: None,
-                    env: Default::default(),
-                })
-                .await?;
-            let ResponsePayload::PaneSpawned(summary) = response else {
-                return Err(RpcError::Proto(ProtoError::Internal(
-                    "unexpected assignment launch response".into(),
-                )));
-            };
-            let pane_id = summary.id;
-            sink.emit(UiEvent::PaneSpawned {
-                summary,
-                agent_preset: preset,
-            });
-            sink.emit(UiEvent::AssignmentStarted {
-                workspace_id,
-                pane_id,
-                assignment,
-            });
-            if let ResponsePayload::Snapshot(snapshot) =
-                conn.call(ClientMessage::GetSnapshot { pane_id }).await?
-            {
-                sink.emit(UiEvent::Snapshot(snapshot));
-            }
+            setup::launch_assignment(conn, sink, workspace_id, assignment, cols, rows).await?;
         }
         UiCommand::AddAgent {
             workspace_id,

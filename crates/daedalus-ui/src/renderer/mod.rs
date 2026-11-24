@@ -34,7 +34,7 @@ const WORKTREE_INPUT_LOGICAL_HEIGHT: f32 = 36.0;
 const WORKTREE_PAD_LOGICAL: f32 = 14.0;
 
 const SEARCH_BAR_LOGICAL_WIDTH: f32 = 340.0;
-const SEARCH_BAR_LOGICAL_HEIGHT: f32 = 30.0;
+const SEARCH_BAR_LOGICAL_HEIGHT: f32 = 58.0;
 
 const CLOSE_MODAL_LOGICAL_WIDTH: f32 = 440.0;
 const CLOSE_MODAL_LOGICAL_HEIGHT: f32 = 272.0;
@@ -166,6 +166,19 @@ pub fn search_bar_rect(pane_rect: &PaneRect, scale_factor: f32) -> Rect {
     let x = pane_rect.outer.right() - bar_w - margin;
     let y = pane_rect.header.bottom() + top_margin;
     Rect::new(x, y, bar_w, bar_h)
+}
+
+/// Previous, next and match-case hit areas occupy the lower row of the search bar.
+pub fn search_controls(bar: Rect) -> [Rect; 3] {
+    let y = bar.y + bar.height * 0.5;
+    let h = bar.bottom() - y;
+    let first = bar.width * 0.28;
+    let second = bar.width * 0.22;
+    [
+        Rect::new(bar.x, y, first, h),
+        Rect::new(bar.x + first, y, second, h),
+        Rect::new(bar.x + first + second, y, bar.width - first - second, h),
+    ]
 }
 
 /// Computes the centered physical-pixel rectangle of the "Close Workspace" confirmation modal.
@@ -786,7 +799,11 @@ fn collect_sidebar_quads(
         );
 
         for badge in &card.badges {
-            push_chrome_badge(quads, badge.rect, theme, border_w, badge.border);
+            if badge.kind == sidebar::BadgeKind::FailedRun {
+                quads.push(QuadInstance::new(badge.rect, theme.status_err));
+            } else {
+                push_chrome_badge(quads, badge.rect, theme, border_w, badge.border);
+            }
         }
     }
 
@@ -871,6 +888,19 @@ fn collect_overlay_quads(
         }
         return;
     }
+    if state.setup_review.open {
+        let modal = crate::setup_review::modal_rect(screen_w, screen_h, s);
+        push_modal_frame(quads, modal, screen, theme, border_w, modal.height * 0.14);
+        for (control, rect) in state.setup_review.controls(modal) {
+            let border = if state.setup_review.focus == control {
+                theme.border_focused
+            } else {
+                theme.border_unfocused
+            };
+            push_chrome_badge(quads, rect, theme, border_w, border);
+        }
+        return;
+    }
     if state.workspace_form.open {
         push_modal_frame(
             quads,
@@ -907,7 +937,7 @@ fn collect_overlay_quads(
             36. * s,
         );
         let modal = crate::settings::modal_rect(screen_w, screen_h, s);
-        for (control, rect) in crate::settings::controls(modal) {
+        for (control, rect) in state.settings.controls(modal) {
             let field = Rect::new(
                 rect.x + 2. * s,
                 rect.y + 2. * s,
@@ -1059,6 +1089,14 @@ fn collect_overlay_quads(
     {
         let bar = search_bar_rect(pane_rect, s);
         quads.push(QuadInstance::new(bar, theme.picker_bg.with_alpha(1.0)));
+        for (idx, rect) in search_controls(bar).into_iter().enumerate() {
+            let border = if idx == 2 && search.case_sensitive {
+                theme.border_focused
+            } else {
+                theme.border_unfocused
+            };
+            push_rect_border(quads, rect, border_w, border);
+        }
         push_rect_border(quads, bar, border_w, theme.border_focused);
     }
 }
@@ -1236,6 +1274,14 @@ impl GpuRenderer {
 
     pub fn cell_size(&self) -> (f32, f32) {
         self.text_renderer.cell_size()
+    }
+
+    pub fn recap_targets(&self) -> &[(Rect, crate::recap::RecapEntry)] {
+        if self.recap_visible() {
+            &self.text_renderer.recap_targets
+        } else {
+            &[]
+        }
     }
 
     pub fn recap_visible(&self) -> bool {

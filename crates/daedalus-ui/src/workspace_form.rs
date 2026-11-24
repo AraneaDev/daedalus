@@ -172,15 +172,22 @@ impl WorkspaceForm {
     }
 
     fn submit(&mut self) -> WorkspaceFormAction {
-        if self.name.trim().is_empty() {
-            self.set_focus(Control::Name);
-            self.error = Some("Enter a workspace name.".into());
-        } else if self.folder.trim().is_empty() {
+        if self.folder.trim().is_empty() {
             self.set_focus(Control::Folder);
             self.error = Some("Enter the workspace folder.".into());
         } else {
             return WorkspaceFormAction::Save {
-                name: self.name.trim().into(),
+                name: if self.name.trim().is_empty() {
+                    self.folder
+                        .trim_end_matches(['/', '\\'])
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .filter(|name| !name.is_empty() && *name != ".")
+                        .unwrap_or("Workspace")
+                        .into()
+                } else {
+                    self.name.trim().into()
+                },
                 folder: PathBuf::from(&self.folder),
             };
         }
@@ -272,11 +279,11 @@ impl WorkspaceForm {
 
     pub(crate) fn visible_label(&self, control: Control, columns: usize) -> String {
         let (label, text) = match control {
-            Control::Name => ("Name", &self.name),
+            Control::Name => ("Name (optional)", &self.name),
             Control::Folder => ("Folder", &self.folder),
             Control::Cancel if self.submitting => return "Dismiss".into(),
             Control::Cancel => return "Cancel".into(),
-            Control::Save => return "Create workspace".into(),
+            Control::Save => return "Review environment".into(),
         };
         if control == self.focus {
             crate::renderer::text::editable_label(label, text, self.cursor, columns)
@@ -287,7 +294,7 @@ impl WorkspaceForm {
 
     pub(crate) fn hint(&self) -> &str {
         if self.submitting {
-            "Creating workspace…"
+            "Checking project on daemon host…"
         } else if let Some(error) = &self.error {
             error
         } else if self.select_all && self.value(self.focus).is_some_and(|text| !text.is_empty()) {
@@ -352,9 +359,11 @@ mod tests {
         let mods = ModifiersState::empty();
         assert_eq!(
             form.key(&Key::Named(NamedKey::Enter), mods),
-            WorkspaceFormAction::None
+            WorkspaceFormAction::Save {
+                name: "initial".into(),
+                folder: "/initial".into()
+            }
         );
-        assert!(form.error.is_some());
         form.insert_text("Project");
         form.key(&Key::Named(NamedKey::Tab), mods);
         form.insert_text("/chosen folder");

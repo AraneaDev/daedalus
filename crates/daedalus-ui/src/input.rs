@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
-use daedalus_proto::{FailureTrace, PaneRole, wrap_bracketed_paste};
+use daedalus_proto::{FailureTrace, PaneRole, WorkspaceId, wrap_bracketed_paste};
 use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 
 pub use crate::state::FocusDirection;
@@ -30,6 +30,9 @@ pub enum UiAction {
     CopySelection,
     PasteClipboard,
     ForwardFailureToAgent,
+    OpenFailedRun(WorkspaceId),
+    OpenNextFailedRun,
+    RunTests,
     FontZoomIn,
     FontZoomOut,
     FontZoomReset,
@@ -57,6 +60,7 @@ pub enum UiAction {
     SearchBackspace,
     SearchNext,
     SearchPrev,
+    SearchToggleCase,
     SearchCancel,
     Ignore,
 }
@@ -89,6 +93,8 @@ impl KeyRepeatGuard {
                 | UiAction::CopySelection
                 | UiAction::PasteSearchQuery
                 | UiAction::PasteClipboard
+                | UiAction::RunTests
+                | UiAction::OpenNextFailedRun
                 | UiAction::ForwardFailureToAgent
                 | UiAction::PickerAdd
                 | UiAction::PickerConfirm
@@ -243,6 +249,10 @@ pub fn translate_key_for_platform(
     if ctrl && !shift && !alt {
         return match key {
             Key::Named(NamedKey::Tab) => UiAction::SwitchWorkspaceNext,
+            Key::Named(NamedKey::ArrowUp) => UiAction::SendBytes(b"\x1b[1;5A".to_vec()),
+            Key::Named(NamedKey::ArrowDown) => UiAction::SendBytes(b"\x1b[1;5B".to_vec()),
+            Key::Named(NamedKey::ArrowRight) => UiAction::SendBytes(b"\x1b[1;5C".to_vec()),
+            Key::Named(NamedKey::ArrowLeft) => UiAction::SendBytes(b"\x1b[1;5D".to_vec()),
             Key::Named(NamedKey::Space) => UiAction::SendBytes(vec![0x00]),
             Key::Character(ch) => {
                 if !is_macos {
@@ -345,6 +355,8 @@ fn translate_primary_shift_char(ch: &str) -> UiAction {
         "c" => UiAction::CopySelection,
         "v" => UiAction::PasteClipboard,
         "e" => UiAction::ForwardFailureToAgent,
+        "r" => UiAction::OpenNextFailedRun,
+        "t" => UiAction::RunTests,
         "=" | "+" => UiAction::FontZoomIn,
         _ => UiAction::Ignore,
     }
@@ -371,7 +383,12 @@ fn translate_macos_cmd(key: &Key, shift: bool) -> UiAction {
     }
 }
 
-fn is_primary_shift_char(key: &Key, mods: ModifiersState, target: &str, is_macos: bool) -> bool {
+pub fn is_primary_shift_char(
+    key: &Key,
+    mods: ModifiersState,
+    target: &str,
+    is_macos: bool,
+) -> bool {
     let primary_only = if is_macos {
         mods.super_key() && !mods.control_key()
     } else {
@@ -515,6 +532,7 @@ fn translate_search_key(
 
     match key {
         Key::Named(NamedKey::Escape) => UiAction::SearchCancel,
+        Key::Named(NamedKey::F4) => UiAction::SearchToggleCase,
         Key::Named(NamedKey::Enter) => {
             if mods.shift_key() {
                 UiAction::SearchPrev
@@ -628,6 +646,56 @@ mod tests {
 
     fn t_macos(key: &Key, text: Option<&str>, mods: ModifiersState) -> UiAction {
         translate_key_for_platform(key, text, mods, false, false, false, false, true)
+    }
+
+    #[test]
+    fn run_tests_uses_the_platform_workbench_modifier() {
+        let key = char_key("T");
+        assert_eq!(
+            t(&key, None, ModifiersState::CONTROL | ModifiersState::SHIFT),
+            UiAction::RunTests
+        );
+        assert_eq!(
+            t_macos(&key, None, ModifiersState::SUPER | ModifiersState::SHIFT),
+            UiAction::RunTests
+        );
+    }
+
+    #[test]
+    fn open_next_failed_run_uses_the_platform_workbench_shortcut() {
+        let key = char_key("R");
+        assert_eq!(
+            t(&key, None, ModifiersState::CONTROL | ModifiersState::SHIFT),
+            UiAction::OpenNextFailedRun
+        );
+        assert_eq!(
+            t_macos(&key, None, ModifiersState::SUPER | ModifiersState::SHIFT),
+            UiAction::OpenNextFailedRun
+        );
+    }
+
+    #[test]
+    fn ctrl_arrow_keys_forward_modified_cursor_sequences_to_the_terminal() {
+        for (key, sequence) in [
+            (NamedKey::ArrowLeft, b"\x1b[1;5D"),
+            (NamedKey::ArrowRight, b"\x1b[1;5C"),
+            (NamedKey::ArrowUp, b"\x1b[1;5A"),
+            (NamedKey::ArrowDown, b"\x1b[1;5B"),
+        ] {
+            for is_macos in [false, true] {
+                let action = translate_key_for_platform(
+                    &named_key(key),
+                    None,
+                    ModifiersState::CONTROL,
+                    false,
+                    false,
+                    false,
+                    false,
+                    is_macos,
+                );
+                assert_eq!(action, UiAction::SendBytes(sequence.to_vec()));
+            }
+        }
     }
 
     #[test]
@@ -1341,6 +1409,15 @@ mod tests {
 
     #[test]
     fn search_mode_captures_query_ime_navigation_and_cancel() {
+        assert_eq!(
+            translate_search_key(
+                &named_key(NamedKey::F4),
+                None,
+                ModifiersState::empty(),
+                false
+            ),
+            UiAction::SearchToggleCase
+        );
         let none = ModifiersState::empty();
         let shift = ModifiersState::SHIFT;
         let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;

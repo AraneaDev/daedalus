@@ -1,4 +1,4 @@
-use daedalus_proto::{PaneId, PaneRole};
+use daedalus_proto::{PaneId, PaneRole, WorkspaceId};
 
 pub const SIDEBAR_LOGICAL_WIDTH: f32 = 240.0;
 pub const HEADER_LOGICAL_HEIGHT: f32 = 26.0;
@@ -165,6 +165,8 @@ pub struct WorkspaceLayout {
     pub close_tab: Option<(PaneId, Rect)>,
     pub named_tabs: Vec<(PaneId, String, Rect)>,
     pub stacked: bool,
+    pub run_tests_button: Option<Rect>,
+    pub failed_run_buttons: Vec<(WorkspaceId, Rect)>,
     pub sidebar_first: usize,
     pub sidebar_content: Option<std::sync::Arc<crate::sidebar_content::SidebarContent>>,
     pub sidebar_toggle: Option<Rect>,
@@ -174,6 +176,26 @@ pub struct WorkspaceLayout {
 }
 
 impl WorkspaceLayout {
+    pub fn enable_run_tests(&mut self, scale: f32) {
+        let Some(header) = self.sidebar_toggle else {
+            return;
+        };
+        let settings = settings_button(
+            header,
+            self.sidebar_content.as_ref().and_then(|list| list.arrows),
+            scale,
+        );
+        let width = 68. * scale;
+        if settings.x - header.x >= width + 42. * scale {
+            self.run_tests_button = Some(Rect::new(
+                settings.x - width,
+                header.y,
+                width,
+                header.height,
+            ));
+        }
+    }
+
     pub fn set_named_tabs(
         &mut self,
         entries: &[(PaneId, String)],
@@ -225,7 +247,18 @@ impl WorkspaceLayout {
             );
         }
         for (id, label) in &entries[start..start + visible] {
-            push(*id, label.clone(), width);
+            let tab_width = if !overflow && Some(*id) == focused {
+                let spare = (available - width * capacity as f32).max(0.);
+                // Leave space for the close control and keep long assignment names bounded.
+                let desired = (unicode_width::UnicodeWidthStr::width(label.as_str()) as f32 * 8.
+                    + 32.)
+                    .min(240.)
+                    * scale;
+                desired.clamp(width, width + spare)
+            } else {
+                width
+            };
+            push(*id, label.clone(), tab_width);
         }
         if overflow {
             push(
@@ -260,8 +293,10 @@ pub enum HitTarget {
     SidebarPageDown,
     SidebarWorkspace(usize),
     SidebarWorkspaceClose(usize),
+    SidebarFailedRun(WorkspaceId),
     SidebarNewWorkspace,
     SidebarNewWorktree,
+    RunTests,
     SessionTab(PaneRole),
     SelectSession(PaneId),
     CloseSession(PaneId),
@@ -441,8 +476,10 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
         )]
     } else {
         let (agent_outer, service_outer, runner_outer) = if stacked {
-            let agent_h = canvas_h * 0.5;
-            let service_h = (canvas_h - agent_h) * 0.5;
+            // Reserve a readable terminal row for each role when the window is short.
+            let one_row = metrics.header_height + 2. * metrics.viewport_pad + input.cell_h.max(0.);
+            let service_h = (canvas_h * 0.25).max(one_row.min(canvas_h / 3.));
+            let agent_h = canvas_h - 2. * service_h;
             (
                 Rect::new(canvas_x, canvas_y, canvas_w, agent_h),
                 Rect::new(canvas_x, canvas_y + agent_h, canvas_w, service_h),
@@ -502,6 +539,8 @@ pub fn compute_layout(input: &LayoutInput) -> WorkspaceLayout {
         close_tab: None,
         named_tabs: Vec::new(),
         sidebar_toggle,
+        run_tests_button: None,
+        failed_run_buttons: Vec::new(),
         sidebar_first: 0,
         sidebar_content: None,
         stacked,
@@ -575,6 +614,15 @@ pub fn sidebar_workspace_rect(sidebar: Rect, index: usize, scale_factor: f32) ->
     let footer_top =
         sidebar.bottom() - m.sidebar_pad - m.sidebar_new_btn_height - m.sidebar_row_gap;
     Rect::new(x, y, w, m.sidebar_row_height.min((footer_top - y).max(0.0)))
+}
+
+/// Keeps the failed-run action inside the card and clear of its close control.
+pub fn sidebar_failed_run_rect(card: Rect, scale_factor: f32) -> Rect {
+    let s = LayoutMetrics::for_scale(scale_factor).scale_factor;
+    let right = (card.right() - 24.0 * s).max(card.x);
+    let left = (right - 78.0 * s).max(card.x);
+    let top = (card.y + 3.0 * s).min(card.bottom());
+    Rect::new(left, top, right - left, (card.bottom() - top).min(22.0 * s))
 }
 
 /// Computes the compact `×` close button rectangle in the top-right corner of a sidebar workspace card.
@@ -673,6 +721,12 @@ pub fn hit_test(
             return HitTarget::SidebarPageDown;
         }
     }
+    if layout
+        .run_tests_button
+        .is_some_and(|button| button.contains(x, y))
+    {
+        return HitTarget::RunTests;
+    }
     if workspace_count > 0
         && layout.sidebar_toggle.is_some_and(|rect| {
             settings_button(rect, list.as_ref().and_then(|l| l.arrows), scale_factor).contains(x, y)
@@ -689,6 +743,13 @@ pub fn hit_test(
     if let Some(sidebar) = layout.sidebar
         && sidebar.contains(x, y)
     {
+        if let Some(&(workspace, _)) = layout
+            .failed_run_buttons
+            .iter()
+            .find(|(_, rect)| rect.contains(x, y))
+        {
+            return HitTarget::SidebarFailedRun(workspace);
+        }
         let list = list.expect("visible sidebar has content");
         for (row, rect) in list.rows[list.visible.clone()].iter().zip(&list.rects) {
             if let SidebarRow::Workspace(i) = row
@@ -810,6 +871,52 @@ mod tests {
         assert_eq!(agent.action_pill.unwrap().width, 116.0);
         assert!(service.action_pill.is_none());
         assert!(runner.action_pill.is_none());
+    }
+
+    #[test]
+    fn wide_header_uses_spare_space_for_the_selected_terminal_title() {
+        let entries = [
+            (PaneId::new(), "Agent".into()),
+            (PaneId::new(), "Service".into()),
+            (PaneId::new(), "Exited 3 · Runner".into()),
+        ];
+        let mut layout = compute_layout(&LayoutInput {
+            window_w: 1440.,
+            zoomed: true,
+            ..default_input()
+        });
+        layout.set_named_tabs(&entries, Some(entries[2].0), 1.);
+        let tab = layout.named_tabs[2].2;
+        assert!(tab.width >= 160.);
+        assert!(tab.right() <= layout.panes[0].tab_strip(1.).right());
+        assert_eq!(layout.close_tab.unwrap().1.right(), tab.right());
+    }
+
+    #[test]
+    fn saved_test_button_has_its_own_workspace_header_target() {
+        for scale in [1., 1.5, 2.] {
+            let mut layout = compute_layout(&LayoutInput {
+                scale_factor: scale,
+                ..default_input()
+            });
+            layout.enable_run_tests(scale);
+            let button = layout.run_tests_button.unwrap();
+            assert!(
+                button.right() <= settings_button(layout.sidebar_toggle.unwrap(), None, scale).x
+            );
+            assert_eq!(
+                hit_test(
+                    &layout,
+                    1,
+                    scale,
+                    8.,
+                    16.,
+                    button.x + 8. * scale,
+                    button.y + 5. * scale
+                ),
+                HitTarget::RunTests
+            );
+        }
     }
 
     #[test]
@@ -1060,6 +1167,27 @@ mod tests {
     }
 
     #[test]
+    fn short_stacked_workbench_keeps_a_full_terminal_row_in_each_pane() {
+        for scale in [1., 1.5, 2.] {
+            let input = LayoutInput {
+                window_w: 420. * scale,
+                window_h: 230. * scale,
+                cell_h: 16. * scale,
+                scale_factor: scale,
+                has_top_banner: true,
+                ..default_input()
+            };
+            let layout = compute_layout(&input);
+            assert!(layout.stacked);
+            assert_eq!(layout.panes.len(), 3);
+            for pane in &layout.panes {
+                assert!(pane.viewport.height >= input.cell_h, "{:?}", pane.role);
+            }
+            assert_eq!(layout.panes.last().unwrap().outer.bottom(), input.window_h);
+        }
+    }
+
+    #[test]
     fn narrow_windows_stack_all_roles_and_keep_them_reachable_at_both_scales() {
         for scale in [1.0, 2.0] {
             let mut input = default_input();
@@ -1101,6 +1229,40 @@ mod tests {
             input.zoomed = true;
             input.focused_role = PaneRole::Runner;
             assert_eq!(compute_layout(&input).panes.len(), 1);
+        }
+    }
+
+    #[test]
+    fn failed_run_button_is_independent_of_card_and_close_at_each_scale() {
+        for scale in [1.0, 1.5, 2.0] {
+            let input = LayoutInput {
+                window_w: 640.0 * scale,
+                window_h: 420.0 * scale,
+                scale_factor: scale,
+                sidebar_override: Some(true),
+                ..default_input()
+            };
+            let mut layout = compute_layout(&input);
+            let row = sidebar_workspace_rect(layout.sidebar.unwrap(), 0, scale);
+            let button = sidebar_failed_run_rect(row, scale);
+            let close = sidebar_workspace_close_rect(row, scale);
+            let hit = |layout: &WorkspaceLayout, rect: Rect| {
+                hit_test(
+                    layout,
+                    1,
+                    scale,
+                    input.cell_w,
+                    input.cell_h,
+                    rect.x + rect.width / 2.0,
+                    rect.y + rect.height / 2.0,
+                )
+            };
+            assert_eq!(hit(&layout, button), HitTarget::SidebarWorkspace(0));
+            let workspace = WorkspaceId::new();
+            layout.failed_run_buttons.push((workspace, button));
+            assert_eq!(hit(&layout, button), HitTarget::SidebarFailedRun(workspace));
+            assert_eq!(hit(&layout, close), HitTarget::SidebarWorkspaceClose(0));
+            assert_eq!(hit(&layout, row), HitTarget::SidebarWorkspace(0));
         }
     }
 

@@ -340,6 +340,11 @@ impl SearchState {
         self.results_received = false;
     }
 
+    pub fn toggle_case(&mut self) {
+        self.case_sensitive = !self.case_sensitive;
+        self.invalidate_results();
+    }
+
     pub fn result_label(&self) -> Option<String> {
         if self.query.is_empty() || !self.results_received {
             return None;
@@ -702,9 +707,11 @@ pub struct AppState {
     pub zoomed: bool,
     pub remote_host: Option<String>,
     pub failure_recipients: Option<FailureRecipients>,
+    pub setup_review: crate::setup_review::SetupReview,
     pub workspace_form: crate::workspace_form::WorkspaceForm,
     pub settings: crate::settings::SettingsDialog,
     pub recap: crate::recap::Recap,
+    pub test_workspaces: HashSet<WorkspaceId>,
     pub session_names: HashMap<PaneId, String>,
     pub action_palette: ActionPaletteState,
     pub picker: PickerState,
@@ -743,9 +750,11 @@ impl AppState {
             zoomed: true,
             remote_host: None,
             failure_recipients: None,
+            setup_review: Default::default(),
             workspace_form: Default::default(),
             settings: Default::default(),
             recap: Default::default(),
+            test_workspaces: HashSet::new(),
             session_names: HashMap::new(),
             action_palette: ActionPaletteState::default(),
             picker: PickerState::default(),
@@ -870,26 +879,47 @@ impl AppState {
         true
     }
 
-    /// Cycles the active workspace forward (`delta > 0`) or backward (`delta < 0`), wrapping cleanly.
-    pub fn cycle_workspace(&mut self, delta: isize) -> Option<WorkspaceId> {
-        let order: Vec<_> = crate::sidebar_content::repository_groups(&self.workspaces)
+    fn workspaces_in_sidebar_order(&self) -> Vec<&WorkspaceView> {
+        crate::sidebar_content::repository_groups(&self.workspaces)
             .into_iter()
             .flat_map(|(_, indices)| indices)
-            .map(|index| self.workspaces[index].id)
-            .collect();
+            .map(|index| &self.workspaces[index])
+            .collect()
+    }
+
+    /// Select the current workspace's failure first, then advance through failures in sidebar order.
+    pub fn next_failed_workspace(&self) -> Option<WorkspaceId> {
+        let order = self.workspaces_in_sidebar_order();
+        let start = order
+            .iter()
+            .position(|ws| Some(ws.id) == self.active_workspace_id)
+            .map_or(0, |current| {
+                let failure = self.failed_runner(order[current]);
+                current + usize::from(failure.is_some() && failure == self.focused_pane_id())
+            });
+        order[start..]
+            .iter()
+            .chain(&order[..start])
+            .find(|ws| self.failed_runner(ws).is_some())
+            .map(|ws| ws.id)
+    }
+
+    /// Cycles the active workspace forward (`delta > 0`) or backward (`delta < 0`), wrapping cleanly.
+    pub fn cycle_workspace(&mut self, delta: isize) -> Option<WorkspaceId> {
+        let order = self.workspaces_in_sidebar_order();
         let len = order.len();
         if len == 0 {
             return None;
         }
         let next_idx = match self
             .active_workspace_id
-            .and_then(|id| order.iter().position(|ws| *ws == id))
+            .and_then(|id| order.iter().position(|ws| ws.id == id))
         {
             Some(idx) => (idx + delta.rem_euclid(len as isize) as usize) % len,
             None if delta < 0 => len - 1,
             None => 0,
         };
-        let next_id = order[next_idx];
+        let next_id = order[next_idx].id;
         self.select_workspace(next_id);
         Some(next_id)
     }
@@ -981,6 +1011,12 @@ impl AppState {
         }
     }
 
+    pub fn active_test_workspace(&self) -> Option<WorkspaceId> {
+        self.active_workspace_id.filter(|id| {
+            self.connection == ConnectionState::Connected && self.test_workspaces.contains(id)
+        })
+    }
+
     pub fn active_workspace(&self) -> Option<&WorkspaceView> {
         let id = self.active_workspace_id?;
         self.workspaces.iter().find(|ws| ws.id == id)
@@ -1029,6 +1065,43 @@ impl AppState {
     pub fn pane_for_role_mut(&mut self, role: PaneRole) -> Option<&mut PaneViewState> {
         let id = self.pane_id_for_role(role)?;
         self.panes.get_mut(&id)
+    }
+
+    pub fn recap_rows(&self, ws: &WorkspaceView) -> Vec<crate::recap::RecapEntry> {
+        let mut rows = self.recap.entries(ws.id);
+        if rows.iter().any(|row| row.pane.is_some()) {
+            let tabs = self.terminal_tabs(ws);
+            for row in &mut rows {
+                if let Some(id) = row.pane {
+                    if let Some((_, title)) = tabs.iter().find(|(pane, _)| *pane == id) {
+                        row.label = format!("{title} · {}", row.label);
+                    } else {
+                        row.pane = None;
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    pub fn focus_recap_row(&mut self, row: &crate::recap::RecapEntry) -> bool {
+        let Some(ws) = self.active_workspace() else {
+            return false;
+        };
+        let Some(id) = row.pane else { return false };
+        if !self.recap_rows(ws).contains(row) {
+            return false;
+        }
+        let Some(role) = self
+            .workspace_panes(ws)
+            .find(|pane| pane.id == id)
+            .map(|pane| pane.role)
+        else {
+            return false;
+        };
+        self.select_session(ws.id, role, id);
+        self.recap.keyboard_row = None;
+        true
     }
 
     /// Keep role ordinals in workspace order, including panes with a custom name.
@@ -1193,6 +1266,22 @@ impl AppState {
         format!("{} · {}", self.recipient_name(agent), agent.short())
     }
 
+    /// The last-listed runner whose latest known result failed, across all panes in the workspace.
+    pub fn failed_runner(&self, ws: &WorkspaceView) -> Option<PaneId> {
+        self.workspace_panes(ws)
+            .rev()
+            .filter(|pane| pane.role == PaneRole::Runner)
+            .find(|pane| {
+                let code = match pane.status {
+                    PaneStatus::Exited { code: Some(code) } => Some(code),
+                    _ => pane.last_exit_code,
+                };
+                // The daemon can retain a historical trace after a successful run.
+                code.map_or(pane.has_failure_trace, |code| code != 0)
+            })
+            .map(|pane| pane.id)
+    }
+
     pub fn runner_has_failure(&self) -> bool {
         self.pane_for_role(PaneRole::Runner)
             .is_some_and(|pane| pane.summary.has_failure_trace)
@@ -1227,6 +1316,8 @@ impl AppState {
         self.workspace_focus
             .retain(|id, _| workspaces.iter().any(|ws| ws.id == *id));
         self.selected_panes.retain(|_, id| live_panes.contains(id));
+        self.test_workspaces
+            .retain(|id| workspaces.iter().any(|ws| ws.id == *id));
         self.workspaces = workspaces;
         self.spawning_workspaces
             .retain(|ws_id| self.workspaces.iter().any(|ws| ws.id == *ws_id));
@@ -1537,6 +1628,58 @@ mod tests {
     }
 
     #[test]
+    fn recap_targets_named_siblings_independently_and_handles_closed_panes() {
+        use daedalus_proto::{ActivityCursor, ActivityEntry, ActivityKind, ActivityPage};
+        let (mut ws, first, _, _) = make_workspace_with_three_panes();
+        let second = make_pane_summary(ws.id, PaneRole::Agent);
+        let second_id = second.id;
+        let workspace = ws.id;
+        ws.panes.push(second);
+        let mut state = AppState::new();
+        state.set_workspaces(vec![ws]);
+        state.recap.select(Some(workspace));
+        state.session_names.insert(first, "Reviewer".into());
+        let page = ActivityPage {
+            workspace_id: workspace,
+            cursor: ActivityCursor {
+                epoch: workspace,
+                seq: 2,
+            },
+            gap: false,
+            entries: [first, second_id]
+                .into_iter()
+                .enumerate()
+                .map(|(index, pane_id)| ActivityEntry {
+                    seq: index as u64 + 1,
+                    at_ms: 0,
+                    kind: ActivityKind::Command {
+                        pane_id,
+                        role: PaneRole::Agent,
+                        exit_code: 0,
+                    },
+                })
+                .collect(),
+        };
+        state.recap.journal(&page, false, false, &state.panes);
+        let rows = state.recap_rows(state.active_workspace().unwrap());
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].label.starts_with("Agent 2 ·"));
+        assert!(rows[1].label.starts_with("Reviewer ·"));
+        for (row, id) in rows.iter().zip([second_id, first]) {
+            assert!(state.focus_recap_row(row));
+            assert_eq!(state.focused_pane_id(), Some(id));
+        }
+        state.remove_session(second_id);
+        assert!(!state.focus_recap_row(&rows[0]));
+        assert!(
+            state.recap_rows(state.active_workspace().unwrap())[0]
+                .pane
+                .is_none()
+        );
+        assert_eq!(state.focused_pane_id(), Some(first));
+    }
+
+    #[test]
     fn terminal_tab_names_count_named_siblings_and_keep_workspace_order() {
         let (mut ws, first, service, runner) = make_workspace_with_three_panes();
         let mut second = make_pane_summary(ws.id, PaneRole::Agent);
@@ -1687,6 +1830,15 @@ mod tests {
             }],
         );
         assert_eq!(search.result_label().as_deref(), Some("(1/1)"));
+        let previous = search.generation;
+        search.toggle_case();
+        assert!(search.case_sensitive);
+        assert_eq!(search.query, "olde");
+        assert_eq!(search.active_match(), None);
+        assert_eq!(search.result_label(), None);
+        assert!(!search.apply_results(previous, 0, vec![]));
+        search.toggle_case();
+        assert!(!search.case_sensitive);
     }
 
     #[test]
@@ -2059,6 +2211,41 @@ mod tests {
         assert!(pane.scrolled_rows.is_none());
         pane.apply_scrollback(resized, 20, vec![make_row(0, 15, "resized")]);
         assert_eq!(row_text(&pane.visible_rows()[0]), "resized");
+    }
+
+    #[test]
+    fn failed_runner_tracks_each_workspaces_last_completed_runner_results() {
+        let (mut ws, agent, _, first) = make_workspace_with_three_panes();
+        let second = make_pane_summary(ws.id, PaneRole::Runner);
+        let second_id = second.id;
+        ws.panes.push(second);
+        let (mut other, _, _, other_runner) = make_workspace_with_three_panes();
+        other.panes.last_mut().unwrap().status = PaneStatus::Exited { code: Some(4) };
+        let mut state = AppState::new();
+        state.set_workspaces(vec![ws, other]);
+        assert_eq!(
+            state.failed_runner(&state.workspaces[1]),
+            Some(other_runner)
+        );
+        for id in [agent, first, second_id] {
+            state.apply_server_event(ServerEvent::CommandFinished {
+                pane_id: id,
+                command: None,
+                exit_code: 1,
+                has_failure_trace: true,
+            });
+        }
+        assert_eq!(state.failed_runner(&state.workspaces[0]), Some(second_id));
+        // Reconnected daemon summaries may retain a trace from before a successful run.
+        state
+            .panes
+            .get_mut(&second_id)
+            .unwrap()
+            .summary
+            .last_exit_code = Some(0);
+        assert_eq!(state.failed_runner(&state.workspaces[0]), Some(first));
+        state.remove_session(first);
+        assert_eq!(state.failed_runner(&state.workspaces[0]), None);
     }
 
     #[test]
@@ -2811,6 +2998,33 @@ mod tests {
         state.focus_clicked_pane(PaneRole::Service);
         assert_eq!(state.focused_role, PaneRole::Service);
         assert!(state.search.is_none());
+    }
+
+    #[test]
+    fn next_failed_workspace_visits_current_then_wraps_in_sidebar_order() {
+        let (mut primary, _, _, first) = make_workspace_with_three_panes();
+        let (mut unrelated, _, _, second) = make_workspace_with_three_panes();
+        let (mut linked, _, _, third) = make_workspace_with_three_panes();
+        primary.project.repository = Some("/one".into());
+        linked.project.repository = primary.project.repository.clone();
+        unrelated.project.repository = Some("/two".into());
+        let expected = [
+            (primary.id, first),
+            (linked.id, third),
+            (unrelated.id, second),
+        ];
+        let mut state = AppState::new();
+        state.set_workspaces(vec![primary, unrelated, linked]);
+        assert_eq!(state.next_failed_workspace(), None);
+        for (_, id) in expected {
+            state.panes.get_mut(&id).unwrap().summary.last_exit_code = Some(1);
+        }
+        for (ws, pane) in expected {
+            assert_eq!(state.next_failed_workspace(), Some(ws));
+            state.select_workspace(ws);
+            state.select_session(ws, PaneRole::Runner, pane);
+        }
+        assert_eq!(state.next_failed_workspace(), Some(expected[0].0));
     }
 
     #[test]

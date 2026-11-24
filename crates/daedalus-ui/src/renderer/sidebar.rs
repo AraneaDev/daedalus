@@ -6,7 +6,7 @@ use super::{
     sidebar_docker_pill_rect, sidebar_external_badge_rect, status_dot_color,
     visible_external_statuses, workspace_branch_badge,
 };
-use crate::layout::{Rect, SIDEBAR_ROW_LOGICAL_HEIGHT};
+use crate::layout::{Rect, SIDEBAR_ROW_LOGICAL_HEIGHT, sidebar_failed_run_rect};
 use crate::sidebar_content::{SidebarContent, SidebarRow};
 use crate::state::{AppState, WorkspaceView};
 use crate::theme::{Rgba, Theme};
@@ -63,6 +63,7 @@ pub(super) struct Card {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum BadgeKind {
+    FailedRun,
     Runner,
     Agent,
     Branch,
@@ -101,31 +102,42 @@ impl Card {
             ports_width: (rect.width - 18.0 * s).max(1.0),
             badges: Vec::new(),
         };
-        if let Some((label, color)) = panes(PaneRole::Runner).and_then(|p| {
-            if p.has_failure_trace {
-                Some((
-                    format!("✗ {}", p.last_exit_code.unwrap_or(1)),
-                    theme.status_err,
-                ))
-            } else if p.last_exit_code == Some(0) {
-                Some(("✓ 0".into(), theme.status_ok))
-            } else {
-                None
-            }
-        }) {
-            card.title_width = (rect.right() - left - 74.0 * s).max(1.0);
+        let runner_badge = if state.failed_runner(ws).is_some() {
+            Some((
+                BadgeKind::FailedRun,
+                "Failed →",
+                theme.bg_pane,
+                sidebar_failed_run_rect(rect, s),
+            ))
+        } else {
+            panes(PaneRole::Runner)
+                .filter(|p| match p.status {
+                    PaneStatus::Exited { code: Some(code) } => code == 0,
+                    _ => p.last_exit_code == Some(0),
+                })
+                .map(|_| {
+                    (
+                        BadgeKind::Runner,
+                        "Passed",
+                        theme.status_ok,
+                        Rect::new(
+                            rect.right() - 70.0 * s,
+                            rect.y + 5.0 * s,
+                            46.0 * s,
+                            18.0 * s,
+                        ),
+                    )
+                })
+        };
+        if let Some((kind, label, color, bounds)) = runner_badge {
+            card.title_width = (bounds.x - left - 4.0 * s).max(1.0);
             card.badges.push(Badge {
-                kind: BadgeKind::Runner,
-                label,
+                kind,
+                label: label.into(),
                 color,
                 bold: true,
                 border: color.with_alpha(0.65),
-                rect: Rect::new(
-                    rect.right() - 70.0 * s,
-                    rect.y + 5.0 * s,
-                    46.0 * s,
-                    18.0 * s,
-                ),
+                rect: bounds,
             });
         }
         if !card.full {

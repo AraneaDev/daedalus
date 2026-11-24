@@ -98,7 +98,7 @@ fn spawn_reader<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHan
     })
 }
 
-pub(super) fn find_compose_file(root_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_compose_file(root_dir: &Path) -> Option<PathBuf> {
     COMPOSE_FILENAMES
         .iter()
         .map(|name| root_dir.join(name))

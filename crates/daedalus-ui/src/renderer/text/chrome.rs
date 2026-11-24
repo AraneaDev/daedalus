@@ -82,19 +82,23 @@ fn compact_service_summary(
     ))
 }
 
-fn service_observations(ws: &WorkspaceView) -> Vec<String> {
+fn service_observations(ws: &WorkspaceView, columns: usize) -> Vec<String> {
     let mut lines: Vec<_> = ws
         .containers
         .iter()
         .map(|container| {
             let name = container.service.as_ref().unwrap_or(&container.name);
             let status = container.health.as_ref().unwrap_or(&container.state);
-            format!("{name} · {status}")
+            super::label_with_trailing_detail(name, status, columns)
         })
         .collect();
     for port in &ws.bound_ports {
         let label = port.service.as_deref().unwrap_or("Port");
-        lines.push(format!("{label} · bound :{}", port.host_port));
+        lines.push(super::label_with_trailing_detail(
+            label,
+            &format!("bound :{}", port.host_port),
+            columns,
+        ));
     }
     if lines.is_empty() {
         lines.push("No service observations".into());
@@ -103,8 +107,9 @@ fn service_observations(ws: &WorkspaceView) -> Vec<String> {
 }
 
 fn sidebar_badge_line(badge: &Badge, s: f32) -> ChromeLineSpec<'_> {
-    let runner = badge.kind == BadgeKind::Runner;
+    let runner = matches!(badge.kind, BadgeKind::Runner | BadgeKind::FailedRun);
     let top_inset = match badge.kind {
+        BadgeKind::FailedRun => (badge.rect.height / s - CHROME_SUB_LINE_HEIGHT_LOGICAL) * 0.5,
         BadgeKind::Runner | BadgeKind::External => 2.0,
         BadgeKind::Branch => 1.0,
         BadgeKind::Agent | BadgeKind::Docker => 1.5,
@@ -113,7 +118,14 @@ fn sidebar_badge_line(badge: &Badge, s: f32) -> ChromeLineSpec<'_> {
     ChromeLineSpec {
         text: &badge.label,
         bounds: rect,
-        left: rect.x + if runner { 4.0 } else { 5.0 } * s,
+        left: rect.x
+            + if badge.kind == BadgeKind::FailedRun {
+                8.0
+            } else if runner {
+                4.0
+            } else {
+                5.0
+            } * s,
         top: rect.y + top_inset * s,
         max_w: (rect.width - if runner { 2.0 } else { 8.0 } * s).max(1.0),
         font_size_logical: if runner {
@@ -128,6 +140,18 @@ fn sidebar_badge_line(badge: &Badge, s: f32) -> ChromeLineSpec<'_> {
         },
         color: badge.color,
         bold: badge.bold,
+    }
+}
+
+fn recap_heading(rows: &[crate::recap::RecapEntry]) -> &'static str {
+    if rows.iter().any(|row| row.pane.is_some()) {
+        if cfg!(target_os = "macos") {
+            "Since you left · ⌘⇧Y"
+        } else {
+            "Since you left · Ctrl+Shift+Y"
+        }
+    } else {
+        "Since you left"
     }
 }
 
@@ -176,7 +200,23 @@ impl TextRenderer {
                     color: theme.border_focused,
                     bold: true,
                 });
-                toggle.width = (button.x - toggle.x).max(0.);
+                let left = if let Some(run) = layout.run_tests_button {
+                    self.push_chrome_line(ChromeLineSpec {
+                        text: "Run tests",
+                        bounds: run,
+                        left: run.x + 3. * s,
+                        top: run.y + (run.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                        max_w: run.width - 3. * s,
+                        font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+                        line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                        color: theme.border_focused,
+                        bold: true,
+                    });
+                    run.x
+                } else {
+                    button.x
+                };
+                toggle.width = (left - toggle.x).max(0.);
             } else if let Some((up, _)) = arrows {
                 toggle.width = (up.x - toggle.x).max(0.0);
             }
@@ -312,6 +352,24 @@ impl TextRenderer {
         }
     }
 
+    fn register_recap_target(
+        &mut self,
+        state: &AppState,
+        rows: &[crate::recap::RecapEntry],
+        line: usize,
+        bounds: Rect,
+    ) -> bool {
+        let Some(row) = line
+            .checked_sub(1)
+            .and_then(|i| rows.get(i))
+            .filter(|row| row.pane.is_some())
+        else {
+            return false;
+        };
+        self.recap_targets.push((bounds, row.clone()));
+        state.recap.keyboard_row.as_ref() == Some(row)
+    }
+
     fn build_sidebar_recap_text(
         &mut self,
         state: &AppState,
@@ -319,7 +377,7 @@ impl TextRenderer {
         sidebar: Rect,
         cards: &SidebarCards,
     ) {
-        let Some(id) = state.active_workspace_id else {
+        let Some(ws) = state.active_workspace() else {
             return;
         };
         let s = self.scale_factor;
@@ -330,30 +388,35 @@ impl TextRenderer {
         if top + height * 2.0 > sidebar.bottom() {
             return;
         }
-        let lines = state.recap.lines(id);
-        for (index, text) in std::iter::once("Since you left")
-            .chain(lines.iter().map(String::as_str))
+        let lines = state.recap_rows(ws);
+        let title = recap_heading(&lines);
+        for (index, text) in std::iter::once(title)
+            .chain(lines.iter().map(|row| row.label.as_str()))
             .enumerate()
         {
             if top + height > sidebar.bottom() {
                 break;
             }
+            let bounds = Rect::new(left, top, width, height);
+            let selected = self.register_recap_target(state, &lines, index, bounds);
             let max_chars = (width / (CHROME_SUB_FONT_SIZE_LOGICAL * s * 0.62)) as usize;
             let label = truncate_right_with_ellipsis(text, max_chars);
             self.push_chrome_line(ChromeLineSpec {
                 text: &label,
-                bounds: Rect::new(left, top, width, height),
+                bounds,
                 left,
                 top,
                 max_w: width,
                 font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
                 line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
-                color: if index == 0 {
+                color: if selected {
+                    theme.border_focused
+                } else if index == 0 {
                     theme.text_primary
                 } else {
                     theme.text_muted
                 },
-                bold: index == 0,
+                bold: selected || index == 0,
             });
             self.recap_drawn |= index > 0;
             top += height;
@@ -365,8 +428,10 @@ impl TextRenderer {
             } else {
                 "Last known services"
             };
+            let glyph_width = self.cell_w * CHROME_SUB_FONT_SIZE_LOGICAL / self.font_size_logical;
+            let columns = (width / glyph_width) as usize;
             for (i, label) in std::iter::once(service_title.to_owned())
-                .chain(service_observations(ws))
+                .chain(service_observations(ws, columns))
                 .enumerate()
             {
                 if top + height > sidebar.bottom() {
@@ -402,8 +467,9 @@ impl TextRenderer {
         if let Some(rect) = layout.compact_recap
             && let Some(ws) = state.active_workspace()
         {
-            let mut lines = vec!["Since you left".to_owned()];
-            lines.extend(state.recap.lines(ws.id));
+            let rows = state.recap_rows(ws);
+            let mut lines = vec![recap_heading(&rows).to_owned()];
+            lines.extend(rows.iter().map(|row| row.label.clone()));
             if let Some(summary) =
                 compact_service_summary(ws.bound_ports.len(), ws.containers.len(), state.connection)
             {
@@ -415,6 +481,12 @@ impl TextRenderer {
                 if top + step > rect.bottom() {
                     break;
                 }
+                let selected = self.register_recap_target(
+                    state,
+                    &rows,
+                    i,
+                    Rect::new(rect.x, top, rect.width, step),
+                );
                 self.recap_drawn |= i > 0;
                 self.push_chrome_line(ChromeLineSpec {
                     text,
@@ -424,12 +496,12 @@ impl TextRenderer {
                     max_w: (rect.width - 16. * s).max(1.),
                     font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
                     line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
-                    color: if i == 0 {
+                    color: if selected || i == 0 {
                         theme.border_focused
                     } else {
                         theme.text_primary
                     },
-                    bold: i == 0,
+                    bold: selected || i == 0,
                 });
             }
         }
@@ -505,8 +577,10 @@ impl TextRenderer {
             theme.text_primary.scale_luminance(0.85)
         };
 
+        let glyph_width = self.cell_w * CHROME_FONT_SIZE_LOGICAL / self.font_size_logical;
+        let title = truncate_right_with_ellipsis(&ws.name, (name_max_w / glyph_width) as usize);
         self.push_chrome_line(ChromeLineSpec {
-            text: &ws.name,
+            text: &title,
             left: left_x,
             top: row_rect.y + 6.0 * s,
             max_w: name_max_w,
@@ -983,6 +1057,13 @@ mod tests {
             &state.panes,
         );
         state.recap.focus(true);
+        assert!(
+            state
+                .recap
+                .entries(id)
+                .iter()
+                .all(|row| row.pane == Some(pane_id))
+        );
         assert_eq!(
             state.recap.lines(id),
             ["Agent terminal · Build passed", "agent command · exit 0"]
@@ -1011,6 +1092,31 @@ mod tests {
         );
         state.panes.get_mut(&pane_id).unwrap().last_seq += 1;
         assert!(crate::recap::activity_excerpt(&entry, &state.panes).is_none());
+    }
+
+    #[test]
+    fn narrow_service_rows_keep_health_and_host_port_visible() {
+        use daedalus_proto::{ContainerHealth, PortMapping, PortSource};
+        let (mut state, _) = make_state_with_agent_row();
+        let ws = state.active_workspace_mut().unwrap();
+        let name = "frontend-development-server";
+        ws.containers = vec![ContainerHealth {
+            name: name.into(),
+            service: None,
+            state: "running".into(),
+            health: Some("unhealthy".into()),
+            ports: vec![3100],
+        }];
+        ws.bound_ports = vec![PortMapping {
+            host_port: 3100,
+            container_port: Some(3000),
+            service: Some(name.into()),
+            source: PortSource::Docker,
+        }];
+        assert_eq!(
+            service_observations(ws, 20),
+            ["fronten… · unhealthy", "front… · bound :3100"]
+        );
     }
 
     #[test]
@@ -1119,6 +1225,43 @@ mod tests {
     }
 
     #[test]
+    fn failed_run_action_takes_priority_and_leaves_room_for_the_workspace_name() {
+        let (mut state, _) = make_state_with_agent_row();
+        let agent = state.workspaces[0].panes[0];
+        let mut runner = state.panes[&agent].summary.clone();
+        runner.id = PaneId::new();
+        runner.role = PaneRole::Runner;
+        runner.last_exit_code = Some(12);
+        state.register_pane(runner.clone(), None);
+        runner.id = PaneId::new();
+        runner.last_exit_code = Some(0);
+        state.register_pane(runner, None);
+
+        for scale in [1.0, 1.5, 2.0] {
+            let theme = Theme::dark();
+            let sidebar = Rect::new(0., 0., 240. * scale, 400. * scale);
+            let cards = SidebarCards::new(&state, sidebar, scale, &theme, None);
+            let card = &cards.cards[0];
+            let badge = &card.badges[0];
+            assert_eq!(badge.kind, BadgeKind::FailedRun);
+            assert_eq!(badge.label, "Failed →");
+            assert_eq!(badge.color, theme.bg_pane);
+            let mut quads = Vec::new();
+            collect_sidebar_quads(&mut quads, &state, sidebar, &theme, scale, scale, &cards);
+            let rect = badge.rect;
+            assert!(quads.iter().any(|quad| quad.rect
+                == [rect.x, rect.y, rect.width, rect.height]
+                && quad.color == theme.status_err.to_array()));
+            assert_eq!(
+                badge.rect,
+                crate::layout::sidebar_failed_run_rect(card.rect, scale)
+            );
+            assert!(card.rect.x + 22. * scale + card.title_width < badge.rect.x);
+            assert!(badge.rect.right() <= sidebar_workspace_close_rect(card.rect, scale).x);
+        }
+    }
+
+    #[test]
     fn sidebar_cards_keep_labels_and_backdrops_together_at_both_sizes() {
         let (mut state, _) = make_state_with_agent_row();
         let theme = Theme::dark();
@@ -1159,7 +1302,7 @@ mod tests {
             assert_eq!(card.full, full_size);
             assert_eq!(card.title_width, card.rect.width - 96.0);
             assert_eq!(card.badges[0].kind, BadgeKind::Runner);
-            assert_eq!(card.badges[0].label, "✓ 0");
+            assert_eq!(card.badges[0].label, "Passed");
             if full_size {
                 assert_eq!(card.badges.len(), 5);
                 assert!(card.badges[2].rect.right() < card.badges[1].rect.x);

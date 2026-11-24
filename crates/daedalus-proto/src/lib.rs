@@ -7,7 +7,10 @@ pub mod types;
 
 pub use activity::{ActivityCursor, ActivityEntry, ActivityKind, ActivityPage};
 pub use codec::{CodecError, MAX_FRAME_SIZE, read_frame, write_frame};
-pub use rpc::{ClientMessage, ProtoError, Request, ResponsePayload, ServerEvent, ServerMessage};
+pub use rpc::{
+    ClientMessage, ProtoError, Request, ResponsePayload, ServerEvent, ServerMessage,
+    SetupInspection,
+};
 pub use types::{
     AgentState, Cell, CellFlags, Color, ContainerHealth, CursorState, CustomAction, ExternalStatus,
     FailureTrace, GitWorkspaceStatus, GitWorktreeInfo, GridDelta, GridRow, GridSnapshot, PaneId,

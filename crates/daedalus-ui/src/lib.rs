@@ -9,6 +9,8 @@ pub mod recap;
 pub mod renderer;
 pub mod selection;
 pub mod settings;
+pub mod setup_review;
+pub mod setup_tools;
 pub mod sidebar_content;
 pub mod state;
 pub mod theme;

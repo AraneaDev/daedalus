@@ -117,6 +117,7 @@ mod tests {
             pong,
             ResponsePayload::Pong {
                 journal_supported: false,
+                inspect_setup_supported: false,
                 ..
             }
         ));

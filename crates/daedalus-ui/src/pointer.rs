@@ -6,7 +6,7 @@ use daedalus_ui::renderer::{
     action_palette_layout, close_modal_cancel_rect, close_modal_compose_rect,
     close_modal_confirm_rect, close_modal_force_rect, close_modal_worktree_rect,
     close_workspace_modal_rect, picker_item_rect, preset_picker_layout, search_bar_rect,
-    worktree_button_rects, worktree_modal_rect,
+    search_controls, worktree_button_rects, worktree_modal_rect,
 };
 use daedalus_ui::selection::{CellPos, Selection, select_word_at};
 use daedalus_ui::settings::SettingsAction;
@@ -60,6 +60,7 @@ enum OverlayClick {
     Consumed,
     Redraw,
     SendFailure,
+    Setup(daedalus_ui::setup_review::SetupAction),
     WorkspaceForm(WorkspaceFormAction),
     Settings(SettingsAction),
     ConfirmAction,
@@ -93,6 +94,8 @@ fn handle_overlay_click(
         } else {
             OverlayClick::Redraw
         }
+    } else if state.setup_review.open {
+        OverlayClick::Setup(state.setup_review.click(x, y, width, height, scale))
     } else if state.workspace_form.open {
         OverlayClick::WorkspaceForm(state.workspace_form.click(x, y, width, height, scale))
     } else if state.settings.open {
@@ -144,6 +147,23 @@ fn handle_overlay_click(
     Some(effect)
 }
 
+fn search_click(bar: Rect, x: f32, y: f32) -> Option<UiAction> {
+    if !bar.contains(x, y) {
+        return None;
+    }
+    let actions = [
+        UiAction::SearchPrev,
+        UiAction::SearchNext,
+        UiAction::SearchToggleCase,
+    ];
+    search_controls(bar)
+        .into_iter()
+        .zip(actions)
+        .find(|(rect, _)| rect.contains(x, y))
+        .map(|(_, action)| action)
+        .or(Some(UiAction::Ignore))
+}
+
 impl DaedalusApp {
     pub(super) fn handle_left_mouse_down(&mut self) {
         let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
@@ -167,6 +187,7 @@ impl DaedalusApp {
                 }
                 self.request_redraw();
             }
+            Some(OverlayClick::Setup(action)) => self.handle_setup_action(action),
             Some(OverlayClick::WorkspaceForm(action)) => self.handle_workspace_form(action),
             Some(OverlayClick::Settings(action)) => self.handle_settings_action(action),
             Some(OverlayClick::ConfirmAction) => self.confirm_workspace_action(),
@@ -192,8 +213,25 @@ impl DaedalusApp {
                 })
                 .map(|p| p.role)
             && let Some(pane_rect) = layout.pane(role)
-            && search_bar_rect(pane_rect, scale_factor).contains(x, y)
         {
+            let bar = search_bar_rect(pane_rect, scale_factor);
+            if let Some(action) = search_click(bar, x, y) {
+                self.handle_ui_action(action);
+                return;
+            }
+        }
+        self.state.recap.keyboard_row = None;
+        if let Some((_, row)) = self
+            .renderer
+            .as_ref()
+            .into_iter()
+            .flat_map(|r| r.recap_targets())
+            .find(|(rect, _)| rect.contains(x, y))
+        {
+            if self.state.focus_recap_row(row) {
+                self.schedule_resize_flush();
+                self.request_redraw();
+            }
             return;
         }
         let target = hit_test(
@@ -218,6 +256,9 @@ impl DaedalusApp {
                 }
             }
             HitTarget::ToggleSidebar => self.handle_ui_action(UiAction::ToggleSidebar),
+            HitTarget::SidebarFailedRun(workspace) => {
+                self.handle_ui_action(UiAction::OpenFailedRun(workspace));
+            }
             HitTarget::SidebarWorkspace(idx) => {
                 if let Some(ws) = self.state.workspaces.get(idx) {
                     let ws_id = ws.id;
@@ -239,6 +280,7 @@ impl DaedalusApp {
                 self.activate_session(target)
             }
             HitTarget::SessionTab(role) => self.handle_ui_action(UiAction::FocusRole(role)),
+            HitTarget::RunTests => self.handle_ui_action(UiAction::RunTests),
             HitTarget::WorkspaceSettings => self.open_workspace_settings(),
             HitTarget::SidebarNewWorkspace => self.create_new_workspace(),
             HitTarget::SidebarNewWorktree => self.open_worktree_modal(),
@@ -376,6 +418,19 @@ fn is_link_click_modifier(mods: ModifiersState) -> bool {
 mod tests {
     use super::*;
     use daedalus_ui::{input::translate_key, state::ConnectionState};
+    #[test]
+    fn search_clicks_use_the_rendered_control_regions() {
+        let bar = Rect::new(20.0, 40.0, 340.0, 58.0);
+        assert_eq!(search_click(bar, 10.0, 60.0), None);
+        assert_eq!(search_click(bar, 180.0, 54.0), Some(UiAction::Ignore));
+        assert_eq!(search_click(bar, 48.0, 84.0), Some(UiAction::SearchPrev));
+        assert_eq!(search_click(bar, 150.0, 84.0), Some(UiAction::SearchNext));
+        assert_eq!(
+            search_click(bar, 228.0, 84.0),
+            Some(UiAction::SearchToggleCase)
+        );
+    }
+
     #[test]
     fn a_modal_consumes_even_clicks_outside_its_controls() {
         let mut state = AppState::new();

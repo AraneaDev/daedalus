@@ -306,6 +306,7 @@ async fn dispatch_request(
                 vt_backend,
                 isolation_mode: registry.isolation_mode().as_str().to_string(),
                 journal_supported: true,
+                inspect_setup_supported: true,
             })
         }
         ClientMessage::Authenticate { .. } => Ok(ResponsePayload::Ok),
@@ -323,6 +324,18 @@ async fn dispatch_request(
         } => Ok(ResponsePayload::WorkspaceCreated(
             registry.create_workspace(name, root_dir, env).await?,
         )),
+        ClientMessage::InspectSetup {
+            root_dir,
+            executables,
+        } => {
+            let inspection =
+                tokio::task::spawn_blocking(move || crate::setup::inspect(&root_dir, executables))
+                    .await
+                    .map_err(|e| {
+                        ProtoError::Internal(format!("setup inspection task failed: {e}"))
+                    })??;
+            Ok(ResponsePayload::SetupInspection(inspection))
+        }
         ClientMessage::ResolveWorkspaceDirectory { root_dir } => Ok(
             ResponsePayload::WorkspaceResolved(registry.workspace_for_directory(root_dir).await?),
         ),

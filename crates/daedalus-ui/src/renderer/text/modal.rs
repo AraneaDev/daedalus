@@ -9,8 +9,8 @@ use crate::renderer::{
     action_palette_layout, close_modal_cancel_rect, close_modal_compose_rect,
     close_modal_confirm_rect, close_modal_dirty_banner_rect, close_modal_force_rect,
     close_modal_metrics, close_modal_worktree_rect, close_workspace_modal_rect, picker_item_rect,
-    preset_picker_layout, search_bar_rect, worktree_button_rects, worktree_content_scale,
-    worktree_input_rect, worktree_modal_rect,
+    preset_picker_layout, search_bar_rect, search_controls, worktree_button_rects,
+    worktree_content_scale, worktree_input_rect, worktree_modal_rect,
 };
 use crate::state::{AgentPreset, SearchState};
 use crate::theme;
@@ -464,6 +464,43 @@ impl TextRenderer {
         };
         let s = self.scale_factor;
         let bar = search_bar_rect(pane_rect, s);
+        let [prev, next, case] = search_controls(bar);
+        let compact = bar.width < 260.0 * s;
+        let case_label = match (compact, search.case_sensitive) {
+            (true, true) => "Aa: On",
+            (true, false) => "Aa: Off",
+            (false, true) => "Match case: On (F4)",
+            (false, false) => "Match case: Off (F4)",
+        };
+        let has_matches = !search.matches.is_empty();
+        for (rect, label, enabled, active) in [
+            (
+                prev,
+                if compact { "Prev" } else { "Previous" },
+                has_matches,
+                false,
+            ),
+            (next, "Next", has_matches, false),
+            (case, case_label, true, search.case_sensitive),
+        ] {
+            let pad = (6.0 * s).min(rect.width * 0.1);
+            self.push_modal_line(ChromeLineSpec {
+                text: label,
+                left: rect.x + pad,
+                top: rect.y + (rect.height - CHROME_SUB_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                max_w: (rect.width - 2.0 * pad).max(0.0),
+                bounds: rect,
+                font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
+                color: if enabled {
+                    theme.text_primary
+                } else {
+                    theme.text_muted
+                },
+                bold: active,
+            });
+        }
+        let bar = Rect::new(bar.x, bar.y, bar.width, bar.height * 0.5);
         let counter = search.result_label().unwrap_or_default();
         let pad = (8.0 * s).min(bar.width * 0.25);
         let content_width = bar.width - 2.0 * pad;

@@ -1,3 +1,5 @@
+mod setup_review;
+pub(super) use setup_review::setup_action;
 mod settings;
 mod terminals;
 pub(super) use settings::settings_action;
@@ -18,12 +20,14 @@ use unicode_segmentation::UnicodeSegmentation;
 const WINDOW: NodeId = NodeId(1);
 const STATUS: NodeId = NodeId(2);
 const WORKSPACE: NodeId = NodeId(3);
+const OPEN_NEW_WORKSPACE: NodeId = NodeId(4);
 const PICKER: NodeId = NodeId(7);
 const ACTIONS: NodeId = NodeId(8);
 const WORKTREE: NodeId = NodeId(9);
 const CLOSE: NodeId = NodeId(10);
 const SEARCH: NodeId = NodeId(11);
 
+const SETUP_REVIEW: NodeId = NodeId(19);
 const SETTINGS: NodeId = NodeId(14);
 const OPEN_SETTINGS: NodeId = NodeId(17);
 const NEW_WORKSPACE: NodeId = NodeId(15);
@@ -54,7 +58,8 @@ pub(super) fn workspace_action(
     state: &mut AppState,
     request: &ActionRequest,
 ) -> Option<WorkspaceFormAction> {
-    if !state.workspace_form.open
+    if state.setup_review.open
+        || !state.workspace_form.open
         || state.settings.open
         || state.failure_recipients.is_some()
         || request.target_tree != TreeId::ROOT
@@ -88,16 +93,35 @@ pub(super) fn workspace_action(
     Some(WorkspaceFormAction::None)
 }
 
-pub(super) fn action(state: &AppState, request: &ActionRequest) -> Option<UiAction> {
+pub(super) fn action(
+    state: &AppState,
+    request: &ActionRequest,
+    controls: &TerminalControls,
+) -> Option<UiAction> {
     if request.target_tree == TreeId::ROOT
-        && request.target_node == OPEN_SETTINGS
         && request.action == Action::Click
-        && state.active_workspace().is_some()
         && overlay(state).is_none()
     {
-        return Some(UiAction::WorkspaceSettings);
+        match request.target_node {
+            OPEN_SETTINGS if state.active_workspace().is_some() => {
+                return Some(UiAction::WorkspaceSettings);
+            }
+            OPEN_NEW_WORKSPACE if state.workspace_list_loaded => {
+                return Some(UiAction::NewWorkspace);
+            }
+            node if state.workspace_list_loaded => {
+                if controls.is_run_tests(state, node) {
+                    return Some(UiAction::RunTests);
+                }
+                if let Some(id) = controls.failed_run_workspace(state, node) {
+                    return Some(UiAction::OpenFailedRun(id));
+                }
+            }
+            _ => {}
+        }
     }
-    if !state.worktree_modal.open
+    if state.setup_review.open
+        || !state.worktree_modal.open
         || state.workspace_form.open
         || state.settings.open
         || state.failure_recipients.is_some()
@@ -149,16 +173,27 @@ fn overlay(state: &AppState) -> Option<(NodeId, Node)> {
                 choices.agents.len()
             ),
         )
+    } else if state.setup_review.open {
+        (
+            SETUP_REVIEW,
+            "Review environment",
+            format!(
+                "{} on {}. {}",
+                state.setup_review.name,
+                state.setup_review.host(),
+                state.setup_review.detail()
+            ),
+        )
     } else if state.settings.open {
         (SETTINGS, "Workspace settings", state.settings.heading())
     } else if state.workspace_form.open {
         (
             NEW_WORKSPACE,
-            "New workspace",
+            "Set up workspace · Choose project",
             if state.workspace_form.submitting() {
-                "Creating workspace. Escape dismisses this dialog.".into()
+                "Checking project on the daemon host. Escape dismisses this dialog.".into()
             } else {
-                "Tab changes focus. Enter creates the workspace. Escape cancels.".into()
+                "Enter a project folder. The workspace name defaults to the folder name. Enter reviews the environment. Escape cancels.".into()
             },
         )
     } else if state.picker.open {
@@ -212,7 +247,8 @@ fn overlay(state: &AppState) -> Option<(NodeId, Node)> {
         if let Some(result) = search.result_label() {
             detail.push_str(&format!(" {result}."));
         }
-        detail.push_str(" Escape to close.");
+        let case = if search.case_sensitive { "on" } else { "off" };
+        detail.push_str(&format!(" Match case {case}. F4 toggles match case. Enter for next match. Shift+Enter for previous match. Escape to close."));
         let mut node = named(Role::Search, "Search pane");
         node.set_description(detail);
         return Some((SEARCH, node));
@@ -295,14 +331,6 @@ fn workspace_fields(
 ) -> NodeId {
     dialog.set_bounds(bounds(modal));
     let error_id = form_node(form, 6);
-    let invalid_field = form.error.as_ref().and_then(|_| {
-        [Control::Name, Control::Folder]
-            .into_iter()
-            .find(|control| {
-                form.value(*control)
-                    .is_some_and(|text| text.trim().is_empty())
-            })
-    });
     if let Some(message) = &form.error {
         let mut alert = named(Role::Alert, message);
         alert.set_live(Live::Assertive);
@@ -313,16 +341,24 @@ fn workspace_fields(
         let offset = field_offset(control);
         let id = form_node(form, offset);
         let label = match control {
-            Control::Name => "Name",
+            Control::Name => "Name (optional)",
             Control::Folder => "Folder",
             Control::Cancel if form.submitting() => "Dismiss",
             Control::Cancel => "Cancel",
-            Control::Save => "Create workspace",
+            Control::Save => "Review environment",
         };
         let mut node = if let Some(value) = form.value(control) {
             let run_id = form_node(form, offset + 4);
             let mut node = editable_field(label, value, run_id, form.selection(control), nodes);
-            if invalid_field == Some(control) {
+            if control == Control::Name {
+                node.clear_required();
+            }
+            if control == Control::Folder
+                && form.error.as_deref().is_some_and(|message| {
+                    message == "Enter the workspace folder."
+                        || message.contains("root_dir does not exist")
+                })
+            {
                 node.set_invalid(Invalid::True);
                 node.set_error_message(error_id);
             }
@@ -383,9 +419,25 @@ pub(super) fn workbench_tree(
     status.set_live(Live::Polite);
     root.push_child(STATUS);
     let mut nodes = vec![(STATUS, status)];
-    let focus = if let Some((id, mut node)) = overlay(state) {
+    let current_overlay = overlay(state);
+    if state.workspace_list_loaded && current_overlay.is_none() {
+        controls.append_run_tests(state, &mut root, &mut nodes);
+        controls.append_failed_runs(state, &mut root, &mut nodes);
+        let mut button = named(Role::Button, "New workspace");
+        button.add_action(Action::Click);
+        root.push_child(OPEN_NEW_WORKSPACE);
+        nodes.push((OPEN_NEW_WORKSPACE, button));
+    }
+    let focus = if let Some((id, mut node)) = current_overlay {
         let mut focus = id;
-        if id == SETTINGS {
+        if id == SETUP_REVIEW {
+            focus = setup_review::fields(
+                &state.setup_review,
+                &mut node,
+                &mut nodes,
+                daedalus_ui::setup_review::modal_rect(width, height, scale),
+            );
+        } else if id == SETTINGS {
             focus = settings::fields(
                 &state.settings,
                 &mut node,
@@ -468,7 +520,7 @@ pub(super) fn workbench_tree(
                 SidebarRow::Workspace(_) => {}
             }
         }
-        description.extend(state.recap.lines(ws.id));
+        description.extend(state.recap_rows(ws).into_iter().map(|row| row.label));
         workspace.set_description(description.join(". "));
         let mut open_settings = named(Role::Button, "Workspace settings");
         open_settings.add_action(Action::Click);
@@ -517,6 +569,8 @@ pub(super) fn workbench_tree(
         }
         nodes.push((WORKSPACE, workspace));
         focus
+    } else if state.workspace_list_loaded {
+        OPEN_NEW_WORKSPACE
     } else {
         WINDOW
     };
@@ -532,6 +586,10 @@ pub(super) fn workbench_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn action(state: &AppState, request: &ActionRequest) -> Option<UiAction> {
+        super::action(state, request, &TerminalControls::default())
+    }
+
     fn tree(state: &AppState) -> TreeUpdate {
         super::tree(state, 1200.0, 800.0, 1.0)
     }
@@ -544,6 +602,27 @@ mod tests {
         assert_eq!(status.label(), Some("Connecting to daemon"));
         assert_eq!(status.live(), Some(Live::Polite));
     }
+    #[test]
+    fn empty_workbench_offers_workspace_creation_and_hides_it_while_editing() {
+        let mut state = AppState::new();
+        state.set_workspaces(Vec::new());
+        let update = tree(&state);
+        assert_eq!(update.focus, OPEN_NEW_WORKSPACE);
+        let button = &update.nodes.iter().find(|n| n.0 == update.focus).unwrap().1;
+        assert_eq!(button.label(), Some("New workspace"));
+        assert!(button.supports_action(Action::Click));
+        let request = ActionRequest {
+            target_tree: TreeId::ROOT,
+            target_node: OPEN_NEW_WORKSPACE,
+            action: Action::Click,
+            data: None,
+        };
+        assert_eq!(action(&state, &request), Some(UiAction::NewWorkspace));
+        state.workspace_form.begin(std::path::Path::new("."));
+        assert!(tree(&state).nodes.iter().all(|n| n.0 != OPEN_NEW_WORKSPACE));
+        assert_eq!(action(&state, &request), None);
+    }
+
     #[test]
     fn modal_reports_current_selection_and_restores_focus() {
         let mut state = AppState::new();
@@ -565,6 +644,27 @@ mod tests {
         state.picker.close();
         assert_eq!(tree(&state).focus, WINDOW);
     }
+    #[test]
+    fn search_description_exposes_case_and_navigation_keys() {
+        let mut state = AppState::new();
+        state.toggle_search(daedalus_proto::PaneId::new());
+        for expected in ["Match case off", "Match case on"] {
+            let update = tree(&state);
+            assert_eq!(update.focus, SEARCH);
+            let search = &update
+                .nodes
+                .iter()
+                .find(|entry| entry.0 == SEARCH)
+                .unwrap()
+                .1;
+            let detail = search.description().unwrap();
+            assert!(detail.contains(expected));
+            assert!(detail.contains("F4"));
+            assert!(detail.contains("Shift+Enter"));
+            state.search.as_mut().unwrap().toggle_case();
+        }
+    }
+
     #[test]
     fn worktree_controls_track_availability_validation_and_dialog_session() {
         let mut state = AppState::new();
@@ -708,7 +808,8 @@ mod tests {
             assert_eq!(node.bounds(), Some(bounds(rect)));
             assert!(node.supports_action(Action::Focus));
             if state.workspace_form.value(control).is_some() {
-                assert!(node.is_required() && node.supports_action(Action::SetValue));
+                assert_eq!(node.is_required(), control == Control::Folder);
+                assert!(node.supports_action(Action::SetValue));
             } else {
                 assert!(node.supports_action(Action::Click));
             }
@@ -745,7 +846,7 @@ mod tests {
     #[test]
     fn workspace_form_validation_submission_and_stale_actions_match_visible_dialog() {
         let mut state = AppState::new();
-        state.workspace_form.begin(std::path::Path::new("/project"));
+        state.workspace_form.begin(std::path::Path::new(""));
         let request = |target_node, action, data| ActionRequest {
             target_tree: TreeId::ROOT,
             target_node,
@@ -770,25 +871,25 @@ mod tests {
             field.error_message(),
             Some(form_node(&state.workspace_form, 6))
         );
-        let name = request(
-            form_node(&state.workspace_form, 0),
+        let folder = request(
+            form_node(&state.workspace_form, 1),
             Action::SetValue,
-            Some(ActionData::Value("日本語 work".into())),
+            Some(ActionData::Value("/repo/日本語 work".into())),
         );
         assert_eq!(
-            workspace_action(&mut state, &name),
+            workspace_action(&mut state, &folder),
             Some(WorkspaceFormAction::None)
         );
         assert_eq!(
             workspace_action(&mut state, &save),
             Some(WorkspaceFormAction::Save {
                 name: "日本語 work".into(),
-                folder: "/project".into()
+                folder: "/repo/日本語 work".into()
             })
         );
         state.workspace_form.begin(std::path::Path::new("/second"));
         assert_eq!(workspace_action(&mut state, &save), None);
-        assert_eq!(workspace_action(&mut state, &name), None);
+        assert_eq!(workspace_action(&mut state, &folder), None);
     }
 
     fn agent_workspace() -> AppState {
@@ -829,6 +930,101 @@ mod tests {
         let pane_id = state.focused_pane_id().unwrap();
         state.session_names.insert(pane_id, "Reviewer".into());
         state
+    }
+
+    #[test]
+    fn run_tests_button_targets_only_its_current_connected_workspace() {
+        let mut state = AppState::new();
+        state.connection = ConnectionState::Connected;
+        state.workspace_list_loaded = true;
+        let workspace = daedalus_proto::WorkspaceId::new();
+        state.active_workspace_id = Some(workspace);
+        state.test_workspaces.insert(workspace);
+        let mut controls = TerminalControls::default();
+        let tree = workbench_tree(&state, 800., 600., 1., &mut controls);
+        let target = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Run tests"))
+            .unwrap()
+            .0;
+        let request = ActionRequest {
+            target_tree: TreeId::ROOT,
+            target_node: target,
+            action: Action::Click,
+            data: None,
+        };
+        assert_eq!(
+            super::action(&state, &request, &controls),
+            Some(UiAction::RunTests)
+        );
+        state.connection = ConnectionState::Reconnecting;
+        assert_eq!(super::action(&state, &request, &controls), None);
+        state.connection = ConnectionState::Connected;
+        state.active_workspace_id = None;
+        assert_eq!(super::action(&state, &request, &controls), None);
+    }
+
+    #[test]
+    fn failed_run_button_targets_its_runner_and_ignores_stale_requests() {
+        let mut state = agent_workspace();
+        let mut failed_ws = state.workspaces[0].clone();
+        failed_ws.id = daedalus_proto::WorkspaceId::new();
+        failed_ws.name = "Feature worktree".into();
+        failed_ws.panes.clear();
+        let ws_id = failed_ws.id;
+        state.workspaces.push(failed_ws);
+        let mut runner = state.panes[&state.focused_pane_id().unwrap()]
+            .summary
+            .clone();
+        runner.id = daedalus_proto::PaneId::new();
+        runner.workspace_id = ws_id;
+        runner.role = PaneRole::Runner;
+        runner.last_exit_code = Some(7);
+        runner.has_failure_trace = true;
+        runner.agent_state = None;
+        runner.status = PaneStatus::Exited { code: Some(7) };
+        let failed = runner.id;
+        state.register_pane(runner, None);
+        let mut controls = TerminalControls::default();
+        let update = workbench_tree(&state, 900., 700., 1., &mut controls);
+        let (id, button) = update
+            .nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Open failed run in Feature worktree"))
+            .unwrap();
+        assert!(button.supports_action(Action::Click));
+        let request = ActionRequest {
+            action: Action::Click,
+            target_node: *id,
+            target_tree: TreeId::ROOT,
+            data: None,
+        };
+        assert_eq!(
+            super::action(&state, &request, &controls),
+            Some(UiAction::OpenFailedRun(ws_id))
+        );
+        state.picker.toggle();
+        assert!(
+            workbench_tree(&state, 900., 700., 1., &mut controls)
+                .nodes
+                .iter()
+                .all(|(node, _)| node != id)
+        );
+        assert_eq!(super::action(&state, &request, &controls), None);
+        state.picker.toggle();
+        let runner = &mut state.panes.get_mut(&failed).unwrap().summary;
+        runner.status = PaneStatus::Idle;
+        runner.last_exit_code = Some(0);
+        assert_eq!(super::action(&state, &request, &controls), None);
+        assert!(
+            workbench_tree(&state, 900., 700., 1., &mut controls)
+                .nodes
+                .iter()
+                .all(|(node, _)| node != id)
+        );
+        state.remove_session(failed);
+        assert_eq!(super::action(&state, &request, &controls), None);
     }
 
     #[test]

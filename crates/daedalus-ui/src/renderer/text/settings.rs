@@ -1,11 +1,11 @@
 use super::{AppState, ChromeLineSpec, Rect, TextRenderer, Theme};
-use crate::settings::{controls, modal_rect};
+use crate::settings::modal_rect;
 
 impl TextRenderer {
     pub(super) fn build_settings_items(&mut self, state: &AppState, theme: &Theme, w: f32, h: f32) {
         let dpi = self.scale_factor;
         let modal = modal_rect(w, h, dpi);
-        let scale = dpi.min(modal.height / 324.0).min(modal.width / 420.0);
+        let scale = dpi.min(modal.height / 480.0).min(modal.width / 420.0);
         let dialog = &state.settings;
         let glyph_width = self.cell_w * (14.0 * scale) / (self.font_size_logical * dpi);
         let mut line = |text: &str, rect: Rect, size: f32, color, bold| {
@@ -32,12 +32,12 @@ impl TextRenderer {
         };
         line(
             &dialog.heading(),
-            row(0.01, 0.13),
+            row(0.0, 0.088),
             17.0,
             theme.text_primary,
             true,
         );
-        for (c, r) in controls(modal) {
+        for (c, r) in dialog.controls(modal) {
             let active = dialog.focus == c;
             let prefix = if active { "▸ " } else { "" };
             let columns = ((r.width - 10.0 * scale) / glyph_width) as usize;
@@ -52,15 +52,8 @@ impl TextRenderer {
             line(&format!("{prefix}{label}"), r, 14.0, color, active);
         }
         line(
-            r#"Argv example   ["cargo", "test", "--workspace"]"#,
-            row(0.66, 0.08),
-            12.0,
-            theme.text_muted,
-            false,
-        );
-        line(
             dialog.hint(),
-            row(0.74, 0.09),
+            row(0.83, 0.074),
             12.0,
             if dialog.error.is_some() {
                 theme.status_err

@@ -25,7 +25,13 @@ asset has a sibling SHA-256 checksum. Compare the downloaded file with its check
 
 ## First workspace
 
-From a terminal in a repository, run:
+Launch **Daedalus** to set up your first workspace. Choose a project folder on the daemon host and select **Review environment**. Daedalus reads the repository configuration and suggests commands for the coding agent, development server, and tests. Review the commands and choose **Open workspace**. Only the agent starts by default. Use **Run tests** when you are ready.
+
+![Environment review with a missing coding agent, an installation command, and on-demand development server and tests](docs/images/environment-setup.png)
+
+The review shows which executables the daemon can find. **Install here** shows the installer command and runs it in a setup terminal on that host. When it exits, the review checks again without discarding your command edits. For supported tools you can also open the official installation guide and select **Check again**. A locked npm project without installed dependencies offers a separate `npm ci` action.
+
+You can skip setup and reopen it from **+ Workspace**. To use the existing direct-start flow from a terminal in a repository, run:
 
 ```sh
 daedalus-ui --dir . --agent shell
@@ -43,15 +49,25 @@ The sidebar groups linked worktrees under their repository and lists tools detec
 workspace root. It recognizes Compose, Cargo, npm, Composer, Python, and Make. Opening a mixed
 project shows each tool and preserves the commands you set in `.daedalus.toml`.
 In **Settings**, add any number of named agents or commands. For example, add a Codex agent named
-“Reviewer” and a runner named “Unit tests” with arguments `["cargo", "test"]`.
+“Reviewer” and a runner named “Unit tests”. For the runner, enter `cargo` as the executable
+and `test` as its first argument. Each argument has its own field, so a value containing spaces
+stays a single argument.
 **Save** records the assignments in your local Daedalus configuration. **Save & launch** also opens
 the selected assignment in its own terminal. Switching workspaces restores your selected terminal.
 
 ![Native workspace settings with named agents and commands](docs/images/workspace-settings.png)
 
 **Since you left** shows observed agent activity, command exits and changes in service status.
+Select a pane event to open the terminal that produced it while that terminal is available.
+With the keyboard, press `Ctrl+Shift+Y`, choose an event with Up or Down, and press Enter.
 When you reopen the UI, the daemon can replay recent activity for each workspace. A gap is shown
 if the daemon restarted or older events expired.
+
+A worktree card shows **Failed →** when one of its runner terminals has failed. Select it to
+open that terminal directly, even from another worktree. Press **Ctrl+Shift+R** to visit
+failing workspaces in sidebar order.
+
+![Failed run button on the orbit worktree and the selected runner showing its failed health check](docs/images/failed-run.png)
 
 ## Keybindings (`daedalus-ui`)
 
@@ -68,9 +84,11 @@ if the daemon restarted or older events expired.
 | `Ctrl+Shift+W` | Open/close New Git Worktree modal |
 | `Ctrl+Shift+A` | Open workspace action palette |
 | `Ctrl+Shift+N` | Open the new workspace form |
+| `Ctrl+Shift+T` | Launch the saved setup test command in the current workspace. |
+| `Ctrl+Shift+R` | Open a failed runner. Repeat to visit the next failing workspace. |
 | `Ctrl+Shift+E` | Forward latest `Runner` failure trace to `Agent` (bracketed paste) |
 | `Ctrl+Shift+C` / `V` | Copy selection / Bracketed-paste clipboard |
-| `Ctrl+Shift+F` | Search the focused pane. Enter advances, Shift+Enter goes back, and Esc closes search. |
+| `Ctrl+Shift+F` | Search the focused pane. Enter advances, Shift+Enter goes back, and Esc closes search. The search bar also has previous and next controls and a match-case toggle (F4). |
 | `Shift+PageUp` / `PageDown` / `End` | Scrollback navigation |
 
 ---

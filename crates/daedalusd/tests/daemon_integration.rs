@@ -2277,7 +2277,9 @@ async fn tcp_wsl2_bridge_rpc_round_trip() {
             vt_backend,
             isolation_mode,
             journal_supported,
+            inspect_setup_supported,
         } => {
+            assert!(inspect_setup_supported);
             assert!(journal_supported);
             assert_eq!(version, env!("CARGO_PKG_VERSION"));
             assert!(!vt_backend.is_empty());
@@ -2285,6 +2287,31 @@ async fn tcp_wsl2_bridge_rpc_round_trip() {
         }
         other => panic!("expected Pong, got {other:?}"),
     }
+
+    std::fs::write(ws_dir.join("Cargo.toml"), "[workspace]").unwrap();
+    let ResponsePayload::SetupInspection(inspection) = send_rpc(
+        &mut client,
+        20,
+        ClientMessage::InspectSetup {
+            root_dir: ws_dir.clone(),
+            executables: vec![],
+        },
+    )
+    .await
+    else {
+        panic!("expected setup inspection")
+    };
+    assert!(
+        inspection
+            .commands
+            .contains(&(PaneRole::Runner, vec!["cargo".into(), "test".into()]))
+    );
+    let ResponsePayload::Workspaces(entries) =
+        send_rpc(&mut client, 21, ClientMessage::ListWorkspaces).await
+    else {
+        panic!("expected workspace list")
+    };
+    assert!(entries.is_empty(), "inspection must not create a workspace");
 
     let created = match send_rpc(
         &mut client,

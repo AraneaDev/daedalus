@@ -15,11 +15,26 @@ pub struct Request {
     pub payload: ClientMessage,
 }
 
+/// Read-only discovery on the daemon host. Commands retain their argument boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupInspection {
+    pub commands: Vec<(PaneRole, Vec<String>)>,
+    pub available: Vec<String>,
+    #[serde(default)]
+    pub dependency_install: Option<Vec<String>>,
+    pub host: String,
+    pub platform: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMessage {
     Ping,
     Authenticate {
         token: String,
+    },
+    InspectSetup {
+        root_dir: PathBuf,
+        executables: Vec<String>,
     },
     CreateManualWorkspace {
         name: String,
@@ -157,7 +172,10 @@ pub enum ResponsePayload {
         isolation_mode: String,
         #[serde(default)]
         journal_supported: bool,
+        #[serde(default)]
+        inspect_setup_supported: bool,
     },
+    SetupInspection(SetupInspection),
     Activity(ActivityPage),
     WorkspaceCreated(WorkspaceInfo),
     WorkspaceResolved(WorkspaceInfo),

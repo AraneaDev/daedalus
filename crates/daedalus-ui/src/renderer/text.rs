@@ -1,6 +1,7 @@
 mod chrome;
 mod modal;
 mod settings;
+mod setup_review;
 mod workspace_form;
 
 use std::collections::{HashMap, HashSet};
@@ -132,10 +133,10 @@ pub fn truncate_right_with_ellipsis(input: &str, columns: usize) -> String {
     format!("{}…", &input[..end])
 }
 
-fn recipient_row_label(name: &str, id: &str, columns: usize) -> String {
-    let suffix = format!(" · {id}");
+fn label_with_trailing_detail(name: &str, detail: &str, columns: usize) -> String {
+    let suffix = format!(" · {detail}");
     if columns <= suffix.width() {
-        return truncate_right_with_ellipsis(id, columns);
+        return truncate_right_with_ellipsis(detail, columns);
     }
     format!(
         "{}{suffix}",
@@ -263,6 +264,7 @@ pub struct TextRenderer {
     modal_items: Vec<ChromeTextItem>,
     pub(super) has_modal_text: bool,
     pub(super) recap_drawn: bool,
+    pub(super) recap_targets: Vec<(Rect, crate::recap::RecapEntry)>,
 }
 
 impl TextRenderer {
@@ -325,6 +327,7 @@ impl TextRenderer {
             modal_items: Vec::new(),
             has_modal_text: false,
             recap_drawn: false,
+            recap_targets: Vec::new(),
         }
     }
 
@@ -521,6 +524,7 @@ impl TextRenderer {
         // 2. Rebuild UI chrome text buffers (sidebar, banner, pane headers, pills).
         self.chrome_items.clear();
         self.recap_drawn = false;
+        self.recap_targets.clear();
         self.build_chrome_items(state, layout, theme, cards);
 
         // 3. Prepare base text pass (terminal rows + UI chrome).
@@ -567,12 +571,14 @@ impl TextRenderer {
             &mut self.swash_cache,
         ) {
             self.recap_drawn = false;
+            self.recap_targets.clear();
             tracing::warn!(%err, "glyphon base text prepare failed");
         }
 
         // 4. Rebuild & prepare overlay text pass if a modal or search bar is open.
         self.modal_items.clear();
         let modal_open = state.failure_recipients.is_some()
+            || state.setup_review.open
             || state.workspace_form.open
             || state.settings.open
             || state.action_palette.open
@@ -599,7 +605,7 @@ impl TextRenderer {
                     let max_w = (rect.width - 20. * s).max(1.);
                     let glyph_width =
                         self.cell_w * CHROME_FONT_SIZE_LOGICAL / self.font_size_logical;
-                    let label = recipient_row_label(
+                    let label = label_with_trailing_detail(
                         state.recipient_name(pane),
                         &pane.short(),
                         (max_w / glyph_width) as usize,
@@ -620,6 +626,8 @@ impl TextRenderer {
                         bold: selected,
                     });
                 }
+            } else if state.setup_review.open {
+                self.build_setup_review_items(state, theme, screen_w, screen_h);
             } else if state.workspace_form.open {
                 self.build_workspace_form_items(state, theme, screen_w, screen_h);
             } else if state.settings.open {
@@ -935,7 +943,7 @@ mod tests {
     #[test]
     fn compact_recipient_rows_keep_the_disambiguating_id_after_long_names() {
         for id in ["deadbeef", "cafefeed"] {
-            let label = recipient_row_label("長い同じ名前を持っているエージェント", id, 22);
+            let label = label_with_trailing_detail("長い同じ名前を持っているエージェント", id, 22);
             assert!(label.ends_with(&format!("… · {id}")));
             assert!(label.width() <= 22);
         }

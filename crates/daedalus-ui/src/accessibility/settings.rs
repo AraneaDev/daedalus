@@ -1,12 +1,20 @@
 use super::{bounds, editable_field, named};
 use accesskit::{Action, ActionData, ActionRequest, Invalid, Live, Node, NodeId, Role, TreeId};
 use daedalus_ui::layout::Rect;
-use daedalus_ui::settings::{Control, SettingsAction, SettingsDialog, control_order, controls};
+use daedalus_ui::settings::{Control, SettingsAction, SettingsDialog};
 use daedalus_ui::state::AppState;
 
 fn id(dialog: &SettingsDialog, offset: u64) -> NodeId {
     // A distinct namespace keeps callbacks from earlier forms and assignments isolated.
-    NodeId((1 << 62) | ((dialog.revision() & ((1 << 57) - 1)) << 5) | offset)
+    NodeId((1 << 62) | ((dialog.revision() & ((1 << 56) - 1)) << 6) | offset)
+}
+
+fn control_id(settings: &SettingsDialog, control: Control) -> NodeId {
+    let offset = settings
+        .control_order()
+        .position(|c| c == control)
+        .expect("visible control");
+    id(settings, offset as u64)
 }
 
 pub(super) fn fields(
@@ -16,36 +24,29 @@ pub(super) fn fields(
     modal: Rect,
 ) -> NodeId {
     dialog.set_bounds(bounds(modal));
-    let error_id = id(settings, 31);
+    let error_id = id(settings, 63);
     if let Some(error) = &settings.error {
         let mut alert = named(Role::Alert, error);
         alert.set_live(Live::Assertive);
         dialog.push_child(error_id);
         nodes.push((error_id, alert));
     }
-    for (control, rect) in controls(modal) {
+    for (index, (control, rect)) in settings.controls(modal).enumerate() {
         let enabled = settings.enabled(control);
         let mut node = match control {
-            Control::Name | Control::Args => {
-                let label = if control == Control::Name {
-                    "Name"
-                } else {
-                    "Arguments"
-                };
+            Control::Name | Control::Executable | Control::Argument(_) => {
+                let label = control.field_label().unwrap();
                 let mut field = if enabled {
                     editable_field(
-                        label,
+                        &label,
                         settings.value(control).unwrap_or_default(),
-                        id(settings, 16 + control as u64),
+                        id(settings, 32 + index as u64),
                         settings.selection(control),
                         nodes,
                     )
                 } else {
                     named(Role::TextInput, label)
                 };
-                if control == Control::Args {
-                    field.set_description("JSON array of arguments, starting with the executable.");
-                }
                 if settings.error.is_some() && settings.invalid_field == Some(control) {
                     field.set_invalid(Invalid::True);
                     field.set_error_message(error_id);
@@ -54,6 +55,9 @@ pub(super) fn fields(
             }
             _ => {
                 let label = match control {
+                    Control::DropArgument(i) => format!("Remove argument {}", i + 1),
+                    Control::PreviousArguments => "Previous arguments".into(),
+                    Control::NextArguments => "Next arguments".into(),
                     Control::Prev => "Previous assignment".into(),
                     Control::Next => "Next assignment".into(),
                     Control::Add => "Add command".into(),
@@ -75,11 +79,11 @@ pub(super) fn fields(
             node.set_disabled();
         }
         node.set_bounds(bounds(rect));
-        let node_id = id(settings, control as u64);
+        let node_id = id(settings, index as u64);
         dialog.push_child(node_id);
         nodes.push((node_id, node));
     }
-    id(settings, settings.focus as u64)
+    control_id(settings, settings.focus)
 }
 
 pub(crate) fn settings_action(
@@ -87,20 +91,22 @@ pub(crate) fn settings_action(
     request: &ActionRequest,
 ) -> Option<SettingsAction> {
     if request.target_tree != TreeId::ROOT
+        || state.setup_review.open
         || !state.settings.open
         || state.failure_recipients.is_some()
     {
         return None;
     }
     let settings = &mut state.settings;
-    let control = control_order()
-        .find(|&c| id(settings, c as u64) == request.target_node && settings.enabled(c))?;
+    let (_, control) = settings.control_order().enumerate().find(|&(index, c)| {
+        id(settings, index as u64) == request.target_node && settings.enabled(c)
+    })?;
     match request.action {
         Action::Focus => settings.set_focus(control),
-        Action::Click if !matches!(control, Control::Name | Control::Args) => {
+        Action::Click if control.field_label().is_none() => {
             return Some(settings.activate(control));
         }
-        Action::SetValue if matches!(control, Control::Name | Control::Args) => {
+        Action::SetValue if control.field_label().is_some() => {
             let Some(ActionData::Value(value)) = &request.data else {
                 return None;
             };
@@ -122,7 +128,7 @@ mod tests {
         data: Option<ActionData>,
     ) -> ActionRequest {
         ActionRequest {
-            target_node: id(settings, control as u64),
+            target_node: control_id(settings, control),
             target_tree: TreeId::ROOT,
             action,
             data,
@@ -153,9 +159,12 @@ mod tests {
         state.settings.begin(vec![]);
         for (w, h, scale) in [(320., 480., 1.), (2400., 1600., 2.)] {
             let update = crate::accessibility::tree(&state, w, h, scale);
-            assert_eq!(update.focus, id(&state.settings, Control::Add as u64));
-            for (control, r) in controls(daedalus_ui::settings::modal_rect(w, h, scale)) {
-                let node_id = id(&state.settings, control as u64);
+            assert_eq!(update.focus, control_id(&state.settings, Control::Add));
+            for (control, r) in state
+                .settings
+                .controls(daedalus_ui::settings::modal_rect(w, h, scale))
+            {
+                let node_id = control_id(&state.settings, control);
                 let n = &update.nodes.iter().find(|(i, _)| *i == node_id).unwrap().1;
                 assert_eq!(n.bounds(), Some(bounds(r)));
                 assert_eq!(n.is_disabled(), !state.settings.enabled(control));
@@ -179,7 +188,10 @@ mod tests {
             Some(SettingsAction::None)
         ));
         let update = crate::accessibility::tree(&state, 320., 480., 1.);
-        assert_eq!(update.focus, id(&state.settings, Control::Args as u64));
+        assert_eq!(
+            update.focus,
+            control_id(&state.settings, Control::Executable)
+        );
         let field = &update
             .nodes
             .iter()
@@ -210,7 +222,9 @@ mod tests {
             ),
             (0, 3)
         );
-        set(&mut state, Control::Args, r#"["printf","test"]"#);
+        set(&mut state, Control::Executable, "printf");
+        click(&mut state, Control::AddArgument);
+        set(&mut state, Control::Argument(0), "test");
         let Some(SettingsAction::Launch(entries, selected)) = click(&mut state, Control::Launch)
         else {
             panic!("expected launch");
@@ -218,6 +232,36 @@ mod tests {
         assert_eq!(entries[0].id, selected);
         assert_eq!(entries[0].name, "日本語");
         assert_eq!(entries[0].argv, ["printf", "test"]);
+    }
+
+    #[test]
+    fn argument_pages_expose_current_rows_and_reject_stale_remove_actions() {
+        let mut state = AppState::new();
+        state.settings.begin(vec![]);
+        click(&mut state, Control::Codex);
+        for value in ["", "one two", "three", "four"] {
+            click(&mut state, Control::AddArgument);
+            let field = state.settings.focus;
+            set(&mut state, field, value);
+        }
+        let stale = request(
+            &state.settings,
+            Control::DropArgument(3),
+            Action::Click,
+            None,
+        );
+        click(&mut state, Control::PreviousArguments);
+        assert!(settings_action(&mut state, &stale).is_none());
+        let tree = crate::accessibility::tree(&state, 320., 480., 1.);
+        assert_eq!(
+            tree.focus,
+            control_id(&state.settings, Control::Argument(0))
+        );
+        click(&mut state, Control::DropArgument(1));
+        let Some(SettingsAction::Save(entries)) = click(&mut state, Control::Save) else {
+            panic!("expected save");
+        };
+        assert_eq!(entries[0].argv, ["codex", "", "three", "four"]);
     }
 
     #[test]
