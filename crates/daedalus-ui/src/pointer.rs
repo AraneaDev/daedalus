@@ -80,6 +80,7 @@ fn divider_at(layout: &WorkspaceLayout, x: f32, y: f32, scale: f32) -> Option<Di
 pub(super) struct PointerState {
     pub(super) position: (f32, f32),
     pub(super) splits: PaneSplits,
+    hovered_url: Option<String>,
     divider_drag: Option<DividerDrag>,
     drag_anchor: Option<(PaneRole, PaneId, CellPos)>,
     last_click: Option<(Instant, PaneRole, u16, u16)>,
@@ -270,6 +271,21 @@ impl DaedalusApp {
         } = metrics;
         let (x, y) = self.pointer.position;
         let layout = self.layout_for(metrics);
+        if layout
+            .preview_panel(&self.state, scale_factor)
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            self.state.image_preview = None;
+            self.request_redraw();
+            return;
+        }
+        if layout
+            .preview_button(&self.state, scale_factor)
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            self.handle_ui_action(UiAction::PreviewImage);
+            return;
+        }
         if let Some(drag) = divider_at(&layout, x, y, scale_factor) {
             self.pointer.divider_drag = Some(drag);
             return;
@@ -388,6 +404,18 @@ impl DaedalusApp {
         }
     }
 
+    pub(super) fn update_link_hover(&mut self, url: Option<String>) {
+        if self.pointer.hovered_url != url {
+            if let Some(window) = &self.window {
+                let title = url
+                    .as_ref()
+                    .map(|url| format!("Daedalus Workbench — {url}"));
+                window.set_title(title.as_deref().unwrap_or("Daedalus Workbench"));
+            }
+            self.pointer.hovered_url = url;
+        }
+    }
+
     pub(super) fn handle_cursor_moved(&mut self, x: f32, y: f32) {
         self.pointer.position = (x, y);
         if let Some(drag) = self.pointer.divider_drag {
@@ -409,14 +437,43 @@ impl DaedalusApp {
         if self.pointer.drag_anchor.is_none()
             && let Some(metrics) = self.viewport_metrics()
         {
+            let layout = self.layout_for(metrics);
             let handle = (!self.state.zoomed)
-                .then(|| divider_at(&self.pane_geometry(metrics), x, y, metrics.scale_factor))
+                .then(|| divider_at(&layout, x, y, metrics.scale_factor))
                 .flatten();
+            let target = hit_test(
+                &layout,
+                self.state.workspaces.len(),
+                metrics.scale_factor,
+                metrics.cell.0,
+                metrics.cell.1,
+                x,
+                y,
+            );
+            let url = if let HitTarget::PaneViewport { role, col, row } = target
+                && handle.is_none()
+                && !self.state.has_input_overlay()
+                && !layout
+                    .preview_panel(&self.state, metrics.scale_factor)
+                    .is_some_and(|rect| rect.contains(x, y))
+                && let Some(pane) = self.state.pane_for_role(role)
+                && let Some(daedalus_ui::links::DetectedLink::Url(url)) =
+                    daedalus_ui::links::browser_link_at(
+                        pane.visible_rows(),
+                        row as usize,
+                        col as usize,
+                    ) {
+                Some(url)
+            } else {
+                None
+            };
+            self.update_link_hover(url);
             if let Some(window) = &self.window {
                 use winit::window::CursorIcon;
                 window.set_cursor(match handle.map(|h| h.divider) {
                     Some(Divider::Column) => CursorIcon::ColResize,
                     Some(_) => CursorIcon::RowResize,
+                    None if self.pointer.hovered_url.is_some() => CursorIcon::Pointer,
                     None => CursorIcon::Default,
                 });
             }
@@ -582,6 +639,8 @@ mod tests {
             agent_state: None,
         });
         pane.viewport_rows.push(GridRow {
+            links: Vec::new(),
+            wraps: false,
             row_index: 0,
             abs_row: 42,
             cells: "a cat"

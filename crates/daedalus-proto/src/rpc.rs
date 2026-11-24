@@ -10,6 +10,23 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImagePreview {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl ImagePreview {
+    pub const MAX_EDGE: u32 = 192;
+
+    pub fn valid(&self) -> bool {
+        (1..=Self::MAX_EDGE).contains(&self.width)
+            && (1..=Self::MAX_EDGE).contains(&self.height)
+            && self.rgba.len() == self.width as usize * self.height as usize * 4
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     pub id: u64,
     pub payload: ClientMessage,
@@ -148,6 +165,10 @@ pub enum ClientMessage {
         #[serde(default)]
         project_setup_events: bool,
     },
+    PreviewImage {
+        workspace_id: WorkspaceId,
+        path: String,
+    },
     ListRecentProjects,
     SetProjectSetup {
         workspace_id: WorkspaceId,
@@ -186,8 +207,11 @@ pub enum ResponsePayload {
         #[serde(default)]
         project_setup_supported: bool,
         #[serde(default)]
+        image_preview_supported: bool,
+        #[serde(default)]
         home_dir: Option<PathBuf>,
     },
+    ImagePreview(ImagePreview),
     RecentProjects(Vec<RecentProject>),
     SetupInspection(SetupInspection),
     Activity(ActivityPage),

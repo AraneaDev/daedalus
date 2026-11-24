@@ -94,6 +94,7 @@ impl Perform for PerformerState {
 
     fn execute(&mut self, byte: u8) {
         match byte {
+            7 => self.pending_events.push(SemanticEvent::Attention),
             b'\r' => self.grid.carriage_return(),
             b'\n' | 0x0b | 0x0c => self.grid.linefeed(),
             0x08 => self.grid.backspace(),
@@ -192,6 +193,23 @@ impl Perform for PerformerState {
             return;
         }
         match params[0] {
+            b"8" => {
+                let parts = params.get(2..).unwrap_or_default();
+                let len = parts.iter().map(|part| part.len()).sum::<usize>()
+                    + parts.len().saturating_sub(1);
+                if len > daedalus_proto::types::LinkSpan::MAX_URI_BYTES {
+                    self.grid.set_hyperlink(&[]);
+                } else {
+                    self.grid.set_hyperlink(&parts.join(&b';'));
+                }
+            }
+            b"0" | b"2" => self
+                .pending_events
+                .push(SemanticEvent::Title(crate::terminal_title(&params[1..]))),
+            b"9" if params.len() == 2 => self.pending_events.push(SemanticEvent::Attention),
+            b"777" if params.get(1) == Some(&b"notify".as_slice()) => {
+                self.pending_events.push(SemanticEvent::Attention)
+            }
             b"7" => {
                 if let Some(uri_bytes) = params.get(1)
                     && let Ok(uri) = std::str::from_utf8(uri_bytes)

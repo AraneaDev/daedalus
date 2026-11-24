@@ -25,6 +25,8 @@ pub struct PaneViewState {
     pub agent_preset: Option<AgentPreset>,
     pub last_failure_trace: Option<FailureTrace>,
     pub show_diagnostic: bool,
+    pub activity: Option<daedalus_proto::types::TerminalActivity>,
+    pub unread_attention: bool,
     pub insight: Option<daedalus_proto::RunnerInsight>,
     pub last_seq: u64,
 }
@@ -51,8 +53,41 @@ impl PaneViewState {
             agent_preset: preset,
             last_failure_trace: None,
             show_diagnostic: false,
+            unread_attention: false,
+            activity: None,
             insight: None,
             last_seq: 0,
+        }
+    }
+
+    pub fn tab_indicator(&self, reduced_motion: bool) -> Option<char> {
+        if self.unread_attention {
+            return Some('●');
+        }
+        if matches!(
+            self.summary.status,
+            daedalus_proto::PaneStatus::Exited { .. }
+        ) {
+            return None;
+        }
+        let title = self
+            .activity
+            .as_ref()
+            .map_or("", |activity| activity.title.as_str());
+        // Both CLIs replace their spinner title when they return to the prompt.
+        if title == "codex" || title.starts_with("✳ ") {
+            return None;
+        }
+        let frame = title.chars().next().filter(|c| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◑".contains(*c));
+        if frame.is_some() || self.summary.agent_state == Some(daedalus_proto::AgentState::Thinking)
+        {
+            Some(if reduced_motion {
+                '•'
+            } else {
+                frame.unwrap_or('•')
+            })
+        } else {
+            None
         }
     }
 
@@ -77,6 +112,7 @@ impl PaneViewState {
     pub fn apply_snapshot(&mut self, snapshot: GridSnapshot) -> bool {
         let erased = self.update_history_generation(snapshot.history_generation);
         self.grid_received = true;
+        self.activity = snapshot.activity;
         self.insight = snapshot.insight;
         self.summary.cols = snapshot.cols;
         self.summary.rows = snapshot.rows;
@@ -103,6 +139,13 @@ impl PaneViewState {
         if delta.insight.as_ref().is_none_or(|i| i.phase != "Failed") {
             self.show_diagnostic = false;
         }
+        if delta.activity.as_ref().is_some_and(|next| {
+            self.grid_received
+                && next.attention_seq > self.activity.as_ref().map_or(0, |old| old.attention_seq)
+        }) {
+            self.unread_attention = true;
+        }
+        self.activity = delta.activity;
         self.insight = delta.insight;
         let erased = self.update_history_generation(delta.history_generation);
         if let Some(len) = delta.scrollback_len {
@@ -125,6 +168,8 @@ impl PaneViewState {
             if idx >= self.viewport_rows.len() {
                 for fill_idx in self.viewport_rows.len()..=idx {
                     self.viewport_rows.push(GridRow {
+                        links: Vec::new(),
+                        wraps: false,
                         row_index: fill_idx as u16,
                         abs_row: 0,
                         cells: Vec::new(),
@@ -242,6 +287,7 @@ mod tests {
 
         // Initial delta when last_seq == 0 should still apply
         pane.apply_delta(GridDelta {
+            activity: None,
             insight: None,
             pane_id: pane.summary.id,
             seq: 1,
@@ -257,6 +303,7 @@ mod tests {
 
         // Newer snapshot advances last_seq to 5
         pane.apply_snapshot(GridSnapshot {
+            activity: None,
             insight: None,
             pane_id: pane.summary.id,
             seq: 5,
@@ -276,6 +323,7 @@ mod tests {
         // Older (seq < last_seq) and duplicate (seq == last_seq) deltas must be ignored
         for stale_seq in [4, 5] {
             pane.apply_delta(GridDelta {
+                activity: None,
                 insight: None,
                 pane_id: pane.summary.id,
                 seq: stale_seq,
@@ -298,6 +346,7 @@ mod tests {
 
         // Newer delta (seq > last_seq) applies normally
         pane.apply_delta(GridDelta {
+            activity: None,
             insight: None,
             pane_id: pane.summary.id,
             seq: 6,
@@ -324,6 +373,7 @@ mod tests {
         let summary = make_pane_summary(ws_id, PaneRole::Runner);
         let mut pane = PaneViewState::from_summary(summary);
         pane.apply_snapshot(GridSnapshot {
+            activity: None,
             insight: None,
             pane_id: pane.summary.id,
             seq: 1,
@@ -393,6 +443,7 @@ mod tests {
         pane.set_scroll_offset(5);
         let original = pane.begin_scrollback_request().unwrap();
         pane.apply_delta(GridDelta {
+            activity: None,
             insight: None,
             pane_id: pane.summary.id,
             seq: 1,

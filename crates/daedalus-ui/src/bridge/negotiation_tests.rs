@@ -35,6 +35,7 @@ fn pong(supported: bool) -> ResponsePayload {
         inspect_setup_supported: true,
         recent_projects_supported: supported,
         project_setup_supported: supported,
+        image_preview_supported: supported,
         home_dir: supported.then(|| PathBuf::from("/home/test")),
     }
 }
@@ -75,6 +76,7 @@ fn fake_daemon(
                     let Ok(Some(request)) = request else { return };
                     let result = match &request.payload {
                         ClientMessage::Ping => pong.clone(),
+                        ClientMessage::PreviewImage {path, ..} if path == "sample.png" => ResponsePayload::ImagePreview(daedalus_proto::rpc::ImagePreview{width:1,height:1,rgba:vec![0,0,0,255]}),
                         ClientMessage::ListWorkspaces => ResponsePayload::Workspaces(vec![]),
                         ClientMessage::ListRecentProjects => {
                             ResponsePayload::RecentProjects(vec![recent()])
@@ -356,4 +358,37 @@ async fn invalid_setup_on_new_daemon_is_rejected_locally() {
     );
     conn.close().await;
     task.abort();
+}
+
+#[tokio::test]
+async fn preview_only_queries_capable_daemon_and_validates_reply() {
+    for supported in [false, true] {
+        let (conn, _, _, task, mut seen, _events) = handshake(supported).await;
+        let (tx, mut ui) = mpsc::unbounded_channel();
+        let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink(tx));
+        let id = WorkspaceId::new();
+        let pane = daedalus_proto::PaneId::new();
+        for path in ["sample.png", "bad.png"] {
+            let cmd = UiCommand::PreviewImage {
+                workspace_id: id,
+                pane_id: pane,
+                path: path.into(),
+            };
+            tokio::time::timeout(WAIT, handle_command(&conn, &sink, cmd))
+                .await
+                .unwrap()
+                .unwrap();
+            let event = ui.try_recv().unwrap();
+            if supported && path == "sample.png" {
+                assert!(
+                    matches!(event,UiEvent::ImagePreview{pane_id,image} if pane_id == pane && image.valid())
+                );
+            } else {
+                assert!(matches!(event, UiEvent::Toast { is_error: true, .. }));
+            }
+            assert_eq!(drain(&mut seen).iter().any(|r| matches!(r,ClientMessage::PreviewImage{workspace_id,path:p} if *workspace_id == id && p == path)),supported);
+        }
+        conn.close().await;
+        task.abort();
+    }
 }

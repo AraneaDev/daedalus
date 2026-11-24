@@ -3457,3 +3457,40 @@ async fn cargo_widget_snapshots_survive_reconnect_and_process_exit() {
     shutdown.send(()).unwrap();
     task.await.unwrap().unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_png_preview_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("images");
+    std::fs::create_dir(&project).unwrap();
+    image::RgbaImage::from_pixel(2, 1, image::Rgba([13, 21, 34, 255]))
+        .save(project.join("sample.png"))
+        .unwrap();
+    let (sock, shutdown, handle) = start_unix_test_daemon(&dir).await;
+    let mut client = IpcStream::connect(&sock).await.unwrap();
+    let workspace = create_ws(&mut client, 1, "screenshots", &project).await;
+    let request = |path: &str| ClientMessage::PreviewImage {
+        workspace_id: workspace.id,
+        path: path.into(),
+    };
+    let ResponsePayload::ImagePreview(preview) =
+        send_rpc(&mut client, 2, request("./sample.png")).await
+    else {
+        panic!("expected thumbnail")
+    };
+    assert!(preview.valid());
+    assert_eq!(preview.rgba, [13, 21, 34, 255].repeat(2));
+    assert!(
+        send_rpc_result(&mut client, 3, request("../sample.png"))
+            .await
+            .is_err()
+    );
+    assert!(
+        send_rpc_result(&mut client, 4, request("missing.png"))
+            .await
+            .is_err()
+    );
+    let _ = shutdown.send(());
+    handle.await.unwrap();
+}

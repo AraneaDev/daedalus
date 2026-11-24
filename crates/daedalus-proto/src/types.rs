@@ -391,7 +391,25 @@ impl Default for Cell {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Half-open cell range of an OSC 8 hyperlink on one physical terminal row.
+pub struct LinkSpan {
+    pub start: u16,
+    pub end: u16,
+    pub url: String,
+}
+
+impl LinkSpan {
+    /// Bound retained memory and snapshot payloads independently of terminal output.
+    pub const MAX_PER_ROW: usize = 16;
+    pub const MAX_URI_BYTES: usize = 2048;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GridRow {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<LinkSpan>,
+    #[serde(default)]
+    pub wraps: bool,
     pub row_index: u16,
     pub abs_row: u64,
     pub cells: Vec<Cell>,
@@ -402,6 +420,12 @@ pub struct CursorState {
     pub col: u16,
     pub row: u16,
     pub visible: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalActivity {
+    pub title: String,
+    pub attention_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,6 +443,8 @@ pub struct GridSnapshot {
     pub history_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub insight: Option<RunnerInsight>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<TerminalActivity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,6 +462,8 @@ pub struct GridDelta {
     pub scrollback_len: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub insight: Option<RunnerInsight>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<TerminalActivity>,
 }
 
 /// A single substring match in a pane's scrollback/viewport history (`end_col` is exclusive).

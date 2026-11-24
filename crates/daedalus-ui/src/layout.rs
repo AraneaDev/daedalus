@@ -179,6 +179,38 @@ pub struct WorkspaceLayout {
 }
 
 impl WorkspaceLayout {
+    pub fn preview_button(&self, state: &crate::state::AppState, scale: f32) -> Option<Rect> {
+        if state.search.is_some() || self.preview_panel(state, scale).is_some() {
+            return None;
+        }
+        state.selected_png_path()?;
+        let view = self.pane(state.focused_role)?.viewport;
+        let width = (114. * scale).min(view.width);
+        Some(Rect::new(
+            view.right() - width,
+            view.y,
+            width,
+            (23. * scale).min(view.height),
+        ))
+    }
+
+    pub fn preview_panel(&self, state: &crate::state::AppState, scale: f32) -> Option<Rect> {
+        let (id, image) = state.image_preview.as_ref()?;
+        if state.focused_pane_id() != Some(*id) || state.search.is_some() {
+            return None;
+        }
+        let view = self.pane(state.focused_role)?.viewport;
+        let width = (320. * scale).min(view.width * 0.45);
+        let height =
+            (width - 8. * scale).max(0.) * image.height as f32 / image.width as f32 + 28. * scale;
+        Some(Rect::new(
+            view.right() - width,
+            view.y,
+            width,
+            height.min(view.height),
+        ))
+    }
+
     pub fn reserve_insights(&mut self, roles: &[PaneRole], scale: f32, cell_h: f32) {
         let [pane] = self.panes.as_mut_slice() else {
             return;

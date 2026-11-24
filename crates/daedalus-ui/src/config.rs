@@ -28,6 +28,8 @@ pub struct UiConfig {
     pub font_size: f32,
     pub default_agent: AgentPreset,
     pub theme: ThemeName,
+    pub notification_ping: bool,
+    pub reduced_motion: bool,
     pub editor: Option<String>,
 }
 
@@ -38,6 +40,8 @@ impl Default for UiConfig {
             font_size: DEFAULT_FONT_SIZE,
             default_agent: AgentPreset::Shell,
             theme: ThemeName::DaedalusDark,
+            notification_ping: false,
+            reduced_motion: false,
             editor: None,
         }
     }
@@ -53,6 +57,10 @@ struct RawUiConfig {
     default_agent: Option<String>,
     #[serde(default)]
     theme: Option<String>,
+    #[serde(default)]
+    notification_ping: bool,
+    #[serde(default)]
+    reduced_motion: bool,
     #[serde(default)]
     editor: Option<String>,
 }
@@ -108,6 +116,8 @@ impl UiConfig {
             font_size,
             default_agent,
             theme,
+            notification_ping: raw.notification_ping,
+            reduced_motion: raw.reduced_motion,
             editor: normalize_non_empty(raw.editor),
         })
     }
@@ -166,6 +176,8 @@ mod tests {
         std::fs::write(
             &cfg_path,
             r#"
+notification_ping = true
+reduced_motion = true
 font_family = "JetBrains Mono"
 font_size = 16.5
 default_agent = "claude"
@@ -176,6 +188,7 @@ editor = "code --goto {path}:{line}:{col}"
         .unwrap();
 
         let cfg = UiConfig::load(Some(&cfg_path));
+        assert!(cfg.notification_ping && cfg.reduced_motion);
         assert_eq!(cfg.font_family.as_deref(), Some("JetBrains Mono"));
         assert_eq!(cfg.font_size, 16.5);
         assert_eq!(cfg.default_agent, AgentPreset::Claude);

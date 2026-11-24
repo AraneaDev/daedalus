@@ -6,6 +6,8 @@ use std::{collections::HashMap, path::PathBuf};
 
 pub(super) fn make_row(row_index: u16, abs_row: u64, text: &str) -> GridRow {
     GridRow {
+        links: Vec::new(),
+        wraps: false,
         row_index,
         abs_row,
         cells: text

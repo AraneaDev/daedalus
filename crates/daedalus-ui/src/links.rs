@@ -77,6 +77,74 @@ pub fn detect_url_in_row(row: &GridRow, col: usize) -> Option<DetectedLink> {
     row_link(row, col, None)
 }
 
+/// Resolve the visible portion of a logical line across terminal soft wraps.
+pub fn browser_link_at(rows: &[GridRow], row: usize, col: usize) -> Option<DetectedLink> {
+    let clicked = rows.get(row)?;
+    clicked.cells.get(col)?;
+    if let Some(span) = clicked
+        .links
+        .iter()
+        .find(|span| (span.start as usize..span.end as usize).contains(&col))
+    {
+        return is_safe_http_url(&span.url).then(|| DetectedLink::Url(span.url.clone()));
+    }
+    if !clicked.wraps && (row == 0 || !rows[row - 1].wraps) {
+        return detect_url_in_row(clicked, col);
+    }
+    let mut x = col;
+    if clicked.cells[x].width == 0 {
+        x = x.checked_sub(1)?;
+    }
+    let origin = (row, x);
+    let mut y = row;
+    let blank = |cell: &daedalus_proto::Cell| {
+        cell.width != 0 && (cell.text.is_empty() || cell.text.chars().any(char::is_whitespace))
+    };
+    if blank(&rows[y].cells[x]) {
+        return None;
+    }
+    // Walk only the clicked token. Hard newlines and word boundaries end it.
+    for _ in 0..8192 {
+        let previous = if x > 0 {
+            (y, x - 1)
+        } else if y > 0 && rows[y - 1].wraps {
+            (y - 1, rows[y - 1].cells.len().checked_sub(1)?)
+        } else {
+            break;
+        };
+        if blank(&rows[previous.0].cells[previous.1]) {
+            break;
+        }
+        (y, x) = previous;
+    }
+    let mut token = String::new();
+    let mut click = None;
+    loop {
+        let cell = rows.get(y)?.cells.get(x)?;
+        if blank(cell) {
+            break;
+        }
+        if (y, x) == origin {
+            click = Some(token.len());
+        }
+        if cell.width != 0 {
+            token.push_str(&cell.text);
+        }
+        if token.len() > 8192 {
+            return None;
+        }
+        x += 1;
+        if x == rows[y].cells.len() {
+            if !rows[y].wraps {
+                break;
+            }
+            y += 1;
+            x = 0;
+        }
+    }
+    extract_url_at(&token, click?).map(DetectedLink::Url)
+}
+
 fn row_link(
     row: &GridRow,
     col: usize,
@@ -605,6 +673,48 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn wrapped_and_labeled_links_use_the_displayed_rows() {
+        let row = |text: &str, wraps| GridRow {
+            row_index: 0,
+            abs_row: 0,
+            wraps,
+            links: Vec::new(),
+            cells: text
+                .chars()
+                .map(|ch| Cell {
+                    text: ch.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        let mut rows = vec![row("See (https://", true), row("host/a), txt", false)];
+        for (y, x) in [(0, 5), (1, 0), (1, 5)] {
+            assert_eq!(
+                browser_link_at(&rows, y, x),
+                Some(DetectedLink::Url("https://host/a".into()))
+            );
+        }
+        assert_eq!(browser_link_at(&rows, 1, 6), None);
+        assert_eq!(browser_link_at(&rows, 0, 3), None);
+        assert_eq!(browser_link_at(&rows[..1], 0, 5), None);
+        rows[0].wraps = false;
+        assert_eq!(browser_link_at(&rows, 1, 1), None);
+        rows[1].links.push(daedalus_proto::types::LinkSpan {
+            start: 8,
+            end: 12,
+            url: "https://different.example/".into(),
+        });
+        assert_eq!(
+            browser_link_at(&rows, 1, 9),
+            Some(DetectedLink::Url("https://different.example/".into()))
+        );
+        rows[1].links[0].url = "file:///tmp/test".into();
+        assert_eq!(browser_link_at(&rows, 1, 9), None);
+        assert_eq!(browser_link_at(&rows, 2, 0), None);
+        assert_eq!(browser_link_at(&rows, 1, 80), None);
+    }
+
+    #[test]
     fn detects_urls_and_strips_trailing_punctuation_with_balanced_parens() {
         let row = "See (https://en.wikipedia.org/wiki/Rust_(programming_language)). and https://example.com/a,";
         let wiki_col = row.find("https://en").unwrap() + 10;
@@ -785,6 +895,8 @@ mod tests {
             },
         ];
         let row = GridRow {
+            links: Vec::new(),
+            wraps: false,
             row_index: 0,
             abs_row: 0,
             cells,

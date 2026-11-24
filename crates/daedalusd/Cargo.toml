@@ -9,6 +9,7 @@ default = []
 ghostty-vt = ["daedalus-vt/ghostty-vt"]
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
 bollard.workspace = true
 clap.workspace = true
 daedalus-proto = { path = "../daedalus-proto" }

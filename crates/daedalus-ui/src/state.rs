@@ -130,6 +130,7 @@ pub struct AppState {
     pub focused_role: PaneRole,
     workspace_focus: HashMap<WorkspaceId, PaneRole>,
     selected_panes: HashMap<(WorkspaceId, PaneRole), PaneId>,
+    pub image_preview: Option<(PaneId, daedalus_proto::rpc::ImagePreview)>,
     pub sidebar_override: Option<bool>,
     pub sidebar_first: usize,
     pub zoomed: bool,
@@ -140,6 +141,7 @@ pub struct AppState {
     pub settings: crate::settings::SettingsDialog,
     pub recap: crate::recap::Recap,
     pub test_workspaces: HashSet<WorkspaceId>,
+    pub reduced_motion: bool,
     pub session_names: HashMap<PaneId, String>,
     pub action_palette: ActionPaletteState,
     pub picker: PickerState,
@@ -158,6 +160,34 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn selected_png_path(&self) -> Option<String> {
+        let pane = self.panes.get(&self.focused_pane_id()?)?;
+        let selection = pane.selection?;
+        if selection.anchor.abs_row != selection.head.abs_row {
+            return None;
+        }
+        let text = crate::selection::extract_selected_text(pane.visible_rows(), &selection);
+        let path = text.trim();
+        (path.len() <= 4096
+            && !path.chars().any(char::is_control)
+            && std::path::Path::new(path)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("png")))
+        .then(|| path.to_owned())
+    }
+
+    pub fn has_input_overlay(&self) -> bool {
+        self.failure_recipients.is_some()
+            || self.setup_review.open
+            || self.workspace_form.open
+            || self.settings.open
+            || self.action_palette.open
+            || self.picker.open
+            || self.worktree_modal.open
+            || self.close_modal.open
+            || self.search.is_some()
+    }
+
     pub fn can_create_worktree(&self) -> bool {
         self.connection == ConnectionState::Connected
             && !self.worktree_modal.branch_input.trim().is_empty()
@@ -171,6 +201,7 @@ impl AppState {
             active_workspace_id: None,
             panes: HashMap::new(),
             focused_role: PaneRole::Agent,
+            image_preview: None,
             sidebar_override: None,
             sidebar_first: 0,
             workspace_focus: HashMap::new(),
@@ -183,6 +214,7 @@ impl AppState {
             settings: Default::default(),
             recap: Default::default(),
             test_workspaces: HashSet::new(),
+            reduced_motion: false,
             session_names: HashMap::new(),
             action_palette: ActionPaletteState::default(),
             picker: PickerState::default(),

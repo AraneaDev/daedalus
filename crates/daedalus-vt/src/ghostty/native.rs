@@ -1,4 +1,5 @@
 use crate::{SemanticEvent, builtin::parse_osc7_file_uri};
+use daedalus_proto::types::LinkSpan;
 use daedalus_proto::{Cell, CellFlags, Color};
 use std::{ffi::c_void, ptr::NonNull};
 
@@ -45,6 +46,8 @@ struct NativeCell {
 
 unsafe extern "C" {
     fn dd_ghostty_new(cols: u16, rows: u16, lines: usize, user: *mut c_void) -> *mut c_void;
+    fn dd_ghostty_row_flags(vt: *mut c_void, y: u32, wrap: *mut bool, links: *mut bool);
+    fn dd_ghostty_link(vt: *mut c_void, x: u16, y: u32, buf: *mut u8, capacity: usize) -> usize;
     fn dd_ghostty_free(vt: *mut c_void);
     fn dd_ghostty_write(vt: *mut c_void, data: *const u8, len: usize);
     fn dd_ghostty_resize(vt: *mut c_void, cols: u16, rows: u16) -> bool;
@@ -81,6 +84,8 @@ extern "C" fn dd_ghostty_event(
         3 => SemanticEvent::CommandInputStart,
         4 => SemanticEvent::CommandExecuted,
         5 => SemanticEvent::CommandFinished { exit_code: code },
+        6 => SemanticEvent::Title(crate::terminal_title(&[bytes])),
+        7 => SemanticEvent::Attention,
         _ => return,
     };
     // SAFETY: the terminal owns this stable allocation and callbacks finish before write returns.
@@ -142,6 +147,44 @@ impl Terminal {
         let mut row = 0;
         // SAFETY: the row out-pointer is writable for the lifetime of the call.
         unsafe { dd_ghostty_anchor_row(self.handle.as_ptr(), &mut row) }.then_some(row)
+    }
+
+    pub fn row_links(&self, y: u32, cols: u16) -> (bool, Vec<LinkSpan>) {
+        let (mut wrap, mut has_links) = (false, false);
+        // SAFETY: both output pointers remain valid for this synchronous call.
+        unsafe { dd_ghostty_row_flags(self.handle.as_ptr(), y, &mut wrap, &mut has_links) };
+        let mut spans: Vec<LinkSpan> = Vec::new();
+        if has_links {
+            let mut buf = [0; LinkSpan::MAX_URI_BYTES];
+            for x in 0..cols {
+                // SAFETY: native writes at most buf.len() bytes and retains no pointer.
+                let len = unsafe {
+                    dd_ghostty_link(self.handle.as_ptr(), x, y, buf.as_mut_ptr(), buf.len())
+                };
+                let Some(url) = buf
+                    .get(..len)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                if let Some(span) = spans.last_mut()
+                    && span.end == x
+                    && span.url == url
+                {
+                    span.end += 1;
+                } else if spans.len() < LinkSpan::MAX_PER_ROW {
+                    spans.push(LinkSpan {
+                        start: x,
+                        end: x + 1,
+                        url: url.to_owned(),
+                    });
+                } else {
+                    break;
+                }
+            }
+        }
+        (wrap, spans)
     }
 
     pub fn cell(&self, x: u16, y: u32) -> Cell {

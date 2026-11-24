@@ -781,11 +781,31 @@ impl TextRenderer {
                         bold: false,
                     });
                 }
-                let inset = if super::super::agent_tab_mark(state, *id, label, *rect, s).is_some() {
-                    22. * s
-                } else {
-                    0.
-                };
+                let mark = super::super::agent_tab_mark(state, *id, label, *rect, s);
+                let mut inset = if mark.is_some() { 22. * s } else { 0. };
+                if mark.is_some()
+                    || (!matches!(label.as_str(), "‹" | "›" | "‹ Prev" | "Next ›")
+                        && state.panes.get(id).is_some_and(|p| p.unread_attention))
+                {
+                    if let Some(indicator) = state
+                        .panes
+                        .get(id)
+                        .and_then(|p| p.tab_indicator(state.reduced_motion))
+                    {
+                        self.push_chrome_line(ChromeLineSpec {
+                            text: &indicator.to_string(),
+                            left: rect.x + inset + 2. * s,
+                            top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                            max_w: 14. * s,
+                            bounds: *rect,
+                            font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+                            line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                            color: theme.border_focused,
+                            bold: true,
+                        });
+                    }
+                    inset += 14. * s;
+                }
                 let max_w =
                     (rect.width - inset - close.map_or(0., |(_, b)| b.width) - 8. * s).max(1.);
                 self.push_chrome_line(ChromeLineSpec {
@@ -1044,6 +1064,7 @@ mod tests {
         let pane_id = ws.panes[0];
         let event = |seq, text: &str| {
             UiEvent::ServerEvent(ServerEvent::GridDelta(GridDelta {
+                activity: None,
                 insight: None,
                 pane_id,
                 seq,
@@ -1051,6 +1072,8 @@ mod tests {
                 rows: 5,
                 cursor: Default::default(),
                 dirty_rows: vec![GridRow {
+                    links: Vec::new(),
+                    wraps: false,
                     row_index: 0,
                     abs_row: 0,
                     cells: vec![Cell {

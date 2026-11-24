@@ -11,6 +11,7 @@ pub struct TrackedOutcome {
 }
 
 pub struct CommandTracker {
+    activity: Option<daedalus_proto::types::TerminalActivity>,
     pane_id: PaneId,
     engine: Box<dyn VtEngine>,
     status: PaneStatus,
@@ -27,6 +28,7 @@ pub struct CommandTracker {
 impl CommandTracker {
     pub fn new(pane_id: PaneId, engine: Box<dyn VtEngine>) -> Self {
         Self {
+            activity: None,
             pane_id,
             engine,
             status: PaneStatus::Starting,
@@ -54,6 +56,10 @@ impl CommandTracker {
 
     pub fn runner_insight(&self) -> Option<daedalus_proto::RunnerInsight> {
         self.runner.as_ref().map(|r| r.snapshot())
+    }
+
+    pub fn activity(&self) -> Option<&daedalus_proto::types::TerminalActivity> {
+        self.activity.as_ref()
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> TrackedOutcome {
@@ -88,6 +94,13 @@ impl CommandTracker {
     fn process_events(&mut self, events: Vec<SemanticEvent>, outcome: &mut TrackedOutcome) {
         for event in events {
             match event {
+                SemanticEvent::Title(title) => {
+                    self.activity.get_or_insert_with(Default::default).title = title
+                }
+                SemanticEvent::Attention => {
+                    let activity = self.activity.get_or_insert_with(Default::default);
+                    activity.attention_seq = activity.attention_seq.saturating_add(1);
+                }
                 SemanticEvent::TerminalReply(bytes) => outcome.terminal_replies.extend(bytes),
                 SemanticEvent::CwdChanged(path) => {
                     self.cwd = Some(path);
@@ -177,5 +190,31 @@ impl CommandTracker {
 
     pub fn engine_mut(&mut self) -> &mut dyn VtEngine {
         self.engine.as_mut()
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    #[test]
+    fn split_terminal_activity_sequences_keep_titles_and_attention_independent() {
+        let mut tracker =
+            CommandTracker::new(PaneId::new(), crate::create_vt_engine(Default::default()));
+        for byte in "\x1b]0;✳ Claude Code\x07\x1b]2;⠋ task;part\x1b\\".as_bytes() {
+            tracker.feed(&[*byte]);
+        }
+        let current = tracker.activity().unwrap();
+        assert_eq!(current.title, "⠋ task;part");
+        assert_eq!(current.attention_seq, 0);
+        tracker.feed(b"\x07\x1b]9;attention\x07\x1b]777;notify;title;body\x07");
+        assert_eq!(tracker.activity().unwrap().attention_seq, 3);
+        tracker.feed(b"\x1b]9;4;1;62\x07");
+        assert_eq!(tracker.activity().unwrap().attention_seq, 3);
+        let title = format!("\x1b]2;{}\x07", "ä".repeat(500));
+        tracker.feed(title.as_bytes());
+        assert_eq!(tracker.activity().unwrap().title.len(), 256);
+        tracker.feed(b"\x1b]2;\x07");
+        assert_eq!(tracker.activity().unwrap().title, "");
     }
 }

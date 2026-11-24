@@ -121,6 +121,19 @@ impl TerminalControls {
             {
                 tab.set_description(insight);
             }
+            if let Some(pane) = state.panes.get(&id)
+                && let Some(indicator) = pane.tab_indicator(true)
+            {
+                let status = if indicator == '●' {
+                    "Unread notification"
+                } else {
+                    "Working"
+                };
+                let description = tab
+                    .description()
+                    .map_or_else(|| status.to_owned(), |text| format!("{text}. {status}"));
+                tab.set_description(description);
+            }
             tab.set_selected(selected);
             tab.add_action(Action::Click);
             tab.add_action(Action::Focus);

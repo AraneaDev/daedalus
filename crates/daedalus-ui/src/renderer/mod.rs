@@ -991,6 +991,42 @@ fn collect_overlay_quads(
             push_rect_border(quads, rect, border_w, border);
         }
         push_rect_border(quads, bar, border_w, theme.border_focused);
+    } else if let Some(panel) = layout.preview_panel(state, s)
+        && let Some((_, image)) = &state.image_preview
+    {
+        quads.push(QuadInstance::new(panel, theme.bg_sidebar));
+        let inset = 4. * s;
+        let header = 24. * s;
+        let pixel = ((panel.width - 2. * inset) / image.width as f32)
+            .min((panel.height - header - inset) / image.height as f32);
+        if pixel > 0. {
+            let left = panel.x + (panel.width - pixel * image.width as f32) / 2.;
+            for (y, row) in image
+                .rgba
+                .chunks_exact(image.width as usize * 4)
+                .enumerate()
+            {
+                let mut x = 0;
+                while x < image.width as usize {
+                    let start = x;
+                    let color = &row[x * 4..x * 4 + 4];
+                    x += 1;
+                    while x < image.width as usize && &row[x * 4..x * 4 + 4] == color {
+                        x += 1;
+                    }
+                    quads.push(QuadInstance::from_xywh(
+                        left + start as f32 * pixel,
+                        panel.y + header + y as f32 * pixel,
+                        (x - start) as f32 * pixel,
+                        pixel,
+                        Rgba::from_rgba_u8(color[0], color[1], color[2], color[3]),
+                    ));
+                }
+            }
+        }
+        push_rect_border(quads, panel, border_w, theme.border_unfocused);
+    } else if let Some(button) = layout.preview_button(state, s) {
+        push_chrome_badge(quads, button, theme, border_w, theme.border_focused);
     }
 }
 
@@ -1348,6 +1384,8 @@ pub(crate) mod tests {
 
         let red = Color::Rgb(200, 30, 30);
         let row = GridRow {
+            links: Vec::new(),
+            wraps: false,
             row_index: 0,
             abs_row: 0,
             cells: vec![
@@ -1377,6 +1415,7 @@ pub(crate) mod tests {
 
         let pane = state.panes.get_mut(&agent_id).unwrap();
         pane.apply_snapshot(GridSnapshot {
+            activity: None,
             insight: None,
             pane_id: agent_id,
             seq: 1,

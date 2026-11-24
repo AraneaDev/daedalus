@@ -69,6 +69,11 @@ impl std::fmt::Debug for BridgeConfig {
 /// Commands sent from the UI thread to `DaemonBridge`.
 #[derive(Debug, Clone)]
 pub enum UiCommand {
+    PreviewImage {
+        workspace_id: WorkspaceId,
+        pane_id: PaneId,
+        path: String,
+    },
     InspectSetup {
         session: u64,
         root_dir: PathBuf,
@@ -179,6 +184,10 @@ pub enum UiCommand {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum UiEvent {
+    ImagePreview {
+        pane_id: PaneId,
+        image: daedalus_proto::rpc::ImagePreview,
+    },
     SetupInspected {
         session: u64,
         result: Result<daedalus_proto::SetupInspection, String>,
@@ -467,6 +476,7 @@ async fn initialize_session(
         inspect_setup_supported,
         recent_projects_supported,
         project_setup_supported,
+        image_preview_supported,
         home_dir,
         ..
     } = conn.call(ClientMessage::Ping).await?
@@ -477,6 +487,7 @@ async fn initialize_session(
     };
     conn.inspect_setup_supported = inspect_setup_supported;
     conn.recent_projects_supported = recent_projects_supported;
+    conn.image_preview_supported = image_preview_supported;
     conn.project_setup_supported = project_setup_supported;
     let _ = conn
         .call(ClientMessage::Subscribe {
@@ -758,6 +769,31 @@ async fn handle_command(
             rows,
         } => {
             replace_agent_preset(conn, sink, workspace_id, old_pane_id, preset, cols, rows).await?;
+        }
+        UiCommand::PreviewImage {
+            workspace_id,
+            pane_id,
+            path,
+        } => {
+            if !conn.image_preview_supported {
+                sink.emit(UiEvent::Toast {
+                    message: "This daemon does not support workspace image previews".into(),
+                    is_error: true,
+                });
+            } else {
+                match conn
+                    .call(ClientMessage::PreviewImage { workspace_id, path })
+                    .await?
+                {
+                    ResponsePayload::ImagePreview(image) if image.valid() => {
+                        sink.emit(UiEvent::ImagePreview { pane_id, image })
+                    }
+                    _ => sink.emit(UiEvent::Toast {
+                        message: "Invalid preview received".into(),
+                        is_error: true,
+                    }),
+                }
+            }
         }
         UiCommand::RunWorkspaceAction {
             workspace_id,

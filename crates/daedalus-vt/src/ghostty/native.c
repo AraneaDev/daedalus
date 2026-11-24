@@ -25,7 +25,7 @@ typedef struct {
     GhosttyTrackedGridRef anchor;
 } DdTerminal;
 
-enum { EVENT_REPLY, EVENT_PWD, EVENT_PROMPT, EVENT_INPUT, EVENT_OUTPUT, EVENT_END };
+enum { EVENT_REPLY, EVENT_PWD, EVENT_PROMPT, EVENT_INPUT, EVENT_OUTPUT, EVENT_END, EVENT_TITLE, EVENT_ATTENTION };
 extern void dd_ghostty_event(void*, unsigned int, int32_t, const uint8_t*, size_t);
 
 static void write_pty(GhosttyTerminal vt, void *ud, const uint8_t *p, size_t n) {
@@ -37,6 +37,22 @@ static void pwd(GhosttyTerminal vt, void *ud) {
     GhosttyString path;
     if (ghostty_terminal_get(vt, GHOSTTY_TERMINAL_DATA_PWD, &path) == GHOSTTY_SUCCESS && path.len)
         dd_ghostty_event(ud, EVENT_PWD, 0, path.ptr, path.len);
+}
+
+static void title(GhosttyTerminal vt, void *ud) {
+    GhosttyString text;
+    if (ghostty_terminal_get(vt, GHOSTTY_TERMINAL_DATA_TITLE, &text) == GHOSTTY_SUCCESS)
+        dd_ghostty_event(ud, EVENT_TITLE, 0, text.ptr, text.len);
+}
+
+static void bell(GhosttyTerminal vt, void *ud) {
+    (void)vt;
+    dd_ghostty_event(ud, EVENT_ATTENTION, 0, NULL, 0);
+}
+
+static void notify(GhosttyTerminal vt, void *ud, const GhosttyTerminalDesktopNotification *n) {
+    (void)n;
+    bell(vt, ud);
 }
 
 static void prompt(GhosttyTerminal vt, void *ud, const GhosttyTerminalSemanticPrompt *p) {
@@ -66,6 +82,9 @@ DdTerminal *dd_ghostty_new(uint16_t cols, uint16_t rows, size_t lines, void *use
         ghostty_terminal_set(t->vt, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &lines) != GHOSTTY_SUCCESS ||
         ghostty_terminal_set(t->vt, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &bytes) != GHOSTTY_SUCCESS ||
         ghostty_terminal_set(t->vt, GHOSTTY_TERMINAL_OPT_USERDATA, user) != GHOSTTY_SUCCESS ||
+        ghostty_terminal_set(t->vt, GHOSTTY_TERMINAL_OPT_TITLE_CHANGED, (const void*)title) != GHOSTTY_SUCCESS ||
+        ghostty_terminal_set(t->vt, GHOSTTY_TERMINAL_OPT_BELL, (const void*)bell) != GHOSTTY_SUCCESS ||
+        ghostty_terminal_set(t->vt, GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION, (const void*)notify) != GHOSTTY_SUCCESS ||
         ghostty_terminal_set(t->vt, GHOSTTY_TERMINAL_OPT_PWD_CHANGED, (const void*)pwd) != GHOSTTY_SUCCESS ||
         ghostty_terminal_set(t->vt, GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT, (const void*)prompt) != GHOSTTY_SUCCESS ||
         ghostty_terminal_set(t->vt, GHOSTTY_TERMINAL_OPT_WRITE_PTY, (const void*)write_pty) != GHOSTTY_SUCCESS) {
@@ -156,4 +175,25 @@ bool dd_ghostty_cell(DdTerminal *t, uint16_t x, uint32_t y, DdCell *out) {
         return ghostty_cell_get(cell, GHOSTTY_CELL_DATA_CODEPOINT, out->scalars) == GHOSTTY_SUCCESS;
     }
     return r == GHOSTTY_SUCCESS;
+}
+
+void dd_ghostty_row_flags(DdTerminal *t, uint32_t y, bool *wrap, bool *links) {
+    GhosttyGridRef ref = {0};
+    GhosttyRow row;
+    GhosttyPoint p = {.tag = GHOSTTY_POINT_TAG_SCREEN, .value.coordinate = {.x = 0, .y = y}};
+    if (ghostty_terminal_grid_ref(t->vt, p, &ref) == GHOSTTY_SUCCESS &&
+        ghostty_grid_ref_row(&ref, &row) == GHOSTTY_SUCCESS) {
+        ghostty_row_get(row, GHOSTTY_ROW_DATA_WRAP, wrap);
+        ghostty_row_get(row, GHOSTTY_ROW_DATA_HYPERLINK, links);
+    }
+}
+
+size_t dd_ghostty_link(DdTerminal *t, uint16_t x, uint32_t y, uint8_t *buf, size_t cap) {
+    GhosttyGridRef ref = {0};
+    size_t written = 0;
+    GhosttyPoint p = {.tag = GHOSTTY_POINT_TAG_SCREEN, .value.coordinate = {.x = x, .y = y}};
+    if (ghostty_terminal_grid_ref(t->vt, p, &ref) == GHOSTTY_SUCCESS &&
+        ghostty_grid_ref_hyperlink_uri(&ref, buf, cap, &written) == GHOSTTY_SUCCESS)
+        return written;
+    return 0;
 }

@@ -27,6 +27,7 @@ pub enum UiAction {
     WorkspaceSettings,
     SwitchWorkspaceNext,
     SwitchWorkspacePrev,
+    PreviewImage,
     CopySelection,
     PasteClipboard,
     ForwardFailureToAgent,
@@ -90,6 +91,7 @@ impl KeyRepeatGuard {
                 | UiAction::ToggleSearch
                 | UiAction::WorkspaceSettings
                 | UiAction::NewWorkspace
+                | UiAction::PreviewImage
                 | UiAction::CopySelection
                 | UiAction::PasteSearchQuery
                 | UiAction::PasteClipboard
@@ -343,6 +345,7 @@ fn translate_primary_shift_char(ch: &str) -> UiAction {
         "k" => UiAction::FocusDir(FocusDirection::Up),
         "l" => UiAction::FocusDir(FocusDirection::Right),
         "z" => UiAction::ToggleZoom,
+        "i" => UiAction::PreviewImage,
         "b" => UiAction::ToggleSidebar,
         "a" => UiAction::ToggleActionPalette,
         "p" => UiAction::ToggleAgentPicker,
@@ -846,6 +849,7 @@ mod tests {
             ("L", UiAction::FocusDir(FocusDirection::Right)),
             ("Z", UiAction::ToggleZoom),
             ("B", UiAction::ToggleSidebar),
+            ("I", UiAction::PreviewImage),
             ("P", UiAction::ToggleAgentPicker),
             ("W", UiAction::ToggleWorktreeModal),
             ("w", UiAction::ToggleWorktreeModal),

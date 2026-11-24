@@ -303,7 +303,7 @@ impl PaneHandle {
 }
 
 struct PaneOutput {
-    runner_frame: Option<daedalus_proto::GridDelta>,
+    last_frame: Option<daedalus_proto::GridDelta>,
     received_output: bool,
     journal: crate::journal::Journal,
     role: PaneRole,
@@ -336,7 +336,7 @@ impl PaneOutput {
             pane_id,
             journal,
             role,
-            runner_frame: None,
+            last_frame: None,
             received_output: false,
             tracker: {
                 let mut tracker = CommandTracker::new(pane_id, engine);
@@ -410,24 +410,26 @@ impl PaneOutput {
             self.dirty = false;
             let received_output = std::mem::take(&mut self.received_output);
             let insight = self.tracker.runner_insight();
+            let activity = self.tracker.activity().cloned();
             let seq = self.seq + 1;
             let grid = self
                 .tracker
                 .engine_mut()
                 .take_dirty_delta(self.pane_id, seq);
             let update = grid.or_else(|| {
-                self.runner_frame
+                self.last_frame
                     .as_ref()
-                    .filter(|old| old.insight != insight)
+                    .filter(|old| old.insight != insight || old.activity != activity)
                     .cloned()
             });
             if let Some(mut delta) = update {
                 self.seq = seq;
                 delta.seq = seq;
                 delta.insight = insight;
-                if self.role == PaneRole::Runner {
+                delta.activity = activity;
+                {
                     let rows = std::mem::take(&mut delta.dirty_rows);
-                    self.runner_frame = Some(delta.clone());
+                    self.last_frame = Some(delta.clone());
                     delta.dirty_rows = rows;
                 }
                 if received_output
@@ -557,7 +559,7 @@ async fn run_pane_actor(
                 output.flush_delta();
             }
             _ = agent_tick.tick(), if output.detector.is_some() || (role==PaneRole::Runner && pty_open) => {
-                if role==PaneRole::Runner && output.runner_frame.as_ref().is_some_and(|old|old.insight!=output.tracker.runner_insight()) {
+                if role==PaneRole::Runner && output.last_frame.as_ref().is_some_and(|old|old.insight!=output.tracker.runner_insight()) {
                     output.dirty=true;
                 }
                 if let Some(detector) = output.detector.as_mut() {
@@ -612,6 +614,7 @@ async fn run_pane_actor(
                         // A snapshot and journal anchor with the same sequence must describe the same frame.
                         output.flush_delta();
                         let mut snapshot = output.tracker.engine().snapshot(pane_id, output.seq);
+                        snapshot.activity = output.tracker.activity().cloned();
                         snapshot.insight = output.tracker.runner_insight();
                         let _ = reply.send(snapshot);
                     }
@@ -733,6 +736,40 @@ mod output_tests {
         );
         assert!(next_pty_output(&mut receiver, elapsed).await.is_none());
         assert!(reader.is_closed());
+    }
+
+    #[test]
+    fn activity_flushes_without_cells_and_coalesces_duplicate_titles() {
+        let (events, mut receiver) = broadcast::channel(16);
+        let (writer, _) = mpsc::channel(1);
+        let mut output = PaneOutput::new(
+            WorkspaceId::new(),
+            PaneId::new(),
+            PaneRole::Service,
+            8,
+            2,
+            events,
+            Default::default(),
+        );
+        output.feed(b"seed", &writer);
+        output.flush_delta();
+        assert!(matches!(receiver.try_recv(), Ok(ServerEvent::GridDelta(_))));
+        output.feed(b"\x1b]0;codex\x07", &writer);
+        output.flush_delta();
+        let Ok(ServerEvent::GridDelta(delta)) = receiver.try_recv() else {
+            panic!("missing title delta")
+        };
+        assert!(delta.dirty_rows.is_empty());
+        assert_eq!(delta.activity.unwrap().title, "codex");
+        output.feed(b"\x1b]0;codex\x07", &writer);
+        output.flush_delta();
+        assert!(receiver.try_recv().is_err());
+        output.feed(b"\x07\x07", &writer);
+        output.flush_delta();
+        let Ok(ServerEvent::GridDelta(delta)) = receiver.try_recv() else {
+            panic!("missing attention delta")
+        };
+        assert_eq!(delta.activity.unwrap().attention_seq, 2);
     }
 
     #[tokio::test]

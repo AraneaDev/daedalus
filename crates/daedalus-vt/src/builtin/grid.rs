@@ -1,3 +1,4 @@
+use daedalus_proto::types::LinkSpan;
 use daedalus_proto::{
     Cell, CellFlags, Color, CursorState, GridDelta, GridRow, GridSnapshot, PaneId, SearchMatch,
 };
@@ -11,6 +12,8 @@ const MAX_CELL_TEXT_BYTES: usize = 256;
 
 #[derive(Debug, Clone)]
 struct StoredRow {
+    links: Vec<LinkSpan>,
+    wraps: bool,
     abs_row: u64,
     cells: Vec<Cell>,
 }
@@ -27,6 +30,37 @@ impl StoredRow {
     fn clear_overlapping_glyphs(&mut self, start: usize, end: usize) {
         if start == end {
             return;
+        }
+        let left =
+            start.saturating_sub(usize::from(start > 0 && self.cells[start].width == 0)) as u16;
+        let right =
+            (end + usize::from(end < self.cells.len() && self.cells[end].width == 0)) as u16;
+        let mut tail = None;
+        self.links.retain_mut(|span| {
+            if span.start >= right || span.end <= left {
+                return true;
+            }
+            if span.start < left {
+                if span.end > right {
+                    tail = Some(LinkSpan {
+                        start: right,
+                        ..span.clone()
+                    });
+                }
+                span.end = left;
+                true
+            } else {
+                span.start = right;
+                span.end > right
+            }
+        });
+        if let Some(tail) = tail
+            && self.links.len() < LinkSpan::MAX_PER_ROW
+        {
+            self.links.push(tail);
+        }
+        if end == self.cells.len() {
+            self.wraps = false;
         }
         if start > 0 && self.cells[start].width == 0 {
             self.cells[start - 1] = Cell::default();
@@ -53,6 +87,7 @@ pub struct Grid {
     scroll_top: u16,
     scroll_bottom: u16,
     next_abs_row: u64,
+    active_url: Option<String>,
     pen_fg: Color,
     pen_bg: Color,
     pen_flags: CellFlags,
@@ -66,6 +101,8 @@ impl Grid {
         let mut viewport = Vec::with_capacity(rows as usize);
         for i in 0..rows {
             viewport.push(StoredRow {
+                links: Vec::new(),
+                wraps: false,
                 abs_row: i as u64,
                 cells: vec![Cell::default(); cols as usize],
             });
@@ -86,6 +123,7 @@ impl Grid {
             scroll_top: 0,
             scroll_bottom: rows - 1,
             next_abs_row: rows as u64,
+            active_url: None,
             pen_fg: Color::Default,
             pen_bg: Color::Default,
             pen_flags: CellFlags::empty(),
@@ -132,6 +170,17 @@ impl Grid {
         self.pen_flags = CellFlags::empty();
     }
 
+    pub fn set_hyperlink(&mut self, uri: &[u8]) {
+        self.active_url = std::str::from_utf8(uri)
+            .ok()
+            .filter(|uri| {
+                uri.len() <= LinkSpan::MAX_URI_BYTES
+                    && (uri.starts_with("http://") || uri.starts_with("https://"))
+                    && !uri.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+            })
+            .map(str::to_owned);
+    }
+
     pub fn set_cursor_visible(&mut self, visible: bool) {
         self.cursor_visible = visible;
     }
@@ -160,6 +209,8 @@ impl Grid {
             (ch, width)
         };
         if self.cursor_col as usize + width > self.cols as usize {
+            self.viewport[self.cursor_row as usize].wraps = true;
+            self.dirty[self.cursor_row as usize] = true;
             self.cursor_col = 0;
             self.linefeed();
         }
@@ -167,6 +218,21 @@ impl Grid {
         let col = self.cursor_col as usize;
         let row = &mut self.viewport[r];
         row.clear_overlapping_glyphs(col, col + width);
+        if let Some(url) = self.active_url.as_ref() {
+            if let Some(span) = row
+                .links
+                .iter_mut()
+                .find(|span| span.end == col as u16 && span.url == *url)
+            {
+                span.end += width as u16;
+            } else if row.links.len() < LinkSpan::MAX_PER_ROW {
+                row.links.push(LinkSpan {
+                    start: col as u16,
+                    end: (col + width) as u16,
+                    url: url.clone(),
+                });
+            }
+        }
         row.cells[col] = Cell {
             text: ch.to_string(),
             fg: self.pen_fg,
@@ -223,6 +289,8 @@ impl Grid {
                 self.scrollback.push_back(removed);
             }
             let new_row = StoredRow {
+                links: Vec::new(),
+                wraps: false,
                 abs_row: self.next_abs_row,
                 cells: vec![Cell::default(); self.cols as usize],
             };
@@ -294,6 +362,8 @@ impl Grid {
             0 => {
                 self.erase_in_line(0);
                 for row_idx in (r + 1)..self.viewport.len() {
+                    self.viewport[row_idx].links.clear();
+                    self.viewport[row_idx].wraps = false;
                     for cell in &mut self.viewport[row_idx].cells {
                         *cell = Cell::default();
                     }
@@ -303,6 +373,8 @@ impl Grid {
             1 => {
                 self.erase_in_line(1);
                 for row_idx in 0..r {
+                    self.viewport[row_idx].links.clear();
+                    self.viewport[row_idx].wraps = false;
                     for cell in &mut self.viewport[row_idx].cells {
                         *cell = Cell::default();
                     }
@@ -317,6 +389,8 @@ impl Grid {
             }
             2 => {
                 for row_idx in 0..self.viewport.len() {
+                    self.viewport[row_idx].links.clear();
+                    self.viewport[row_idx].wraps = false;
                     for cell in &mut self.viewport[row_idx].cells {
                         *cell = Cell::default();
                     }
@@ -332,6 +406,8 @@ impl Grid {
             let mut alt = Vec::with_capacity(self.rows as usize);
             for i in 0..self.rows {
                 alt.push(StoredRow {
+                    links: Vec::new(),
+                    wraps: false,
                     abs_row: i as u64,
                     cells: vec![Cell::default(); self.cols as usize],
                 });
@@ -403,6 +479,13 @@ impl Grid {
         push_to_scrollback: bool,
     ) {
         for row in buf.iter_mut() {
+            if row.cells.len() != cols as usize {
+                row.wraps = false;
+            }
+            row.links.retain_mut(|span| {
+                span.end = span.end.min(cols);
+                span.start < span.end
+            });
             row.cells.resize(cols as usize, Cell::default());
             if let Some(last) = row.cells.last_mut()
                 && last.width == 2
@@ -412,6 +495,8 @@ impl Grid {
         }
         while buf.len() < rows as usize {
             buf.push(StoredRow {
+                links: Vec::new(),
+                wraps: false,
                 abs_row: *next_abs_row,
                 cells: vec![Cell::default(); cols as usize],
             });
@@ -434,12 +519,15 @@ impl Grid {
             .iter()
             .enumerate()
             .map(|(i, row)| GridRow {
+                wraps: row.wraps,
+                links: row.links.clone(),
                 row_index: i as u16,
                 abs_row: row.abs_row,
                 cells: row.cells.clone(),
             })
             .collect();
         GridSnapshot {
+            activity: None,
             insight: None,
             pane_id,
             seq,
@@ -477,6 +565,8 @@ impl Grid {
             .take(end - start)
         {
             out.push(GridRow {
+                wraps: row.wraps,
+                links: row.links.clone(),
                 row_index: (idx - start) as u16,
                 abs_row: row.abs_row,
                 cells: row.cells.clone(),
@@ -491,6 +581,8 @@ impl Grid {
             if *is_dirty {
                 *is_dirty = false;
                 dirty_rows.push(GridRow {
+                    wraps: self.viewport[i].wraps,
+                    links: self.viewport[i].links.clone(),
                     row_index: i as u16,
                     abs_row: self.viewport[i].abs_row,
                     cells: self.viewport[i].cells.clone(),
@@ -507,6 +599,7 @@ impl Grid {
         self.last_emitted_cursor = Some(cursor);
         self.last_emitted_history_generation = self.history_generation;
         Some(GridDelta {
+            activity: None,
             insight: None,
             pane_id,
             seq,

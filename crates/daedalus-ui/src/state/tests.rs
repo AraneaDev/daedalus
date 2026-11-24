@@ -179,6 +179,7 @@ fn workspace_refresh_keeps_live_grid_and_selected_pane_metadata() {
     state.set_workspaces(vec![ws.clone()]);
     state.select_session(ws.id, PaneRole::Agent, id);
     state.apply_grid_snapshot(GridSnapshot {
+        activity: None,
         insight: None,
         pane_id: id,
         seq: 0,
@@ -193,6 +194,7 @@ fn workspace_refresh_keeps_live_grid_and_selected_pane_metadata() {
     assert_eq!(state.panes[&id].summary.cols, 99);
 
     state.apply_server_event(ServerEvent::GridDelta(GridDelta {
+        activity: None,
         insight: None,
         pane_id: id,
         seq: 1,
@@ -233,6 +235,7 @@ fn snapshot_and_delta_patching_tracks_dirty_rows() {
     state.set_workspaces(vec![ws]);
 
     let snapshot = GridSnapshot {
+        activity: None,
         insight: None,
         pane_id: agent_id,
         seq: 1,
@@ -260,6 +263,7 @@ fn snapshot_and_delta_patching_tracks_dirty_rows() {
     assert!(pane.dirty_row_indices.is_empty());
 
     let delta = GridDelta {
+        activity: None,
         insight: None,
         pane_id: agent_id,
         seq: 2,
@@ -320,6 +324,7 @@ fn history_reset_discards_displayed_rows_inflight_reads_and_search_results() {
     pane.set_scroll_offset(5);
     let late = pane.begin_scrollback_request().unwrap();
     let reset = GridDelta {
+        activity: None,
         insight: None,
         pane_id,
         seq: 10,
@@ -354,6 +359,7 @@ fn resync_snapshot_invalidates_erased_history_even_if_new_lines_already_accumula
     pane.set_scroll_offset(2);
     let pending = pane.begin_scrollback_request().unwrap();
     let reset = GridSnapshot {
+        activity: None,
         insight: None,
         pane_id: id,
         seq: 4,
