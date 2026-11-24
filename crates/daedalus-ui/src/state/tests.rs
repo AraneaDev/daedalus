@@ -689,6 +689,7 @@ fn dormant_workspace_helpers_prevent_double_spawning() {
     let ws_id = WorkspaceId::new();
     let dormant = WorkspaceInfo {
         project: Default::default(),
+        setup: None,
         default_panes_pending: None,
         id: ws_id,
         name: "dormant".to_string(),

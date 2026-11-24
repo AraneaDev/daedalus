@@ -8,11 +8,21 @@ use daedalus_ui::{
 use std::path::PathBuf;
 use winit::keyboard::Key;
 
-enum AfterCreate {
+/// What to run on a workspace once it exists.
+enum SetupStep {
     Install(Vec<String>),
     Apply {
         assignments: Vec<Assignment>,
         launch: Vec<String>,
+    },
+}
+
+enum AfterCreate {
+    Step(SetupStep),
+    /// A reopened recent project: apply the setup the daemon returns with the workspace.
+    /// `form` is the start-screen session that asked for it.
+    Reopen {
+        form: u64,
     },
 }
 
@@ -26,6 +36,8 @@ pub(super) struct SetupFlow {
     installer: Option<PaneId>,
     reconciling_installer: bool,
     editing_folder: bool,
+    /// Start-screen session of a recent project being reopened with its stored setup.
+    reopen: Option<u64>,
     awaiting_mutation: bool,
     installer_result: Option<String>,
 }
@@ -75,6 +87,7 @@ impl DaedalusApp {
         self.setup.installer_result = None;
         self.setup.workspace = None;
         self.setup.folder_request = None;
+        self.setup.reopen = None;
     }
 
     pub(super) fn offer_first_workspace(&mut self) {
@@ -107,6 +120,50 @@ impl DaedalusApp {
         } else {
             self.state.workspace_form.error = Some("Reconnect to check the project folder.".into());
         }
+    }
+
+    /// Reopens a recent project. One with a stored setup is created first and then started
+    /// from the setup the daemon returns with it; one without opens the environment review.
+    pub(super) fn reopen_project(&mut self, project: daedalus_proto::RecentProject) {
+        if !project.has_setup {
+            self.inspect_setup_folder(project.name, project.root_dir);
+            return;
+        }
+        self.setup.request = self.setup.request.wrapping_add(1);
+        if self.send_command(UiCommand::CreateManualWorkspace {
+            session: self.setup.request,
+            name: project.name,
+            root_dir: project.root_dir,
+        }) {
+            self.setup.after_create = Some(AfterCreate::Reopen {
+                form: self.state.workspace_form.session(),
+            });
+            self.state.workspace_form.start_submission();
+        } else {
+            self.state.workspace_form.error = Some("Reconnect to open this project.".into());
+        }
+    }
+
+    /// The reopened workspace exists: start it from its stored setup, or review it.
+    fn reopened(&mut self, form: u64, ws: &WorkspaceInfo) -> Option<SetupStep> {
+        if let Some(assignments) = ws.setup.clone() {
+            self.setup.reopen = Some(form);
+            self.state.workspace_form.finish_submission(form, None);
+            let launch = assignments
+                .iter()
+                .filter(|entry| entry.role == PaneRole::Agent)
+                .map(|entry| entry.id.clone())
+                .collect();
+            return Some(SetupStep::Apply {
+                assignments,
+                launch,
+            });
+        }
+        // The setup is gone since the list was made. The review then belongs to this
+        // workspace, so its Open applies here instead of creating the workspace again.
+        self.state.setup_review.folder = ws.root_dir.clone();
+        self.inspect_setup_folder(ws.name.clone(), ws.root_dir.clone());
+        None
     }
 
     pub(super) fn setup_inspected(
@@ -197,7 +254,7 @@ impl DaedalusApp {
                 };
                 self.setup_send(cmd, "Checking tools on the daemon host…");
             }
-            SetupAction::Install(argv) => self.prepare_setup(AfterCreate::Install(argv)),
+            SetupAction::Install(argv) => self.prepare_setup(SetupStep::Install(argv)),
             SetupAction::Open => match review.commands() {
                 Err(e) => review.feedback = e,
                 Ok(rows) => {
@@ -219,7 +276,7 @@ impl DaedalusApp {
                             launch.push(id.into());
                         }
                     }
-                    self.prepare_setup(AfterCreate::Apply {
+                    self.prepare_setup(SetupStep::Apply {
                         assignments,
                         launch,
                     });
@@ -241,7 +298,7 @@ impl DaedalusApp {
         sent
     }
 
-    fn prepare_setup(&mut self, action: AfterCreate) {
+    fn prepare_setup(&mut self, action: SetupStep) {
         if self.state.setup_review.busy || self.setup.installer.is_some() {
             return;
         }
@@ -259,15 +316,15 @@ impl DaedalusApp {
                 root_dir: self.state.setup_review.folder.clone(),
             };
             if self.setup_send(cmd, "Creating workspace…") {
-                self.setup.after_create = Some(action);
+                self.setup.after_create = Some(AfterCreate::Step(action));
             }
         }
     }
 
-    fn run_setup_action(&mut self, workspace_id: WorkspaceId, action: AfterCreate) {
+    fn run_setup_action(&mut self, workspace_id: WorkspaceId, action: SetupStep) {
         let cmd = match action {
-            AfterCreate::Install(argv) => UiCommand::InstallSetupTool { workspace_id, argv },
-            AfterCreate::Apply {
+            SetupStep::Install(argv) => UiCommand::InstallSetupTool { workspace_id, argv },
+            SetupStep::Apply {
                 assignments,
                 launch,
             } => UiCommand::ApplySetup {
@@ -281,20 +338,36 @@ impl DaedalusApp {
 
     pub(super) fn setup_created(&mut self, session: u64, ws: WorkspaceInfo) {
         let id = ws.id;
-        self.state.upsert_workspace(ws);
+        self.state.upsert_workspace(ws.clone());
         if self.setup.request == session
             && let Some(action) = self.setup.after_create.take()
         {
             self.setup.workspace = Some(id);
             self.state.select_workspace(id);
-            self.run_setup_action(id, action);
+            let action = match action {
+                AfterCreate::Reopen { form } => self.reopened(form, &ws),
+                AfterCreate::Step(step) => Some(step),
+            };
+            if let Some(action) = action {
+                self.run_setup_action(id, action);
+            }
         }
         self.schedule_resize_flush();
     }
 
     pub(super) fn setup_creation_failed(&mut self, session: u64, message: String) {
         if self.setup.request == session {
-            self.setup.after_create = None;
+            if let Some(AfterCreate::Reopen { form }) = self.setup.after_create.take() {
+                // The form may have been dismissed or reopened since; then say it here.
+                if !self
+                    .state
+                    .workspace_form
+                    .finish_submission(form, Some(message.clone()))
+                {
+                    self.show_toast(message, true);
+                }
+                return;
+            }
             self.state.setup_review.busy = false;
             self.state.setup_review.feedback = message;
         }
@@ -313,13 +386,19 @@ impl DaedalusApp {
         self.state.setup_review.busy = false;
         self.state.setup_review.open = false;
         self.setup.workspace = None;
+        self.setup.reopen = None;
         self.state.select_workspace(id);
         self.request_redraw();
     }
 
     pub(super) fn setup_failed(&mut self, id: WorkspaceId, message: String) {
         self.setup.awaiting_mutation = false;
-        if self.setup.workspace == Some(id) {
+        if self.setup.workspace == Some(id) && self.setup.reopen.take().is_some() {
+            // A reopened project never showed the review, so there is nothing to return to.
+            self.state.setup_review.busy = false;
+            self.setup.workspace = None;
+            self.show_toast(message, true);
+        } else if self.setup.workspace == Some(id) {
             self.state.setup_review.busy = false;
             self.state.setup_review.open = true;
             self.state.setup_review.feedback = message;
@@ -384,6 +463,7 @@ impl DaedalusApp {
     pub(super) fn setup_disconnected(&mut self) {
         self.setup.request = self.setup.request.wrapping_add(1);
         self.setup.folder_request = None;
+        self.setup.reopen = None;
         let uncertain = self.setup.after_create.take().is_some() || self.setup.awaiting_mutation;
         self.setup.awaiting_mutation = false;
         if uncertain {

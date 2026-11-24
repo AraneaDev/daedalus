@@ -38,8 +38,10 @@ without discarding your command edits. For supported tools you can also open the
 installation guide and select **Check again**. A locked npm project without installed dependencies
 offers a separate `npm ci` action.
 
-You can skip setup and reopen it from **+ Workspace**. To use the existing direct-start flow from
-a terminal in a repository, run:
+You can skip setup and reopen it from **+ Workspace**. The start screen lists your recent projects
+above the form for a new one. Choosing a project that already has a saved setup opens its workspace
+and starts only its agent. A project without one goes through the environment review. To use the
+existing direct-start flow from a terminal in a repository, run:
 
 ```sh
 daedalus-ui --dir . --agent shell
@@ -163,19 +165,114 @@ daedalus-ctl status publish --source ci.test --dir . --level error --label "2 fa
 daedalus-ctl status clear ci.test --dir .
 ```
 
-## Remote workspaces and custom actions
+## Run the daemon on another machine
 
-Start `daedalusd` on the remote host, then pass its Unix socket path to either client. The example
-assumes the SSH alias `devbox` and remote UID 1000. OpenSSH must be installed on the client and
-socket forwarding enabled on the server.
+The daemon runs where your projects live. It starts the coding agent, the development server and the
+tests there, and the setup review checks and installs tools on that host. The UI and the CLI only
+display and steer, so they can run on a different machine. Install the agent CLI, Git and your
+project toolchain on the daemon host. The client needs only Daedalus.
+
+Clients find the daemon through `--socket` or `DAEDALUS_SOCKET`, and send a token through
+`--auth-token` or `DAEDALUS_AUTH_TOKEN`. When the socket points elsewhere, the UI does not start a
+local daemon. Folder paths you enter belong to the daemon host, such as `/home/you/project`. The
+folder the UI suggests is the home directory of the daemon host, not the working directory of the
+client. Pass `--dir` to open the UI on a project there.
+
+The daemon keeps the recent projects and each project's setup, so every client of that daemon
+shares them. Set a project up from one machine and the other clients reopen it as it is.
+
+### Keep the daemon running
+
+A client with a local socket starts the daemon on demand. A remote client cannot, so run the daemon
+as a systemd user service on the daemon host. Save this as
+`~/.config/systemd/user/daedalusd.service`:
+
+```ini
+[Unit]
+Description=Daedalus daemon
+
+[Service]
+EnvironmentFile=-%h/.config/daedalus/daemon.env
+ExecStart=/usr/bin/daedalusd
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Enable it, and let it start at boot without a login session:
 
 ```sh
-daedalus-ui --socket ssh://devbox/run/user/1000/daedalus/daedalusd.sock
+systemctl --user daemon-reload
+systemctl --user enable --now daedalusd
+sudo loginctl enable-linger "$USER"
+```
+
+The optional `daemon.env` file holds settings such as `DAEDALUS_SOCKET` and `DAEDALUS_AUTH_TOKEN`.
+Without it the daemon listens on `$XDG_RUNTIME_DIR/daedalus/daedalusd.sock`, which systemd sets to
+`/run/user/<uid>`. Clients on the daemon host read the same variables, so give them the same values
+or they start a second daemon on the default socket.
+
+### Windows with projects in WSL
+
+Install the Windows `.msi` on Windows and the `.deb` inside your WSL distribution. The daemon runs
+in WSL and listens on localhost over TCP. Use a token, because any local Windows process can reach
+that port.
+
+In WSL, create the settings file and start the service from the previous section:
+
+```sh
+mkdir -p ~/.config/daedalus
+printf 'DAEDALUS_SOCKET=tcp://127.0.0.1:7777\nDAEDALUS_AUTH_TOKEN=%s\n' "$(openssl rand -hex 24)" \
+  > ~/.config/daedalus/daemon.env
+chmod 600 ~/.config/daedalus/daemon.env
+cat ~/.config/daedalus/daemon.env
+```
+
+In PowerShell on Windows, store the same two values for your account, then start **Daedalus** from
+Start:
+
+```powershell
+setx DAEDALUS_SOCKET tcp://127.0.0.1:7777
+setx DAEDALUS_AUTH_TOKEN <token from daemon.env>
+daedalus-ctl ping
+```
+
+`setx` applies to programs started afterwards, so open a new terminal before `daedalus-ctl ping`.
+Windows reaches `127.0.0.1` inside WSL through localhost forwarding, which is on by default, and in
+mirrored networking mode. The distribution must be running. With `vmIdleTimeout=-1` in
+`.wslconfig` it stays up. Otherwise, open a WSL terminal first.
+
+In the setup screen, type the WSL path of your project, such as `/home/you/project`. Clicking a
+file path in a terminal does not open it on Windows. Web links work.
+
+### A remote host over SSH
+
+The UI and the CLI open an SSH tunnel themselves when the socket starts with `ssh://`. This needs
+the OpenSSH client on your machine (built into Windows 10 and later) and key-based login: the
+tunnel cannot ask for a password or confirm an unknown host key. Run `ssh devbox` once to accept the
+key and check that no prompt appears. Start the daemon on the remote host as described in
+[Keep the daemon running](#keep-the-daemon-running).
+
+Point the client at the remote daemon's Unix socket. Replace `devbox` with your SSH alias or
+`user@host` and `1000` with the remote user's UID (`id -u`):
+
+```sh
+daedalus-ui --socket ssh://devbox/run/user/1000/daedalus/daedalusd.sock --dir /home/you/project
 daedalus-ctl --socket ssh://devbox/run/user/1000/daedalus/daedalusd.sock ping
 ```
 
-To require a bearer token, set `DAEDALUS_AUTH_TOKEN` in the daemon environment and supply the same
-value in the client environment.
+The form is `ssh://[user@]host[:port][/remote/socket/path]`. If the remote daemon listens on TCP,
+use `ssh://devbox?tcp=127.0.0.1:7777` instead. Without a socket path or `tcp=`, the tunnel targets
+`127.0.0.1:7777` on the remote host. The SSH server must allow forwarding to a Unix socket
+(`AllowStreamLocalForwarding`, on by default). A token is optional over SSH. If the daemon has one,
+set the same `DAEDALUS_AUTH_TOKEN` on the client.
+
+Agents, terminals and tests keep running on the remote host when you close the UI or lose the
+connection. Reconnect with the same command. Terminal links open web URLs only, because file paths
+belong to the remote host.
+
+## Custom actions
 
 Define actions in the workspace root's `.daedalus.toml`. For example, this action submits the
 workspace test command to the runner pane.

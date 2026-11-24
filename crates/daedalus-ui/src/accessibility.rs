@@ -16,7 +16,7 @@ use daedalus_ui::layout::overlays::{
     worktree_button_rects, worktree_input_rect, worktree_modal_rect,
 };
 use daedalus_ui::state::{AppState, ConnectionState};
-use daedalus_ui::workspace_form::{self, Control, WorkspaceForm, WorkspaceFormAction};
+use daedalus_ui::workspace_form::{Control, WorkspaceForm, WorkspaceFormAction};
 use unicode_segmentation::UnicodeSegmentation;
 
 const WINDOW: NodeId = NodeId(1);
@@ -47,13 +47,23 @@ fn form_node(form: &WorkspaceForm, offset: u64) -> NodeId {
     NodeId((1 << 63) | form.session().wrapping_mul(8) | offset)
 }
 
-fn field_offset(control: Control) -> u64 {
+fn control_node(form: &WorkspaceForm, control: Control) -> NodeId {
     match control {
-        Control::Name => 0,
-        Control::Folder => 1,
-        Control::Cancel => 2,
-        Control::Save => 3,
+        Control::Name => form_node(form, 0),
+        Control::Folder => form_node(form, 1),
+        Control::Cancel => form_node(form, 2),
+        Control::Save => form_node(form, 3),
+        Control::Recent(i) => recent_node(form, i as u64),
     }
+}
+
+// Bit 62 next to the form's bit keeps recent rows apart from the form's other nodes.
+fn recent_node(form: &WorkspaceForm, offset: u64) -> NodeId {
+    NodeId((0b11 << 62) | ((form.session() & ((1 << 56) - 1)) << 6) | offset)
+}
+
+fn recent_list_node(form: &WorkspaceForm) -> NodeId {
+    recent_node(form, 63)
 }
 
 pub(super) fn workspace_action(
@@ -69,14 +79,10 @@ pub(super) fn workspace_action(
         return None;
     }
     let form = &mut state.workspace_form;
-    let control = [
-        Control::Name,
-        Control::Folder,
-        Control::Cancel,
-        Control::Save,
-    ]
-    .into_iter()
-    .find(|c| form.enabled(*c) && form_node(form, field_offset(*c)) == request.target_node)?;
+    let (control, _) = form
+        .controls(Rect::new(0., 0., 1., 1.))
+        .into_iter()
+        .find(|(c, _)| form.enabled(*c) && control_node(form, *c) == request.target_node)?;
     match request.action {
         Action::Focus => {
             if control != form.focus {
@@ -341,9 +347,26 @@ fn workspace_fields(
         dialog.push_child(error_id);
         nodes.push((error_id, alert));
     }
-    for (control, rect) in workspace_form::controls(modal) {
-        let offset = field_offset(control);
-        let id = form_node(form, offset);
+    let list_id = recent_list_node(form);
+    let mut list = form.recent_heading(modal).map(|heading| {
+        dialog.push_child(list_id);
+        let mut list = named(Role::List, "Recent projects");
+        let rows = form.controls(modal);
+        let last = rows
+            .iter()
+            .filter(|(c, _)| matches!(c, Control::Recent(_)))
+            .map(|(_, rect)| rect.bottom())
+            .fold(heading.bottom(), f32::max);
+        list.set_bounds(bounds(Rect::new(
+            heading.x,
+            heading.y,
+            heading.width,
+            last - heading.y,
+        )));
+        list
+    });
+    for (control, rect) in form.controls(modal) {
+        let id = control_node(form, control);
         let label = match control {
             Control::Name if form.name_is_fixed() => "Workspace name",
             Control::Name => "Name (optional)",
@@ -351,8 +374,18 @@ fn workspace_fields(
             Control::Cancel if form.submitting() => "Dismiss",
             Control::Cancel => "Cancel",
             Control::Save => "Review environment",
+            Control::Recent(_) => "",
         };
-        let mut node = if let Some(value) = form.value(control) {
+        let mut node = if let Control::Recent(i) = control {
+            let project = &form.recent()[i];
+            let mut node = named(
+                Role::ListItem,
+                format!("{}, {}", project.name, project.root_dir.display()),
+            );
+            node.add_action(Action::Click);
+            node
+        } else if let Some(value) = form.value(control) {
+            let offset = if control == Control::Name { 0 } else { 1 };
             let run_id = form_node(form, offset + 4);
             let mut node = editable_field(label, value, run_id, form.selection(control), nodes);
             if control == Control::Name {
@@ -381,10 +414,16 @@ fn workspace_fields(
             node.remove_action(Action::Click);
             node.remove_action(Action::SetValue);
         }
-        dialog.push_child(id);
+        match (&mut list, control) {
+            (Some(list), Control::Recent(_)) => list.push_child(id),
+            _ => dialog.push_child(id),
+        }
         nodes.push((id, node));
     }
-    form_node(form, field_offset(form.focus))
+    if let Some(list) = list {
+        nodes.push((list_id, list));
+    }
+    control_node(form, form.focus)
 }
 
 #[cfg(test)]
@@ -454,7 +493,7 @@ pub(super) fn workbench_tree(
                 &state.workspace_form,
                 &mut node,
                 &mut nodes,
-                workspace_form::modal_rect(width, height, scale),
+                state.workspace_form.modal_rect(width, height, scale),
             );
         } else if id == WORKTREE {
             let (branch, cancel, create) = worktree_controls(state);
@@ -804,11 +843,11 @@ mod tests {
     fn workspace_form_exposes_editable_controls_matching_keyboard_focus_and_bounds() {
         let mut state = AppState::new();
         state.workspace_form.begin(std::path::Path::new("/日本語"));
-        let modal = workspace_form::modal_rect(320., 480., 1.);
+        let modal = state.workspace_form.modal_rect(320., 480., 1.);
         let update = super::tree(&state, 320., 480., 1.);
         assert_eq!(update.focus, form_node(&state.workspace_form, 0));
-        for (control, rect) in workspace_form::controls(modal) {
-            let id = form_node(&state.workspace_form, field_offset(control));
+        for (control, rect) in state.workspace_form.controls(modal) {
+            let id = control_node(&state.workspace_form, control);
             let node = &update.nodes.iter().find(|(n, _)| *n == id).unwrap().1;
             assert_eq!(node.bounds(), Some(bounds(rect)));
             assert!(node.supports_action(Action::Focus));
@@ -897,6 +936,80 @@ mod tests {
         assert_eq!(workspace_action(&mut state, &folder), None);
     }
 
+    #[test]
+    fn recent_projects_are_a_list_whose_items_reopen_on_click() {
+        let mut state = AppState::new();
+        state
+            .workspace_form
+            .begin(std::path::Path::new("/home/dev"));
+        let project = |name: &str, root: &str| daedalus_proto::RecentProject {
+            name: name.into(),
+            root_dir: root.into(),
+            last_used: 0,
+            has_setup: true,
+        };
+        let projects = vec![
+            project("daedalus", "/home/tim/daedalus"),
+            project("notes", "/home/tim/notes"),
+        ];
+        state.workspace_form.set_recent(projects.clone());
+        let update = super::tree(&state, 800., 600., 1.);
+        let node = |id: NodeId| &update.nodes.iter().find(|(n, _)| *n == id).unwrap().1;
+        let (list_id, list) = update
+            .nodes
+            .iter()
+            .find(|(_, n)| n.role() == Role::List)
+            .expect("recent projects list");
+        assert_eq!(list.label(), Some("Recent projects"));
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, n)| n.children().contains(list_id))
+        );
+        let items = list.children().to_vec();
+        assert_eq!(items.len(), 2);
+        assert_eq!(node(items[0]).role(), Role::ListItem);
+        assert_eq!(node(items[0]).label(), Some("daedalus, /home/tim/daedalus"));
+        assert_eq!(node(items[1]).label(), Some("notes, /home/tim/notes"));
+        let modal = state.workspace_form.modal_rect(800., 600., 1.);
+        assert_eq!(
+            node(items[1]).bounds(),
+            Some(bounds(state.workspace_form.controls(modal)[1].1))
+        );
+        assert!(node(items[1]).supports_action(Action::Click));
+        let request = |target_node, action| ActionRequest {
+            target_tree: TreeId::ROOT,
+            target_node,
+            action,
+            data: None,
+        };
+        assert_eq!(
+            workspace_action(&mut state, &request(items[1], Action::Focus)),
+            Some(WorkspaceFormAction::None)
+        );
+        assert_eq!(tree(&state).focus, items[1]);
+        assert_eq!(
+            workspace_action(&mut state, &request(items[1], Action::Click)),
+            Some(WorkspaceFormAction::Reopen(projects[1].clone()))
+        );
+        state.workspace_form.start_submission();
+        let update = tree(&state);
+        let busy = &update.nodes.iter().find(|(n, _)| *n == items[0]).unwrap().1;
+        assert!(busy.is_disabled() && !busy.supports_action(Action::Click));
+        assert_eq!(
+            workspace_action(&mut state, &request(items[0], Action::Click)),
+            None
+        );
+        state.workspace_form.set_recent(Vec::new());
+        assert!(
+            tree(&state)
+                .nodes
+                .iter()
+                .all(|(_, n)| n.role() != Role::List)
+        );
+    }
+
     fn agent_workspace() -> AppState {
         use daedalus_proto::{PaneId, PaneSummary, WorkspaceId, WorkspaceInfo};
         let mut state = AppState::new();
@@ -915,6 +1028,7 @@ mod tests {
         };
         state.set_workspaces(vec![WorkspaceInfo {
             project: Default::default(),
+            setup: None,
             default_panes_pending: None,
             id: ws,
             name: "Project".into(),

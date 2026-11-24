@@ -3,7 +3,7 @@ use crate::types::{
     GridDelta, GridRow, GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary, PortMapping,
     SearchMatch, StatusLevel, WorkspaceId, WorkspaceInfo,
 };
-use crate::{ActivityCursor, ActivityPage};
+use crate::{ActivityCursor, ActivityPage, Assignment, RecentProject};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -145,6 +145,13 @@ pub enum ClientMessage {
     },
     Subscribe {
         pane_ids: Option<Vec<PaneId>>,
+        #[serde(default)]
+        project_setup_events: bool,
+    },
+    ListRecentProjects,
+    SetProjectSetup {
+        workspace_id: WorkspaceId,
+        assignments: Vec<Assignment>,
     },
     Unsubscribe,
     RunWorkspaceAction {
@@ -174,7 +181,14 @@ pub enum ResponsePayload {
         journal_supported: bool,
         #[serde(default)]
         inspect_setup_supported: bool,
+        #[serde(default)]
+        recent_projects_supported: bool,
+        #[serde(default)]
+        project_setup_supported: bool,
+        #[serde(default)]
+        home_dir: Option<PathBuf>,
     },
+    RecentProjects(Vec<RecentProject>),
     SetupInspection(SetupInspection),
     Activity(ActivityPage),
     WorkspaceCreated(WorkspaceInfo),
@@ -238,6 +252,10 @@ pub enum ServerEvent {
         workspace_id: WorkspaceId,
         status: ExternalStatus,
     },
+    ProjectSetupChanged {
+        root_dir: PathBuf,
+        assignments: Vec<Assignment>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
@@ -256,4 +274,96 @@ pub enum ProtoError {
     IoError(String),
     #[error("internal daemon error: {0}")]
     Internal(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pong_without_new_fields_decodes_with_defaults() {
+        #[derive(Serialize)]
+        enum OldPayload {
+            Pong {
+                version: String,
+                vt_backend: String,
+                isolation_mode: String,
+            },
+        }
+        let bytes = rmp_serde::to_vec_named(&OldPayload::Pong {
+            version: "0.0.1".into(),
+            vt_backend: "vt".into(),
+            isolation_mode: "none".into(),
+        })
+        .unwrap();
+        let decoded: ResponsePayload = rmp_serde::from_slice(&bytes).unwrap();
+        match decoded {
+            ResponsePayload::Pong {
+                recent_projects_supported,
+                project_setup_supported,
+                home_dir,
+                ..
+            } => {
+                assert!(!recent_projects_supported);
+                assert!(!project_setup_supported);
+                assert_eq!(home_dir, None);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subscribe_without_opt_in_defaults_to_no_project_events() {
+        #[derive(Serialize)]
+        enum OldMessage {
+            Subscribe { pane_ids: Option<Vec<PaneId>> },
+        }
+        let bytes = rmp_serde::to_vec_named(&OldMessage::Subscribe { pane_ids: None }).unwrap();
+        let decoded: ClientMessage = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(
+            decoded,
+            ClientMessage::Subscribe {
+                pane_ids: None,
+                project_setup_events: false,
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_info_without_setup_decodes() {
+        #[derive(Serialize)]
+        #[serde(rename = "WorkspaceInfo")]
+        struct WithoutSetup {
+            id: WorkspaceId,
+            name: String,
+            root_dir: PathBuf,
+            slot_index: u16,
+            injected_env: HashMap<String, String>,
+            panes: Vec<PaneSummary>,
+        }
+        let stripped = rmp_serde::to_vec_named(&WithoutSetup {
+            id: WorkspaceId::new(),
+            name: "w".into(),
+            root_dir: PathBuf::from("/tmp/w"),
+            slot_index: 0,
+            injected_env: HashMap::new(),
+            panes: Vec::new(),
+        })
+        .unwrap();
+        let decoded: WorkspaceInfo = rmp_serde::from_slice(&stripped).unwrap();
+        assert_eq!(decoded.setup, None);
+    }
+
+    #[test]
+    fn assignment_round_trips() {
+        let assignment = Assignment {
+            id: "setup-runner".into(),
+            name: "Setup".into(),
+            role: PaneRole::Runner,
+            argv: vec!["make".into(), "test".into()],
+        };
+        let bytes = rmp_serde::to_vec_named(&assignment).unwrap();
+        let decoded: Assignment = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, assignment);
+    }
 }

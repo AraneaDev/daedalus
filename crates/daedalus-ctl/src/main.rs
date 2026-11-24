@@ -117,6 +117,8 @@ enum WorkspaceAction {
         env: Vec<String>,
     },
     List,
+    /// List recently used projects, newest first
+    Recent,
     Close {
         id: Uuid,
         #[arg(long)]
@@ -313,9 +315,12 @@ fn parse_env_pairs(pairs: &[String]) -> Result<HashMap<String, String>, String> 
     Ok(map)
 }
 
+/// Anchors a relative directory at the client's working directory. A path with a root is sent as
+/// given, because on Windows `/home/dev/project` has no drive and may name a directory on a
+/// daemon running in WSL or on another host.
 fn resolve_dir(dir: Option<PathBuf>) -> Result<PathBuf, std::io::Error> {
     match dir {
-        Some(d) if d.is_relative() => {
+        Some(d) if !d.has_root() => {
             let joined = std::env::current_dir()?.join(d);
             Ok(daedalus_proto::strip_windows_verbatim_prefix(
                 std::fs::canonicalize(&joined).unwrap_or(joined),
@@ -339,6 +344,36 @@ fn resolve_target_root_dir(
 
 fn unexpected_response(payload: ResponsePayload) -> Box<dyn std::error::Error> {
     format!("unexpected response payload: {payload:?}").into()
+}
+
+/// Format unix seconds as `YYYY-MM-DD HH:MM` in UTC.
+fn format_utc_minute(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    // Civil-from-days (Howard Hinnant), valid for the proleptic Gregorian calendar.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        rem / 3_600,
+        rem % 3_600 / 60
+    )
+}
+
+fn format_recent_project(project: &daedalus_proto::RecentProject) -> String {
+    format!(
+        "{}\t{}\t{}",
+        project.name,
+        project.root_dir.display(),
+        format_utc_minute(project.last_used)
+    )
 }
 
 fn expect_ok(payload: ResponsePayload) -> Result<(), Box<dyn std::error::Error>> {
@@ -506,6 +541,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 other => return Err(unexpected_response(other)),
             },
+            WorkspaceAction::Recent => {
+                let supported = matches!(
+                    client.request(ClientMessage::Ping).await?,
+                    ResponsePayload::Pong {
+                        recent_projects_supported: true,
+                        ..
+                    }
+                );
+                if !supported {
+                    return Err(
+                        "This daemon does not keep recent projects. Upgrade daedalusd.".into(),
+                    );
+                }
+                match client.request(ClientMessage::ListRecentProjects).await? {
+                    ResponsePayload::RecentProjects(list) if list.is_empty() => {
+                        println!("No recent projects.");
+                    }
+                    ResponsePayload::RecentProjects(list) => {
+                        for project in &list {
+                            println!("{}", format_recent_project(project));
+                        }
+                    }
+                    other => return Err(unexpected_response(other)),
+                }
+            }
             WorkspaceAction::Close {
                 id,
                 compose_down,
@@ -684,6 +744,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 client
                     .request(ClientMessage::Subscribe {
                         pane_ids: pane.map(|p| vec![PaneId(p)]),
+                        project_setup_events: false,
                     })
                     .await?,
             )?;
@@ -763,6 +824,15 @@ mod tests {
                     compose_down: true,
                     ..
                 }
+            }
+        ));
+
+        let recent = Cli::try_parse_from(["daedalus-ctl", "workspace", "recent"])
+            .expect("parse workspace recent");
+        assert!(matches!(
+            recent.command,
+            Commands::Workspace {
+                action: WorkspaceAction::Recent
             }
         ));
 
@@ -1044,6 +1114,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_dir_sends_rooted_daemon_paths_unchanged() {
+        for raw in ["/home/dev/project", "/tmp/does-not-exist-here"] {
+            assert_eq!(
+                resolve_dir(Some(PathBuf::from(raw))).unwrap(),
+                PathBuf::from(raw)
+            );
+        }
+    }
+
+    #[test]
     fn parses_service_print_launchd_cli_flags() {
         let default_cmd = Cli::try_parse_from(["daedalus-ctl", "service", "print-launchd"])
             .expect("parse service print-launchd");
@@ -1152,6 +1232,21 @@ mod tests {
             escaped
                 .contains("<string>/tmp/log&amp;&lt;&quot;&apos;&gt;/daedalusd.err.log</string>")
         );
+    }
+
+    #[test]
+    fn formats_recent_project_line_in_utc() {
+        let project = daedalus_proto::RecentProject {
+            name: "demo".into(),
+            root_dir: PathBuf::from("/work/demo"),
+            last_used: 0,
+            has_setup: false,
+        };
+        assert_eq!(
+            format_recent_project(&project),
+            "demo\t/work/demo\t1970-01-01 00:00"
+        );
+        assert_eq!(format_utc_minute(951_782_400 + 3_661), "2000-02-29 01:01");
     }
 
     #[test]

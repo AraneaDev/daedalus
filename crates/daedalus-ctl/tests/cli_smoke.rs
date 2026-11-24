@@ -1144,3 +1144,130 @@ async fn service_plist_can_be_generated_offline_with_escaped_user_paths() {
         );
     }
 }
+
+#[tokio::test]
+async fn workspace_recent_lists_closed_project() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daedalusd.sock");
+    let runtime = dir.path().join("runtime");
+    let server = DaemonServer::bind_with_supervisor(sock.clone(), runtime, test_supervisor())
+        .await
+        .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+    let dir_path = dir.path().to_path_buf();
+    let body = tokio::spawn(async move {
+        let bin = env!("CARGO_BIN_EXE_daedalus-ctl");
+        let run = |args: Vec<String>| {
+            let sock = sock.clone();
+            async move {
+                Command::new(bin)
+                    .kill_on_drop(true)
+                    .arg("--socket")
+                    .arg(sock)
+                    .args(args)
+                    .output()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let empty = run(vec!["workspace".into(), "recent".into()]).await;
+        assert!(empty.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&empty.stdout),
+            "No recent projects.\n"
+        );
+
+        let project_dir = dir_path.join("proj");
+        std::fs::create_dir(&project_dir).unwrap();
+        let create = run(vec![
+            "workspace".into(),
+            "create".into(),
+            "recent-demo".into(),
+            "--dir".into(),
+            project_dir.to_str().unwrap().into(),
+        ])
+        .await;
+        assert!(create.status.success());
+        let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+        let close = run(vec!["workspace".into(), "close".into(), id]).await;
+        assert!(close.status.success());
+
+        let recent = run(vec!["workspace".into(), "recent".into()]).await;
+        assert!(recent.status.success());
+        let out = String::from_utf8_lossy(&recent.stdout);
+        let fields: Vec<&str> = out.trim_end().split('\t').collect();
+        assert_eq!(fields.len(), 3, "{out}");
+        assert_eq!(fields[0], "recent-demo");
+        assert!(fields[1].ends_with("proj"), "{out}");
+        assert_eq!(fields[2].len(), "YYYY-MM-DD HH:MM".len(), "{out}");
+    });
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), body).await;
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), srv_handle).await;
+    result
+        .expect("workspace recent e2e timed out")
+        .expect("workspace recent e2e body panicked");
+}
+
+#[tokio::test]
+async fn workspace_recent_reports_unsupported_daemon() {
+    // The file-level protocol imports are Unix-only; this mock speaks TCP on every platform.
+    use daedalus_proto::transport::IpcListener;
+    use daedalus_proto::{
+        ClientMessage, Request, ResponsePayload, ServerMessage, read_frame, write_frame,
+    };
+    let mut listener = IpcListener::bind(std::path::Path::new("tcp://127.0.0.1:0"))
+        .await
+        .unwrap();
+    let endpoint = listener.local_endpoint();
+    let mock = tokio::spawn(async move {
+        let mut stream = listener.accept().await.unwrap();
+        let req: Request = read_frame(&mut stream).await.unwrap().unwrap();
+        assert_eq!(req.payload, ClientMessage::Ping);
+        write_frame(
+            &mut stream,
+            &ServerMessage::Response {
+                id: req.id,
+                result: Ok(ResponsePayload::Pong {
+                    version: "0.0.1".into(),
+                    vt_backend: "test".into(),
+                    isolation_mode: "test".into(),
+                    journal_supported: false,
+                    inspect_setup_supported: false,
+                    project_setup_supported: false,
+                    home_dir: None,
+                    recent_projects_supported: false,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    });
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let output = Command::new(env!("CARGO_BIN_EXE_daedalus-ctl"))
+            .kill_on_drop(true)
+            .arg("--socket")
+            .arg(endpoint)
+            .args(["workspace", "recent"])
+            .output()
+            .await
+            .unwrap();
+        mock.await.unwrap();
+        output
+    })
+    .await
+    .expect("CLI or mock daemon timed out");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("This daemon does not keep recent projects. Upgrade daedalusd.")
+    );
+}

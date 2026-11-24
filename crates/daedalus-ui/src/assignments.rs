@@ -1,18 +1,12 @@
 use daedalus_proto::{PaneId, PaneRole, WorkspaceId, default_config_file_path};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Assignment {
-    pub id: String,
-    pub name: String,
-    pub role: PaneRole,
-    pub argv: Vec<String>,
-}
+pub use daedalus_proto::Assignment;
 
 pub fn setup_runner(entries: &[Assignment]) -> Option<&Assignment> {
     entries
@@ -30,34 +24,19 @@ struct AssignmentList<'a> {
     assignments: &'a [Assignment],
 }
 
-fn workspace_path(id: WorkspaceId) -> PathBuf {
-    default_config_file_path()
-        .with_file_name("assignments")
-        .join(format!("{id}.toml"))
+pub(crate) fn assignments_dir() -> PathBuf {
+    default_config_file_path().with_file_name("assignments")
 }
 
-fn validate(assignments: &[Assignment]) -> Result<(), String> {
-    let mut ids = HashSet::new();
-    for assignment in assignments {
-        if assignment.id.trim().is_empty() || !ids.insert(&assignment.id) {
-            return Err("Each assignment needs a unique, nonempty ID".into());
-        }
-        if assignment.name.trim().is_empty() {
-            return Err("Each assignment needs a name".into());
-        }
-        if assignment
-            .argv
-            .first()
-            .is_none_or(|arg| arg.trim().is_empty())
-        {
-            return Err("Each assignment needs an executable".into());
-        }
-        if assignment.argv.iter().any(|arg| arg.contains('\0')) {
-            return Err("Assignment arguments cannot contain a NUL character".into());
-        }
-    }
-    Ok(())
+pub(crate) fn file_in(dir: &Path, id: WorkspaceId) -> PathBuf {
+    dir.join(format!("{id}.toml"))
 }
+
+fn workspace_path(id: WorkspaceId) -> PathBuf {
+    file_in(&assignments_dir(), id)
+}
+
+use daedalus_proto::validate_assignments as validate;
 
 pub fn load(workspace_id: WorkspaceId) -> Result<Vec<Assignment>, String> {
     load_or(workspace_id, Vec::new())
@@ -70,7 +49,7 @@ pub fn load_or(
     load_from(&workspace_path(workspace_id), defaults)
 }
 
-fn load_from(path: &Path, defaults: Vec<Assignment>) -> Result<Vec<Assignment>, String> {
+pub(crate) fn load_from(path: &Path, defaults: Vec<Assignment>) -> Result<Vec<Assignment>, String> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(defaults),
@@ -86,7 +65,7 @@ pub fn save(workspace_id: WorkspaceId, assignments: &[Assignment]) -> Result<(),
     save_to(&workspace_path(workspace_id), assignments)
 }
 
-fn save_to(path: &Path, assignments: &[Assignment]) -> Result<(), String> {
+pub(crate) fn save_to(path: &Path, assignments: &[Assignment]) -> Result<(), String> {
     validate(assignments)?;
     let contents = toml::to_string(&AssignmentList { assignments })
         .map_err(|error| format!("Could not encode assignments: {error}"))?;

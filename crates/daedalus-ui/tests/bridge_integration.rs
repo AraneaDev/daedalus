@@ -970,7 +970,10 @@ async fn queued_terminal_input_stays_with_its_connection() {
         let (mut peer, _) = listener.accept().await.unwrap();
         for expected in [
             ClientMessage::Ping,
-            ClientMessage::Subscribe { pane_ids: None },
+            ClientMessage::Subscribe {
+                pane_ids: None,
+                project_setup_events: false,
+            },
         ] {
             let request = read_frame::<_, Request>(&mut peer).await.unwrap().unwrap();
             assert_eq!(request.payload, expected);
@@ -981,6 +984,9 @@ async fn queued_terminal_input_stays_with_its_connection() {
                     isolation_mode: "test".into(),
                     journal_supported: false,
                     inspect_setup_supported: false,
+                    recent_projects_supported: false,
+                    project_setup_supported: false,
+                    home_dir: None,
                 },
                 _ => ResponsePayload::Ok,
             };
@@ -1608,7 +1614,19 @@ async fn wizard_inspects_installs_and_launches_only_selected_roles() {
             }
         }
         assert_eq!(started, ["serve"]);
-        assert_eq!(assignments::load(ws).unwrap(), entries);
+        // The daemon owns the setup now, so nothing is written locally.
+        assert!(assignments::load(ws).unwrap().is_empty());
+        tokio::task::spawn_blocking(move || bridge.shutdown())
+            .await
+            .unwrap();
+        let (bridge, mut events) = connect();
+        loop {
+            if let UiEvent::WorkspacesLoaded(workspaces) = events.recv().await.unwrap() {
+                let workspace = workspaces.iter().find(|w| w.id == ws).unwrap();
+                assert_eq!(workspace.setup.as_deref(), Some(entries.as_slice()));
+                break;
+            }
+        }
         while !project.join("started service").exists() || !project.join("installed tool").exists()
         {
             tokio::time::sleep(Duration::from_millis(10)).await;

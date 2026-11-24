@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod codec;
+pub mod project;
 pub mod remote;
 pub mod rpc;
 pub mod transport;
@@ -7,6 +8,7 @@ pub mod types;
 
 pub use activity::{ActivityCursor, ActivityEntry, ActivityKind, ActivityPage};
 pub use codec::{CodecError, MAX_FRAME_SIZE, read_frame, write_frame};
+pub use project::{Assignment, RecentProject, validate_assignments};
 pub use rpc::{
     ClientMessage, ProtoError, Request, ResponsePayload, ServerEvent, ServerMessage,
     SetupInspection,
@@ -620,6 +622,7 @@ mod tests {
 
         let ws_info = WorkspaceInfo {
             project: Default::default(),
+            setup: None,
             default_panes_pending: None,
             id: ws_id,
             name: "feat-auth".to_string(),
@@ -769,6 +772,7 @@ mod tests {
         };
         let ws_info = WorkspaceInfo {
             project: Default::default(),
+            setup: None,
             default_panes_pending: None,
             id: ws_id,
             name: "manifest-ws".to_string(),
@@ -1047,6 +1051,7 @@ mod tests {
 
         let ws_info = WorkspaceInfo {
             project: Default::default(),
+            setup: None,
             default_panes_pending: None,
             id: ws_id,
             name: "wt1".to_string(),
@@ -1304,6 +1309,7 @@ mod tests {
         };
         let ws_info = WorkspaceInfo {
             project: Default::default(),
+            setup: None,
             default_panes_pending: None,
             id: ws_id,
             name: "actions-ws".to_string(),

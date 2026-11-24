@@ -7,6 +7,7 @@ use daedalus_proto::{
 };
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::warn;
 
 pub(super) async fn inspect(
     conn: &RpcConnection,
@@ -106,6 +107,63 @@ pub(super) async fn launch_assignment(
     snapshot(conn, sink, pane_id).await
 }
 
+async fn store_on_daemon(
+    conn: &RpcConnection,
+    workspace_id: WorkspaceId,
+    entries: &[Assignment],
+) -> Result<Result<(), String>, RpcError> {
+    if let Err(message) = daedalus_proto::validate_assignments(entries) {
+        return Ok(Err(message));
+    }
+    match conn
+        .call(ClientMessage::SetProjectSetup {
+            workspace_id,
+            assignments: entries.to_vec(),
+        })
+        .await
+    {
+        Ok(_) => Ok(Ok(())),
+        Err(RpcError::Disconnected) => Err(RpcError::Disconnected),
+        Err(RpcError::Proto(err)) => Ok(Err(err.to_string())),
+    }
+}
+
+pub(super) async fn save_project_setup(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+    workspace_id: WorkspaceId,
+    entries: Vec<Assignment>,
+) -> Result<(), RpcError> {
+    if !conn.project_setup_supported {
+        return Ok(());
+    }
+    if let Err(message) = store_on_daemon(conn, workspace_id, &entries).await? {
+        sink.emit(UiEvent::ProjectSetupSaveFailed {
+            workspace_id,
+            message,
+        });
+    }
+    Ok(())
+}
+
+pub(super) async fn refresh_recent_projects(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+) -> Result<(), RpcError> {
+    if !conn.recent_projects_supported {
+        return Ok(());
+    }
+    match conn.call(ClientMessage::ListRecentProjects).await {
+        Ok(ResponsePayload::RecentProjects(projects)) => {
+            sink.emit(UiEvent::RecentProjectsLoaded(projects));
+        }
+        Err(RpcError::Disconnected) => return Err(RpcError::Disconnected),
+        Err(error) => warn!("listing recent projects failed: {error:?}"),
+        Ok(other) => warn!("unexpected reply to ListRecentProjects: {other:?}"),
+    }
+    Ok(())
+}
+
 pub(super) async fn apply(
     conn: &RpcConnection,
     sink: &Arc<dyn UiEventSink>,
@@ -113,7 +171,12 @@ pub(super) async fn apply(
     entries: Vec<Assignment>,
     launch: Vec<String>,
 ) -> Result<(), RpcError> {
-    if let Err(message) = assignments::save(workspace_id, &entries) {
+    let stored = if conn.project_setup_supported {
+        store_on_daemon(conn, workspace_id, &entries).await?
+    } else {
+        assignments::save(workspace_id, &entries)
+    };
+    if let Err(message) = stored {
         sink.emit(UiEvent::SetupApplied {
             workspace_id,
             error: Some(message),

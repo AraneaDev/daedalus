@@ -136,6 +136,8 @@ struct ViewportMetrics {
 struct DaedalusApp {
     config: BridgeConfig,
     ui_config: UiConfig,
+    project_setups: daedalus_ui::project_setups::ProjectSetups,
+    daemon_home: Option<PathBuf>,
     setup: setup::SetupFlow,
     history: daedalus_ui::activity_history::ActivityHistory,
     focused: bool,
@@ -165,6 +167,8 @@ impl DaedalusApp {
         profile: &std::path::Path,
     ) -> Self {
         Self {
+            project_setups: Default::default(),
+            daemon_home: None,
             setup: Default::default(),
             history: daedalus_ui::activity_history::ActivityHistory::new(
                 profile,
@@ -427,6 +431,27 @@ impl DaedalusApp {
         self.request_redraw();
     }
 
+    /// Where a new project starts: the `--dir` folder, else the daemon host's home, else nothing.
+    /// Never this process's working directory, which means nothing on the daemon host.
+    fn folder_suggestion(&self) -> PathBuf {
+        if self.config.bootstrap_explicit_dir {
+            self.config.initial_dir.clone()
+        } else {
+            self.daemon_home.clone().unwrap_or_default()
+        }
+    }
+
+    /// Keeps folders that are open as a workspace out of the form's recent list.
+    fn hide_open_recent_projects(&mut self) {
+        let open = self
+            .state
+            .workspaces
+            .iter()
+            .map(|ws| ws.root_dir.clone())
+            .collect();
+        self.state.workspace_form.hide_open(open);
+    }
+
     fn create_new_workspace(&mut self) {
         if self.setup_installer_is_running() {
             self.show_toast(
@@ -436,7 +461,10 @@ impl DaedalusApp {
             return;
         }
         self.reset_setup_draft();
-        self.state.workspace_form.begin(&self.config.initial_dir);
+        let folder = self.folder_suggestion();
+        self.state.workspace_form.begin(&folder);
+        self.hide_open_recent_projects();
+        self.send_command(UiCommand::RefreshRecentProjects);
         self.state
             .workspace_form
             .set_focus(daedalus_ui::workspace_form::Control::Folder);
@@ -545,7 +573,7 @@ impl DaedalusApp {
             .state
             .active_workspace()
             .map(|ws| ws.root_dir.clone())
-            .unwrap_or_else(|| self.config.initial_dir.clone());
+            .unwrap_or_else(|| self.folder_suggestion());
         if self.send_command(UiCommand::CreateWorktreeWorkspace {
             repo_dir,
             branch,
@@ -1370,6 +1398,34 @@ impl DaedalusApp {
         self.sync_history_visit();
         match event {
             UiEvent::JournalCapability(supported) => self.history.connection(supported),
+            UiEvent::DaemonCapabilities {
+                home_dir,
+                project_setups,
+                recent_projects,
+            } => {
+                self.daemon_home = home_dir;
+                self.project_setups.set_daemon_backed(project_setups);
+                if !recent_projects {
+                    // Rows from the previous daemon would name folders this one never saw.
+                    self.state.workspace_form.set_recent(Vec::new());
+                }
+            }
+            UiEvent::RecentProjectsLoaded(projects) => {
+                self.hide_open_recent_projects();
+                self.state.workspace_form.set_recent(projects);
+            }
+            UiEvent::ProjectSetupChanged {
+                root_dir,
+                assignments,
+            } => self.project_setup_changed(&root_dir, assignments),
+            UiEvent::ProjectSetupSaveFailed {
+                workspace_id,
+                message,
+            } => {
+                self.project_setups.rejected(workspace_id);
+                self.refresh_workspace_setup(workspace_id);
+                self.show_toast(message, true);
+            }
             UiEvent::ActivityRead { token, page } => {
                 use daedalus_ui::activity_history::PageUpdate;
                 match self.history.received(token, &page) {
@@ -1415,6 +1471,15 @@ impl DaedalusApp {
                 self.schedule_resize_flush();
             }
             UiEvent::WorkspacesLoaded(workspaces) => {
+                self.project_setups.absorb(&workspaces);
+                for (workspace_id, assignments) in self.project_setups.migrations(&workspaces) {
+                    if !self.send_command(UiCommand::SaveProjectSetup {
+                        workspace_id,
+                        assignments,
+                    }) {
+                        self.project_setups.rejected(workspace_id);
+                    }
+                }
                 self.restore_session_names(&workspaces);
                 self.state.set_workspaces(workspaces);
                 self.reconcile_setup_installer();
@@ -1446,6 +1511,7 @@ impl DaedalusApp {
             }
             UiEvent::WorkspaceCreated(ws) => {
                 let ws_id = ws.id;
+                self.project_setups.absorb(std::slice::from_ref(&ws));
                 self.state.upsert_workspace(ws);
                 self.state.select_workspace(ws_id);
                 self.state.close_search();
@@ -1923,13 +1989,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?
         .map(|target| target.host);
     let bootstrap_explicit_dir = args.dir.is_some();
-    let initial_dir = args.dir.unwrap_or_else(|| {
-        if remote_host.is_some() {
-            PathBuf::from(".")
-        } else {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        }
-    });
+    // Without --dir the folder suggestion comes from the daemon (see `folder_suggestion`).
+    let initial_dir = args.dir.unwrap_or_default();
 
     let config = BridgeConfig {
         bootstrap_explicit_dir,

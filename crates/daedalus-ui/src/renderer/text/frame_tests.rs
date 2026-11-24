@@ -273,3 +273,41 @@ fn zoomed_headers_switch_from_default_role_tabs_to_named_sessions_with_a_close_t
     assert_eq!(close.bounds.left, button.x.floor() as i32);
     assert_eq!(close.bounds.right, button.right().ceil() as i32);
 }
+
+#[test]
+fn start_screen_lists_recent_projects_above_the_new_project_form() {
+    let mut frame = Frame::new();
+    let form = &mut frame.state.workspace_form;
+    form.begin(std::path::Path::new("/home/dev"));
+    let project = |name: &str, root: &str| daedalus_proto::RecentProject {
+        name: name.into(),
+        root_dir: root.into(),
+        last_used: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        has_setup: true,
+    };
+    form.set_recent(vec![
+        project("daedalus", "/home/tim/daedalus"),
+        project("tim-vitepress", "/home/tim/tim-vitepress"),
+    ]);
+    let labels = frame.labels(1200., 800.);
+    let at = |prefix: &str| {
+        labels
+            .iter()
+            .position(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("{prefix} missing from {labels:?}"))
+    };
+    let heading = at("Recent projects");
+    let first = at("daedalus   /home/tim/daedalus   just now");
+    let second = at("tim-vitepress   /home/tim/tim-vitepress   just now");
+    at("Set up a new project");
+    assert!(heading < first && first < second);
+    assert!(labels.iter().any(|line| line.starts_with("Folder")));
+
+    frame.state.workspace_form.set_recent(Vec::new());
+    let labels = frame.labels(1200., 800.);
+    assert_eq!(labels[0], "Set up workspace · Choose project");
+    assert!(!labels.iter().any(|line| line == "Recent projects"));
+}

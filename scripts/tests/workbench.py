@@ -170,10 +170,12 @@ def exercise(binaries, scratch, screen):
         "--events-socket",
         scratch / "events.sock",
     ]
-    with running(binaries / "daedalusd", args, project, env):
+    # The UI suggests the daemon host's home as the folder, not its own working dir.
+    with running(binaries / "daedalusd", args, project, dict(env, HOME=str(project))):
         until("daemon", lambda: cli("ping").returncode == 0)
         project_dialog = (460, 332)
         review_dialog = (370, 200)
+        recent_dialog = (460, 292)
         with running(
             binaries / "daedalus-ui", ["--no-auto-spawn"], project, env
         ) as client:
@@ -231,6 +233,33 @@ def exercise(binaries, scratch, screen):
             assert listing.returncode == 0 and listing.stdout.count("panes=") == 1, (
                 listing
             )
+            ui.close(client)
+
+        # Close the workspace, then reopen the project from the recent list.
+        ids = [
+            line.split()[0]
+            for line in cli("workspace", "list").stdout.splitlines()
+            if line.strip()
+        ]
+        assert len(ids) == 1, ids
+        assert cli("workspace", "close", ids[0]).returncode == 0
+        assert "panes=" not in cli("workspace", "list").stdout
+        assert "orbit" in cli("workspace", "recent").stdout
+        (project / "agent-started").unlink()
+        with running(
+            binaries / "daedalus-ui", ["--no-auto-spawn"], project, env
+        ) as client:
+            ui = Workbench(screen, client)
+            ui.wait_dialog(recent_dialog)
+            ui.click(720, 349)  # The recent project
+            until("agent relaunched", lambda: (project / "agent-started").exists())
+            assert not (project / "server-started").exists()
+            ui.wait_dialog(recent_dialog, visible=False)
+            until(
+                "reopened workspace",
+                lambda: ui.pixel(1208, 67) == bytes.fromhex("b2e589"),
+            )
+            assert cli("workspace", "list").stdout.count("panes=") == 1
             ui.close(client)
 
 

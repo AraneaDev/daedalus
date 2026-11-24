@@ -942,6 +942,7 @@ impl AppState {
                 }
                 None
             }
+            ServerEvent::ProjectSetupChanged { .. } => None,
         }
     }
 

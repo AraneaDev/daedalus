@@ -182,12 +182,18 @@ impl DaemonServer {
 struct SubscriptionFilter {
     active: bool,
     pane_ids: Option<HashSet<PaneId>>,
+    /// Older UIs drop the connection on an event variant they do not know, so
+    /// `ProjectSetupChanged` is sent only to connections that asked for it.
+    project_setup_events: bool,
 }
 
 impl SubscriptionFilter {
     fn matches(&self, event: &ServerEvent) -> bool {
         if !self.active {
             return false;
+        }
+        if matches!(event, ServerEvent::ProjectSetupChanged { .. }) {
+            return self.project_setup_events;
         }
         let Some(allowed) = &self.pane_ids else {
             return true;
@@ -200,7 +206,8 @@ impl SubscriptionFilter {
             | ServerEvent::PaneExited { pane_id, .. }
             | ServerEvent::ResyncRequired { pane_id } => allowed.contains(pane_id),
             ServerEvent::WorkspaceRuntimeUpdated { .. }
-            | ServerEvent::ExternalStatusUpdated { .. } => false,
+            | ServerEvent::ExternalStatusUpdated { .. }
+            | ServerEvent::ProjectSetupChanged { .. } => false,
         }
     }
 }
@@ -307,6 +314,9 @@ async fn dispatch_request(
                 isolation_mode: registry.isolation_mode().as_str().to_string(),
                 journal_supported: true,
                 inspect_setup_supported: true,
+                recent_projects_supported: true,
+                project_setup_supported: true,
+                home_dir: std::env::home_dir(),
             })
         }
         ClientMessage::Authenticate { .. } => Ok(ResponsePayload::Ok),
@@ -495,16 +505,33 @@ async fn dispatch_request(
         ClientMessage::GetFailureTrace { pane_id } => Ok(ResponsePayload::FailureTrace(
             registry.get_failure_trace(pane_id).await?,
         )),
-        ClientMessage::Subscribe { pane_ids } => {
+        ClientMessage::Subscribe {
+            pane_ids,
+            project_setup_events,
+        } => {
             let mut f = filter.write().await;
             f.active = true;
             f.pane_ids = pane_ids.map(|ids| ids.into_iter().collect());
+            f.project_setup_events = project_setup_events;
+            Ok(ResponsePayload::Ok)
+        }
+        ClientMessage::ListRecentProjects => Ok(ResponsePayload::RecentProjects(
+            registry.recent_projects().await,
+        )),
+        ClientMessage::SetProjectSetup {
+            workspace_id,
+            assignments,
+        } => {
+            registry
+                .set_project_setup(workspace_id, assignments)
+                .await?;
             Ok(ResponsePayload::Ok)
         }
         ClientMessage::Unsubscribe => {
             let mut f = filter.write().await;
             f.active = false;
             f.pane_ids = None;
+            f.project_setup_events = false;
             Ok(ResponsePayload::Ok)
         }
         ClientMessage::RunWorkspaceAction {
@@ -650,6 +677,24 @@ mod tests {
         })
     }
 
+    #[test]
+    fn project_setup_events_require_opt_in_for_global_and_scoped_filters() {
+        let event = ServerEvent::ProjectSetupChanged {
+            root_dir: PathBuf::from("/p"),
+            assignments: Vec::new(),
+        };
+        for pane_ids in [None, Some(HashSet::new())] {
+            let mut filter = SubscriptionFilter {
+                active: true,
+                pane_ids,
+                project_setup_events: false,
+            };
+            assert!(!filter.matches(&event));
+            filter.project_setup_events = true;
+            assert!(filter.matches(&event));
+        }
+    }
+
     #[tokio::test]
     async fn resync_required_is_delivered_after_backpressure_drains() {
         let (event_tx, _) = broadcast::channel(16);
@@ -658,6 +703,7 @@ mod tests {
         let filter = Arc::new(RwLock::new(SubscriptionFilter {
             active: true,
             pane_ids: None,
+            ..Default::default()
         }));
 
         let handle = tokio::spawn(forward_subscriber_events(event_rx, out_tx, filter));
@@ -706,6 +752,7 @@ mod tests {
         let filter = Arc::new(RwLock::new(SubscriptionFilter {
             active: true,
             pane_ids: None,
+            ..Default::default()
         }));
 
         let handle = tokio::spawn(forward_subscriber_events(event_rx, out_tx, filter));
