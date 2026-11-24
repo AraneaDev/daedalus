@@ -3303,7 +3303,9 @@ async fn project_setup_events_only_reach_opted_in_clients() {
             pane_id: Some(pane.id),
             workspace_id: None,
             root_dir: None,
-            state: AgentState::Thinking,
+            // A state no output can produce: on Windows the ping output already reads as
+            // Thinking, and setting an unchanged state emits no event.
+            state: AgentState::Error,
         },
     )
     .await;
@@ -3317,7 +3319,13 @@ async fn project_setup_events_only_reach_opted_in_clients() {
                 !matches!(event, ServerEvent::ProjectSetupChanged { .. }),
                 "non-opted-in client must not see ProjectSetupChanged, got {event:?}"
             );
-            matches!(event, ServerEvent::AgentStateChanged { .. })
+            matches!(
+                event,
+                ServerEvent::AgentStateChanged {
+                    state: AgentState::Error,
+                    ..
+                }
+            )
         })
         .await;
     }
