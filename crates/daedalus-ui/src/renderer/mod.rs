@@ -591,16 +591,24 @@ fn collect_overlay_quads(
         return;
     }
     if state.workspace_form.open {
-        push_modal_frame(
-            quads,
-            crate::workspace_form::modal_rect(screen_w, screen_h, s),
-            screen,
-            theme,
-            border_w,
-            36. * s,
-        );
-        let modal = crate::workspace_form::modal_rect(screen_w, screen_h, s);
-        for (control, rect) in crate::workspace_form::controls(modal) {
+        let form = &state.workspace_form;
+        let modal = form.modal_rect(screen_w, screen_h, s);
+        let heading = form
+            .recent_heading(modal)
+            .map_or(36. * s, |band| band.height * 0.9);
+        push_modal_frame(quads, modal, screen, theme, border_w, heading);
+        if form.recent_heading(modal).is_some() {
+            // Separates the recent list from the new-project form below it.
+            let area = form.form_area(modal);
+            quads.push(QuadInstance::from_xywh(
+                modal.x + border_w,
+                area.y,
+                (modal.width - 2.0 * border_w).max(0.0),
+                border_w,
+                theme.border_unfocused,
+            ));
+        }
+        for (control, rect) in form.controls(modal) {
             let field = Rect::new(
                 rect.x + 2. * s,
                 rect.y + 2. * s,
@@ -1759,7 +1767,10 @@ pub(crate) mod tests {
         state.workspace_form.focus = crate::workspace_form::Control::Folder;
         assert_focus(
             &state,
-            crate::workspace_form::controls(crate::workspace_form::modal_rect(w, h, 1.))
+            state
+                .workspace_form
+                .controls(state.workspace_form.modal_rect(w, h, 1.))
+                .into_iter()
                 .map(|(c, r)| (c == state.workspace_form.focus, r))
                 .collect(),
             2.,

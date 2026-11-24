@@ -39,10 +39,25 @@ impl Workbench {
         }
     }
 
-    fn command(&self) -> UiCommand {
+    /// Nothing was sent apart from recent-project refreshes.
+    fn idle(&self) -> bool {
         self.commands
-            .try_recv()
-            .expect("expected controller command")
+            .try_iter()
+            .all(|command| matches!(command, UiCommand::RefreshRecentProjects))
+    }
+
+    /// The next command, past the recent-project refresh every opened form asks for.
+    fn command(&self) -> UiCommand {
+        loop {
+            match self
+                .commands
+                .try_recv()
+                .expect("expected controller command")
+            {
+                UiCommand::RefreshRecentProjects => continue,
+                command => return command,
+            }
+        }
     }
 
     fn begin_review(&mut self) {
@@ -145,7 +160,7 @@ fn first_workspace_installs_a_tool_then_applies_review_to_same_workspace() {
     assert_eq!(root_dir, w.root.path());
     w.app
         .handle_setup_action(SetupAction::Install(install.clone()));
-    assert!(w.commands.try_recv().is_err());
+    assert!(w.idle());
     let ws = workspace("Workbench");
     let id = ws.id;
     let pane = ws.panes[2].id;
@@ -476,7 +491,7 @@ fn dormant_workspaces_spawn_once_and_failure_forwarding_revalidates_agent_choice
         matches!(w.command(), UiCommand::EnsureWorkspacePanes { workspace_id, .. } if workspace_id == dormant.id)
     );
     w.app.ensure_active_workspace_panes();
-    assert!(w.commands.try_recv().is_err());
+    assert!(w.idle());
     w.app.handle_daemon_event(UiEvent::WorkspacePanesEnsured {
         workspace_id: dormant.id,
         complete: true,
@@ -502,7 +517,7 @@ fn dormant_workspaces_spawn_once_and_failure_forwarding_revalidates_agent_choice
     w.app.handle_ui_action(UiAction::SwitchWorkspacePrev);
     w.app.send_failure_to_recipient(choices);
     assert!(w.app.state.toast.as_ref().unwrap().0.contains("changed"));
-    assert!(w.commands.try_recv().is_err());
+    assert!(w.idle());
     w.app.handle_ui_action(UiAction::SwitchWorkspaceNext);
     assert_eq!(w.app.state.active_workspace_id, Some(failed.id));
 }
@@ -679,7 +694,7 @@ fn disconnected_state_clears_pending_commands_and_keeps_actionable_feedback_visi
     w.app.handle_daemon_event(UiEvent::Disconnected);
     w.app.handle_ui_action(UiAction::CloseModalConfirm);
     assert!(w.app.state.toast.as_ref().unwrap().0.contains("Reconnect"));
-    assert!(w.commands.try_recv().is_err());
+    assert!(w.idle());
     w.app
         .handle_daemon_event(UiEvent::WorkspaceCloseFailed(vec![ws]));
     assert_eq!(w.app.state.active_workspace_id, Some(id));
@@ -756,7 +771,10 @@ fn pointer_routes_header_sidebar_and_overlay_clicks_using_the_rendered_layout() 
     click(&mut w.app, list.new_workspace);
     assert!(w.app.state.workspace_form.open);
     use daedalus_ui::workspace_form;
-    let cancel = workspace_form::controls(workspace_form::modal_rect(1440., 900., 1.))
+    let form = &w.app.state.workspace_form;
+    let cancel = form
+        .controls(form.modal_rect(1440., 900., 1.))
+        .into_iter()
         .find(|(control, _)| *control == workspace_form::Control::Cancel)
         .unwrap()
         .1;
@@ -804,7 +822,7 @@ fn keyboard_and_ime_route_unicode_to_the_active_editor_and_suppress_modal_confir
     w.app.handle_ui_action(UiAction::SearchCancel);
     w.app.handle_ui_action(UiAction::ToggleAgentPicker);
     w.app.commit_text("ignored".into());
-    assert!(w.commands.try_recv().is_err());
+    assert!(w.idle());
     w.app.handle_ui_action(UiAction::PickerCancel);
     w.app.handle_ui_action(UiAction::ToggleWorktreeModal);
     w.app.commit_text("étape".into());
@@ -895,7 +913,7 @@ fn keyboard_and_ime_route_unicode_to_the_active_editor_and_suppress_modal_confir
         None,
         true,
     );
-    assert!(w.commands.try_recv().is_err());
+    assert!(w.idle());
     w.app.key_pressed(
         KeyCode::Enter.into(),
         &Key::Named(NamedKey::Enter),
@@ -935,7 +953,7 @@ fn terminal_dimensions_retry_rejected_commands_and_drag_selection_uses_absolute_
             if pane_id == pane && (cols, rows) == (agent.cols, agent.rows))
     );
     w.app.resize_panes(&layout);
-    assert!(w.commands.try_recv().is_err());
+    assert!(w.idle());
     w.app.handle_daemon_event(UiEvent::Snapshot(GridSnapshot {
         pane_id: pane,
         seq: 1,
@@ -1162,7 +1180,7 @@ fn wheel_gestures_target_hovered_panel_and_modal_without_scrolling_the_terminal_
     };
     wheel(&mut w.app, -1.);
     assert!(w.app.state.sidebar_first > 0);
-    assert!(w.commands.try_recv().is_err());
+    assert!(w.idle());
     wheel(&mut w.app, 1.);
     assert_eq!(w.app.state.sidebar_first, 0);
     let viewport = layout.pane(PaneRole::Agent).unwrap().viewport;
@@ -1186,7 +1204,7 @@ fn wheel_gestures_target_hovered_panel_and_modal_without_scrolling_the_terminal_
     w.app.handle_ui_action(UiAction::NewWorkspace);
     wheel(&mut w.app, 1.);
     assert!(w.app.wheel_scroll.target.is_none());
-    assert!(w.commands.try_recv().is_err());
+    assert!(w.idle());
 }
 
 #[test]
@@ -1348,7 +1366,7 @@ fn daemon_backed_settings_save_sends_the_setup_and_follows_changes_from_the_daem
             .unwrap()
             .contains("unique")
     );
-    assert!(w.commands.try_recv().is_err());
+    assert!(w.idle());
     w.app
         .handle_settings_action(SettingsAction::Save(vec![entry.clone()]));
     assert!(!w.app.state.settings.open);
@@ -1394,7 +1412,7 @@ fn old_daemon_keeps_setups_in_local_files_and_sends_nothing() {
     let entry = runner_entry("Suite");
     w.app
         .handle_settings_action(SettingsAction::Save(vec![entry.clone()]));
-    assert!(w.commands.try_recv().is_err());
+    assert!(w.idle());
     assert_eq!(daedalus_ui::assignments::load(id).unwrap(), vec![entry]);
 }
 
@@ -1420,7 +1438,7 @@ fn local_setups_are_sent_to_the_daemon_once_and_the_files_stay() {
     );
     w.app
         .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws.clone()]));
-    assert!(w.commands.try_recv().is_err());
+    assert!(w.idle());
     assert_eq!(daedalus_ui::assignments::load(ws.id).unwrap(), vec![entry]);
 }
 
@@ -1462,4 +1480,238 @@ fn rejected_or_unsent_setup_saves_fall_back_to_the_confirmed_setup() {
             .contains("Reconnect")
     );
     assert_eq!(w.app.project_setups.load(id).unwrap(), vec![confirmed]);
+}
+
+fn recent_project(name: &str, root: &str, has_setup: bool) -> daedalus_proto::RecentProject {
+    daedalus_proto::RecentProject {
+        name: name.into(),
+        root_dir: root.into(),
+        last_used: 1,
+        has_setup,
+    }
+}
+
+fn form_folder(w: &Workbench) -> String {
+    w.app
+        .state
+        .workspace_form
+        .value(daedalus_ui::workspace_form::Control::Folder)
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn startup_without_dir_never_uses_working_directory() {
+    // The workbench config carries a folder, as a stale working directory would.
+    let mut w = Workbench::new();
+    w.app.handle_daemon_event(UiEvent::WorkspacesLoaded(vec![]));
+    assert!(w.app.state.workspace_form.open);
+    assert_eq!(form_folder(&w), "");
+    assert!(matches!(
+        w.commands.try_recv(),
+        Ok(UiCommand::RefreshRecentProjects)
+    ));
+    w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
+        home_dir: Some("/home/dev".into()),
+        project_setups: true,
+    });
+    w.app.handle_ui_action(UiAction::NewWorkspace);
+    assert_eq!(form_folder(&w), "/home/dev");
+    assert!(matches!(
+        w.commands.try_recv(),
+        Ok(UiCommand::RefreshRecentProjects)
+    ));
+
+    let mut w = Workbench::new();
+    w.app.config.bootstrap_explicit_dir = true;
+    w.app.config.initial_dir = "/p".into();
+    w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
+        home_dir: Some("/home/dev".into()),
+        project_setups: true,
+    });
+    w.app.handle_ui_action(UiAction::NewWorkspace);
+    assert_eq!(form_folder(&w), "/p");
+}
+
+#[test]
+fn worktree_fallback_uses_folder_suggestion() {
+    let mut w = Workbench::new();
+    w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
+        home_dir: Some("/home/dev".into()),
+        project_setups: true,
+    });
+    w.app.handle_daemon_event(UiEvent::WorkspacesLoaded(vec![]));
+    w.app.handle_workspace_form(WorkspaceFormAction::Cancel);
+    w.app.handle_ui_action(UiAction::ToggleWorktreeModal);
+    w.app
+        .handle_ui_action(UiAction::WorktreeModalSetText("topic".into()));
+    w.app.handle_ui_action(UiAction::WorktreeModalConfirm);
+    assert!(matches!(
+        w.command(),
+        UiCommand::CreateWorktreeWorkspace { repo_dir, branch, .. }
+            if repo_dir == std::path::Path::new("/home/dev") && branch == "topic"
+    ));
+}
+
+fn stored_setup() -> Vec<daedalus_ui::assignments::Assignment> {
+    use daedalus_ui::assignments::Assignment;
+    let entry = |id: &str, role| Assignment {
+        id: id.into(),
+        name: id.into(),
+        role,
+        argv: vec![id.into()],
+    };
+    vec![
+        entry("agent", PaneRole::Agent),
+        entry("tests", PaneRole::Runner),
+        entry("server", PaneRole::Service),
+        entry("reviewer", PaneRole::Agent),
+    ]
+}
+
+/// A connected daemon that knows the setup of `/project` and lists it as recent.
+fn start_screen_with_recent(w: &mut Workbench, has_setup: bool) {
+    w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
+        home_dir: None,
+        project_setups: true,
+    });
+    let mut known = workspace("Project");
+    known.setup = Some(stored_setup());
+    // Seen while it was open on this connection; it has been closed since.
+    w.app.project_setups.absorb(std::slice::from_ref(&known));
+    w.app.handle_daemon_event(UiEvent::WorkspacesLoaded(vec![]));
+    w.app
+        .handle_daemon_event(UiEvent::RecentProjectsLoaded(vec![
+            recent_project("Project", "/project", has_setup),
+            recent_project("Unknown", "/unknown", true),
+        ]));
+    assert!(matches!(
+        w.commands.try_recv(),
+        Ok(UiCommand::RefreshRecentProjects)
+    ));
+    assert_eq!(w.app.state.workspace_form.recent().len(), 2);
+}
+
+#[test]
+fn reopen_with_setup_creates_and_launches_agents_only() {
+    use daedalus_ui::workspace_form::Control;
+    let mut w = Workbench::new();
+    start_screen_with_recent(&mut w, true);
+    w.app.state.workspace_form.set_focus(Control::Recent(0));
+    w.app.workspace_form_key(&Key::Named(NamedKey::Enter));
+    let UiCommand::CreateManualWorkspace {
+        session,
+        name,
+        root_dir,
+    } = w.command()
+    else {
+        panic!("expected workspace creation")
+    };
+    assert_eq!(
+        (name.as_str(), root_dir.as_path()),
+        ("Project", std::path::Path::new("/project"))
+    );
+    assert!(w.app.state.workspace_form.submitting());
+    assert!(!w.app.state.setup_review.open);
+    let ws = workspace("Project");
+    w.app.handle_daemon_event(UiEvent::ManualWorkspaceCreated {
+        session,
+        workspace: ws.clone(),
+    });
+    assert!(!w.app.state.workspace_form.open);
+    let UiCommand::ApplySetup {
+        workspace_id,
+        assignments,
+        launch,
+    } = w.command()
+    else {
+        panic!("expected the stored setup")
+    };
+    assert_eq!(workspace_id, ws.id);
+    assert_eq!(assignments, stored_setup());
+    assert_eq!(launch, ["agent", "reviewer"]);
+    w.app.handle_daemon_event(UiEvent::SetupApplied {
+        workspace_id,
+        error: None,
+    });
+    assert_eq!(w.app.state.active_workspace_id, Some(ws.id));
+    assert!(!w.app.state.setup_review.open);
+}
+
+#[test]
+fn reopen_without_setup_opens_review() {
+    let mut w = Workbench::new();
+    start_screen_with_recent(&mut w, false);
+    let projects = w.app.state.workspace_form.recent().to_vec();
+    for project in projects {
+        w.app
+            .handle_workspace_form(WorkspaceFormAction::Reopen(project.clone()));
+        let UiCommand::InspectSetup {
+            session, root_dir, ..
+        } = w.command()
+        else {
+            panic!("expected the environment review for {}", project.name)
+        };
+        assert_eq!(root_dir, project.root_dir);
+        w.app.handle_daemon_event(UiEvent::SetupInspected {
+            session,
+            result: Ok(inspection()),
+        });
+        assert!(w.app.state.setup_review.open);
+        assert_eq!(w.app.state.setup_review.name, project.name);
+        w.app.handle_setup_action(SetupAction::Cancel);
+        w.app.handle_ui_action(UiAction::NewWorkspace);
+        assert!(matches!(
+            w.commands.try_recv(),
+            Ok(UiCommand::RefreshRecentProjects)
+        ));
+    }
+}
+
+#[test]
+fn reopen_failures_are_reported_where_the_user_is() {
+    use daedalus_ui::workspace_form::Control;
+    let mut w = Workbench::new();
+    start_screen_with_recent(&mut w, true);
+    let project = w.app.state.workspace_form.recent()[0].clone();
+    w.app
+        .handle_workspace_form(WorkspaceFormAction::Reopen(project.clone()));
+    let UiCommand::CreateManualWorkspace { session, .. } = w.command() else {
+        panic!("expected workspace creation")
+    };
+    w.app.handle_daemon_event(UiEvent::ManualWorkspaceFailed {
+        session,
+        message: "occupied".into(),
+    });
+    let form = &w.app.state.workspace_form;
+    assert!(form.open && !form.submitting());
+    assert_eq!(form.error.as_deref(), Some("occupied"));
+    assert!(form.enabled(Control::Recent(0)));
+
+    w.app
+        .handle_workspace_form(WorkspaceFormAction::Reopen(project.clone()));
+    let UiCommand::CreateManualWorkspace { session, .. } = w.command() else {
+        panic!("expected workspace creation")
+    };
+    let ws = workspace("Project");
+    w.app.handle_daemon_event(UiEvent::ManualWorkspaceCreated {
+        session,
+        workspace: ws.clone(),
+    });
+    assert!(matches!(w.command(), UiCommand::ApplySetup { .. }));
+    w.app.handle_daemon_event(UiEvent::SetupApplied {
+        workspace_id: ws.id,
+        error: Some("agent missing".into()),
+    });
+    assert!(!w.app.state.setup_review.open);
+    assert!(matches!(&w.app.state.toast, Some((message, true, _)) if message == "agent missing"));
+
+    w.app.handle_ui_action(UiAction::NewWorkspace);
+    w.app.bridge = None;
+    w.app
+        .handle_workspace_form(WorkspaceFormAction::Reopen(project));
+    assert_eq!(
+        w.app.state.workspace_form.error.as_deref(),
+        Some("Reconnect to open this project.")
+    );
 }

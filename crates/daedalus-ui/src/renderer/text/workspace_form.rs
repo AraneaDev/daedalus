@@ -1,5 +1,4 @@
 use super::{AppState, ChromeLineSpec, Rect, TextRenderer, Theme};
-use crate::workspace_form::{controls, modal_rect};
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -47,9 +46,10 @@ impl TextRenderer {
         h: f32,
     ) {
         let dpi = self.scale_factor;
-        let modal = modal_rect(w, h, dpi);
-        let scale = dpi.min(modal.height / 236.0).min(modal.width / 330.0);
         let form = &state.workspace_form;
+        let modal = form.modal_rect(w, h, dpi);
+        let area = form.form_area(modal);
+        let scale = dpi.min(area.height / 236.0).min(modal.width / 330.0);
         let glyph_width = self.cell_w * (14.0 * scale) / (self.font_size_logical * dpi);
         let mut line = |text: &str, rect: Rect, size: f32, color, bold| {
             let inset = 4.0 * scale;
@@ -67,20 +67,23 @@ impl TextRenderer {
         };
         let row = |y: f32, h: f32| {
             Rect::new(
-                modal.x + modal.width * 0.04,
-                modal.y + modal.height * y,
-                modal.width * 0.92,
-                modal.height * h,
+                area.x + area.width * 0.04,
+                area.y + area.height * y,
+                area.width * 0.92,
+                area.height * h,
             )
         };
+        if let Some(band) = form.recent_heading(modal) {
+            line("Recent projects", band, 17.0, theme.text_primary, true);
+        }
         line(
-            "Set up workspace · Choose project",
+            form.heading(),
             row(0.02, 0.17),
             17.0,
             theme.text_primary,
             true,
         );
-        for (control, rect) in controls(modal) {
+        for (control, rect) in form.controls(modal) {
             let active = control == form.focus;
             let columns = ((rect.width - 8.0 * scale) / glyph_width) as usize;
             let label = form.visible_label(control, columns);

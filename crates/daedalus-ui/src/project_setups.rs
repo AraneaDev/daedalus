@@ -99,6 +99,14 @@ impl ProjectSetups {
         }
     }
 
+    /// The daemon-confirmed setup of a project folder, if this connection has seen one.
+    pub fn for_folder(&self, root_dir: &Path) -> Option<Vec<Assignment>> {
+        if !self.daemon_backed {
+            return None;
+        }
+        self.confirmed.get(root_dir).cloned()
+    }
+
     pub fn load(&self, id: WorkspaceId) -> Result<Vec<Assignment>, String> {
         self.load_or(id, Vec::new())
     }
@@ -393,5 +401,24 @@ mod tests {
         assert_eq!(store.migrations(std::slice::from_ref(&ws)).len(), 1);
         store.rejected(ws.id);
         assert!(store.load(ws.id).unwrap().is_empty());
+    }
+    #[test]
+    fn a_folder_setup_is_known_only_from_the_daemon() {
+        let (_dir, mut store) = store();
+        let known = info("/known", Some(vec![entry("a")]));
+        store.absorb(std::slice::from_ref(&known));
+        assert_eq!(store.for_folder(Path::new("/known")), None);
+        store.set_daemon_backed(true);
+        store.absorb(std::slice::from_ref(&known));
+        assert_eq!(
+            store.for_folder(Path::new("/known")),
+            Some(vec![entry("a")])
+        );
+        store.changed(Path::new("/known"), vec![entry("b")], &[known]);
+        assert_eq!(
+            store.for_folder(Path::new("/known")),
+            Some(vec![entry("b")])
+        );
+        assert_eq!(store.for_folder(Path::new("/other")), None);
     }
 }

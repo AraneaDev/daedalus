@@ -170,7 +170,8 @@ def exercise(binaries, scratch, screen):
         "--events-socket",
         scratch / "events.sock",
     ]
-    with running(binaries / "daedalusd", args, project, env):
+    # The UI suggests the daemon host's home as the folder, never its own working directory.
+    with running(binaries / "daedalusd", args, project, dict(env, HOME=str(project))):
         until("daemon", lambda: cli("ping").returncode == 0)
         project_dialog = (460, 332)
         review_dialog = (370, 200)

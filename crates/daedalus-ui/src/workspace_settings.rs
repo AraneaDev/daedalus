@@ -64,6 +64,7 @@ impl DaedalusApp {
             Action::None => {}
             Action::Cancel => self.state.workspace_form.open = false,
             Action::Save { name, folder } => self.inspect_setup_folder(name, folder),
+            Action::Reopen(project) => self.reopen_project(project),
         }
         self.request_redraw();
     }
