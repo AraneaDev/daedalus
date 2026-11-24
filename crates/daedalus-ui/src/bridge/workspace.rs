@@ -363,6 +363,7 @@ mod tests {
             external_statuses: vec![],
             manifest: Some(manifest),
             project: Default::default(),
+            setup: None,
             default_panes_pending,
         };
         let request = async {

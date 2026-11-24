@@ -1108,6 +1108,7 @@ pub(crate) mod tests {
         let agent_id = PaneId::new();
         let ws = WorkspaceInfo {
             project: Default::default(),
+            setup: None,
             default_panes_pending: None,
             id: ws_id,
             name: "main".to_string(),

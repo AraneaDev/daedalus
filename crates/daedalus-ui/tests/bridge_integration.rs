@@ -970,7 +970,10 @@ async fn queued_terminal_input_stays_with_its_connection() {
         let (mut peer, _) = listener.accept().await.unwrap();
         for expected in [
             ClientMessage::Ping,
-            ClientMessage::Subscribe { pane_ids: None },
+            ClientMessage::Subscribe {
+                pane_ids: None,
+                project_setup_events: false,
+            },
         ] {
             let request = read_frame::<_, Request>(&mut peer).await.unwrap().unwrap();
             assert_eq!(request.payload, expected);
@@ -981,6 +984,9 @@ async fn queued_terminal_input_stays_with_its_connection() {
                     isolation_mode: "test".into(),
                     journal_supported: false,
                     inspect_setup_supported: false,
+                    recent_projects_supported: false,
+                    project_setup_supported: false,
+                    home_dir: None,
                 },
                 _ => ResponsePayload::Ok,
             };

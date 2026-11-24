@@ -200,7 +200,8 @@ impl SubscriptionFilter {
             | ServerEvent::PaneExited { pane_id, .. }
             | ServerEvent::ResyncRequired { pane_id } => allowed.contains(pane_id),
             ServerEvent::WorkspaceRuntimeUpdated { .. }
-            | ServerEvent::ExternalStatusUpdated { .. } => false,
+            | ServerEvent::ExternalStatusUpdated { .. }
+            | ServerEvent::ProjectSetupChanged { .. } => false,
         }
     }
 }
@@ -307,6 +308,9 @@ async fn dispatch_request(
                 isolation_mode: registry.isolation_mode().as_str().to_string(),
                 journal_supported: true,
                 inspect_setup_supported: true,
+                recent_projects_supported: false,
+                project_setup_supported: false,
+                home_dir: None,
             })
         }
         ClientMessage::Authenticate { .. } => Ok(ResponsePayload::Ok),
@@ -495,12 +499,15 @@ async fn dispatch_request(
         ClientMessage::GetFailureTrace { pane_id } => Ok(ResponsePayload::FailureTrace(
             registry.get_failure_trace(pane_id).await?,
         )),
-        ClientMessage::Subscribe { pane_ids } => {
+        ClientMessage::Subscribe { pane_ids, .. } => {
             let mut f = filter.write().await;
             f.active = true;
             f.pane_ids = pane_ids.map(|ids| ids.into_iter().collect());
             Ok(ResponsePayload::Ok)
         }
+        ClientMessage::ListRecentProjects | ClientMessage::SetProjectSetup { .. } => Err(
+            ProtoError::InvalidRequest("project setup is not supported yet".to_string()),
+        ),
         ClientMessage::Unsubscribe => {
             let mut f = filter.write().await;
             f.active = false;

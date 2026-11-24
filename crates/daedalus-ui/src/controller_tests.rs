@@ -112,6 +112,7 @@ fn workspace(name: &str) -> WorkspaceInfo {
         root_dir: "/project".into(),
         slot_index: 0,
         project: Default::default(),
+        setup: None,
         default_panes_pending: None,
         injected_env: Default::default(),
         port_offset: 0,

@@ -318,6 +318,7 @@ async fn bash_osc133_captures_failure_trace_and_survives_client_reconnect() {
         3,
         ClientMessage::Subscribe {
             pane_ids: Some(vec![pane.id]),
+            project_setup_events: false,
         },
     )
     .await;
@@ -455,6 +456,7 @@ async fn zsh_osc133_captures_failure_trace_when_zsh_installed() {
         3,
         ClientMessage::Subscribe {
             pane_ids: Some(vec![pane.id]),
+            project_setup_events: false,
         },
     )
     .await;
@@ -1032,7 +1034,10 @@ statuses = ["build", "test"]
     send_rpc(
         &mut sub_client,
         2,
-        ClientMessage::Subscribe { pane_ids: None },
+        ClientMessage::Subscribe {
+            pane_ids: None,
+            project_setup_events: false,
+        },
     )
     .await;
 
@@ -1567,6 +1572,7 @@ async fn fish_osc133_captures_failure_trace_when_fish_installed() {
         3,
         ClientMessage::Subscribe {
             pane_ids: Some(vec![pane.id]),
+            project_setup_events: false,
         },
     )
     .await;
@@ -1715,7 +1721,10 @@ async fn set_agent_state_and_hook_events_broadcast_and_clear_status() {
     send_rpc(
         &mut sub_client,
         10,
-        ClientMessage::Subscribe { pane_ids: None },
+        ClientMessage::Subscribe {
+            pane_ids: None,
+            project_setup_events: false,
+        },
     )
     .await;
 
@@ -1961,6 +1970,7 @@ async fn get_failure_trace_includes_git_branch_and_diff_stat_for_dirty_repo() {
         3,
         ClientMessage::Subscribe {
             pane_ids: Some(vec![pane.id]),
+            project_setup_events: false,
         },
     )
     .await;
@@ -2332,6 +2342,7 @@ async fn tcp_wsl2_bridge_rpc_round_trip() {
             isolation_mode,
             journal_supported,
             inspect_setup_supported,
+            ..
         } => {
             assert!(inspect_setup_supported);
             assert!(journal_supported);

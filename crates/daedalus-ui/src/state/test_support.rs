@@ -48,6 +48,7 @@ pub(super) fn make_workspace_with_three_panes() -> (WorkspaceInfo, PaneId, PaneI
     let ids = (agent.id, service.id, runner.id);
     let ws = WorkspaceInfo {
         project: Default::default(),
+        setup: None,
         default_panes_pending: None,
         id: ws_id,
         name: "demo".to_string(),

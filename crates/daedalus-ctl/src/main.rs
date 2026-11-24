@@ -687,6 +687,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 client
                     .request(ClientMessage::Subscribe {
                         pane_ids: pane.map(|p| vec![PaneId(p)]),
+                        project_setup_events: false,
                     })
                     .await?,
             )?;

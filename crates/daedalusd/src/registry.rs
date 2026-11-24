@@ -85,6 +85,7 @@ impl WorkspaceRecord {
             external_statuses: self.external_statuses.clone(),
             manifest: self.manifest.clone(),
             project: self.project.clone(),
+            setup: None,
         }
     }
 

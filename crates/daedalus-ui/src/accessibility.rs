@@ -915,6 +915,7 @@ mod tests {
         };
         state.set_workspaces(vec![WorkspaceInfo {
             project: Default::default(),
+            setup: None,
             default_panes_pending: None,
             id: ws,
             name: "Project".into(),

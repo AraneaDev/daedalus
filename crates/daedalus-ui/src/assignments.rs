@@ -6,13 +6,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Assignment {
-    pub id: String,
-    pub name: String,
-    pub role: PaneRole,
-    pub argv: Vec<String>,
-}
+pub use daedalus_proto::Assignment;
 
 pub fn setup_runner(entries: &[Assignment]) -> Option<&Assignment> {
     entries

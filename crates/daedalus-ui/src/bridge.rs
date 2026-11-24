@@ -452,7 +452,10 @@ async fn initialize_session(
     };
     conn.inspect_setup_supported = inspect_setup_supported;
     let _ = conn
-        .call(ClientMessage::Subscribe { pane_ids: None })
+        .call(ClientMessage::Subscribe {
+            pane_ids: None,
+            project_setup_events: false,
+        })
         .await?;
     session.send_replace(Some(cmd_tx));
     sink.emit(UiEvent::Connected);

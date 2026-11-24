@@ -277,6 +277,8 @@ pub struct Workspace<P> {
     pub manifest: Option<WorkspaceManifest>,
     #[serde(default)]
     pub project: ProjectInfo,
+    #[serde(default)]
+    pub setup: Option<Vec<crate::project::Assignment>>,
 }
 
 impl<P> Workspace<P> {
@@ -299,6 +301,7 @@ impl<P> Workspace<P> {
             external_statuses: self.external_statuses,
             manifest: self.manifest,
             project: self.project,
+            setup: self.setup,
         }
     }
 
