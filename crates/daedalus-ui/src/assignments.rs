@@ -24,10 +24,16 @@ struct AssignmentList<'a> {
     assignments: &'a [Assignment],
 }
 
+pub(crate) fn assignments_dir() -> PathBuf {
+    default_config_file_path().with_file_name("assignments")
+}
+
+pub(crate) fn file_in(dir: &Path, id: WorkspaceId) -> PathBuf {
+    dir.join(format!("{id}.toml"))
+}
+
 fn workspace_path(id: WorkspaceId) -> PathBuf {
-    default_config_file_path()
-        .with_file_name("assignments")
-        .join(format!("{id}.toml"))
+    file_in(&assignments_dir(), id)
 }
 
 use daedalus_proto::validate_assignments as validate;
@@ -43,7 +49,7 @@ pub fn load_or(
     load_from(&workspace_path(workspace_id), defaults)
 }
 
-fn load_from(path: &Path, defaults: Vec<Assignment>) -> Result<Vec<Assignment>, String> {
+pub(crate) fn load_from(path: &Path, defaults: Vec<Assignment>) -> Result<Vec<Assignment>, String> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(defaults),
@@ -59,7 +65,7 @@ pub fn save(workspace_id: WorkspaceId, assignments: &[Assignment]) -> Result<(),
     save_to(&workspace_path(workspace_id), assignments)
 }
 
-fn save_to(path: &Path, assignments: &[Assignment]) -> Result<(), String> {
+pub(crate) fn save_to(path: &Path, assignments: &[Assignment]) -> Result<(), String> {
     validate(assignments)?;
     let contents = toml::to_string(&AssignmentList { assignments })
         .map_err(|error| format!("Could not encode assignments: {error}"))?;

@@ -5,6 +5,7 @@ pub mod config;
 pub mod input;
 pub mod layout;
 pub mod links;
+pub mod project_setups;
 pub mod recap;
 pub mod renderer;
 pub mod selection;

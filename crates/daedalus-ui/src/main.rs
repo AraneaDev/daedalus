@@ -136,6 +136,7 @@ struct ViewportMetrics {
 struct DaedalusApp {
     config: BridgeConfig,
     ui_config: UiConfig,
+    project_setups: daedalus_ui::project_setups::ProjectSetups,
     setup: setup::SetupFlow,
     history: daedalus_ui::activity_history::ActivityHistory,
     focused: bool,
@@ -165,6 +166,7 @@ impl DaedalusApp {
         profile: &std::path::Path,
     ) -> Self {
         Self {
+            project_setups: Default::default(),
             setup: Default::default(),
             history: daedalus_ui::activity_history::ActivityHistory::new(
                 profile,
@@ -1370,11 +1372,16 @@ impl DaedalusApp {
         self.sync_history_visit();
         match event {
             UiEvent::JournalCapability(supported) => self.history.connection(supported),
-            // Consumed by the start screen and settings in later tasks.
-            UiEvent::DaemonCapabilities { .. }
-            | UiEvent::RecentProjectsLoaded(_)
-            | UiEvent::ProjectSetupChanged { .. }
-            | UiEvent::ProjectSetupSaveFailed { .. } => {}
+            UiEvent::DaemonCapabilities { project_setups, .. } => {
+                self.project_setups.set_daemon_backed(project_setups);
+            }
+            // Consumed by the start screen in a later task.
+            UiEvent::RecentProjectsLoaded(_) => {}
+            UiEvent::ProjectSetupChanged {
+                root_dir,
+                assignments,
+            } => self.project_setup_changed(&root_dir, assignments),
+            UiEvent::ProjectSetupSaveFailed { message, .. } => self.show_toast(message, true),
             UiEvent::ActivityRead { token, page } => {
                 use daedalus_ui::activity_history::PageUpdate;
                 match self.history.received(token, &page) {
@@ -1420,6 +1427,13 @@ impl DaedalusApp {
                 self.schedule_resize_flush();
             }
             UiEvent::WorkspacesLoaded(workspaces) => {
+                self.project_setups.absorb(&workspaces);
+                for (workspace_id, assignments) in self.project_setups.migrations(&workspaces) {
+                    self.send_command(UiCommand::SaveProjectSetup {
+                        workspace_id,
+                        assignments,
+                    });
+                }
                 self.restore_session_names(&workspaces);
                 self.state.set_workspaces(workspaces);
                 self.reconcile_setup_installer();
@@ -1451,6 +1465,7 @@ impl DaedalusApp {
             }
             UiEvent::WorkspaceCreated(ws) => {
                 let ws_id = ws.id;
+                self.project_setups.absorb(std::slice::from_ref(&ws));
                 self.state.upsert_workspace(ws);
                 self.state.select_workspace(ws_id);
                 self.state.close_search();

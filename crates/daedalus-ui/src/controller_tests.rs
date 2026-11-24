@@ -1290,3 +1290,136 @@ fn inspection_failures_leave_the_wizard_editable_and_a_closed_installer_is_reche
     assert!(!w.app.state.setup_review.busy);
     assert!(w.app.state.setup_review.feedback.contains("Reconnect"));
 }
+
+fn run_in_isolated_profile(test: &str, child: &str) -> bool {
+    if std::env::var_os(child).is_some() {
+        return true;
+    }
+    let profile = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(child, "1")
+        .env("DAEDALUS_CONFIG", profile.path().join("config.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
+fn runner_entry(name: &str) -> daedalus_ui::assignments::Assignment {
+    daedalus_ui::assignments::Assignment {
+        id: "setup-runner".into(),
+        name: name.into(),
+        role: PaneRole::Runner,
+        argv: vec!["cargo".into(), "test".into()],
+    }
+}
+
+fn daemon_capabilities(w: &mut Workbench, project_setups: bool) {
+    w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
+        home_dir: None,
+        project_setups,
+    });
+}
+
+#[test]
+fn daemon_backed_settings_save_sends_the_setup_and_follows_changes_from_the_daemon() {
+    use daedalus_ui::settings::SettingsAction;
+    let mut w = Workbench::new();
+    daemon_capabilities(&mut w, true);
+    let ws = workspace("Daemon");
+    let (id, root) = (ws.id, ws.root_dir.clone());
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+    let entry = runner_entry("Suite");
+    w.app.handle_ui_action(UiAction::WorkspaceSettings);
+    w.app
+        .handle_settings_action(SettingsAction::Save(vec![entry.clone(), entry.clone()]));
+    assert!(
+        w.app
+            .state
+            .settings
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("unique")
+    );
+    assert!(w.commands.try_recv().is_err());
+    w.app
+        .handle_settings_action(SettingsAction::Save(vec![entry.clone()]));
+    assert!(!w.app.state.settings.open);
+    assert!(
+        matches!(w.command(), UiCommand::SaveProjectSetup { workspace_id, assignments }
+            if workspace_id == id && assignments == vec![entry.clone()])
+    );
+    let renamed = runner_entry("Renamed");
+    w.app.handle_daemon_event(UiEvent::ProjectSetupChanged {
+        root_dir: root,
+        assignments: vec![renamed.clone()],
+    });
+    assert!(w.app.state.test_workspaces.contains(&id));
+    w.app.handle_ui_action(UiAction::RunTests);
+    assert!(
+        matches!(w.command(), UiCommand::LaunchAssignment { assignment, .. } if assignment == renamed)
+    );
+    w.app.handle_daemon_event(UiEvent::ProjectSetupSaveFailed {
+        workspace_id: id,
+        message: "disk full".into(),
+    });
+    let toast = w.app.state.toast.as_ref().unwrap();
+    assert!(toast.0.contains("disk full") && toast.1);
+}
+
+#[test]
+fn old_daemon_keeps_setups_in_local_files_and_sends_nothing() {
+    use daedalus_ui::settings::SettingsAction;
+    const CHILD: &str = "DAEDALUS_TEST_OLD_DAEMON_SETUP";
+    if !run_in_isolated_profile(
+        "controller_tests::old_daemon_keeps_setups_in_local_files_and_sends_nothing",
+        CHILD,
+    ) {
+        return;
+    }
+    let mut w = Workbench::new();
+    daemon_capabilities(&mut w, false);
+    let ws = workspace("Old");
+    let id = ws.id;
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+    w.app.handle_ui_action(UiAction::WorkspaceSettings);
+    let entry = runner_entry("Suite");
+    w.app
+        .handle_settings_action(SettingsAction::Save(vec![entry.clone()]));
+    assert!(w.commands.try_recv().is_err());
+    assert_eq!(daedalus_ui::assignments::load(id).unwrap(), vec![entry]);
+}
+
+#[test]
+fn local_setups_are_sent_to_the_daemon_once_and_the_files_stay() {
+    const CHILD: &str = "DAEDALUS_TEST_SETUP_MIGRATION";
+    if !run_in_isolated_profile(
+        "controller_tests::local_setups_are_sent_to_the_daemon_once_and_the_files_stay",
+        CHILD,
+    ) {
+        return;
+    }
+    let mut w = Workbench::new();
+    let ws = workspace("Migrate");
+    let entry = runner_entry("Local");
+    daedalus_ui::assignments::save(ws.id, std::slice::from_ref(&entry)).unwrap();
+    daemon_capabilities(&mut w, true);
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws.clone()]));
+    assert!(
+        matches!(w.command(), UiCommand::SaveProjectSetup { workspace_id, assignments }
+            if workspace_id == ws.id && assignments == vec![entry.clone()])
+    );
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws.clone()]));
+    assert!(w.commands.try_recv().is_err());
+    assert_eq!(daedalus_ui::assignments::load(ws.id).unwrap(), vec![entry]);
+}

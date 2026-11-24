@@ -72,7 +72,10 @@ impl DaedalusApp {
             self.show_toast("Create a workspace to configure its terminals", false);
             return;
         };
-        match assignments::load_or(ws.id, initial_assignments(ws, self.config.default_agent)) {
+        match self
+            .project_setups
+            .load_or(ws.id, initial_assignments(ws, self.config.default_agent))
+        {
             Ok(entries) => {
                 self.state.close_search();
                 self.state.action_palette.close();
@@ -102,10 +105,20 @@ impl DaedalusApp {
             self.state.settings.open = false;
             return;
         };
-        if let Err(error) = assignments::save(workspace.id, &entries) {
-            self.state.settings.error = Some(error);
-            self.request_redraw();
-            return;
+        match self.project_setups.save(workspace.id, entries.clone()) {
+            Ok(Some(command)) => {
+                if !self.send_command(command) {
+                    self.state.settings.error = Some("Reconnect to save these settings.".into());
+                    self.request_redraw();
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.state.settings.error = Some(error);
+                self.request_redraw();
+                return;
+            }
         }
         self.restore_workspace_names(workspace.id, workspace.panes.iter().copied());
         if let Some(assignment) =
@@ -123,7 +136,7 @@ impl DaedalusApp {
 
     pub(super) fn refresh_test_runner(&mut self, workspace: WorkspaceId) {
         self.state.test_workspaces.remove(&workspace);
-        match assignments::load(workspace) {
+        match self.project_setups.load(workspace) {
             Ok(entries) if assignments::setup_runner(&entries).is_some() => {
                 self.state.test_workspaces.insert(workspace);
             }
@@ -137,7 +150,7 @@ impl DaedalusApp {
             self.show_toast("No test command available for this workspace", false);
             return;
         };
-        let entries = match assignments::load(workspace_id) {
+        let entries = match self.project_setups.load(workspace_id) {
             Ok(entries) => entries,
             Err(err) => {
                 self.state.test_workspaces.remove(&workspace_id);
@@ -210,8 +223,9 @@ impl DaedalusApp {
         panes: impl Iterator<Item = PaneId>,
     ) {
         self.state.test_workspaces.remove(&workspace);
+        let project_setups = &self.project_setups;
         match assignments::load_bindings(workspace)
-            .and_then(|bindings| Ok((bindings, assignments::load(workspace)?)))
+            .and_then(|bindings| Ok((bindings, project_setups.load(workspace)?)))
         {
             Ok((bindings, entries)) => {
                 if assignments::setup_runner(&entries).is_some() {
@@ -230,6 +244,26 @@ impl DaedalusApp {
             }
             Err(err) => self.show_toast(err, true),
         }
+    }
+
+    pub(super) fn project_setup_changed(
+        &mut self,
+        root_dir: &std::path::Path,
+        assignments: Vec<Assignment>,
+    ) {
+        self.project_setups
+            .changed(root_dir, assignments, &self.state.workspaces);
+        let affected: Vec<_> = self
+            .state
+            .workspaces
+            .iter()
+            .filter(|ws| ws.root_dir == root_dir)
+            .map(|ws| (ws.id, ws.panes.clone()))
+            .collect();
+        for (id, panes) in affected {
+            self.restore_workspace_names(id, panes.into_iter());
+        }
+        self.request_redraw();
     }
 
     pub(super) fn assignment_started(
