@@ -3087,3 +3087,249 @@ test -f "$ALLOW_TEARDOWN" || { echo "service unavailable" >&2; exit 1; }
     );
     daemon.kill().await.unwrap();
 }
+
+async fn start_unix_test_daemon(
+    dir: &TempDir,
+) -> (PathBuf, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let sock = dir.path().join("daedalusd.sock");
+    let server = DaemonServer::bind_with_supervisor(
+        sock.clone(),
+        dir.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let _ = server
+            .serve(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+    (sock, shutdown_tx, handle)
+}
+
+async fn create_ws(
+    client: &mut IpcStream,
+    id: u64,
+    name: &str,
+    root: &Path,
+) -> daedalus_proto::WorkspaceInfo {
+    match send_rpc(
+        client,
+        id,
+        ClientMessage::CreateWorkspace {
+            name: name.to_string(),
+            root_dir: root.to_path_buf(),
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::WorkspaceCreated(ws) => ws,
+        other => panic!("expected WorkspaceCreated, got {other:?}"),
+    }
+}
+
+async fn close_ws(client: &mut IpcStream, id: u64, ws: daedalus_proto::WorkspaceId) {
+    let resp = send_rpc(
+        client,
+        id,
+        ClientMessage::CloseWorkspace {
+            id: ws,
+            compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
+        },
+    )
+    .await;
+    assert_eq!(resp, ResponsePayload::Ok);
+}
+
+#[tokio::test]
+async fn ping_reports_project_capabilities_and_home() {
+    let dir = TempDir::new().unwrap();
+    let (sock, shutdown_tx, handle) = start_unix_test_daemon(&dir).await;
+    let mut client = IpcStream::connect(&sock).await.unwrap();
+    match send_rpc(&mut client, 1, ClientMessage::Ping).await {
+        ResponsePayload::Pong {
+            recent_projects_supported,
+            project_setup_supported,
+            home_dir,
+            ..
+        } => {
+            assert!(recent_projects_supported);
+            assert!(project_setup_supported);
+            assert_eq!(home_dir, std::env::home_dir());
+        }
+        other => panic!("expected Pong, got {other:?}"),
+    }
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn recent_projects_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let proj = dir.path().join("recent-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let (sock, shutdown_tx, handle) = start_unix_test_daemon(&dir).await;
+    let mut client = IpcStream::connect(&sock).await.unwrap();
+
+    let ws = create_ws(&mut client, 1, "recent-proj", &proj).await;
+    close_ws(&mut client, 2, ws.id).await;
+    let ResponsePayload::RecentProjects(list) =
+        send_rpc(&mut client, 3, ClientMessage::ListRecentProjects).await
+    else {
+        panic!("expected RecentProjects")
+    };
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].root_dir, proj);
+    assert!(!list[0].has_setup);
+
+    let ws2 = create_ws(&mut client, 4, "recent-proj", &proj).await;
+    let resp = send_rpc(
+        &mut client,
+        5,
+        ClientMessage::SetProjectSetup {
+            workspace_id: ws2.id,
+            assignments: vec![daedalus_proto::Assignment {
+                id: "a1".into(),
+                name: "agent".into(),
+                role: PaneRole::Agent,
+                argv: sleep_command(),
+            }],
+        },
+    )
+    .await;
+    assert_eq!(resp, ResponsePayload::Ok);
+    close_ws(&mut client, 6, ws2.id).await;
+    let ResponsePayload::RecentProjects(list) =
+        send_rpc(&mut client, 7, ClientMessage::ListRecentProjects).await
+    else {
+        panic!("expected RecentProjects")
+    };
+    assert_eq!(list.len(), 1);
+    assert!(list[0].has_setup);
+
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn project_setup_events_only_reach_opted_in_clients() {
+    let dir = TempDir::new().unwrap();
+    let proj = dir.path().join("setup-events");
+    std::fs::create_dir_all(&proj).unwrap();
+    let (sock, shutdown_tx, handle) = start_unix_test_daemon(&dir).await;
+    let mut sender = IpcStream::connect(&sock).await.unwrap();
+    let ws = create_ws(&mut sender, 1, "setup-events", &proj).await;
+    let pane = match send_rpc(
+        &mut sender,
+        2,
+        ClientMessage::SpawnPane {
+            workspace_id: ws.id,
+            role: PaneRole::Agent,
+            command: Some(sleep_command()),
+            shell: None,
+            cols: 80,
+            rows: 24,
+            env: HashMap::new(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::PaneSpawned(p) => p,
+        other => panic!("expected PaneSpawned, got {other:?}"),
+    };
+
+    // opted in (pane-scoped), old-style global, pane-scoped without opt-in
+    let mut opted_in = IpcStream::connect(&sock).await.unwrap();
+    let mut global_old = IpcStream::connect(&sock).await.unwrap();
+    let mut scoped_old = IpcStream::connect(&sock).await.unwrap();
+    for (client, id, pane_ids, opt) in [
+        (&mut opted_in, 10, Some(vec![pane.id]), true),
+        (&mut global_old, 11, None, false),
+        (&mut scoped_old, 12, Some(vec![pane.id]), false),
+    ] {
+        send_rpc(
+            client,
+            id,
+            ClientMessage::Subscribe {
+                pane_ids,
+                project_setup_events: opt,
+            },
+        )
+        .await;
+    }
+
+    let assignments = vec![daedalus_proto::Assignment {
+        id: "a1".into(),
+        name: "agent".into(),
+        role: PaneRole::Agent,
+        argv: sleep_command(),
+    }];
+    let resp = send_rpc(
+        &mut sender,
+        3,
+        ClientMessage::SetProjectSetup {
+            workspace_id: ws.id,
+            assignments: assignments.clone(),
+        },
+    )
+    .await;
+    assert_eq!(resp, ResponsePayload::Ok);
+
+    let msg = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame::<_, ServerMessage>(&mut opted_in),
+    )
+    .await
+    .expect("opted-in client got no event")
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        msg,
+        ServerMessage::Event(ServerEvent::ProjectSetupChanged {
+            root_dir: proj.clone(),
+            assignments,
+        })
+    );
+
+    let resp = send_rpc(
+        &mut sender,
+        4,
+        ClientMessage::SetAgentState {
+            pane_id: Some(pane.id),
+            workspace_id: None,
+            root_dir: None,
+            state: AgentState::Thinking,
+        },
+    )
+    .await;
+    assert_eq!(resp, ResponsePayload::Ok);
+
+    for client in [&mut global_old, &mut scoped_old] {
+        // The first event this client sees must be the pane event; the setup event was
+        // broadcast earlier and must have been withheld.
+        let msg = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_frame::<_, ServerMessage>(client),
+        )
+        .await
+        .expect("subscribed client got no pane event")
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(
+                msg,
+                ServerMessage::Event(ServerEvent::AgentStateChanged { .. })
+            ),
+            "non-opted-in client must not see ProjectSetupChanged, got {msg:?}"
+        );
+    }
+
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap();
+}
