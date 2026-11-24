@@ -21,6 +21,8 @@ type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<ResponsePayload,
 
 pub(super) struct RpcConnection {
     pub(super) inspect_setup_supported: bool,
+    pub(super) recent_projects_supported: bool,
+    pub(super) project_setup_supported: bool,
     write_tx: mpsc::UnboundedSender<Request>,
     pending: PendingMap,
     next_id: AtomicU64,
@@ -84,6 +86,15 @@ impl RpcConnection {
                                 git_branch,
                             });
                         }
+                        ServerEvent::ProjectSetupChanged {
+                            root_dir,
+                            assignments,
+                        } => {
+                            sink.emit(UiEvent::ProjectSetupChanged {
+                                root_dir,
+                                assignments,
+                            });
+                        }
                         other => {
                             sink.emit(UiEvent::ServerEvent(other));
                         }
@@ -117,6 +128,8 @@ impl RpcConnection {
 
         Self {
             inspect_setup_supported: false,
+            recent_projects_supported: false,
+            project_setup_supported: false,
             write_tx,
             pending,
             next_id: AtomicU64::new(1),

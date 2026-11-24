@@ -1,4 +1,6 @@
 mod launch;
+#[cfg(test)]
+mod negotiation_tests;
 mod rpc;
 mod setup;
 mod workspace;
@@ -80,6 +82,12 @@ pub enum UiCommand {
     InstallSetupTool {
         workspace_id: WorkspaceId,
         argv: Vec<String>,
+    },
+    /// Reloads recent projects. Does nothing on a daemon that does not serve them.
+    RefreshRecentProjects,
+    SaveProjectSetup {
+        workspace_id: WorkspaceId,
+        assignments: Vec<crate::assignments::Assignment>,
     },
     ReadActivity {
         workspace_id: WorkspaceId,
@@ -189,6 +197,19 @@ pub enum UiEvent {
         message: String,
     },
     JournalCapability(bool),
+    DaemonCapabilities {
+        home_dir: Option<PathBuf>,
+        project_setups: bool,
+    },
+    RecentProjectsLoaded(Vec<daedalus_proto::RecentProject>),
+    ProjectSetupChanged {
+        root_dir: PathBuf,
+        assignments: Vec<crate::assignments::Assignment>,
+    },
+    ProjectSetupSaveFailed {
+        workspace_id: WorkspaceId,
+        message: String,
+    },
     ActivityRead {
         token: u64,
         page: daedalus_proto::ActivityPage,
@@ -443,6 +464,9 @@ async fn initialize_session(
     let ResponsePayload::Pong {
         journal_supported,
         inspect_setup_supported,
+        recent_projects_supported,
+        project_setup_supported,
+        home_dir,
         ..
     } = conn.call(ClientMessage::Ping).await?
     else {
@@ -451,15 +475,22 @@ async fn initialize_session(
         )));
     };
     conn.inspect_setup_supported = inspect_setup_supported;
+    conn.recent_projects_supported = recent_projects_supported;
+    conn.project_setup_supported = project_setup_supported;
     let _ = conn
         .call(ClientMessage::Subscribe {
             pane_ids: None,
-            project_setup_events: false,
+            project_setup_events: project_setup_supported,
         })
         .await?;
     session.send_replace(Some(cmd_tx));
     sink.emit(UiEvent::Connected);
     sink.emit(UiEvent::JournalCapability(journal_supported));
+    sink.emit(UiEvent::DaemonCapabilities {
+        home_dir,
+        project_setups: project_setup_supported,
+    });
+    setup::refresh_recent_projects(conn, sink).await?;
 
     let workspaces = match conn.call(ClientMessage::ListWorkspaces).await? {
         ResponsePayload::Workspaces(ws) => ws,
@@ -571,6 +602,15 @@ async fn handle_command(
         }
         UiCommand::InstallSetupTool { workspace_id, argv } => {
             setup::install(conn, sink, workspace_id, argv).await?;
+        }
+        UiCommand::RefreshRecentProjects => {
+            setup::refresh_recent_projects(conn, sink).await?;
+        }
+        UiCommand::SaveProjectSetup {
+            workspace_id,
+            assignments,
+        } => {
+            setup::save_project_setup(conn, sink, workspace_id, assignments).await?;
         }
         UiCommand::ReadActivity {
             workspace_id,

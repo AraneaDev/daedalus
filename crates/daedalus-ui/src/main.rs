@@ -1370,6 +1370,11 @@ impl DaedalusApp {
         self.sync_history_visit();
         match event {
             UiEvent::JournalCapability(supported) => self.history.connection(supported),
+            // Consumed by the start screen and settings in later tasks.
+            UiEvent::DaemonCapabilities { .. }
+            | UiEvent::RecentProjectsLoaded(_)
+            | UiEvent::ProjectSetupChanged { .. }
+            | UiEvent::ProjectSetupSaveFailed { .. } => {}
             UiEvent::ActivityRead { token, page } => {
                 use daedalus_ui::activity_history::PageUpdate;
                 match self.history.received(token, &page) {
