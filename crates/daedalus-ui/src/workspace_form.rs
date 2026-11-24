@@ -84,6 +84,8 @@ pub struct WorkspaceForm {
     cursor: usize,
     select_all: bool,
     recent: Vec<RecentProject>,
+    /// Folders that are open as a workspace; they are never offered for reopening.
+    open_roots: Vec<PathBuf>,
 }
 
 impl WorkspaceForm {
@@ -93,12 +95,22 @@ impl WorkspaceForm {
             session: self.session.wrapping_add(1),
             folder: folder.to_string_lossy().into_owned(),
             recent: std::mem::take(&mut self.recent),
+            open_roots: std::mem::take(&mut self.open_roots),
             ..Default::default()
         };
     }
 
+    /// Records which folders are open as workspaces and drops their rows from the list now
+    /// and from every list set later, so an open project is never reopened a second time.
+    pub fn hide_open(&mut self, open_roots: Vec<PathBuf>) {
+        self.open_roots = open_roots;
+        let kept = std::mem::take(&mut self.recent);
+        self.set_recent(kept);
+    }
+
     /// Replaces the recent projects shown above the form, most recent first.
     pub fn set_recent(&mut self, mut projects: Vec<RecentProject>) {
+        projects.retain(|project| !self.open_roots.contains(&project.root_dir));
         projects.truncate(MAX_RECENT_ROWS);
         self.recent = projects;
         if let Control::Recent(i) = self.focus
@@ -692,6 +704,28 @@ mod tests {
         assert_eq!(form.focus, Control::Recent(0));
         form.set_recent(Vec::new());
         assert_eq!(form.focus, Control::Name);
+    }
+
+    #[test]
+    fn open_folders_are_hidden_from_the_recent_list() {
+        let mut form = WorkspaceForm::default();
+        form.begin(Path::new("/home/dev"));
+        form.set_recent(two_projects());
+        // A project reopened while the list was stale disappears at once.
+        form.hide_open(vec![PathBuf::from("/home/tim/daedalus")]);
+        assert_eq!(form.recent.len(), 1);
+        assert_eq!(form.recent[0].name, "notes");
+        // A refresh that still lists it (the daemon filters on its own timing) stays hidden,
+        // also after the form is opened again.
+        form.set_recent(two_projects());
+        assert_eq!(form.recent.len(), 1);
+        form.begin(Path::new("/home/dev"));
+        form.set_recent(two_projects());
+        assert_eq!(form.recent.len(), 1);
+        // Closing the workspace makes it eligible again.
+        form.hide_open(Vec::new());
+        form.set_recent(two_projects());
+        assert_eq!(form.recent.len(), 2);
     }
 
     #[test]

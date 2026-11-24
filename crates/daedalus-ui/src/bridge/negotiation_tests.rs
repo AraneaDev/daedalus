@@ -164,7 +164,8 @@ async fn old_daemon_gets_no_new_requests() {
         event,
         UiEvent::DaemonCapabilities {
             home_dir: None,
-            project_setups: false
+            project_setups: false,
+            recent_projects: false
         }
     )));
     assert!(
@@ -222,12 +223,14 @@ async fn new_daemon_handshake_loads_recent_projects() {
             UiEvent::DaemonCapabilities {
                 home_dir,
                 project_setups,
+                recent_projects,
             } => {
                 assert_eq!(
                     home_dir.as_deref(),
                     Some(std::path::Path::new("/home/test"))
                 );
                 assert!(*project_setups);
+                assert!(*recent_projects);
                 Some("capabilities")
             }
             UiEvent::RecentProjectsLoaded(projects) => {

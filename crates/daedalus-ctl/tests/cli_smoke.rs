@@ -1146,7 +1146,7 @@ async fn service_plist_can_be_generated_offline_with_escaped_user_paths() {
 }
 
 #[tokio::test]
-async fn workspace_recent_lists_closed_project_and_rejects_old_daemon() {
+async fn workspace_recent_lists_closed_project() {
     let dir = TempDir::new().unwrap();
     let sock = dir.path().join("daedalusd.sock");
     let runtime = dir.path().join("runtime");

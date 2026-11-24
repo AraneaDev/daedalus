@@ -1325,6 +1325,12 @@ fn run_in_isolated_profile(test: &str, child: &str) -> bool {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // A renamed test matches nothing and still exits 0.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 passed"),
+        "the isolated run did not execute {test}: {stdout}"
+    );
     false
 }
 
@@ -1341,6 +1347,7 @@ fn daemon_capabilities(w: &mut Workbench, project_setups: bool) {
     w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
         home_dir: None,
         project_setups,
+        recent_projects: true,
     });
 }
 
@@ -1514,6 +1521,7 @@ fn startup_without_dir_never_uses_working_directory() {
     w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
         home_dir: Some("/home/dev".into()),
         project_setups: true,
+        recent_projects: true,
     });
     w.app.handle_ui_action(UiAction::NewWorkspace);
     assert_eq!(form_folder(&w), "/home/dev");
@@ -1528,6 +1536,7 @@ fn startup_without_dir_never_uses_working_directory() {
     w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
         home_dir: Some("/home/dev".into()),
         project_setups: true,
+        recent_projects: true,
     });
     w.app.handle_ui_action(UiAction::NewWorkspace);
     assert_eq!(form_folder(&w), "/p");
@@ -1539,6 +1548,7 @@ fn worktree_fallback_uses_folder_suggestion() {
     w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
         home_dir: Some("/home/dev".into()),
         project_setups: true,
+        recent_projects: true,
     });
     w.app.handle_daemon_event(UiEvent::WorkspacesLoaded(vec![]));
     w.app.handle_workspace_form(WorkspaceFormAction::Cancel);
@@ -1574,6 +1584,7 @@ fn start_screen_with_recent(w: &mut Workbench, has_setup: bool) {
     w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
         home_dir: None,
         project_setups: true,
+        recent_projects: true,
     });
     w.app.handle_daemon_event(UiEvent::WorkspacesLoaded(vec![]));
     w.app
@@ -1749,4 +1760,126 @@ fn reopen_failures_are_reported_where_the_user_is() {
         w.app.state.workspace_form.error.as_deref(),
         Some("Reconnect to open this project.")
     );
+}
+
+/// Reopens the first recent project, dismisses the form and opens it again before the
+/// daemon answers, then answers with the created workspace.
+fn reopen_dismissed_then_form_reopened(
+    w: &mut Workbench,
+    setup: Option<Vec<daedalus_ui::assignments::Assignment>>,
+) -> WorkspaceInfo {
+    use daedalus_ui::workspace_form::Control;
+    w.app.state.workspace_form.set_focus(Control::Recent(0));
+    w.app.workspace_form_key(&Key::Named(NamedKey::Enter));
+    let UiCommand::CreateManualWorkspace { session, .. } = w.command() else {
+        panic!("expected workspace creation")
+    };
+    w.app.handle_workspace_form(WorkspaceFormAction::Cancel);
+    w.app.handle_ui_action(UiAction::NewWorkspace);
+    assert!(w.app.state.workspace_form.open);
+    let mut ws = workspace("Project");
+    ws.setup = setup;
+    w.app.handle_daemon_event(UiEvent::ManualWorkspaceCreated {
+        session,
+        workspace: ws.clone(),
+    });
+    ws
+}
+
+#[test]
+fn dismissed_reopen_still_applies_the_stored_setup() {
+    let mut w = Workbench::new();
+    start_screen_with_recent(&mut w, true);
+    let ws = reopen_dismissed_then_form_reopened(&mut w, Some(stored_setup()));
+    let applied = std::iter::from_fn(|| w.commands.try_recv().ok())
+        .find(|command| matches!(command, UiCommand::ApplySetup { .. }));
+    let Some(UiCommand::ApplySetup {
+        workspace_id,
+        assignments,
+        launch,
+    }) = applied
+    else {
+        panic!("the created workspace must get its setup")
+    };
+    assert_eq!(workspace_id, ws.id);
+    assert_eq!(assignments, stored_setup());
+    assert_eq!(launch, ["agent", "reviewer"]);
+}
+
+#[test]
+fn dismissed_reopen_without_setup_still_reviews_the_workspace() {
+    let mut w = Workbench::new();
+    start_screen_with_recent(&mut w, true);
+    let ws = reopen_dismissed_then_form_reopened(&mut w, None);
+    let inspect = std::iter::from_fn(|| w.commands.try_recv().ok())
+        .find(|command| matches!(command, UiCommand::InspectSetup { .. }));
+    let Some(UiCommand::InspectSetup {
+        session, root_dir, ..
+    }) = inspect
+    else {
+        panic!("the created workspace must be reviewed, not left empty")
+    };
+    assert_eq!(root_dir, ws.root_dir);
+    w.app.handle_daemon_event(UiEvent::SetupInspected {
+        session,
+        result: Ok(inspection()),
+    });
+    assert!(w.app.state.setup_review.open);
+}
+
+#[test]
+fn dismissed_reopen_failure_is_still_reported() {
+    let mut w = Workbench::new();
+    start_screen_with_recent(&mut w, true);
+    use daedalus_ui::workspace_form::Control;
+    w.app.state.workspace_form.set_focus(Control::Recent(0));
+    w.app.workspace_form_key(&Key::Named(NamedKey::Enter));
+    let UiCommand::CreateManualWorkspace { session, .. } = w.command() else {
+        panic!("expected workspace creation")
+    };
+    w.app.handle_workspace_form(WorkspaceFormAction::Cancel);
+    w.app.handle_ui_action(UiAction::NewWorkspace);
+    w.app.handle_daemon_event(UiEvent::ManualWorkspaceFailed {
+        session,
+        message: "occupied".into(),
+    });
+    assert!(matches!(&w.app.state.toast, Some((message, true, _)) if message == "occupied"));
+}
+
+#[test]
+fn reopened_project_is_not_offered_again_while_the_refresh_is_pending() {
+    let mut w = Workbench::new();
+    start_screen_with_recent(&mut w, true);
+    reopen_first(&mut w, Some(stored_setup()));
+    // Opening the form again keeps the old list until the daemon answers.
+    w.app.handle_ui_action(UiAction::NewWorkspace);
+    let listed: Vec<_> = w
+        .app
+        .state
+        .workspace_form
+        .recent()
+        .iter()
+        .map(|project| project.name.as_str())
+        .collect();
+    assert_eq!(listed, ["Other"]);
+    // A late answer that still lists the open project cannot bring it back.
+    w.app
+        .handle_daemon_event(UiEvent::RecentProjectsLoaded(vec![
+            recent_project("Project", "/project", true),
+            recent_project("Other", "/other", false),
+        ]));
+    assert_eq!(w.app.state.workspace_form.recent().len(), 1);
+}
+
+#[test]
+fn recent_list_is_cleared_when_the_daemon_has_no_recent_projects() {
+    let mut w = Workbench::new();
+    start_screen_with_recent(&mut w, true);
+    assert_eq!(w.app.state.workspace_form.recent().len(), 2);
+    w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
+        home_dir: None,
+        project_setups: false,
+        recent_projects: false,
+    });
+    assert!(w.app.state.workspace_form.recent().is_empty());
 }

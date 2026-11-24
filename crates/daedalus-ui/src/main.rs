@@ -441,6 +441,17 @@ impl DaedalusApp {
         }
     }
 
+    /// Keeps folders that are open as a workspace out of the form's recent list.
+    fn hide_open_recent_projects(&mut self) {
+        let open = self
+            .state
+            .workspaces
+            .iter()
+            .map(|ws| ws.root_dir.clone())
+            .collect();
+        self.state.workspace_form.hide_open(open);
+    }
+
     fn create_new_workspace(&mut self) {
         if self.setup_installer_is_running() {
             self.show_toast(
@@ -452,6 +463,7 @@ impl DaedalusApp {
         self.reset_setup_draft();
         let folder = self.folder_suggestion();
         self.state.workspace_form.begin(&folder);
+        self.hide_open_recent_projects();
         self.send_command(UiCommand::RefreshRecentProjects);
         self.state
             .workspace_form
@@ -1389,11 +1401,17 @@ impl DaedalusApp {
             UiEvent::DaemonCapabilities {
                 home_dir,
                 project_setups,
+                recent_projects,
             } => {
                 self.daemon_home = home_dir;
                 self.project_setups.set_daemon_backed(project_setups);
+                if !recent_projects {
+                    // Rows from the previous daemon would name folders this one never saw.
+                    self.state.workspace_form.set_recent(Vec::new());
+                }
             }
             UiEvent::RecentProjectsLoaded(projects) => {
+                self.hide_open_recent_projects();
                 self.state.workspace_form.set_recent(projects);
             }
             UiEvent::ProjectSetupChanged {

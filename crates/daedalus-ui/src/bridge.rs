@@ -200,6 +200,7 @@ pub enum UiEvent {
     DaemonCapabilities {
         home_dir: Option<PathBuf>,
         project_setups: bool,
+        recent_projects: bool,
     },
     RecentProjectsLoaded(Vec<daedalus_proto::RecentProject>),
     ProjectSetupChanged {
@@ -489,6 +490,7 @@ async fn initialize_session(
     sink.emit(UiEvent::DaemonCapabilities {
         home_dir,
         project_setups: project_setup_supported,
+        recent_projects: recent_projects_supported,
     });
     setup::refresh_recent_projects(conn, sink).await?;
 
