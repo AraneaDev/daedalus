@@ -87,9 +87,10 @@ class Workbench:
         return self.window.get_image(x, y, 1, 1, X.ZPixmap, 0xFFFFFFFF).data[:3]
 
     def wait_dialog(self, position, visible=True):
-        # Sample the focused border after redraw on the Xvfb TrueColor visual.
-        accent = bytes.fromhex("b2e589")
-        until("dialog transition", lambda: (self.pixel(*position) == accent) == visible)
+        # Sample the straight top edge, clear of the rounded corner.
+        x, y = position
+        border = bytes.fromhex("42332b")
+        until("dialog transition", lambda: (self.pixel(x + 20, y) == border) == visible)
 
     def close(self, process):
         event = protocol.event.ClientMessage(
@@ -195,13 +196,13 @@ def exercise(binaries, scratch, screen):
             # The install button disappears after the daemon rechecks the executable.
             until(
                 "install action removed",
-                lambda: ui.pixel(752, 518) == bytes.fromhex("281e18"),
+                lambda: ui.pixel(752, 518) == ui.pixel(384, 518),
             )
             ui.click(710, 588)  # Install project dependencies
             until("project dependencies", lambda: (project / "node_modules").is_dir())
             until(
                 "dependency action removed",
-                lambda: ui.pixel(710, 588) == bytes.fromhex("281e18"),
+                lambda: ui.pixel(710, 588) == ui.pixel(384, 588),
             )
             ui.click(922, 660)  # Open workspace
             until("agent launched", lambda: (project / "agent-started").exists())
@@ -210,7 +211,7 @@ def exercise(binaries, scratch, screen):
             ui.wait_dialog(review_dialog, visible=False)
             until(
                 "active workspace",
-                lambda: ui.pixel(1208, 67) == bytes.fromhex("b2e589"),
+                lambda: ui.pixel(1209, 74) == bytes.fromhex("b2e589"),
             )
             ui.shortcut("t")
             runs = project / "test-runs"
@@ -225,7 +226,7 @@ def exercise(binaries, scratch, screen):
         ) as client:
             ui = Workbench(screen, client)
             until(
-                "workspace card", lambda: ui.pixel(1208, 67) == bytes.fromhex("b2e589")
+                "workspace card", lambda: ui.pixel(1209, 74) == bytes.fromhex("b2e589")
             )
             ui.shortcut("t")
             until("restored test assignment", lambda: runs.read_text() == "ran\nran\n")
@@ -257,7 +258,7 @@ def exercise(binaries, scratch, screen):
             ui.wait_dialog(recent_dialog, visible=False)
             until(
                 "reopened workspace",
-                lambda: ui.pixel(1208, 67) == bytes.fromhex("b2e589"),
+                lambda: ui.pixel(1209, 74) == bytes.fromhex("b2e589"),
             )
             assert cli("workspace", "list").stdout.count("panes=") == 1
             ui.close(client)
