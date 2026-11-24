@@ -11,7 +11,9 @@ fn target_directory(dir: Option<PathBuf>, remote: bool) -> std::io::Result<PathB
         return Ok(dir.unwrap_or_else(|| PathBuf::from(".")));
     }
     match dir {
-        Some(dir) if dir.is_absolute() => Ok(dir),
+        // A rooted path such as `/home/dev/project` names a daemon-host directory even on
+        // Windows, where it has no drive and so is not `is_absolute`.
+        Some(dir) if dir.has_root() => Ok(dir),
         Some(dir) => Ok(std::env::current_dir()?.join(dir)),
         None => std::env::current_dir(),
     }
@@ -131,6 +133,11 @@ mod tests {
         assert_eq!(
             target_directory(Some(relative.clone()), false).unwrap(),
             cwd.join(relative)
+        );
+        let daemon_path = PathBuf::from("/home/dev/project");
+        assert_eq!(
+            target_directory(Some(daemon_path.clone()), false).unwrap(),
+            daemon_path
         );
     }
 }

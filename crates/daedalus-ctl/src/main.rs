@@ -313,9 +313,12 @@ fn parse_env_pairs(pairs: &[String]) -> Result<HashMap<String, String>, String> 
     Ok(map)
 }
 
+/// Anchors a relative directory at the client's working directory. A path with a root is sent as
+/// given, because on Windows `/home/dev/project` has no drive and may name a directory on a
+/// daemon running in WSL or on another host.
 fn resolve_dir(dir: Option<PathBuf>) -> Result<PathBuf, std::io::Error> {
     match dir {
-        Some(d) if d.is_relative() => {
+        Some(d) if !d.has_root() => {
             let joined = std::env::current_dir()?.join(d);
             Ok(daedalus_proto::strip_windows_verbatim_prefix(
                 std::fs::canonicalize(&joined).unwrap_or(joined),
@@ -1041,6 +1044,16 @@ mod tests {
             std::fs::canonicalize(&cwd).unwrap_or(cwd),
         );
         assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_dir_sends_rooted_daemon_paths_unchanged() {
+        for raw in ["/home/dev/project", "/tmp/does-not-exist-here"] {
+            assert_eq!(
+                resolve_dir(Some(PathBuf::from(raw))).unwrap(),
+                PathBuf::from(raw)
+            );
+        }
     }
 
     #[test]
