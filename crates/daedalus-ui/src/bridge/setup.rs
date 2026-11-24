@@ -7,6 +7,7 @@ use daedalus_proto::{
 };
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::warn;
 
 pub(super) async fn inspect(
     conn: &RpcConnection,
@@ -157,7 +158,8 @@ pub(super) async fn refresh_recent_projects(
             sink.emit(UiEvent::RecentProjectsLoaded(projects));
         }
         Err(RpcError::Disconnected) => return Err(RpcError::Disconnected),
-        _ => {}
+        Err(error) => warn!("listing recent projects failed: {error:?}"),
+        Ok(other) => warn!("unexpected reply to ListRecentProjects: {other:?}"),
     }
     Ok(())
 }

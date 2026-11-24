@@ -4,10 +4,17 @@ use daedalus_proto::{
     Assignment, ProtoError, RecentProject, ServerEvent, WorkspaceId, WorkspaceInfo,
 };
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How many recent projects the daemon remembers.
 const MAX_RECENT_PROJECTS: usize = 20;
+
+/// How long one `recent_projects` request waits for folder checks before it drops the
+/// folders that have not answered yet.
+const DIR_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+type DirCheck = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -20,21 +27,54 @@ impl Registry {
     /// Projects seen before, most recent first. Folders that no longer exist and folders
     /// that are open as a workspace right now are left out, but stay stored.
     pub async fn recent_projects(&self) -> Vec<RecentProject> {
+        self.recent_projects_with(Arc::new(|path: &Path| path.is_dir()), DIR_CHECK_TIMEOUT)
+            .await
+    }
+
+    /// `recent_projects` with an injectable folder check and deadline.
+    async fn recent_projects_with(&self, check: DirCheck, timeout: Duration) -> Vec<RecentProject> {
         let open: Vec<PathBuf> = {
             let ws_map = self.workspaces.read().await;
             ws_map.values().map(|ws| ws.root_dir.clone()).collect()
         };
-        let recent = self.recent_projects.read().await;
-        let setups = self.project_setups.read().await;
-        recent
-            .iter()
-            .filter(|entry| !open.contains(&entry.root_dir) && entry.root_dir.is_dir())
-            .map(|entry| RecentProject {
-                name: entry.name.clone(),
-                root_dir: entry.root_dir.clone(),
-                last_used: entry.last_used,
-                has_setup: setups.contains_key(&entry.root_dir),
-            })
+        // Copy what is needed and release the locks: the folder checks below can hang on a
+        // stale mount, and must not hold up writers or other requests.
+        let candidates: Vec<RecentProject> = {
+            let recent = self.recent_projects.read().await;
+            let setups = self.project_setups.read().await;
+            recent
+                .iter()
+                .filter(|entry| !open.contains(&entry.root_dir))
+                .map(|entry| RecentProject {
+                    name: entry.name.clone(),
+                    root_dir: entry.root_dir.clone(),
+                    last_used: entry.last_used,
+                    has_setup: setups.contains_key(&entry.root_dir),
+                })
+                .collect()
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for (index, entry) in candidates.iter().enumerate() {
+            let check = check.clone();
+            let path = entry.root_dir.clone();
+            let tx = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = tx.send((index, check(&path)));
+            });
+        }
+        drop(tx);
+
+        let mut exists = vec![false; candidates.len()];
+        let deadline = tokio::time::Instant::now() + timeout;
+        // Folders whose check has not answered by the deadline are left out of this reply.
+        while let Ok(Some((index, is_dir))) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            exists[index] = is_dir;
+        }
+        candidates
+            .into_iter()
+            .zip(exists)
+            .filter_map(|(entry, is_dir)| is_dir.then_some(entry))
             .collect()
     }
 
@@ -318,5 +358,78 @@ mod tests {
         assert_eq!(reg2.recent_projects().await, before);
         let reopened = open(&reg2, "a", &ws.root_dir).await;
         assert_eq!(reopened.setup.as_ref(), Some(&setup));
+    }
+
+    /// A folder check that blocks until the returned sender is dropped or sent to.
+    fn blocking_check(blocked: PathBuf) -> (DirCheck, std::sync::mpsc::Sender<()>) {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let check: DirCheck = Arc::new(move |path: &Path| {
+            if path == blocked {
+                let _ = gate.lock().unwrap().recv();
+            }
+            true
+        });
+        (check, release)
+    }
+
+    #[tokio::test]
+    async fn writers_are_not_blocked_by_a_slow_folder_check() {
+        let tmp = TempDir::new().unwrap();
+        let reg = Arc::new(registry_at(tmp.path(), tmp.path().join("state.json")));
+        let slow = folder(tmp.path(), "slow");
+        reg.record_recent_project("slow", &slow).await;
+        let (check, release) = blocking_check(slow);
+
+        let lister = {
+            let reg = reg.clone();
+            tokio::spawn(async move {
+                reg.recent_projects_with(check, Duration::from_secs(30))
+                    .await
+            })
+        };
+        // Let the check start and block.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let other = folder(tmp.path(), "other");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            reg.record_recent_project("other", &other).await;
+            reg.project_setups
+                .write()
+                .await
+                .insert(other.clone(), vec![assignment("x")]);
+        })
+        .await
+        .expect("writers must not wait for the folder check");
+        assert!(!lister.is_finished());
+
+        release.send(()).unwrap();
+        let listed = tokio::time::timeout(Duration::from_secs(5), lister)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "slow");
+    }
+
+    #[tokio::test]
+    async fn folders_that_do_not_answer_in_time_are_dropped_but_kept() {
+        let tmp = TempDir::new().unwrap();
+        let reg = registry_at(tmp.path(), tmp.path().join("state.json"));
+        let hung = folder(tmp.path(), "hung");
+        let fine = folder(tmp.path(), "fine");
+        reg.record_recent_project("hung", &hung).await;
+        reg.record_recent_project("fine", &fine).await;
+        let (check, release) = blocking_check(hung);
+
+        let started = std::time::Instant::now();
+        let listed = reg
+            .recent_projects_with(check, Duration::from_millis(200))
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let names: Vec<&str> = listed.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["fine"]);
+        assert_eq!(reg.recent_projects.read().await.len(), 2);
+        drop(release);
     }
 }
