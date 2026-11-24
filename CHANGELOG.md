@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.14](https://github.com/AraneaDev/daedalus/compare/v0.0.13...v0.0.14) (2026-11-24)
+
+
+### Features
+
+* guide first-run workspace setup and surface failed runs ([#41](https://github.com/AraneaDev/daedalus/issues/41)) ([0a1bea4](https://github.com/AraneaDev/daedalus/commit/0a1bea41a106a18bec03136c2d98708df11cdb30))
+
 ## [0.0.13](https://github.com/AraneaDev/daedalus/compare/v0.0.12...v0.0.13) (2026-11-23)
 
 
