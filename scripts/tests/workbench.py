@@ -234,7 +234,37 @@ def exercise(binaries, scratch, screen):
             ui.close(client)
 
 
+def enable_accessibility():
+    """Turn AT-SPI on so accesskit requests the tree, as a screen reader would."""
+
+    def call(method, *args):
+        return subprocess.run(
+            [
+                "dbus-send",
+                "--session",
+                "--print-reply",
+                "--dest=org.a11y.Bus",
+                "/org/a11y/bus",
+                f"org.freedesktop.DBus.Properties.{method}",
+                "string:org.a11y.Status",
+                "string:IsEnabled",
+                *args,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+
+    call("Set", "variant:boolean:true")
+    reply = call("Get")
+    assert "boolean true" in reply, f"AT-SPI did not enable: {reply}"
+
+
 if __name__ == "__main__":
+    if "DBUS_SESSION_BUS_ADDRESS" not in os.environ:
+        sys.exit("run under dbus-run-session so the accessibility tree is exercised")
+    enable_accessibility()
     screen = display.Display()
     try:
         with TemporaryDirectory(prefix="daedalus-ui-") as folder:

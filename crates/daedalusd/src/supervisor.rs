@@ -590,6 +590,29 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn parse_proc_stat_reads_state_and_group_after_the_last_paren() {
+        assert_eq!(
+            parse_proc_stat("4242 (odd) name (x)) S 1 777 777 0 -1"),
+            Some(('S', 777))
+        );
+        assert_eq!(parse_proc_stat("4242 (agent) Z 1 9 9"), Some(('Z', 9)));
+        assert_eq!(parse_proc_stat("4242 (agent) S 1 group"), None);
+        assert_eq!(parse_proc_stat("4242 (agent) S"), None);
+        assert_eq!(parse_proc_stat("no paren"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pgid_scan_finds_this_test_group_and_not_an_unused_one() {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let (_, own_group) = parse_proc_stat(&stat).unwrap();
+        assert!(pgid_has_non_zombie_proc(own_group));
+        // Linux caps PIDs at 2^22, so no process group can have this id.
+        assert!(!pgid_has_non_zombie_proc(i32::MAX));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn systemd_resolves_program_using_workspace_path_and_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
