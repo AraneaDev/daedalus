@@ -1,6 +1,6 @@
 use daedalus_proto::RunnerInsight;
 use std::time::Instant;
-use vte::{Parser, Perform};
+use vte::{Params, Parser, Perform};
 
 pub(crate) struct RunnerObserver {
     parser: Parser,
@@ -24,6 +24,20 @@ impl Perform for CargoLines {
     }
     fn execute(&mut self, byte: u8) {
         if matches!(byte, b'\n' | b'\r') {
+            self.complete_line();
+        }
+    }
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        // ConPTY can position the cursor at the start of the next output row
+        // instead of emitting CRLF between a test case and its summary.
+        if !ignore
+            && intermediates.is_empty()
+            && matches!(action, 'H' | 'f')
+            && params
+                .iter()
+                .nth(1)
+                .is_none_or(|column| matches!(column, [0] | [1]))
+        {
             self.complete_line();
         }
     }
@@ -124,6 +138,22 @@ impl RunnerObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conpty_cursor_positions_separate_test_cases_and_summaries() {
+        let mut observer = RunnerObserver::new();
+        let transcript = concat!(
+            "test first ... \x1b[38;5;2mok\x1b[m",
+            "\x1b[8;1Htest result: ok. 1 passed; 0 failed;",
+            "\x1b[10;1H   Doc-tests sample\r\nrunning 0 tests",
+            "\x1b[14;1Htest result: ok. 0 passed; 0 failed;\x1b[16;1H",
+        );
+        for chunk in transcript.as_bytes().chunks(3) {
+            observer.feed(chunk);
+        }
+        observer.finish(Some(0));
+        assert_eq!(observer.snapshot().passed, 1);
+    }
+
     #[test]
     fn aggregates_suites_and_waits_for_exit() {
         let mut observer = RunnerObserver::new();

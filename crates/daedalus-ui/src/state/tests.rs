@@ -1156,3 +1156,80 @@ fn runner_overrides_and_failure_details_leave_agent_selected() {
     );
     assert_eq!(state.focused_pane_id(), Some(agent));
 }
+
+#[test]
+fn cargo_widgets_select_metrics_by_command() {
+    let (mut ws, _, _, runner) = make_workspace_with_three_panes();
+    ws.manifest = Some(daedalus_proto::WorkspaceManifest {
+        runner_command: Some(vec!["cargo".into(), "test".into()]),
+        ..Default::default()
+    });
+    let mut state = AppState::new();
+    state.set_workspaces(vec![ws]);
+    state.session_names.remove(&runner);
+    let pane = state.panes.get_mut(&runner).unwrap();
+    pane.summary.status = PaneStatus::Busy;
+    pane.insight = Some(daedalus_proto::RunnerInsight {
+        phase: "Testing".into(),
+        passed: 3,
+        failed: 1,
+        warnings: 2,
+        elapsed_secs: 7,
+        ..Default::default()
+    });
+    assert_eq!(
+        state.widget_label(PaneRole::Runner).unwrap(),
+        "Workspace tests · Testing · 3 passed · 1 failed · 7s"
+    );
+    state.workspaces[0]
+        .manifest
+        .as_mut()
+        .unwrap()
+        .runner_command
+        .as_mut()
+        .unwrap()[1] = "check".into();
+    assert_eq!(
+        state.widget_label(PaneRole::Runner).unwrap(),
+        "Compiler · Testing · 3 passed · 1 failed · 2 warnings · 7s"
+    );
+    state.workspaces[0].manifest.as_mut().unwrap().runner_widget =
+        Some(daedalus_proto::WidgetConfig {
+            preset: Some("command".into()),
+            ..Default::default()
+        });
+    assert_eq!(
+        state.widget_label(PaneRole::Runner).unwrap(),
+        "Runner · Running · 7s"
+    );
+    assert!(state.widget_diagnostic().is_none());
+}
+
+#[test]
+fn service_widget_only_advertises_ports_while_live() {
+    let (mut ws, _, service, _) = make_workspace_with_three_panes();
+    ws.bound_ports.push(daedalus_proto::PortMapping {
+        host_port: 3141,
+        container_port: None,
+        service: None,
+        source: daedalus_proto::PortSource::LocalProcess,
+    });
+    let mut state = AppState::new();
+    state.set_workspaces(vec![ws]);
+    state.session_names.remove(&service);
+    state.panes.get_mut(&service).unwrap().summary.status = PaneStatus::Busy;
+    assert_eq!(
+        state.widget_label(PaneRole::Service).unwrap(),
+        "Service · Running · workspace :3141"
+    );
+    for (code, label) in [
+        (Some(0), "Completed"),
+        (Some(1), "Failed"),
+        (None, "Stopped"),
+    ] {
+        state.panes.get_mut(&service).unwrap().summary.status = PaneStatus::Exited { code };
+        assert_eq!(
+            state.widget_label(PaneRole::Service).unwrap(),
+            format!("Service · {label}")
+        );
+    }
+}

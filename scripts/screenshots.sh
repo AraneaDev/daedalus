@@ -121,7 +121,7 @@ capture focused-workbench
 convert -size 240x128 xc:'#17242c' -fill '#afc9c1' -font DejaVu-Sans -pointsize 13 \
     -annotate +14+23 'Health probe latency' -stroke '#355059' -strokewidth 1 \
     -draw 'line 14,49 225,49 line 14,76 225,76 line 14,103 225,103' \
-    -stroke '#89e5b2' -strokewidth 3 -fill none \
+    -stroke '#f3ab65' -strokewidth 3 -fill none \
     -draw 'polyline 14,86 38,86 58,67 77,81 94,63 113,77 134,55 153,74 175,61 199,74 225,67' \
     PNG32:health-report.png
 touch .git/preview
@@ -130,6 +130,12 @@ xdotool mousemove --window "$window" 9 59 mousedown 1 mousemove --window "$windo
 xdotool key ctrl+shift+i
 xdotool mousemove 1439 899
 capture image-preview
+# Check the actual plot stroke so a closed panel or path selection fails the capture.
+if ! convert "$scratch/image-preview.png" -crop 320x220+435+20 +repage -format %c histogram:info:- | \
+    awk 'toupper($0) ~ /#F3AB65/ && $1 + 0 >= 100 { found = 1 } END { exit !found }'; then
+    echo 'The image preview did not display the health report chart.' >&2
+    exit 1
+fi
 xdotool key ctrl+shift+i
 xdotool key ctrl+shift+w
 xdotool type --delay 30 'feature/add-metrics'
