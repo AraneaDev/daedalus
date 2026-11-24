@@ -1,6 +1,6 @@
 use daedalus_proto::{PaneId, PaneRole, WorkspaceId, default_config_file_path};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -30,28 +30,7 @@ fn workspace_path(id: WorkspaceId) -> PathBuf {
         .join(format!("{id}.toml"))
 }
 
-fn validate(assignments: &[Assignment]) -> Result<(), String> {
-    let mut ids = HashSet::new();
-    for assignment in assignments {
-        if assignment.id.trim().is_empty() || !ids.insert(&assignment.id) {
-            return Err("Each assignment needs a unique, nonempty ID".into());
-        }
-        if assignment.name.trim().is_empty() {
-            return Err("Each assignment needs a name".into());
-        }
-        if assignment
-            .argv
-            .first()
-            .is_none_or(|arg| arg.trim().is_empty())
-        {
-            return Err("Each assignment needs an executable".into());
-        }
-        if assignment.argv.iter().any(|arg| arg.contains('\0')) {
-            return Err("Assignment arguments cannot contain a NUL character".into());
-        }
-    }
-    Ok(())
-}
+use daedalus_proto::validate_assignments as validate;
 
 pub fn load(workspace_id: WorkspaceId) -> Result<Vec<Assignment>, String> {
     load_or(workspace_id, Vec::new())

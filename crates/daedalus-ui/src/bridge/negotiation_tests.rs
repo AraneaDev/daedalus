@@ -307,3 +307,50 @@ async fn project_setup_change_event_is_forwarded() {
     conn.close().await;
     task.abort();
 }
+
+#[tokio::test]
+async fn invalid_setup_on_new_daemon_is_rejected_locally() {
+    let (conn, _ui, _emitted, task, mut seen, _events) = handshake(true).await;
+    drain(&mut seen);
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+    let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink(ui_tx));
+    let workspace_id = WorkspaceId::new();
+    let invalid = vec![assignment("")];
+
+    tokio::time::timeout(
+        WAIT,
+        setup::apply(&conn, &sink, workspace_id, invalid.clone(), vec![]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        ui_rx.try_recv(),
+        Ok(UiEvent::SetupApplied { error: Some(_), .. })
+    ));
+    tokio::time::timeout(
+        WAIT,
+        handle_command(
+            &conn,
+            &sink,
+            UiCommand::SaveProjectSetup {
+                workspace_id,
+                assignments: invalid,
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        ui_rx.try_recv(),
+        Ok(UiEvent::ProjectSetupSaveFailed { .. })
+    ));
+    assert!(
+        !drain(&mut seen)
+            .iter()
+            .any(|message| matches!(message, ClientMessage::SetProjectSetup { .. }))
+    );
+    conn.close().await;
+    task.abort();
+}

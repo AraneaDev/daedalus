@@ -111,6 +111,9 @@ async fn store_on_daemon(
     workspace_id: WorkspaceId,
     entries: &[Assignment],
 ) -> Result<Result<(), String>, RpcError> {
+    if let Err(message) = daedalus_proto::validate_assignments(entries) {
+        return Ok(Err(message));
+    }
     match conn
         .call(ClientMessage::SetProjectSetup {
             workspace_id,

@@ -44,6 +44,7 @@ impl Registry {
         workspace_id: WorkspaceId,
         assignments: Vec<Assignment>,
     ) -> Result<(), ProtoError> {
+        daedalus_proto::validate_assignments(&assignments).map_err(ProtoError::InvalidRequest)?;
         let root_dir = {
             let ws_map = self.workspaces.read().await;
             ws_map
@@ -226,6 +227,23 @@ mod tests {
 
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(reg.recent_projects().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_setup_is_rejected_without_storing_or_broadcasting() {
+        let tmp = TempDir::new().unwrap();
+        let reg = registry_at(tmp.path(), tmp.path().join("state.json"));
+        let dir = folder(tmp.path(), "a");
+        let ws = open(&reg, "a", &dir).await;
+        let mut events = reg.subscribe_events();
+
+        let err = reg
+            .set_project_setup(ws.id, vec![assignment("dup"), assignment("dup")])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProtoError::InvalidRequest(_)));
+        assert_eq!(reg.list_workspaces().await[0].setup, None);
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
