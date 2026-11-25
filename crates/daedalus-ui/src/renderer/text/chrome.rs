@@ -1355,10 +1355,10 @@ mod tests {
         runner.id = PaneId::new();
         runner.role = PaneRole::Runner;
         runner.last_exit_code = Some(12);
-        state.register_pane(runner.clone(), None);
+        state.register_pane(runner.clone(), false);
         runner.id = PaneId::new();
         runner.last_exit_code = Some(0);
-        state.register_pane(runner, None);
+        state.register_pane(runner, false);
 
         for scale in [1.0, 1.5, 2.0] {
             let theme = Theme::dark();
@@ -1407,7 +1407,7 @@ mod tests {
         runner.id = PaneId::new();
         runner.role = PaneRole::Runner;
         runner.last_exit_code = Some(0);
-        state.register_pane(runner, None);
+        state.register_pane(runner, false);
         let ws = state.active_workspace_mut().unwrap();
         for label in ["old", "second", "last"] {
             ws.external_statuses.push(ExternalStatus {

@@ -1,6 +1,9 @@
+mod process_tree;
+
 use super::runtime::SourceFields;
 use daedalus_proto::WorkspaceInfo;
 use daedalus_proto::workbench::{CommandOutput, WidgetResult, WorkspaceCommand};
+use process_tree::ProcessTree;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -51,17 +54,31 @@ async fn execute(
         process.env(name, value);
     }
     let start = Instant::now();
-    let mut child = process
-        .spawn()
+    let (mut child, process_tree) = ProcessTree::spawn(&mut process)
+        .await
         .map_err(|error| format!("Could not start '{program}': {error}"))?;
     let stdout = child.stdout.take().ok_or("Could not read command output")?;
     let stderr = child.stderr.take().ok_or("Could not read command errors")?;
     let limit = Duration::from_secs(u64::from(spec.timeout_seconds.unwrap_or(15)));
-    let execution =
-        async { tokio::try_join!(child.wait(), read_output(stdout), read_output(stderr)) };
+    let execution = async {
+        // Keep the process ID allocated while output is still open so cleanup
+        // always addresses the original process group.
+        let (stdout, stderr) = tokio::try_join!(read_output(stdout), read_output(stderr))?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, stdout, stderr))
+    };
     let (status, stdout, stderr) = match tokio::time::timeout(limit, execution).await {
-        Ok(result) => result.map_err(|error| error.to_string())?,
+        Ok(Ok(result)) => {
+            process_tree.complete();
+            result
+        }
+        Ok(Err(error)) => {
+            drop(process_tree);
+            let _ = child.kill().await;
+            return Err(error.to_string());
+        }
         Err(_) => {
+            drop(process_tree);
             let _ = child.kill().await;
             return Err(format!("Command exceeded {} seconds", limit.as_secs()));
         }
@@ -169,7 +186,7 @@ fn read_json(fields: &mut SourceFields, path: &str, value: &serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use crate::workbench::test_workspace;
 
     #[tokio::test]
@@ -314,6 +331,80 @@ mod tests {
         .expect("command did not return after its configured timeout");
         assert_eq!(fields["error"], "Command exceeded 1 seconds");
         assert!(!fields.contains_key("exit_code"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_command_stops_its_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = test_workspace(root.path().into());
+        let mut spec = shell(
+            "(trap '' HUP; touch ready; while [ ! -f release ]; do sleep 0.02; done; touch escaped) </dev/null >/dev/null 2>&1 & wait",
+        );
+        spec.timeout_seconds = Some(1);
+        let fields = run(&workspace, &spec, &CommandOutput::ExitStatus).await;
+        assert_eq!(fields["error"], "Command exceeded 1 seconds");
+        assert_descendant_stopped(root.path()).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_limit_error_stops_command_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = test_workspace(root.path().into());
+        let spec = shell(
+            "(trap '' HUP; touch ready; while [ ! -f release ]; do sleep 0.02; done; touch escaped) </dev/null >/dev/null 2>&1 &
+while [ ! -f ready ]; do sleep 0.02; done
+head -c 65537 /dev/zero
+wait",
+        );
+        let fields = run(&workspace, &spec, &CommandOutput::ExitStatus).await;
+        assert_eq!(fields["error"], "Command output exceeded 64 KiB");
+        assert_descendant_stopped(root.path()).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn timed_out_command_stops_its_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = test_workspace(root.path().into());
+        std::fs::write(
+            root.path().join("descendant.ps1"),
+            "New-Item ready -ItemType File
+while (!(Test-Path release)) { Start-Sleep -Milliseconds 20 }
+New-Item escaped -ItemType File",
+        )
+        .unwrap();
+        let spec = WorkspaceCommand {
+            argv: [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "$child = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File descendant.ps1' -NoNewWindow -PassThru; $child.WaitForExit()",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            env: Vec::new(),
+            timeout_seconds: Some(5),
+        };
+        let fields = run(&workspace, &spec, &CommandOutput::ExitStatus).await;
+        assert_eq!(fields["error"], "Command exceeded 5 seconds");
+        assert_descendant_stopped(root.path()).await;
+    }
+
+    #[cfg(any(unix, windows))]
+    async fn assert_descendant_stopped(root: &std::path::Path) {
+        let ready = root.join("ready").exists();
+        std::fs::write(root.join("release"), "").unwrap();
+        assert!(ready, "descendant never started");
+        let escaped = root.join("escaped");
+        let completed = tokio::time::timeout(Duration::from_millis(600), async {
+            while !escaped.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(completed.is_err(), "descendant ran after the timeout");
     }
 
     #[cfg(unix)]

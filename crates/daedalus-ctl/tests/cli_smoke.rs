@@ -1534,6 +1534,8 @@ async fn workspace_recent_reports_unsupported_daemon() {
                     workbench_supported: false,
                     workspace_membership_supported: false,
                     runner_assignment_supported: false,
+                    resolved_import_preview_supported: false,
+                    agent_launch_metadata_supported: false,
                     home_dir: None,
                     recent_projects_supported: false,
                 }),

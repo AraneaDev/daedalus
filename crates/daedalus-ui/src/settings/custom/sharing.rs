@@ -14,11 +14,7 @@ impl SettingsDialog {
             vec![CustomImportTemplate, CustomExportTemplate],
         ];
         if self.custom.import.is_some() || self.custom.creation.is_some() {
-            if let Some(detail) = &self.custom.preview {
-                rows.extend(
-                    (0..detail.details.len().min(6)).map(|index| vec![CustomDetail(index)]),
-                );
-            }
+            self.append_detail_rows(&mut rows);
             if self.next_import_conflict().is_some() {
                 rows.push(vec![CustomResolve, CustomResolveIncoming]);
             }
@@ -60,14 +56,12 @@ impl SettingsDialog {
         let editor = &mut self.custom;
         match control {
             CustomImport | CustomRepo => {
+                editor.clear_import_review();
                 let source = if control == CustomRepo {
                     WorkspaceImportSource::Repo
                 } else {
                     WorkspaceImportSource::Text(read_file(&editor.path)?)
                 };
-                editor.import = None;
-                editor.creation = None;
-                editor.resolutions.clear();
                 if !editor.new_root.trim().is_empty() {
                     return Ok(Some(ClientMessage::PreviewWorkspaceCreation {
                         root_dir: editor.new_root.trim().into(),
@@ -111,25 +105,24 @@ impl SettingsDialog {
                 }));
             }
             CustomResolve | CustomResolveIncoming => {
-                if let Some(path) = editor
-                    .import
-                    .as_ref()
-                    .and_then(|preview| {
-                        preview
-                            .conflicts
-                            .iter()
-                            .find(|conflict| !editor.resolutions.contains_key(&conflict.path))
-                    })
-                    .map(|conflict| conflict.path.clone())
+                if let Some(preview) = &editor.import
+                    && let Some(conflict) = preview.conflicts.first()
                 {
                     editor.resolutions.insert(
-                        path,
+                        conflict.path.clone(),
                         if control == CustomResolve {
                             ConflictChoice::Local
                         } else {
                             ConflictChoice::Incoming
                         },
                     );
+                    return Ok(Some(ClientMessage::ResolveWorkspaceImport {
+                        workspace_id: id,
+                        revision: preview.revision,
+                        incoming: preview.incoming.clone(),
+                        linked: preview.linked,
+                        resolutions: editor.resolutions.clone(),
+                    }));
                 }
             }
             CustomApplyImport => {
@@ -158,12 +151,21 @@ impl SettingsDialog {
     }
 
     fn import_conflict(&self) -> Option<&daedalus_proto::workbench::MergeConflict> {
-        self.custom
-            .import
-            .as_ref()?
-            .conflicts
-            .iter()
-            .find(|conflict| !self.custom.resolutions.contains_key(&conflict.path))
+        self.custom.import.as_ref()?.conflicts.first()
+    }
+
+    pub(super) fn can_apply_import(&self) -> bool {
+        self.custom.sharing
+            && !self.custom.is_reviewing_import()
+            && (self.custom.creation.is_some()
+                || self.custom.import.as_ref().is_some_and(|preview| {
+                    preview.conflicts.is_empty()
+                        && self
+                            .custom
+                            .state
+                            .as_ref()
+                            .is_none_or(|state| state.revision <= preview.revision)
+                }))
     }
 }
 

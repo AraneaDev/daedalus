@@ -77,6 +77,31 @@ fn terminal_tab_names_count_named_siblings_and_keep_workspace_order() {
 }
 
 #[test]
+fn membership_refresh_updates_agent_identity_without_selecting_its_tab() {
+    let (mut workspace, first, _, _) = make_workspace_with_three_panes();
+    let mut second = make_pane_summary(workspace.id, PaneRole::Agent);
+    workspace.panes.push(second.clone());
+    let mut state = AppState::new();
+    state.set_workspaces(vec![workspace.clone()]);
+    state.select_session(workspace.id, PaneRole::Agent, first);
+
+    second.launch_preset = Some("claude".into());
+    *workspace.panes.last_mut().unwrap() = second.clone();
+    state.set_workspaces(vec![workspace]);
+
+    assert_eq!(state.focused_pane_id(), Some(first));
+    assert_eq!(
+        state.panes[&second.id].agent_preset,
+        Some(AgentPreset::Claude)
+    );
+    assert!(
+        state
+            .terminal_tabs(state.active_workspace().unwrap())
+            .contains(&(second.id, "Claude".into()))
+    );
+}
+
+#[test]
 fn refresh_recovers_focus_when_a_terminal_closed_in_another_client() {
     let (mut ws, agent, _, runner) = make_workspace_with_three_panes();
     let mut state = AppState::new();
@@ -739,7 +764,7 @@ fn dormant_workspace_helpers_prevent_double_spawning() {
 
     // Legacy daemons infer completion from the first pane.
     assert!(state.mark_workspace_spawning(ws_id));
-    state.register_pane(make_pane_summary(ws_id, PaneRole::Agent), None);
+    state.register_pane(make_pane_summary(ws_id, PaneRole::Agent), false);
     state.finish_workspace_spawning(ws_id, false);
     assert!(state.active_dormant_workspace().is_none());
 

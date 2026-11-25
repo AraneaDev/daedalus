@@ -4,11 +4,10 @@ mod commands;
 use clap::{Parser, Subcommand, ValueEnum};
 use client::DaemonClient;
 use daedalus_proto::{
-    AgentState, ClientMessage, PaneId, PaneRole, ResponsePayload, StatusLevel, WorkspaceId,
-    default_socket_path,
+    AgentState, ClientMessage, PaneRole, ResponsePayload, StatusLevel, default_socket_path,
 };
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 const DEFAULT_LAUNCHD_LABEL: &str = "dev.aranea.daedalusd";
@@ -411,102 +410,13 @@ fn expect_ok(payload: ResponsePayload) -> Result<(), Box<dyn std::error::Error>>
     }
 }
 
-fn resolve_daedalusd_binary(explicit: Option<PathBuf>, current_exe: Option<&Path>) -> PathBuf {
-    if let Some(path) = explicit {
-        return path;
-    }
-    if let Some(sibling) = current_exe
-        .and_then(|exe| exe.parent())
-        .map(|dir| dir.join("daedalusd"))
-        .filter(|path| path.is_file())
-    {
-        return sibling;
-    }
-    PathBuf::from(DEFAULT_DAEDALUSD_BIN)
-}
-
-fn default_launchd_log_dir(home: Option<&str>) -> PathBuf {
-    match home.map(str::trim).filter(|h| !h.is_empty()) {
-        Some(h) => PathBuf::from(format!("{}/Library/Logs", h.trim_end_matches('/'))),
-        None => std::env::temp_dir(),
-    }
-}
-
-fn escape_xml(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-fn render_launchd_plist(label: &str, binary: &Path, socket: &Path, log_dir: &Path) -> String {
-    let label_xml = escape_xml(label);
-    let binary_xml = escape_xml(&binary.to_string_lossy());
-    let socket_xml = escape_xml(&socket.to_string_lossy());
-    let log_dir_str = log_dir.to_string_lossy();
-    let log_prefix = log_dir_str.trim_end_matches(['/', '\\']);
-    let stdout_xml = escape_xml(&format!("{log_prefix}/daedalusd.out.log"));
-    let stderr_xml = escape_xml(&format!("{log_prefix}/daedalusd.err.log"));
-
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{label_xml}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{binary_xml}</string>
-    <string>--socket</string>
-    <string>{socket_xml}</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>{stdout_xml}</string>
-  <key>StandardErrorPath</key>
-  <string>{stderr_xml}</string>
-</dict>
-</plist>
-"#
-    )
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let socket = cli.socket.unwrap_or_else(default_socket_path);
 
     if let Commands::Service { action } = cli.command {
-        match action {
-            ServiceAction::PrintLaunchd { binary, label } => {
-                let label = label
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(DEFAULT_LAUNCHD_LABEL)
-                    .to_string();
-                let current_exe = std::env::current_exe().ok();
-                let binary = resolve_daedalusd_binary(binary, current_exe.as_deref());
-                let home = std::env::var("HOME").ok();
-                let log_dir = default_launchd_log_dir(home.as_deref());
-                print!(
-                    "{}",
-                    render_launchd_plist(&label, &binary, &socket, &log_dir)
-                );
-            }
-        }
+        commands::service::execute(action, &socket);
         return Ok(());
     }
 
@@ -524,186 +434,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             other => return Err(unexpected_response(other)),
         },
-        Commands::Workspace { action } => match action {
-            WorkspaceAction::Configure(args) => args.run(&mut client).await?,
-            WorkspaceAction::Import(args) => args.run(&mut client).await?,
-            WorkspaceAction::Export(args) => args.run(&mut client).await?,
-            WorkspaceAction::Update(args) => args.run(&mut client).await?,
-            WorkspaceAction::Create { name, dir, env } => {
-                let root_dir = resolve_dir(Some(dir))?;
-                let env_map = parse_env_pairs(&env)?;
-                match client
-                    .request(ClientMessage::CreateWorkspace {
-                        name,
-                        root_dir,
-                        env: env_map,
-                    })
-                    .await?
-                {
-                    ResponsePayload::WorkspaceCreated(ws) => println!("{}", ws.id),
-                    other => return Err(unexpected_response(other)),
-                }
-            }
-            WorkspaceAction::List => match client.request(ClientMessage::ListWorkspaces).await? {
-                ResponsePayload::Workspaces(list) => {
-                    for ws in list {
-                        let mut line = format!(
-                            "{}  {}  ({})  panes={}",
-                            ws.id,
-                            ws.name,
-                            ws.root_dir.display(),
-                            ws.panes.len()
-                        );
-                        if let Some(branch) = &ws.git_branch {
-                            line.push_str(&format!("  branch={branch}"));
-                        }
-                        if ws.port_offset > 0 {
-                            line.push_str(&format!("  offset=+{}", ws.port_offset));
-                        }
-                        if !ws.external_statuses.is_empty() {
-                            let badges: Vec<String> = ws
-                                .external_statuses
-                                .iter()
-                                .map(|s| format!("{}:{}", s.source, s.label))
-                                .collect();
-                            line.push_str(&format!("  status=[{}]", badges.join(", ")));
-                        }
-                        println!("{line}");
-                    }
-                }
-                other => return Err(unexpected_response(other)),
-            },
-            WorkspaceAction::Recent => {
-                let supported = matches!(
-                    client.request(ClientMessage::Ping).await?,
-                    ResponsePayload::Pong {
-                        recent_projects_supported: true,
-                        ..
-                    }
-                );
-                if !supported {
-                    return Err(
-                        "This daemon does not keep recent projects. Upgrade daedalusd.".into(),
-                    );
-                }
-                match client.request(ClientMessage::ListRecentProjects).await? {
-                    ResponsePayload::RecentProjects(list) if list.is_empty() => {
-                        println!("No recent projects.");
-                    }
-                    ResponsePayload::RecentProjects(list) => {
-                        for project in &list {
-                            println!("{}", format_recent_project(project));
-                        }
-                    }
-                    other => return Err(unexpected_response(other)),
-                }
-            }
-            WorkspaceAction::Close {
-                id,
-                compose_down,
-                remove_worktree,
-                force,
-            } => {
-                expect_ok(
-                    client
-                        .request(ClientMessage::CloseWorkspace {
-                            id: WorkspaceId(id),
-                            compose_down,
-                            remove_worktree,
-                            force_remove_worktree: force,
-                        })
-                        .await?,
-                )?;
-                println!("closed {id}");
-            }
-        },
+        Commands::Workspace { action } => commands::workspace::execute(&mut client, action).await?,
         Commands::Widget { action } => action.run(&mut client).await?,
-        Commands::Worktree { action } => match action {
-            WorktreeAction::List { dir } => {
-                let repo_dir = resolve_dir(dir)?;
-                match client
-                    .request(ClientMessage::DiscoverWorktrees { repo_dir })
-                    .await?
-                {
-                    ResponsePayload::Worktrees(worktrees) => {
-                        for wt in worktrees {
-                            let branch = wt.branch.as_deref().unwrap_or("<detached>");
-                            let short_head: String = wt.head.chars().take(8).collect();
-                            let tag = if wt.is_primary { " [primary]" } else { "" };
-                            println!("{}  {}  ({}){}", wt.path.display(), branch, short_head, tag);
-                        }
-                    }
-                    other => return Err(unexpected_response(other)),
-                }
-            }
-            WorktreeAction::Create {
-                branch,
-                dir,
-                existing,
-                env,
-            } => {
-                let repo_dir = resolve_dir(dir)?;
-                let env_map = parse_env_pairs(&env)?;
-                match client
-                    .request(ClientMessage::CreateWorktreeWorkspace {
-                        repo_dir,
-                        branch,
-                        create_branch: !existing,
-                        env: env_map,
-                    })
-                    .await?
-                {
-                    ResponsePayload::WorkspaceCreated(ws) => println!("{}", ws.id),
-                    other => return Err(unexpected_response(other)),
-                }
-            }
-        },
-        Commands::Status { action } => match action {
-            StatusAction::Publish {
-                preset,
-                source,
-                label,
-                level,
-                workspace,
-                dir,
-                detail,
-            } => {
-                let source = resolve_status_source(preset, source)?;
-                let root_dir = resolve_target_root_dir(workspace.is_some(), dir)?;
-                expect_ok(
-                    client
-                        .request(ClientMessage::PublishExternalStatus {
-                            workspace_id: workspace.map(WorkspaceId),
-                            root_dir,
-                            source,
-                            level: level.into(),
-                            label,
-                            detail,
-                        })
-                        .await?,
-                )?;
-                println!("published");
-            }
-            StatusAction::Clear {
-                source,
-                preset,
-                workspace,
-                dir,
-            } => {
-                let source = resolve_status_source(preset, source)?;
-                let root_dir = resolve_target_root_dir(workspace.is_some(), dir)?;
-                expect_ok(
-                    client
-                        .request(ClientMessage::ClearExternalStatus {
-                            workspace_id: workspace.map(WorkspaceId),
-                            root_dir,
-                            source,
-                        })
-                        .await?,
-                )?;
-                println!("cleared");
-            }
-        },
+        Commands::Worktree { action } => commands::worktree::execute(&mut client, action).await?,
+        Commands::Status { action } => commands::status::execute(&mut client, action).await?,
         Commands::Pane { action } => commands::pane::execute(&mut client, action).await?,
         Commands::Action { action } => {
             commands::action::execute(
@@ -713,81 +447,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?
         }
-        Commands::AgentState { action } => match action {
-            AgentStateAction::Set {
-                state,
-                pane,
-                workspace,
-                dir,
-            } => {
-                let root_dir = resolve_target_root_dir(pane.is_some() || workspace.is_some(), dir)?;
-                expect_ok(
-                    client
-                        .request(ClientMessage::SetAgentState {
-                            pane_id: pane.map(PaneId),
-                            workspace_id: workspace.map(WorkspaceId),
-                            root_dir,
-                            state,
-                        })
-                        .await?,
-                )?;
-                println!("agent state set to {state}");
-            }
-        },
+        Commands::AgentState { action } => {
+            commands::status::set_agent_state(&mut client, action).await?
+        }
         Commands::FailureTrace { pane_id, json } => {
-            match client
-                .request(ClientMessage::GetFailureTrace {
-                    pane_id: PaneId(pane_id),
-                })
-                .await?
-            {
-                ResponsePayload::FailureTrace(trace) => match trace {
-                    Some(t) => {
-                        if json {
-                            println!("{}", serde_json::to_string_pretty(&t)?);
-                        } else {
-                            println!("pane_id: {}", t.pane_id);
-                            println!("exit_code: {}", t.exit_code);
-                            println!("command: {}", t.command.as_deref().unwrap_or("<unknown>"));
-                            if let Some(cwd) = &t.cwd {
-                                println!("cwd: {}", cwd.display());
-                            }
-                            if let Some(branch) = &t.git_branch {
-                                println!("git_branch: {branch}");
-                            }
-                            if let Some(diff_stat) = &t.git_diff_stat {
-                                println!("git_diff_stat:\n{diff_stat}");
-                            }
-                            println!("output:\n{}", t.output);
-                        }
-                    }
-                    None => {
-                        if json {
-                            println!("null");
-                        } else {
-                            println!("No failure trace captured for pane {pane_id}");
-                        }
-                    }
-                },
-                other => return Err(unexpected_response(other)),
-            }
+            commands::diagnostics::failure_trace(&mut client, pane_id, json).await?
         }
         Commands::Events { pane, json } => {
-            expect_ok(
-                client
-                    .request(ClientMessage::Subscribe {
-                        pane_ids: pane.map(|p| vec![PaneId(p)]),
-                        project_setup_events: false,
-                    })
-                    .await?,
-            )?;
-            while let Some(evt) = client.next_event().await? {
-                if json {
-                    println!("{}", serde_json::to_string(&evt)?);
-                } else {
-                    println!("{evt:?}");
-                }
-            }
+            commands::diagnostics::events(&mut client, pane, json).await?
         }
         Commands::Service { .. } => unreachable!("service commands exit before daemon connect"),
     }
@@ -798,6 +465,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::service::{render_launchd_plist, resolve_daedalusd_binary};
+    use std::path::Path;
 
     #[test]
     fn parses_phase3_cli_subcommands_and_flags() {

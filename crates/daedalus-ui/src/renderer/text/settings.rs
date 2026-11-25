@@ -111,7 +111,14 @@ impl TextRenderer {
             } else {
                 theme.text_primary
             };
-            line(&label, r, 14.0, color, active, true);
+            line(
+                &label,
+                r,
+                14.0,
+                color,
+                active,
+                !dialog.is_import_review_text(c),
+            );
         }
         line(
             dialog.hint(),

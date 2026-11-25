@@ -34,11 +34,18 @@ pub struct PaneViewState {
 }
 
 impl PaneViewState {
-    pub fn from_summary(summary: PaneSummary) -> Self {
-        let preset = summary
+    pub(super) fn agent_launch_preset(summary: &PaneSummary) -> Option<AgentPreset> {
+        if summary.role != daedalus_proto::PaneRole::Agent {
+            return None;
+        }
+        summary
             .launch_preset
             .as_deref()
-            .and_then(AgentPreset::from_cli_name);
+            .and_then(AgentPreset::from_cli_name)
+    }
+
+    pub fn from_summary(summary: PaneSummary) -> Self {
+        let preset = Self::agent_launch_preset(&summary);
         let cargo_preset = (summary.role == daedalus_proto::PaneRole::Runner)
             .then(|| {
                 summary

@@ -23,9 +23,90 @@ pub struct WidgetEditor {
     pub creation: Option<daedalus_proto::workbench::WorkspaceCreationPreview>,
     pub import: Option<WorkspaceImportPreview>,
     pub resolutions: std::collections::BTreeMap<String, daedalus_proto::workbench::ConflictChoice>,
+    widget_test: Option<(uuid::Uuid, String, WidgetDefinition)>,
+    import_review: Option<uuid::Uuid>,
+    import_lines: Vec<String>,
 }
 
 impl WidgetEditor {
+    pub(crate) fn start_widget_test(
+        &mut self,
+        name: &str,
+        definition: &WidgetDefinition,
+    ) -> uuid::Uuid {
+        let token = uuid::Uuid::new_v4();
+        self.preview = None;
+        self.widget_test = Some((token, name.into(), definition.clone()));
+        token
+    }
+
+    pub fn finish_widget_test(&mut self, token: uuid::Uuid) -> bool {
+        let Some((_, name, definition)) = self.widget_test.take_if(|test| test.0 == token) else {
+            return false;
+        };
+        !self.sharing
+            && self
+                .draft
+                .as_ref()
+                .and_then(|draft| draft.build().ok())
+                .is_some_and(|widget| {
+                    widget.name == name && widget.definition.unwrap_or_default() == definition
+                })
+    }
+
+    pub fn clear_preview(&mut self) {
+        self.preview = None;
+        self.widget_test = None;
+    }
+
+    pub(crate) fn start_import_review(&mut self) -> uuid::Uuid {
+        let token = uuid::Uuid::new_v4();
+        self.import_review = Some(token);
+        token
+    }
+
+    pub fn finish_import_review(&mut self, token: uuid::Uuid) -> bool {
+        if !self.sharing || self.import_review != Some(token) {
+            return false;
+        }
+        self.import_review = None;
+        true
+    }
+
+    pub(crate) fn is_reviewing_import(&self) -> bool {
+        self.import_review.is_some()
+    }
+
+    pub(crate) fn import_lines(&self) -> &[String] {
+        &self.import_lines
+    }
+
+    pub fn show_import_review(&mut self, result: WidgetResult) {
+        self.import_lines.clear();
+        for (label, value) in &result.details {
+            let row = format!("{label} · {value}");
+            self.import_lines.extend(wrap_review_row(&row));
+        }
+        self.preview = Some(result);
+        self.detail_page = 0;
+    }
+
+    pub fn clear_import_review(&mut self) {
+        self.import = None;
+        self.creation = None;
+        self.import_review = None;
+        self.import_lines.clear();
+        self.resolutions.clear();
+        self.detail_page = 0;
+        self.clear_preview();
+    }
+
+    pub fn interrupt_previews(&mut self) -> bool {
+        let widget_test_running = self.widget_test.take().is_some();
+        let import_review_running = self.import_review.take().is_some();
+        widget_test_running || import_review_running
+    }
+
     pub fn selected(&self) -> Option<&WidgetInstance> {
         self.state.as_ref()?.document.widgets.get(self.selected)
     }
@@ -50,18 +131,16 @@ impl WidgetEditor {
             .widget_definition(widget)
             .cloned()
             .unwrap_or_default();
-        self.preview = None;
-        self.draft = Some(WidgetDraft::new(
-            state.revision,
-            widget.clone(),
-            definition,
-            true,
-        ));
+        let (revision, widget) = (state.revision, widget.clone());
+        self.clear_preview();
+        self.draft = Some(WidgetDraft::new(revision, widget, definition, true));
     }
 
     pub fn create(&mut self) {
-        let Some(state) = &self.state else { return };
-        self.preview = None;
+        let Some(revision) = self.state.as_ref().map(|state| state.revision) else {
+            return;
+        };
+        self.clear_preview();
         let widget = WidgetInstance {
             id: uuid::Uuid::new_v4().to_string(),
             name: String::new(),
@@ -70,7 +149,7 @@ impl WidgetEditor {
             definition: None,
         };
         self.draft = Some(WidgetDraft::new(
-            state.revision,
+            revision,
             widget,
             WidgetDefinition::default(),
             false,
@@ -90,7 +169,7 @@ impl WidgetEditor {
             .map_or(0, |index| (index + 1) % self.library.templates.len());
         let template = self.library.templates[index].clone();
         draft.set_template(&template);
-        self.preview = None;
+        self.clear_preview();
     }
 
     pub fn update(
@@ -175,6 +254,37 @@ impl WidgetEditor {
         })
         .ok_or_else(|| "Workspace settings are still loading".into())
     }
+}
+
+fn wrap_review_row(text: &str) -> Vec<String> {
+    // Fit long argument and environment values into readable settings rows.
+    const MAX_COLUMNS: usize = 34;
+    let mut printable = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() {
+            printable.extend(character.escape_default());
+        } else {
+            printable.push(character);
+        }
+    }
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut columns = 0;
+    for character in printable.chars() {
+        let width = if character.is_ascii() && !matches!(character, 'M' | 'W' | 'm' | 'w' | '@') {
+            1
+        } else {
+            2
+        };
+        if columns + width > MAX_COLUMNS {
+            rows.push(std::mem::take(&mut row));
+            columns = 0;
+        }
+        row.push(character);
+        columns += width;
+    }
+    rows.push(row);
+    rows
 }
 
 #[derive(Clone, Debug)]

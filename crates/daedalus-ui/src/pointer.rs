@@ -26,6 +26,30 @@ struct DividerDrag {
     offset: f32,
 }
 
+#[derive(Clone, Copy)]
+enum PreviewTarget {
+    Button,
+    Panel,
+}
+
+fn preview_at(
+    layout: &WorkspaceLayout,
+    state: &AppState,
+    scale: f32,
+    (x, y): (f32, f32),
+) -> Option<PreviewTarget> {
+    if layout
+        .preview_panel(state, scale)
+        .is_some_and(|rect| rect.contains(x, y))
+    {
+        return Some(PreviewTarget::Panel);
+    }
+    layout
+        .preview_button(state, scale)
+        .filter(|rect| rect.contains(x, y))
+        .map(|_| PreviewTarget::Button)
+}
+
 fn divider_at(layout: &WorkspaceLayout, x: f32, y: f32, scale: f32) -> Option<DividerDrag> {
     let agent = layout.pane(PaneRole::Agent)?.outer;
     let service = layout.pane(PaneRole::Service)?.outer;
@@ -342,24 +366,37 @@ impl DaedalusApp {
         } = metrics;
         let (x, y) = self.pointer.position;
         let layout = self.layout_for(metrics);
-        if layout
-            .preview_panel(&self.state, scale_factor)
-            .is_some_and(|rect| rect.contains(x, y))
-        {
-            self.state.image_preview = None;
-            self.request_redraw();
+        if self.handle_viewport_controls(&layout, scale_factor) {
             return;
         }
-        if layout
-            .preview_button(&self.state, scale_factor)
-            .is_some_and(|rect| rect.contains(x, y))
-        {
-            self.handle_ui_action(UiAction::PreviewImage);
-            return;
+        let target = hit_test(
+            &layout,
+            self.state.workspaces.len(),
+            scale_factor,
+            cell_w,
+            cell_h,
+            x,
+            y,
+        );
+
+        self.activate_hit_target(&layout, target);
+    }
+
+    fn handle_viewport_controls(&mut self, layout: &WorkspaceLayout, scale: f32) -> bool {
+        let (x, y) = self.pointer.position;
+        if let Some(target) = preview_at(layout, &self.state, scale, (x, y)) {
+            match target {
+                PreviewTarget::Panel => {
+                    self.state.image_preview = None;
+                    self.request_redraw();
+                }
+                PreviewTarget::Button => self.handle_ui_action(UiAction::PreviewImage),
+            }
+            return true;
         }
-        if let Some(drag) = divider_at(&layout, x, y, scale_factor) {
+        if let Some(drag) = divider_at(layout, x, y, scale) {
             self.pointer.divider_drag = Some(drag);
-            return;
+            return true;
         }
         if let Some(search) = self.state.search.as_ref()
             && let Some(role) = self
@@ -373,10 +410,10 @@ impl DaedalusApp {
                 .map(|p| p.role)
             && let Some(pane_rect) = layout.pane(role)
         {
-            let bar = search_bar_rect(pane_rect, scale_factor);
+            let bar = search_bar_rect(pane_rect, scale);
             if let Some(action) = search_click(bar, x, y) {
                 self.handle_ui_action(action);
-                return;
+                return true;
             }
         }
         self.state.recap.keyboard_row = None;
@@ -391,18 +428,12 @@ impl DaedalusApp {
                 self.schedule_resize_flush();
                 self.request_redraw();
             }
-            return;
+            return true;
         }
-        let target = hit_test(
-            &layout,
-            self.state.workspaces.len(),
-            scale_factor,
-            cell_w,
-            cell_h,
-            x,
-            y,
-        );
+        false
+    }
 
+    fn activate_hit_target(&mut self, layout: &WorkspaceLayout, target: HitTarget) {
         match target {
             HitTarget::SidebarPageUp | HitTarget::SidebarPageDown => {
                 if let Some(list) = &layout.sidebar_content {
@@ -423,15 +454,8 @@ impl DaedalusApp {
                 self.handle_ui_action(UiAction::OpenFailedRun(workspace));
             }
             HitTarget::SidebarWorkspace(idx) => {
-                if let Some(ws) = self.state.workspaces.get(idx) {
-                    let ws_id = ws.id;
-                    if self.state.active_workspace_id != Some(ws_id) {
-                        self.state.select_workspace(ws_id);
-                        self.state.close_search();
-                        self.ensure_active_workspace_panes();
-                        self.schedule_resize_flush();
-                        self.request_redraw();
-                    }
+                if let Some(id) = self.state.workspaces.get(idx).map(|workspace| workspace.id) {
+                    self.activate_workspace(id);
                 }
             }
             HitTarget::SidebarWorkspaceClose(idx) => {
@@ -461,42 +485,42 @@ impl DaedalusApp {
                 self.request_redraw();
             }
             HitTarget::PaneViewport { role, col, row } => {
-                self.state.focus_clicked_pane(role);
-                if is_link_click_modifier(self.modifiers) {
-                    self.open_clicked_link(role, col, row);
-                    self.request_redraw();
-                    return;
-                }
-                if let Some(pane_id) = self.state.pane_id_for_role(role)
-                    && let Some(pane) = self.state.panes.get_mut(&pane_id)
-                {
-                    let cell = (col, row);
-                    if !self.modifiers.shift_key()
-                        && let Some(modes) = live_terminal_modes(pane)
-                        && let Some(data) = terminal_mouse_report(
-                            modes,
-                            TerminalMouseEvent::Press,
-                            self.modifiers,
-                            cell,
-                        )
-                    {
-                        self.pointer.last_click = None;
-                        self.pointer.terminal_hover = None;
-                        if self.send_command(UiCommand::SendInput { pane_id, data }) {
-                            self.pointer.terminal_press = Some(TerminalPress {
-                                pane_id,
-                                modes,
-                                cell,
-                            });
-                        }
-                    } else {
-                        self.pointer.select_at(pane, col, row, Instant::now());
-                    }
-                }
-                self.request_redraw();
+                self.handle_terminal_press(role, col, row);
             }
             HitTarget::None => {}
         }
+    }
+
+    fn handle_terminal_press(&mut self, role: PaneRole, col: u16, row: u16) {
+        self.state.focus_clicked_pane(role);
+        if is_link_click_modifier(self.modifiers) {
+            self.open_clicked_link(role, col, row);
+            self.request_redraw();
+            return;
+        }
+        if let Some(pane_id) = self.state.pane_id_for_role(role)
+            && let Some(pane) = self.state.panes.get_mut(&pane_id)
+        {
+            let cell = (col, row);
+            if !self.modifiers.shift_key()
+                && let Some(modes) = live_terminal_modes(pane)
+                && let Some(data) =
+                    terminal_mouse_report(modes, TerminalMouseEvent::Press, self.modifiers, cell)
+            {
+                self.pointer.last_click = None;
+                self.pointer.terminal_hover = None;
+                if self.send_command(UiCommand::SendInput { pane_id, data }) {
+                    self.pointer.terminal_press = Some(TerminalPress {
+                        pane_id,
+                        modes,
+                        cell,
+                    });
+                }
+            } else {
+                self.pointer.select_at(pane, col, row, Instant::now());
+            }
+        }
+        self.request_redraw();
     }
 
     pub(super) fn handle_left_mouse_up(&mut self) {
@@ -579,6 +603,10 @@ impl DaedalusApp {
     }
 
     pub(super) fn handle_cursor_moved(&mut self, x: f32, y: f32) {
+        self.move_pointer(x, y, self.viewport_metrics());
+    }
+
+    pub(super) fn move_pointer(&mut self, x: f32, y: f32, metrics: Option<ViewportMetrics>) {
         self.pointer.position = (x, y);
         if let Some(drag) = self.pointer.divider_drag {
             let coordinate = if drag.divider == Divider::Column {
@@ -597,7 +625,7 @@ impl DaedalusApp {
             return;
         }
         if self.pointer.drag_anchor.is_none()
-            && let Some(metrics) = self.viewport_metrics()
+            && let Some(metrics) = metrics
         {
             let layout = self.layout_for(metrics);
             let handle = (!self.state.zoomed)
@@ -614,9 +642,7 @@ impl DaedalusApp {
             );
             let viewport_available = handle.is_none()
                 && !self.state.has_input_overlay()
-                && !layout
-                    .preview_panel(&self.state, metrics.scale_factor)
-                    .is_some_and(|rect| rect.contains(x, y));
+                && preview_at(&layout, &self.state, metrics.scale_factor, (x, y)).is_none();
             self.report_terminal_motion(viewport_available.then_some(target));
             let url = if viewport_available
                 && let HitTarget::PaneViewport { role, col, row } = target
@@ -644,7 +670,7 @@ impl DaedalusApp {
         }
 
         if self.pointer.drag_anchor.is_some()
-            && let Some(metrics) = self.viewport_metrics()
+            && let Some(metrics) = metrics
         {
             self.drag_selection(metrics);
         }

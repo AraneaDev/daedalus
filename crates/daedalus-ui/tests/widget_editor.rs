@@ -8,14 +8,12 @@ use daedalus_ui::widget_editor::WidgetEditor;
 fn editor(widget: WidgetInstance) -> WidgetEditor {
     let mut document = WorkspaceDocument::new("Editor".into());
     document.widgets.push(widget);
-    let mut editor = WidgetEditor {
-        state: Some(WorkbenchState {
-            revision: 5,
-            document,
-            repo_baseline: None,
-        }),
-        ..Default::default()
-    };
+    let mut editor = WidgetEditor::default();
+    editor.state = Some(WorkbenchState {
+        revision: 5,
+        document,
+        repo_baseline: None,
+    });
     editor.edit();
     editor
 }

@@ -540,21 +540,37 @@ async fn linked_import_applies_the_explicit_choices_from_a_renewed_preview() {
 
     let renewed = daemon.repo_preview(workspace_id).await;
     assert_eq!(renewed, preview);
-    let ResponsePayload::Workbench(saved) = daemon
-        .call(apply(
-            renewed,
-            [
-                (paths[0].into(), ConflictChoice::Incoming),
-                (paths[1].into(), ConflictChoice::Local),
-            ]
-            .into(),
-        ))
-        .await
-        .unwrap()
+    let resolutions: std::collections::BTreeMap<_, _> = [
+        (paths[0].into(), ConflictChoice::Incoming),
+        (paths[1].into(), ConflictChoice::Local),
+    ]
+    .into();
+    let resolve = |revision| ClientMessage::ResolveWorkspaceImport {
+        workspace_id,
+        revision,
+        incoming: renewed.incoming.clone(),
+        linked: renewed.linked,
+        resolutions: resolutions.clone(),
+    };
+    assert!(matches!(
+        daemon.call(resolve(renewed.revision - 1)).await,
+        Err(ProtoError::InvalidRequest(message)) if message.contains("Preview the import again")
+    ));
+    let ResponsePayload::WorkspaceImportPreview(reviewed) =
+        daemon.call(resolve(renewed.revision)).await.unwrap()
+    else {
+        panic!("expected resolved import review");
+    };
+    assert_eq!(reviewed.revision, renewed.revision);
+    assert!(reviewed.conflicts.is_empty());
+    assert_eq!(reviewed.proposed.name, "Repo name");
+    assert_eq!(daemon.workbench(workspace_id).await, edited);
+    let ResponsePayload::Workbench(saved) = daemon.call(apply(renewed, resolutions)).await.unwrap()
     else {
         panic!("expected resolved workbench");
     };
     assert_eq!(saved.revision, edited.revision + 1);
+    assert_eq!(saved.document, reviewed.proposed);
     assert_eq!(saved.document.name, "Repo name");
     assert_eq!(saved.document.widgets, local.widgets);
     assert_eq!(saved.document.templates, local.templates);

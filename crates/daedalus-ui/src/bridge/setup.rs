@@ -1,4 +1,5 @@
 use super::rpc::{RpcConnection, RpcError};
+use super::workspace::emit_spawned_pane;
 use super::{DEFAULT_PANE_COLS, DEFAULT_PANE_ROWS, UiEvent, UiEventSink};
 use crate::assignments::{self, Assignment};
 use crate::state::AgentPreset;
@@ -89,7 +90,7 @@ pub(super) async fn launch_assignment(
         assignment
             .argv
             .first()
-            .and_then(|program| AgentPreset::from_cli_name(program))
+            .and_then(|program| AgentPreset::from_executable(program))
     } else {
         None
     };
@@ -115,10 +116,7 @@ pub(super) async fn launch_assignment(
         spawn(conn, workspace_id, assignment.role, command, cols, rows).await?
     };
     let pane_id = summary.id;
-    sink.emit(UiEvent::PaneSpawned {
-        summary,
-        agent_preset,
-    });
+    emit_spawned_pane(conn, sink, summary, agent_preset, false);
     sink.emit(UiEvent::AssignmentStarted {
         workspace_id,
         pane_id,
@@ -292,10 +290,7 @@ pub(super) async fn install(
     {
         Ok(summary) => {
             let pane_id = summary.id;
-            sink.emit(UiEvent::PaneSpawned {
-                summary,
-                agent_preset: None,
-            });
+            emit_spawned_pane(conn, sink, summary, None, false);
             sink.emit(UiEvent::SetupInstallerStarted {
                 workspace_id,
                 pane_id,

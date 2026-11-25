@@ -13,6 +13,7 @@ use crate::persistence::{PersistedRecentProject, PersistedWorkspace, StateStore}
 use crate::runtime_monitor::WorkspaceMonitorTarget;
 use crate::shell_integration::ShellIntegration;
 use crate::supervisor::{IsolationMode, Supervisor};
+use crate::workbench::scheduler::WidgetCommands;
 use crate::workbench::store::WorkbenchStore;
 use crate::worktree::{self, WorktreeError};
 use daedalus_proto::{
@@ -64,6 +65,7 @@ struct WorkspaceRecord {
     pane_ids: Vec<PaneId>,
     default_panes: DefaultPanes,
     lifecycle: std::sync::Arc<Mutex<()>>,
+    widget_commands: Arc<WidgetCommands>,
     journal: Journal,
     bound_ports: Vec<PortMapping>,
     containers: Vec<ContainerHealth>,
@@ -202,6 +204,7 @@ fn build_workspace_record(
             DefaultPanes::Pending(HashSet::new())
         },
         lifecycle: Default::default(),
+        widget_commands: Default::default(),
         journal: Journal::default(),
         bound_ports: Vec::new(),
         containers: Vec::new(),
@@ -218,7 +221,6 @@ pub struct Registry {
     event_tx: broadcast::Sender<ServerEvent>,
     state_store: Option<StateStore>,
     pub(crate) workbench_store: WorkbenchStore,
-    widget_commands: crate::workbench::scheduler::WidgetCommands,
     persist_lock: Arc<Mutex<persistence::PersistenceWriteState>>,
     unresolved_legacy_roots: RwLock<Vec<PersistedWorkspace>>,
     create_lock: Mutex<()>,
@@ -255,7 +257,6 @@ impl Registry {
             event_tx,
             state_store,
             workbench_store: WorkbenchStore::new(workbench_directory),
-            widget_commands: Default::default(),
             persist_lock: Arc::new(Mutex::new(persistence::PersistenceWriteState::Unchecked)),
             unresolved_legacy_roots: RwLock::new(Vec::new()),
             create_lock: Mutex::new(()),
@@ -319,6 +320,22 @@ impl Registry {
         env: HashMap<String, String>,
         manual_launch: bool,
     ) -> Result<WorkspaceInfo, ProtoError> {
+        let create_guard = self.create_lock.lock().await;
+        let info = self
+            .register_workspace(name, root_dir, env, manual_launch)
+            .await?;
+        drop(create_guard);
+        Ok(self.finish_workspace_creation(info).await)
+    }
+
+    /// Registers the workspace while the caller holds `create_lock`.
+    async fn register_workspace(
+        &self,
+        name: String,
+        root_dir: PathBuf,
+        env: HashMap<String, String>,
+        manual_launch: bool,
+    ) -> Result<WorkspaceInfo, ProtoError> {
         let root_dir =
             std::path::absolute(root_dir).map_err(|err| ProtoError::IoError(err.to_string()))?;
         if !root_dir.is_dir() {
@@ -328,7 +345,6 @@ impl Registry {
             )));
         }
 
-        let _create_guard = self.create_lock.lock().await;
         let (slot_index, reserved_ports) = {
             let ws_map = self.workspaces.read().await;
             let used_slots: HashSet<u16> = ws_map.values().map(|ws| ws.slot_index).collect();
@@ -353,14 +369,17 @@ impl Registry {
 
         let id = WorkspaceId::new();
         let record = build_workspace_record(id, name, root_dir, prepared, manual_launch);
-        let mut info = record.to_info(Vec::new());
+        let info = record.to_info(Vec::new());
         self.record_recent_project(&info.name, &info.root_dir).await;
         self.workspaces.write().await.insert(id, record);
         self.notify_membership();
-        drop(_create_guard);
+        Ok(info)
+    }
+
+    async fn finish_workspace_creation(&self, mut info: WorkspaceInfo) -> WorkspaceInfo {
         self.persist_state().await;
         self.attach_project_setup(&mut info).await;
-        Ok(info)
+        info
     }
 
     pub async fn discover_worktrees(
@@ -397,22 +416,58 @@ impl Registry {
         let base_dir = self.worktrees_base_dir();
         let branch_clone = branch.clone();
         let wt = tokio::task::spawn_blocking(move || {
-            worktree::create_worktree(&repo_dir, &branch_clone, create_branch, &base_dir)
+            worktree::create_worktree_for_registration(
+                &repo_dir,
+                &branch_clone,
+                create_branch,
+                &base_dir,
+            )
         })
         .await
         .map_err(|e| ProtoError::Internal(format!("worktree creation task failed: {e}")))?
         .map_err(ProtoError::InvalidRequest)?;
 
-        let name = wt
-            .path
+        let path = wt.info.path.clone();
+        let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .or_else(|| wt.branch.clone())
+            .or_else(|| wt.info.branch.clone())
             .unwrap_or(branch);
 
-        self.create_workspace(name, wt.path, env).await
+        // Git hooks can run while other workspace requests proceed. Serialize registration
+        // and rollback from here, and check whether a request already claimed this checkout.
+        let create_guard = self.create_lock.lock().await;
+        let info = match self
+            .register_workspace(name, path.clone(), env, false)
+            .await
+        {
+            Ok(info) => info,
+            Err(error) => {
+                let already_registered = self
+                    .workspaces
+                    .read()
+                    .await
+                    .values()
+                    .any(|record| record.canonical_root_dir == wt.canonical_target);
+                let cleanup_error = if already_registered {
+                    "another workspace is using the checkout".into()
+                } else {
+                    match tokio::task::spawn_blocking(move || wt.rollback()).await {
+                        Ok(Ok(())) => return Err(error),
+                        Ok(Err(reason)) => reason,
+                        Err(task_error) => task_error.to_string(),
+                    }
+                };
+                return Err(ProtoError::IoError(format!(
+                    "{error}. Worktree cleanup at {} failed: {cleanup_error}. Inspect the checkout and branch with git worktree list before retrying.",
+                    path.display()
+                )));
+            }
+        };
+        drop(create_guard);
+        Ok(self.finish_workspace_creation(info).await)
     }
 
     pub async fn list_workspaces(&self) -> Vec<WorkspaceInfo> {
@@ -679,7 +734,7 @@ impl Registry {
         is_default: bool,
         assignment_id: Option<String>,
     ) -> Result<PaneSummary, ProtoError> {
-        let (root_dir, mut merged_env, journal) = {
+        let (root_dir, mut merged_env, journal, manifest_preset) = {
             let ws_map = self.workspaces.read().await;
             let ws = ws_map
                 .get(&workspace_id)
@@ -688,6 +743,16 @@ impl Registry {
                 ws.root_dir.clone(),
                 ws.injected_env.clone(),
                 ws.journal.clone(),
+                ws.manifest
+                    .as_ref()
+                    .filter(|_| role == PaneRole::Agent)
+                    .filter(|manifest| {
+                        command.as_ref().is_some_and(|argv| {
+                            !argv.is_empty() && manifest.agent_command.as_ref() == Some(argv)
+                        })
+                    })
+                    .and_then(|manifest| manifest.agent_preset.as_deref())
+                    .and_then(daedalus_proto::canonical_agent_preset),
             )
         };
         merged_env.extend(pane_env);
@@ -697,7 +762,7 @@ impl Registry {
             .shell_integration
             .build_launch_spec(command.as_deref(), shell.as_deref());
 
-        let spawned = self
+        let mut spawned = self
             .supervisor
             .spawn_pty(
                 workspace_id,
@@ -710,6 +775,9 @@ impl Registry {
                 &merged_env,
             )
             .map_err(ProtoError::SpawnFailed)?;
+        if spawned.launch_preset.is_none() {
+            spawned.launch_preset = manifest_preset.map(str::to_owned);
+        }
 
         let handle = PaneHandle::spawn_journaled(
             workspace_id,
@@ -895,7 +963,9 @@ impl Registry {
             return Err(error);
         }
 
-        self.workspaces.write().await.remove(&workspace_id);
+        if let Some(workspace) = self.workspaces.write().await.remove(&workspace_id) {
+            workspace.widget_commands.close();
+        }
         self.notify_membership();
         if persist {
             self.persist_state().await;
@@ -1390,6 +1460,78 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ProtoError::WorkspaceNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn failed_worktree_registration_preserves_existing_branch_and_allows_retry() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let worktrees = dir.path().join("worktrees");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let commit = |message| {
+            git(&["add", ".env"]);
+            git(&[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "-m",
+                message,
+            ]);
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(repo.join(".env"), "PORT=65500\n").unwrap();
+        commit("overflowing port");
+        git(&["branch", "existing"]);
+
+        let registry = test_registry(dir.path());
+        registry.set_worktrees_dir(worktrees.clone());
+        registry
+            .create_workspace("slot zero".into(), dir.path().to_path_buf(), HashMap::new())
+            .await
+            .unwrap();
+
+        for (branch, create_branch) in [("new", true), ("existing", false)] {
+            let error = registry
+                .create_worktree_workspace(
+                    repo.clone(),
+                    branch.into(),
+                    create_branch,
+                    HashMap::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ProtoError::IoError(message) if message.contains("port block"))
+            );
+            assert!(!worktrees.join("repo").join(branch).exists());
+        }
+        git(&["show-ref", "--verify", "refs/heads/existing"]);
+        assert_eq!(worktree::discover_worktrees(&repo).unwrap().len(), 1);
+        assert_eq!(registry.list_workspaces().await.len(), 1);
+
+        std::fs::write(repo.join(".env"), "# no port reservation\n").unwrap();
+        commit("remove invalid port");
+        let workspace = registry
+            .create_worktree_workspace(repo, "new".into(), true, HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(workspace.git_branch.as_deref(), Some("new"));
+        assert!(workspace.root_dir.is_dir());
     }
 
     #[tokio::test]

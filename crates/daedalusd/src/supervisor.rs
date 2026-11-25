@@ -176,13 +176,11 @@ impl Supervisor {
             .take_writer()
             .map_err(|e| format!("take master writer failed: {e}"))?;
 
-        let program = launch.program.rsplit(['/', '\\']).next().unwrap_or("");
         let launch_preset = match role {
-            PaneRole::Agent => daedalus_proto::canonical_agent_preset(
-                program.trim_end_matches(".exe").trim_end_matches(".cmd"),
-            ),
+            PaneRole::Agent => daedalus_proto::agent_launch_preset(&launch.program)
+                .or((!launch.direct).then_some("shell")),
             PaneRole::Runner if launch.direct => daedalus_proto::cargo_launch_preset(
-                program,
+                &launch.program,
                 launch.args.first().map(String::as_str),
             ),
             _ => None,

@@ -106,12 +106,13 @@ async fn daemon_bridge_bootstraps_three_panes_and_forwards_runner_failure_to_age
                 }
                 UiEvent::PaneSpawned {
                     summary,
-                    agent_preset,
+                    select_tab,
                 } => {
                     if summary.role == PaneRole::Agent {
-                        assert_eq!(agent_preset, Some(AgentPreset::Shell));
+                        assert_eq!(summary.launch_preset.as_deref(), Some("shell"));
+                        assert!(select_tab);
                     } else {
-                        assert_eq!(agent_preset, None);
+                        assert!(!select_tab);
                     }
                     panes_by_role.insert(summary.role, summary.id);
                 }
@@ -136,11 +137,12 @@ async fn daemon_bridge_bootstraps_three_panes_and_forwards_runner_failure_to_age
         loop {
             if let UiEvent::PaneSpawned {
                 summary,
-                agent_preset,
+                select_tab,
             } = evt_rx.recv().await.unwrap()
             {
                 assert_eq!(summary.role, PaneRole::Agent);
-                assert_eq!(agent_preset, Some(AgentPreset::Shell));
+                assert_eq!(summary.launch_preset.as_deref(), Some("shell"));
+                assert!(select_tab);
                 break summary.id;
             }
         }
@@ -991,6 +993,8 @@ async fn queued_terminal_input_stays_with_its_connection() {
                     workbench_supported: false,
                     workspace_membership_supported: false,
                     runner_assignment_supported: false,
+                    resolved_import_preview_supported: false,
+                    agent_launch_metadata_supported: false,
                     home_dir: None,
                 },
                 _ => ResponsePayload::Ok,

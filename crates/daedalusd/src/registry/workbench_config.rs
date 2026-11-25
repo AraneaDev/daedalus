@@ -26,23 +26,21 @@ impl Registry {
         document: WorkspaceDocument,
         repo_link: RepoLink,
     ) -> Result<Change<WorkbenchState>, ProtoError> {
-        let lifecycle = self
+        let _guard = self.lock_workspace_lifecycle(id).await?;
+        let widget_commands = self
             .workspaces
             .read()
             .await
             .get(&id)
             .ok_or(ProtoError::WorkspaceNotFound(id))?
-            .lifecycle
+            .widget_commands
             .clone();
-        let _guard = lifecycle.lock().await;
-        if !self.workspaces.read().await.contains_key(&id) {
-            return Err(ProtoError::WorkspaceNotFound(id));
-        }
         let result = self
             .workbench_store
             .update_workspace(id, revision, document, repo_link)
             .await?;
         if let Change::Applied(state) = &result {
+            widget_commands.reconcile(state);
             let _ = self.event_tx.send(ServerEvent::WorkbenchChanged {
                 workspace_id: id,
                 revision: state.revision,

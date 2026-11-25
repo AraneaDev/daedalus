@@ -2,17 +2,19 @@ use super::Registry;
 use crate::pane_actor::PaneHandle;
 use crate::workbench::documents::validate_definition;
 use crate::workbench::runtime::{SourceFields, WidgetInputs, evaluate_widget};
-use crate::workbench::scheduler::Trigger;
+use crate::workbench::scheduler::{Trigger, WidgetCommands};
 use crate::workbench::{command, sources};
 use daedalus_proto::workbench::{
     CommandOutput, WidgetAction, WidgetActionResult, WidgetDefinition, WidgetResult,
     WidgetSnapshot, WidgetSource, WorkspaceCommand,
 };
 use daedalus_proto::{PaneRole, ProtoError, WorkspaceId, WorkspaceInfo};
+use std::sync::Arc;
 
 struct WidgetWorkspace {
     info: WorkspaceInfo,
     handles: Vec<PaneHandle>,
+    commands: Arc<WidgetCommands>,
 }
 
 impl Registry {
@@ -93,6 +95,7 @@ impl Registry {
     ) -> Result<Vec<WidgetSnapshot>, ProtoError> {
         let state = self.workbench(id).await?;
         let workspace = self.widget_workspace(id).await?;
+        workspace.commands.reconcile(&state);
         if let Some(id) = &refresh
             && !state.document.widgets.iter().any(|widget| &widget.id == id)
         {
@@ -111,6 +114,7 @@ impl Registry {
                     definition,
                     &widget.name,
                     Some((
+                        state.revision,
                         &widget.id,
                         if refresh.as_ref() == Some(&widget.id) {
                             Trigger::Manual
@@ -144,22 +148,29 @@ impl Registry {
             .await
             .values()
             .filter(|workspace| runner.is_none_or(|id| workspace.id == id))
-            .map(|workspace| workspace.to_info(Vec::new()))
+            .map(|workspace| {
+                (
+                    workspace.to_info(Vec::new()),
+                    workspace.widget_commands.clone(),
+                )
+            })
             .collect::<Vec<_>>();
-        for workspace in workspaces {
+        for (workspace, commands) in workspaces {
             let Ok(state) = self.workbench(workspace.id).await else {
                 continue;
             };
             if state.revision == 0 {
                 continue;
             }
-            let workspace = std::sync::Arc::new(workspace);
+            commands.reconcile(&state);
+            let workspace = Arc::new(workspace);
             for widget in &state.document.widgets {
                 let Some(definition) = state.document.widget_definition(widget) else {
                     continue;
                 };
                 for source in &definition.sources {
-                    self.widget_commands.schedule(
+                    commands.schedule(
+                        state.revision,
                         workspace.clone(),
                         &widget.id,
                         source,
@@ -172,16 +183,23 @@ impl Registry {
     }
 
     async fn widget_workspace(&self, id: WorkspaceId) -> Result<WidgetWorkspace, ProtoError> {
-        let (info, handles) = {
+        let ((info, handles), commands) = {
             let workspaces = self.workspaces.read().await;
             let panes = self.panes.read().await;
-            workspaces
+            let workspace = workspaces
                 .get(&id)
-                .ok_or(ProtoError::WorkspaceNotFound(id))?
-                .snapshot_handles(&panes)
+                .ok_or(ProtoError::WorkspaceNotFound(id))?;
+            (
+                workspace.snapshot_handles(&panes),
+                workspace.widget_commands.clone(),
+            )
         };
         let info = Self::with_pane_summaries(info, handles.clone()).await;
-        Ok(WidgetWorkspace { info, handles })
+        Ok(WidgetWorkspace {
+            info,
+            handles,
+            commands,
+        })
     }
 
     async fn widget_result(
@@ -189,7 +207,7 @@ impl Registry {
         workspace: &WidgetWorkspace,
         definition: &WidgetDefinition,
         name: &str,
-        saved: Option<(&str, Trigger)>,
+        saved: Option<(u64, &str, Trigger)>,
     ) -> WidgetResult {
         let mut inputs = WidgetInputs::new();
         for named in &definition.sources {
@@ -216,9 +234,10 @@ impl Registry {
                     output,
                     ..
                 } => match saved {
-                    Some((widget, trigger)) => {
-                        self.widget_commands
-                            .fields(&workspace.info, widget, named, trigger)
+                    Some((revision, widget, trigger)) => {
+                        workspace
+                            .commands
+                            .fields(revision, &workspace.info, widget, named, trigger)
                             .await
                     }
                     None => command::run(&workspace.info, spec, output).await,
@@ -272,6 +291,7 @@ mod tests {
     use crate::supervisor::{IsolationMode, Supervisor};
     use daedalus_proto::workbench::{
         NamedAction, NamedSource, RefreshPolicy, WidgetDisplay, WidgetField, WidgetInstance,
+        WorkspaceDocument,
     };
     use daedalus_proto::{Assignment, PaneStatus, StatusLevel};
     use std::path::Path;
@@ -283,6 +303,140 @@ mod tests {
             ShellIntegration::prepare(path).unwrap(),
             events,
         )
+    }
+
+    async fn hold_queued_refresh(
+        path: &Path,
+    ) -> (
+        Registry,
+        WorkspaceId,
+        WorkspaceDocument,
+        tokio::task::JoinSet<()>,
+    ) {
+        let registry = test_registry(path);
+        let workspace = registry
+            .create_workspace("Queued refresh".into(), path.into(), Default::default())
+            .await
+            .unwrap();
+        let mut document = registry.workbench(workspace.id).await.unwrap().document;
+        document.widgets.push(WidgetInstance {
+            id: "queued".into(),
+            name: "Queued".into(),
+            pinned: true,
+            template: None,
+            definition: Some(WidgetDefinition {
+                sources: vec![NamedSource {
+                    id: "command".into(),
+                    source: WidgetSource::Command {
+                        command: WorkspaceCommand {
+                            argv: vec![
+                                "/bin/sh".into(),
+                                "-c".into(),
+                                "echo run >> runs; while [ ! -f release ]; do sleep 0.01; done"
+                                    .into(),
+                            ],
+                            env: Vec::new(),
+                            timeout_seconds: Some(10),
+                        },
+                        refresh: RefreshPolicy {
+                            interval_seconds: None,
+                            on_runner_completion: true,
+                        },
+                        output: CommandOutput::ExitStatus,
+                    },
+                }],
+                ..WidgetDefinition::default()
+            }),
+        });
+        registry
+            .update_workbench(workspace.id, Some(0), document.clone())
+            .await
+            .unwrap();
+
+        let mut jobs = tokio::task::JoinSet::new();
+        registry
+            .refresh_scheduled_widgets(Some(workspace.id), &mut jobs)
+            .await;
+        let runs = path.join("runs");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !runs.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        registry
+            .refresh_scheduled_widgets(Some(workspace.id), &mut jobs)
+            .await;
+        assert_eq!(jobs.len(), 1, "the runner refresh should be coalesced");
+        (registry, workspace.id, document, jobs)
+    }
+
+    async fn finish_held_refresh(path: &Path, mut jobs: tokio::task::JoinSet<()>) -> String {
+        std::fs::write(path.join("release"), "").unwrap();
+        jobs.join_next().await.unwrap().unwrap();
+        assert!(jobs.is_empty());
+        std::fs::read_to_string(path.join("runs")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn deleting_a_widget_retires_its_queued_runner_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, workspace, mut document, jobs) = hold_queued_refresh(dir.path()).await;
+        document.widgets.clear();
+        registry
+            .update_workbench(workspace, Some(1), document)
+            .await
+            .unwrap();
+        assert_eq!(finish_held_refresh(dir.path(), jobs).await, "run\n");
+    }
+
+    #[tokio::test]
+    async fn closing_the_workspace_retires_its_queued_runner_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, workspace, _, jobs) = hold_queued_refresh(dir.path()).await;
+        registry
+            .close_workspace(workspace, false, false, false)
+            .await
+            .unwrap();
+        assert_eq!(finish_held_refresh(dir.path(), jobs).await, "run\n");
+    }
+
+    #[tokio::test]
+    async fn a_replacement_uses_only_its_own_queued_runner_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, workspace, mut document, mut jobs) = hold_queued_refresh(dir.path()).await;
+        let source = &mut document.widgets[0].definition.as_mut().unwrap().sources[0];
+        let WidgetSource::Command { command, .. } = &mut source.source else {
+            unreachable!("the fixture installs a command source");
+        };
+        // The replacement records if it overlaps the original process.
+        command.argv[2] =
+            "if [ -f release ]; then echo replacement; else echo overlapped; fi >> runs".into();
+        registry
+            .update_workbench(workspace, Some(1), document)
+            .await
+            .unwrap();
+        registry
+            .refresh_scheduled_widgets(Some(workspace), &mut jobs)
+            .await;
+        assert_eq!(jobs.len(), 1, "the original process still owns the slot");
+        assert_eq!(
+            finish_held_refresh(dir.path(), jobs).await,
+            "run\nreplacement\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_revision_keeps_the_queued_runner_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, workspace, mut document, jobs) = hold_queued_refresh(dir.path()).await;
+        document.name = "Renamed".into();
+        registry
+            .update_workbench(workspace, Some(1), document)
+            .await
+            .unwrap();
+        assert_eq!(finish_held_refresh(dir.path(), jobs).await, "run\nrun\n");
     }
 
     fn action(id: &str, action: WidgetAction) -> NamedAction {

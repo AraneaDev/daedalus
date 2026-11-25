@@ -1,8 +1,8 @@
 use super::command;
 use super::runtime::SourceFields;
 use crate::registry::Registry;
-use daedalus_proto::workbench::{NamedSource, WidgetSource};
-use daedalus_proto::{PaneId, PaneRole, ServerEvent, WorkspaceId, WorkspaceInfo};
+use daedalus_proto::workbench::{NamedSource, WidgetSource, WorkbenchState};
+use daedalus_proto::{PaneId, PaneRole, ServerEvent, WorkspaceInfo};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,21 +18,74 @@ pub(crate) enum Trigger {
     Runner,
 }
 
-type Key = (WorkspaceId, String, String);
+type Key = (String, String);
 type Entry = Arc<Mutex<CommandState>>;
 
+pub(crate) struct WidgetCommands(Mutex<Option<WorkspaceCommands>>);
+
 #[derive(Default)]
-pub(crate) struct WidgetCommands(Mutex<HashMap<Key, Entry>>);
+struct WorkspaceCommands {
+    revision: u64,
+    entries: HashMap<Key, Entry>,
+}
+
+impl Default for WidgetCommands {
+    fn default() -> Self {
+        Self(Mutex::new(Some(WorkspaceCommands::default())))
+    }
+}
 
 #[derive(Default)]
 struct CommandState {
+    specification: Option<Arc<WidgetSource>>,
     active: bool,
-    pending_runner: Option<(WorkspaceInfo, NamedSource)>,
+    pending_runner: Option<(WorkspaceInfo, Arc<WidgetSource>)>,
     previous: Option<Run>,
 }
 
+impl CommandState {
+    fn configure(&mut self, specification: Option<&WidgetSource>) {
+        if self.specification.as_deref() != specification {
+            self.specification = specification.cloned().map(Arc::new);
+            self.pending_runner = None;
+            self.previous = None;
+        }
+    }
+
+    fn is_current(&self, specification: &Arc<WidgetSource>) -> bool {
+        self.specification
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, specification))
+    }
+
+    fn remember(&mut self, fields: &mut SourceFields) {
+        let last_success = if fields.contains_key("error") {
+            if let Some(previous) = &self.previous {
+                for (key, value) in &previous.fields {
+                    fields.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+                previous.last_success
+            } else {
+                None
+            }
+        } else {
+            Some(Instant::now())
+        };
+        if let Some(last_success) = last_success.filter(|_| fields.contains_key("error")) {
+            fields.insert(
+                "detail.Last successful refresh".into(),
+                format!("{} seconds ago", last_success.elapsed().as_secs()),
+            );
+        }
+        self.previous = Some(Run {
+            fields: fields.clone(),
+            completion: Instant::now(),
+            last_success,
+        });
+    }
+}
+
 struct Run {
-    specification: WidgetSource,
     fields: SourceFields,
     completion: Instant,
     last_success: Option<Instant>,
@@ -45,6 +98,7 @@ enum Refresh {
 
 struct ActiveRun {
     entry: Entry,
+    specification: Arc<WidgetSource>,
     owns_entry: bool,
 }
 
@@ -59,48 +113,28 @@ impl Drop for ActiveRun {
 }
 
 impl ActiveRun {
-    async fn execute(mut self, workspace: &WorkspaceInfo, source: &NamedSource) -> SourceFields {
+    async fn execute(mut self, workspace: &WorkspaceInfo) -> SourceFields {
         let mut queued = None;
+        let mut fields = SourceFields::new();
         loop {
-            let (workspace, source) = queued
+            let (workspace, specification) = queued
                 .as_ref()
-                .map_or((workspace, source), |(ws, source)| (ws, source));
-            let WidgetSource::Command {
-                command: spec,
-                output,
-                ..
-            } = &source.source
-            else {
-                return SourceFields::new();
-            };
-            let mut fields = command::run(workspace, spec, output).await;
-            let mut state = self.entry.lock().unwrap();
-            let previous = state
-                .previous
-                .as_ref()
-                .filter(|run| run.specification == source.source);
-            let last_success = if fields.contains_key("error") {
-                if let Some(previous) = previous {
-                    for (key, value) in &previous.fields {
-                        fields.entry(key.clone()).or_insert_with(|| value.clone());
-                    }
-                }
-                previous.and_then(|run| run.last_success)
-            } else {
-                Some(Instant::now())
-            };
-            if let Some(last_success) = last_success.filter(|_| fields.contains_key("error")) {
-                fields.insert(
-                    "detail.Last successful refresh".into(),
-                    format!("{} seconds ago", last_success.elapsed().as_secs()),
-                );
+                .map_or((workspace, &self.specification), |(ws, spec)| (ws, spec));
+            // The entry lock orders this admission against source retirement.
+            let admitted = self.entry.lock().unwrap().is_current(specification);
+            if admitted
+                && let WidgetSource::Command {
+                    command: spec,
+                    output,
+                    ..
+                } = specification.as_ref()
+            {
+                fields = command::run(workspace, spec, output).await;
             }
-            state.previous = Some(Run {
-                specification: source.source.clone(),
-                fields: fields.clone(),
-                completion: Instant::now(),
-                last_success,
-            });
+            let mut state = self.entry.lock().unwrap();
+            if admitted && state.is_current(specification) {
+                state.remember(&mut fields);
+            }
             // Consume the queued trigger or release the slot under the same
             // lock. A concurrent runner cannot enqueue after the final check.
             queued = state.pending_runner.take();
@@ -114,8 +148,48 @@ impl ActiveRun {
 }
 
 impl WidgetCommands {
+    pub(crate) fn reconcile(&self, snapshot: &WorkbenchState) {
+        let mut commands = self.0.lock().unwrap();
+        let Some(commands) = commands.as_mut() else {
+            return;
+        };
+        if snapshot.revision <= commands.revision {
+            return;
+        }
+        commands.revision = snapshot.revision;
+        commands.entries.retain(|(widget_id, source_id), entry| {
+            let document = &snapshot.document;
+            let specification = document
+                .widgets
+                .iter()
+                .find(|widget| &widget.id == widget_id)
+                .and_then(|widget| document.widget_definition(widget))
+                .and_then(|definition| {
+                    definition.sources.iter().find(|source| {
+                        &source.id == source_id
+                            && matches!(source.source, WidgetSource::Command { .. })
+                    })
+                })
+                .map(|source| &source.source);
+            let mut state = entry.lock().unwrap();
+            state.configure(specification);
+            // A running job keeps the slot until it finishes. Re-adding the same source
+            // meanwhile must not start a competing process.
+            state.active || specification.is_some()
+        });
+    }
+
+    pub(crate) fn close(&self) {
+        if let Some(commands) = self.0.lock().unwrap().take() {
+            for entry in commands.entries.values() {
+                entry.lock().unwrap().configure(None);
+            }
+        }
+    }
+
     fn refresh(
         &self,
+        revision: u64,
         workspace: &WorkspaceInfo,
         widget: &str,
         source: &NamedSource,
@@ -130,19 +204,35 @@ impl WidgetCommands {
         {
             return empty();
         }
-        let key = (workspace.id, widget.into(), source.id.clone());
-        let entry = self.0.lock().unwrap().entry(key).or_default().clone();
+        let key = (widget.into(), source.id.clone());
+        let mut commands = self.0.lock().unwrap();
+        let Some(commands) = commands
+            .as_mut()
+            .filter(|commands| commands.revision == revision)
+        else {
+            return empty();
+        };
+        let entry = commands
+            .entries
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(CommandState {
+                    specification: Some(Arc::new(source.source.clone())),
+                    ..CommandState::default()
+                }))
+            })
+            .clone();
         let mut state = entry.lock().unwrap();
+        let Some(specification) = state.specification.clone() else {
+            return empty();
+        };
         if state.active {
             if matches!(trigger, Trigger::Runner) {
-                state.pending_runner = Some((workspace.clone(), source.clone()));
+                state.pending_runner = Some((workspace.clone(), specification));
             }
             return Refresh::Cached(SourceFields::from([("label".into(), "Refreshing…".into())]));
         }
-        let previous = state
-            .previous
-            .as_ref()
-            .filter(|run| run.specification == source.source);
+        let previous = state.previous.as_ref();
         let due = match trigger {
             Trigger::View => false,
             Trigger::Manual | Trigger::Runner => true,
@@ -156,6 +246,7 @@ impl WidgetCommands {
             drop(state);
             Refresh::Run(ActiveRun {
                 entry,
+                specification,
                 owns_entry: true,
             })
         } else {
@@ -165,29 +256,30 @@ impl WidgetCommands {
 
     pub async fn fields(
         &self,
+        revision: u64,
         workspace: &WorkspaceInfo,
         widget: &str,
         source: &NamedSource,
         trigger: Trigger,
     ) -> SourceFields {
-        match self.refresh(workspace, widget, source, trigger) {
+        match self.refresh(revision, workspace, widget, source, trigger) {
             Refresh::Cached(fields) => fields,
-            Refresh::Run(run) => run.execute(workspace, source).await,
+            Refresh::Run(run) => run.execute(workspace).await,
         }
     }
 
     pub fn schedule(
         &self,
+        revision: u64,
         workspace: Arc<WorkspaceInfo>,
         widget: &str,
         source: &NamedSource,
         trigger: Trigger,
         jobs: &mut JoinSet<()>,
     ) {
-        if let Refresh::Run(run) = self.refresh(&workspace, widget, source, trigger) {
-            let source = source.clone();
+        if let Refresh::Run(run) = self.refresh(revision, &workspace, widget, source, trigger) {
             jobs.spawn(async move {
-                run.execute(&workspace, &source).await;
+                run.execute(&workspace).await;
             });
         }
     }
@@ -233,7 +325,9 @@ pub(crate) fn spawn(
 mod tests {
     use super::*;
     use crate::supervisor::{IsolationMode, Supervisor};
-    use daedalus_proto::workbench::{CommandOutput, RefreshPolicy, WorkspaceCommand};
+    use daedalus_proto::workbench::{
+        CommandOutput, RefreshPolicy, WorkspaceCommand, WorkspaceDocument,
+    };
 
     fn command_source(id: &str, script: &str) -> NamedSource {
         NamedSource {
@@ -263,21 +357,59 @@ mod tests {
         .expect("command did not reach the expected state");
     }
 
-    #[tokio::test]
-    async fn independent_timers_and_coalesced_runner_requests_keep_one_run_per_source() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn workspace_at(path: &std::path::Path) -> Arc<WorkspaceInfo> {
         let (events, _) = tokio::sync::broadcast::channel(16);
         let registry = Registry::new(
             Supervisor::with_mode(IsolationMode::PgidFallback),
-            crate::shell_integration::ShellIntegration::prepare(dir.path()).unwrap(),
+            crate::shell_integration::ShellIntegration::prepare(path).unwrap(),
             events,
         );
-        let workspace = Arc::new(
+        Arc::new(
             registry
-                .create_workspace("Scheduling".into(), dir.path().into(), HashMap::new())
+                .create_workspace("Scheduling".into(), path.into(), HashMap::new())
                 .await
                 .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn retired_sources_cannot_start_reserved_runs_or_be_revived_by_stale_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = workspace_at(dir.path()).await;
+        let commands = WidgetCommands::default();
+        let source = command_source("retired", "touch unexpected");
+        let Refresh::Run(run) = commands.refresh(0, &workspace, "test", &source, Trigger::Runner)
+        else {
+            panic!("the first runner trigger should reserve the slot");
+        };
+        let removed = WorkbenchState {
+            revision: 1,
+            document: WorkspaceDocument::new("Scheduling".into()),
+            repo_baseline: None,
+        };
+        commands.reconcile(&removed);
+        assert!(run.execute(&workspace).await.is_empty());
+        assert!(
+            commands
+                .fields(0, &workspace, "test", &source, Trigger::Runner)
+                .await
+                .is_empty()
         );
+        commands.close();
+        commands.reconcile(&removed);
+        assert!(
+            commands
+                .fields(1, &workspace, "test", &source, Trigger::Runner)
+                .await
+                .is_empty()
+        );
+        assert!(!dir.path().join("unexpected").exists());
+    }
+
+    #[tokio::test]
+    async fn independent_timers_and_coalesced_runner_requests_keep_one_run_per_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = workspace_at(dir.path()).await;
         let commands = WidgetCommands::default();
         let slow = command_source(
             "slow",
@@ -286,28 +418,31 @@ mod tests {
         let fast = command_source("fast", "echo run >> fast");
         let runs = |file| std::fs::read_to_string(dir.path().join(file)).unwrap_or_default();
         let mut jobs = JoinSet::new();
+        let schedule = |source, trigger, jobs: &mut JoinSet<()>| {
+            commands.schedule(0, workspace.clone(), "test", source, trigger, jobs);
+        };
 
-        commands.schedule(workspace.clone(), "test", &slow, Trigger::Timer, &mut jobs);
+        schedule(&slow, Trigger::Timer, &mut jobs);
         wait_for(|| runs("slow") == "run\n").await;
         for _ in 0..3 {
-            commands.schedule(workspace.clone(), "test", &slow, Trigger::Runner, &mut jobs);
-            commands.schedule(workspace.clone(), "test", &slow, Trigger::Timer, &mut jobs);
+            schedule(&slow, Trigger::Runner, &mut jobs);
+            schedule(&slow, Trigger::Timer, &mut jobs);
         }
         assert_eq!(
             commands
-                .fields(&workspace, "test", &slow, Trigger::Manual)
+                .fields(0, &workspace, "test", &slow, Trigger::Manual)
                 .await["label"],
             "Refreshing…"
         );
 
-        commands.schedule(workspace.clone(), "test", &fast, Trigger::Timer, &mut jobs);
+        schedule(&fast, Trigger::Timer, &mut jobs);
         jobs.join_next().await.unwrap().unwrap();
         {
-            let entries = commands.0.lock().unwrap();
-            let entry = &entries[&(workspace.id, "test".into(), "fast".into())];
+            let commands = commands.0.lock().unwrap();
+            let entry = &commands.as_ref().unwrap().entries[&("test".into(), "fast".into())];
             entry.lock().unwrap().previous.as_mut().unwrap().completion -= Duration::from_secs(1);
         }
-        commands.schedule(workspace.clone(), "test", &fast, Trigger::Timer, &mut jobs);
+        schedule(&fast, Trigger::Timer, &mut jobs);
         jobs.join_next().await.unwrap().unwrap();
         assert_eq!(runs("fast"), "run\nrun\n");
         assert_eq!(runs("slow"), "run\n");

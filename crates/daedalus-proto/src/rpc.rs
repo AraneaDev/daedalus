@@ -261,6 +261,14 @@ pub enum ClientMessage {
         widget: String,
         action: String,
     },
+    /// Recompute the proposal with the user's choices without applying it.
+    ResolveWorkspaceImport {
+        workspace_id: WorkspaceId,
+        revision: u64,
+        incoming: WorkspaceDocument,
+        linked: bool,
+        resolutions: std::collections::BTreeMap<String, ConflictChoice>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +308,10 @@ pub enum ResponsePayload {
         runner_assignment_supported: bool,
         #[serde(default)]
         home_dir: Option<PathBuf>,
+        #[serde(default)]
+        resolved_import_preview_supported: bool,
+        #[serde(default)]
+        agent_launch_metadata_supported: bool,
     },
     ImagePreview(ImagePreview),
     RecentProjects(Vec<RecentProject>),
@@ -436,6 +448,8 @@ mod tests {
                 paste_supported,
                 workspace_membership_supported,
                 runner_assignment_supported,
+                resolved_import_preview_supported,
+                agent_launch_metadata_supported,
                 home_dir,
                 ..
             } => {
@@ -444,6 +458,8 @@ mod tests {
                 assert!(!paste_supported);
                 assert!(!workspace_membership_supported);
                 assert!(!runner_assignment_supported);
+                assert!(!resolved_import_preview_supported);
+                assert!(!agent_launch_metadata_supported);
                 assert_eq!(home_dir, None);
             }
             other => panic!("unexpected payload: {other:?}"),

@@ -50,6 +50,92 @@ fn apply_control(w: &mut Workbench, control: Control) {
     w.app.handle_settings_action(action);
 }
 
+fn timed_widget(name: &str) -> daedalus_proto::workbench::WidgetInstance {
+    use daedalus_proto::workbench::{
+        CommandOutput, NamedSource, RefreshPolicy, WidgetDefinition, WidgetInstance, WidgetSource,
+        WorkspaceCommand,
+    };
+    WidgetInstance {
+        id: "timer".into(),
+        name: name.into(),
+        pinned: true,
+        template: None,
+        definition: Some(WidgetDefinition {
+            sources: vec![NamedSource {
+                id: "heartbeat".into(),
+                source: WidgetSource::Command {
+                    command: WorkspaceCommand {
+                        argv: vec!["cargo".into(), "--argument with spaces".into()],
+                        env: vec!["TEST_OPTIONS".into()],
+                        timeout_seconds: Some(20),
+                    },
+                    refresh: RefreshPolicy {
+                        interval_seconds: Some(30),
+                        on_runner_completion: true,
+                    },
+                    output: CommandOutput::ExitStatus,
+                },
+            }],
+            ..Default::default()
+        }),
+    }
+}
+
+#[test]
+fn late_widget_test_cannot_populate_the_next_draft() {
+    use daedalus_proto::{StatusLevel, workbench::WidgetResult};
+
+    let ws = workspace("Preview isolation");
+    let id = ws.id;
+    let mut w = modern_client(ws);
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(workbench_snapshot(1))),
+    );
+    w.commands.try_iter().for_each(drop);
+    apply_control(&mut w, Control::CustomWidgetsPage);
+    let start_test = |w: &mut Workbench, name| {
+        apply_control(w, Control::CustomNew);
+        w.app.state.settings.set_value(Control::CustomName, name);
+        apply_control(w, Control::CustomPreview);
+        let UiCommand::Workbench { operation, .. } = w.command() else {
+            panic!("widget test request");
+        };
+        operation
+    };
+    let result = |label: &str| {
+        Ok(ResponsePayload::WidgetResult(WidgetResult {
+            label: label.into(),
+            level: StatusLevel::Ok,
+            details: Vec::new(),
+        }))
+    };
+    let first = start_test(&mut w, "First");
+    apply_control(&mut w, Control::CustomBack);
+    let second = start_test(&mut w, "Second");
+    daemon_workbench_reply(&mut w, id, first.clone(), result("First result"));
+    assert!(w.app.state.settings.custom.preview.is_none());
+    daemon_workbench_reply(&mut w, id, first, Err("Old error".into()));
+    assert!(w.app.state.settings.error.is_none());
+    daemon_workbench_reply(&mut w, id, second, result("Second result"));
+    assert_eq!(
+        w.app.state.settings.custom.preview.as_ref().unwrap().label,
+        "Second result"
+    );
+    apply_control(&mut w, Control::CustomPreview);
+    let UiCommand::Workbench { operation, .. } = w.command() else {
+        panic!("expected repeat preview");
+    };
+    w.app
+        .state
+        .settings
+        .set_value(Control::CustomExecutable, "cargo");
+    daemon_workbench_reply(&mut w, id, operation, result("Old draft definition"));
+    assert!(w.app.state.settings.custom.preview.is_none());
+}
+
 fn save_runner_label(w: &mut Workbench, label: &str) {
     apply_control(w, Control::WidgetsPage);
     w.app.state.settings.set_value(Control::RunnerLabel, label);
@@ -515,8 +601,16 @@ fn sharing_conflicts_take_both_choices_and_export_paths_stay_with_the_request() 
     );
     assert!(w.idle());
     apply_control(&mut w, Control::CustomRepo);
-    assert!(matches!(w.command(), UiCommand::Workbench { request, .. }
-        if matches!(request.as_ref(), ClientMessage::PreviewWorkspaceImport { linked: true, .. })));
+    let UiCommand::Workbench {
+        operation, request, ..
+    } = w.command()
+    else {
+        panic!("expected repo review");
+    };
+    assert!(matches!(
+        *request,
+        ClientMessage::PreviewWorkspaceImport { linked: true, .. }
+    ));
     let mut incoming = state.document.clone();
     incoming.name = "Incoming".into();
     incoming.layout.split_view = !incoming.layout.split_view;
@@ -546,8 +640,8 @@ fn sharing_conflicts_take_both_choices_and_export_paths_stay_with_the_request() 
     daemon_workbench_reply(
         &mut w,
         id,
-        WorkbenchOperation::Read,
-        Ok(ResponsePayload::WorkspaceImportPreview(preview)),
+        operation,
+        Ok(ResponsePayload::WorkspaceImportPreview(preview.clone())),
     );
     assert!(
         w.app
@@ -570,6 +664,25 @@ fn sharing_conflicts_take_both_choices_and_export_paths_stay_with_the_request() 
             .contains("Local")
     );
     apply_control(&mut w, Control::CustomResolve);
+    let UiCommand::Workbench {
+        operation, request, ..
+    } = w.command()
+    else {
+        panic!("expected updated review");
+    };
+    assert!(
+        matches!(*request, ClientMessage::ResolveWorkspaceImport { revision: 5, resolutions, .. }
+        if resolutions.get("name") == Some(&ConflictChoice::Local))
+    );
+    assert!(!w.app.state.settings.enabled(Control::CustomApplyImport));
+    let mut review = preview.clone();
+    review.conflicts.remove(0);
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        operation,
+        Ok(ResponsePayload::WorkspaceImportPreview(review.clone())),
+    );
     assert!(
         w.app
             .state
@@ -578,6 +691,51 @@ fn sharing_conflicts_take_both_choices_and_export_paths_stay_with_the_request() 
             .contains("Remove")
     );
     apply_control(&mut w, Control::CustomResolveIncoming);
+    let UiCommand::Workbench {
+        operation, request, ..
+    } = w.command()
+    else {
+        panic!("expected completed review");
+    };
+    assert!(
+        matches!(*request, ClientMessage::ResolveWorkspaceImport { resolutions, .. }
+        if resolutions.get("layout") == Some(&ConflictChoice::Incoming))
+    );
+    assert!(!w.app.state.settings.enabled(Control::CustomApplyImport));
+    apply_control(&mut w, Control::CustomApplyImport);
+    assert!(w.idle());
+    review.conflicts.clear();
+    review.proposed.assignments = (0..7)
+        .map(|index| runner_entry(&format!("Assignment {index}")))
+        .collect();
+    review
+        .proposed
+        .widgets
+        .push(timed_widget("Reviewed command"));
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        operation,
+        Ok(ResponsePayload::WorkspaceImportPreview(review)),
+    );
+    let mut saw_reviewed_command = false;
+    while w.app.state.settings.enabled(Control::CustomDetailNext) {
+        apply_control(&mut w, Control::CustomDetailNext);
+        saw_reviewed_command |= w
+            .app
+            .state
+            .settings
+            .control_order()
+            .filter(|control| matches!(control, Control::CustomDetail(_)))
+            .any(|control| {
+                w.app
+                    .state
+                    .settings
+                    .label(control)
+                    .contains("Reviewed command")
+            });
+    }
+    assert!(saw_reviewed_command);
     apply_control(&mut w, Control::CustomApplyImport);
     assert!(
         matches!(w.command(), UiCommand::Workbench { operation: WorkbenchOperation::Import, request, .. }
@@ -879,14 +1037,21 @@ fn workspace_creation_preview_stays_separate_from_existing_workspace_import() {
         .settings
         .set_value(Control::CustomRoot, root.to_str().unwrap());
     apply_control(&mut w, Control::CustomImport);
-    assert!(matches!(w.command(), UiCommand::Workbench { request, .. }
-        if matches!(request.as_ref(), ClientMessage::PreviewWorkspaceCreation {
+    let UiCommand::Workbench {
+        operation, request, ..
+    } = w.command()
+    else {
+        panic!("expected new workspace review");
+    };
+    assert!(
+        matches!(request.as_ref(), ClientMessage::PreviewWorkspaceCreation {
             root_dir, source: WorkspaceImportSource::Text(text), linked: false,
-        } if root_dir == &root && text == content)));
+        } if root_dir == &root && text == content)
+    );
 
     let mut incoming = workbench_snapshot(0).document;
     incoming.name = "Shared workspace".into();
-    incoming.assignments.push(runner_entry("Imported suite"));
+    incoming.widgets.push(timed_widget("Timer"));
     let preview = WorkspaceCreationPreview {
         root_dir: root,
         incoming,
@@ -895,20 +1060,61 @@ fn workspace_creation_preview_stays_separate_from_existing_workspace_import() {
     daemon_workbench_reply(
         &mut w,
         id,
-        WorkbenchOperation::Read,
+        operation,
         Ok(ResponsePayload::WorkspaceCreationPreview(preview.clone())),
     );
     assert!(w.app.state.settings.custom.import.is_none());
-    assert_eq!(
-        w.app
-            .state
-            .settings
-            .custom
-            .preview
-            .as_ref()
-            .unwrap()
-            .details,
-        vec![("Imported suite".into(), "cargo test".into())],
+    let rows = &w
+        .app
+        .state
+        .settings
+        .custom
+        .preview
+        .as_ref()
+        .unwrap()
+        .details;
+    assert!(
+        rows.iter().any(|(label, value)| label.contains("Timer")
+            && value.contains(r#""--argument with spaces""#))
+    );
+    assert!(rows.iter().any(|(_, value)| value.contains("TEST_OPTIONS")));
+    assert!(
+        rows.iter()
+            .any(|(_, value)| value.contains("30s") && value.contains("runner completion"))
+    );
+    let mut controls = crate::accessibility::TerminalControls::default();
+    let tree = crate::accessibility::workbench_tree(&w.app.state, 650., 720., 1., &mut controls);
+    assert!(tree.nodes.iter().any(|(_, node)| {
+        node.role() == accesskit::Role::Label
+            && node.label().is_some_and(|label| label.contains("Layout"))
+            && !node.is_disabled()
+    }));
+    let replacement = w.root.path().join("different");
+    w.app
+        .state
+        .settings
+        .set_value(Control::CustomRoot, replacement.to_str().unwrap());
+    assert!(!w.app.state.settings.enabled(Control::CustomApplyImport));
+    assert!(w.app.state.settings.custom.creation.is_none());
+    apply_control(&mut w, Control::CustomImport);
+    let UiCommand::Workbench {
+        operation, request, ..
+    } = w.command()
+    else {
+        panic!("expected new destination review");
+    };
+    assert!(
+        matches!(request.as_ref(), ClientMessage::PreviewWorkspaceCreation { root_dir, .. } if root_dir == &replacement)
+    );
+    let preview = WorkspaceCreationPreview {
+        root_dir: replacement,
+        ..preview
+    };
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        operation,
+        Ok(ResponsePayload::WorkspaceCreationPreview(preview.clone())),
     );
     apply_control(&mut w, Control::CustomApplyImport);
     assert!(

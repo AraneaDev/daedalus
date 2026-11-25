@@ -27,6 +27,7 @@ pub enum UiAction {
     WorkspaceSettings,
     SwitchWorkspaceNext,
     SwitchWorkspacePrev,
+    SelectWorkspace(WorkspaceId),
     PreviewImage,
     CopySelection,
     PasteClipboard,

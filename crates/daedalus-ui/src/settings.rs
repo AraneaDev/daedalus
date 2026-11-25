@@ -265,6 +265,10 @@ impl SettingsDialog {
         self.page == Page::CustomWidgets
     }
 
+    pub fn is_import_review_text(&self, control: Control) -> bool {
+        self.is_custom_page() && self.custom.sharing && matches!(control, CustomDetail(_))
+    }
+
     pub fn open_custom_page(&mut self) {
         self.activate(CustomWidgetsPage);
     }
@@ -389,6 +393,8 @@ impl SettingsDialog {
             "Saving workspace settings…"
         } else if let Some(error) = &self.error {
             error
+        } else if self.is_custom_page() && self.custom.is_reviewing_import() {
+            "Reviewing workspace configuration…"
         } else if self.is_custom_page()
             && let Some(path) = self.next_import_conflict()
         {
@@ -414,7 +420,14 @@ impl SettingsDialog {
     }
 
     pub(crate) fn position_label(&self) -> String {
-        if self.is_pane_widgets_page() || self.is_custom_page() {
+        if self.is_custom_page() && self.custom.sharing {
+            let pages = self.detail_line_count().div_ceil(self.detail_page_size());
+            if pages > 1 {
+                format!("Page {} of {pages}", self.custom.detail_page + 1)
+            } else {
+                String::new()
+            }
+        } else if self.is_pane_widgets_page() || self.is_custom_page() {
             String::new()
         } else if self.assignments.is_empty() {
             "No assignments".into()

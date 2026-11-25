@@ -75,6 +75,8 @@ pub enum WorkbenchOperation {
     Migration,
     PaneWidgets(u64),
     WidgetEdit,
+    WidgetPreview(uuid::Uuid),
+    ImportPreview(uuid::Uuid),
     Import,
     Export(PathBuf),
 }
@@ -286,7 +288,7 @@ pub enum UiEvent {
     },
     PaneSpawned {
         summary: PaneSummary,
-        agent_preset: Option<AgentPreset>,
+        select_tab: bool,
     },
     AssignmentStarted {
         workspace_id: WorkspaceId,
@@ -540,6 +542,8 @@ async fn initialize_session(
         workbench_supported,
         workspace_membership_supported,
         runner_assignment_supported,
+        resolved_import_preview_supported,
+        agent_launch_metadata_supported,
         home_dir,
         ..
     } = conn.call(ClientMessage::Ping).await?
@@ -555,6 +559,8 @@ async fn initialize_session(
     conn.paste_supported = paste_supported;
     conn.workbench_supported = workbench_supported;
     conn.runner_assignment_supported = runner_assignment_supported;
+    conn.resolved_import_preview_supported = resolved_import_preview_supported;
+    conn.agent_launch_metadata_supported = agent_launch_metadata_supported;
     let _ = conn
         .call(ClientMessage::Subscribe {
             pane_ids: None,
@@ -759,10 +765,16 @@ async fn handle_command(
             request,
         } => {
             if conn.workbench_supported {
-                let response = match conn.call(*request).await {
-                    Ok(response) => Ok(response),
-                    Err(RpcError::Proto(error)) => Err(error.to_string()),
-                    Err(error) => return Err(error),
+                let response = if matches!(*request, ClientMessage::ResolveWorkspaceImport { .. })
+                    && !conn.resolved_import_preview_supported
+                {
+                    Err("Upgrade the daemon to review and apply a workspace with conflicts.".into())
+                } else {
+                    match conn.call(*request).await {
+                        Ok(response) => Ok(response),
+                        Err(RpcError::Proto(error)) => Err(error.to_string()),
+                        Err(error) => return Err(error),
+                    }
                 };
                 sink.emit(UiEvent::Workbench {
                     workspace_id,

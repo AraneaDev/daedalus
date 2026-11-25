@@ -96,6 +96,10 @@ impl DaedalusApp {
                 self.setup_disconnected();
                 self.workspace_settings_disconnected();
                 self.pane_widget_save_disconnected();
+                if self.state.settings.custom.interrupt_previews() && self.state.settings.open {
+                    self.state.settings.error =
+                        Some("Connection lost. Run the preview again when reconnected.".into());
+                }
                 self.history.connection(false);
                 self.state.connection = ConnectionState::Reconnecting;
                 self.state.workspace_list_loaded = false;
@@ -170,9 +174,9 @@ impl DaedalusApp {
             }
             UiEvent::PaneSpawned {
                 summary,
-                agent_preset,
+                select_tab,
             } => {
-                self.state.register_pane(summary, agent_preset);
+                self.state.register_pane(summary, select_tab);
                 self.schedule_resize_flush();
             }
             UiEvent::AssignmentStarted {

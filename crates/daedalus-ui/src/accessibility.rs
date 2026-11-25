@@ -134,6 +134,9 @@ pub(super) fn action(
                 if let Some(id) = controls.failed_run_workspace(state, node) {
                     return Some(UiAction::OpenFailedRun(id));
                 }
+                if let Some(id) = controls.workspace_for_node(state, node) {
+                    return Some(UiAction::SelectWorkspace(id));
+                }
             }
             _ => {}
         }
@@ -472,6 +475,7 @@ pub(super) fn workbench_tree(
     let mut nodes = vec![(STATUS, status)];
     let current_overlay = overlay(state);
     if state.workspace_list_loaded && current_overlay.is_none() {
+        controls.append_workspaces(state, &mut root, &mut nodes);
         controls.append_run_tests(state, &mut root, &mut nodes);
         controls.append_widgets(state, &mut root, &mut nodes);
         controls.append_failed_runs(state, &mut root, &mut nodes);
@@ -1087,7 +1091,7 @@ mod tests {
         runner.agent_state = None;
         runner.status = PaneStatus::Exited { code: Some(7) };
         let failed = runner.id;
-        state.register_pane(runner, None);
+        state.register_pane(runner, false);
         let mut controls = TerminalControls::default();
         let update = workbench_tree(&state, 900., 700., 1., &mut controls);
         let (id, button) = update
@@ -1204,7 +1208,7 @@ mod tests {
         other.id = daedalus_proto::PaneId::new();
         let second = other.id;
         let ws = other.workspace_id;
-        state.register_pane(other, None);
+        state.register_pane(other, false);
         state.session_names.insert(second, "Builder".into());
         state.select_session(ws, PaneRole::Agent, first);
         let mut controls = TerminalControls::default();

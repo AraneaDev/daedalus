@@ -1,10 +1,12 @@
+mod live;
+mod replay;
+pub use replay::activity_excerpt;
+
 use std::collections::{HashMap, VecDeque};
 
 use crate::bridge::UiEvent;
 use crate::state::{PaneViewState, WorkspaceView};
-use daedalus_proto::{
-    ActivityEntry, ActivityKind, AgentState, GridRow, PaneId, PaneRole, ServerEvent, WorkspaceId,
-};
+use daedalus_proto::{PaneId, WorkspaceId};
 
 const MAX_EVENTS: usize = 4;
 
@@ -41,69 +43,6 @@ pub struct Recap {
     disconnected: bool,
     unsupported: bool,
     visits: HashMap<WorkspaceId, Visit>,
-}
-
-fn short_label(text: &str) -> String {
-    text.chars()
-        .filter(|ch| !ch.is_control())
-        .take(80)
-        .collect()
-}
-
-fn excerpt(row: &GridRow) -> Option<String> {
-    let text: String = row
-        .cells
-        .iter()
-        .filter(|cell| cell.width > 0)
-        .flat_map(|cell| {
-            if cell.text.is_empty() {
-                " "
-            } else {
-                &cell.text
-            }
-            .chars()
-        })
-        .filter(|ch| !ch.is_control())
-        .skip_while(|ch| ch.is_whitespace())
-        .take(240)
-        .collect();
-    let line = text.trim_end();
-    let prompt = line.split_whitespace().next().unwrap_or_default();
-    if !line.chars().any(char::is_alphanumeric)
-        || prompt.ends_with(['$', '#', '❯', '>', 'λ', '%'])
-        || line.starts_with(['❯', '›', '»'])
-    {
-        return None;
-    }
-    Some(format!("Agent terminal · {line}"))
-}
-
-/// A later redraw can replace text at the same absolute row in a terminal UI.
-/// Only quote a live viewport that still matches the exact output frame.
-pub fn activity_excerpt(
-    entry: &ActivityEntry,
-    panes: &HashMap<PaneId, PaneViewState>,
-) -> Option<String> {
-    let ActivityKind::AgentOutput {
-        pane_id,
-        abs_row,
-        history_generation,
-        pane_seq,
-    } = entry.kind
-    else {
-        return None;
-    };
-    let pane = panes.get(&pane_id)?;
-    if pane.summary.role != PaneRole::Agent
-        || pane.history_generation != history_generation
-        || pane.last_seq != pane_seq
-    {
-        return None;
-    }
-    pane.viewport_rows
-        .iter()
-        .find(|r| r.abs_row == abs_row)
-        .and_then(excerpt)
 }
 
 impl Recap {
@@ -160,8 +99,6 @@ impl Recap {
         workspaces: &[WorkspaceView],
         panes: &HashMap<PaneId, PaneViewState>,
     ) {
-        let workspace = |id| workspaces.iter().find(|ws| ws.id == id);
-        let pane = |id: PaneId| panes.get(&id).map(|view| &view.summary);
         match event {
             UiEvent::JournalCapability(supported) => self.unsupported = !*supported,
             UiEvent::Connected => self.disconnected = false,
@@ -178,126 +115,7 @@ impl Recap {
                 self.visits
                     .retain(|id, _| list.iter().any(|ws| ws.id == *id));
             }
-            UiEvent::AgentStateChanged {
-                workspace_id,
-                pane_id,
-                state,
-            } => {
-                if pane(*pane_id).and_then(|p| p.agent_state) != Some(*state) {
-                    self.record(*workspace_id, Some(*pane_id), || match state {
-                        AgentState::WaitingForApproval => "Check agent · approval signal".into(),
-                        AgentState::Error => "Agent reported an error".into(),
-                        AgentState::Idle => "Agent became idle".into(),
-                        AgentState::Thinking => "Agent started thinking".into(),
-                    });
-                }
-            }
-            UiEvent::WorkspaceRuntimeUpdated {
-                workspace_id,
-                bound_ports,
-                containers,
-                git_status,
-                git_branch,
-            } => {
-                if let Some(ws) = workspace(*workspace_id) {
-                    if ws.git_branch != *git_branch || ws.git_status != *git_status {
-                        self.record(*workspace_id, None, || "Git status changed".into());
-                    }
-                    if ws.bound_ports != *bound_ports {
-                        self.record(*workspace_id, None, || {
-                            format!("Ports changed · {} bound", bound_ports.len())
-                        });
-                    }
-                    if ws.containers != *containers {
-                        self.record(*workspace_id, None, || {
-                            if let Some(changed) =
-                                containers.iter().find(|c| !ws.containers.contains(c))
-                            {
-                                let name = changed.service.as_deref().unwrap_or(&changed.name);
-                                let status = changed.health.as_deref().unwrap_or(&changed.state);
-                                format!("{} reported {}", short_label(name), short_label(status))
-                            } else if let Some(removed) =
-                                ws.containers.iter().find(|c| !containers.contains(c))
-                            {
-                                format!("{} left inventory", short_label(&removed.name))
-                            } else {
-                                "Container inventory updated".into()
-                            }
-                        });
-                    }
-                }
-            }
-            UiEvent::ServerEvent(ServerEvent::GridDelta(delta)) => {
-                if let Some(view) = panes.get(&delta.pane_id)
-                    && (view.last_seq == 0 || delta.seq > view.last_seq)
-                    && delta.history_generation >= view.history_generation
-                    && view.summary.role == PaneRole::Agent
-                    && self.visible() != Some(view.summary.workspace_id)
-                    && let Some(visit) = self.visits.get_mut(&view.summary.workspace_id)
-                {
-                    if let Some(line) = delta.dirty_rows.iter().rev().find_map(excerpt) {
-                        visit.agent_line = Some(RecapEntry {
-                            label: line,
-                            pane: Some(delta.pane_id),
-                        });
-                    } else if visit.agent_line.is_none() {
-                        visit.agent_line = Some(RecapEntry {
-                            label: "Agent pane produced output".into(),
-                            pane: Some(delta.pane_id),
-                        });
-                    }
-                }
-            }
-            UiEvent::ServerEvent(ServerEvent::ResyncRequired { pane_id }) => {
-                if let Some(p) = pane(*pane_id)
-                    && self.visible() != Some(p.workspace_id)
-                    && let Some(visit) = self.visits.get_mut(&p.workspace_id)
-                {
-                    visit.gap = true;
-                }
-            }
-            UiEvent::ServerEvent(ServerEvent::CommandFinished {
-                pane_id, exit_code, ..
-            }) => {
-                if let Some(p) = pane(*pane_id) {
-                    self.record(p.workspace_id, Some(*pane_id), || {
-                        format!("{} command · exit {exit_code}", p.role)
-                    });
-                }
-            }
-            UiEvent::ServerEvent(ServerEvent::PaneExited { pane_id, exit_code }) => {
-                if let Some(p) = pane(*pane_id) {
-                    self.record(p.workspace_id, Some(*pane_id), || match exit_code {
-                        Some(code) => format!("{} exited · code {code}", p.role),
-                        None => format!("{} exited", p.role),
-                    });
-                }
-            }
-            UiEvent::ServerEvent(ServerEvent::ExternalStatusUpdated {
-                workspace_id,
-                status,
-            }) if workspace(*workspace_id).is_some_and(|ws| {
-                !ws.external_statuses.iter().any(|old| {
-                    old.source == status.source
-                        && (old.updated_at_ms > status.updated_at_ms
-                            || (old.label == status.label
-                                && old.level == status.level
-                                && old.detail == status.detail))
-                })
-            }) =>
-            {
-                self.record(*workspace_id, None, || {
-                    if status.label.trim().is_empty() {
-                        return format!("{} cleared status", short_label(&status.source));
-                    }
-                    format!(
-                        "{} reported {}",
-                        short_label(&status.source),
-                        short_label(&status.label)
-                    )
-                });
-            }
-            _ => {}
+            _ => self.observe_live(event, workspaces, panes),
         }
     }
 
@@ -312,48 +130,7 @@ impl Recap {
             return;
         }
         let visit = self.visits.entry(page.workspace_id).or_default();
-        let mut lines = Vec::new();
-        if gap {
-            lines.push("Update gap · partial history".into());
-        }
-        let latest_output = page
-            .entries
-            .iter()
-            .rev()
-            .find(|e| matches!(e.kind, ActivityKind::AgentOutput { .. }));
-        for entry in latest_output.into_iter().chain(
-            page.entries
-                .iter()
-                .rev()
-                .filter(|e| !matches!(e.kind, ActivityKind::AgentOutput { .. })),
-        ) {
-            let label = activity_excerpt(entry, panes).unwrap_or_else(|| entry.kind.to_string());
-            let pane = match entry.kind {
-                ActivityKind::AgentOutput { pane_id, .. }
-                | ActivityKind::Agent { pane_id, .. }
-                | ActivityKind::Command { pane_id, .. }
-                | ActivityKind::Exit { pane_id, .. } => Some(pane_id),
-                _ => None,
-            };
-            let row = RecapEntry { label, pane };
-            if !lines.contains(&row) {
-                lines.push(row);
-            }
-            if lines.len() >= MAX_EVENTS + usize::from(gap) {
-                break;
-            }
-        }
-        if lines.is_empty() {
-            lines.push(
-                if first {
-                    "First visit"
-                } else {
-                    "No changes observed while away"
-                }
-                .into(),
-            );
-        }
-        visit.journal_lines = Some(lines);
+        visit.journal_lines = Some(replay::rows(page, first, gap, panes));
     }
 
     pub fn foreground_activity(&mut self, id: WorkspaceId, count: usize) {
@@ -417,7 +194,8 @@ impl Recap {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{replay::excerpt, *};
+    use daedalus_proto::{AgentState, GridRow, ServerEvent};
 
     #[test]
     fn recognizable_prompts_and_echoed_commands_do_not_become_quotes() {

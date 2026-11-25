@@ -122,16 +122,39 @@ impl Registry {
                 ));
             }
         };
-        let (proposed, conflicts) = reconcile(&state, &incoming, linked, &BTreeMap::new())?;
-        Ok(WorkspaceImportPreview {
-            workspace_id: id,
-            revision: state.revision,
-            incoming,
-            current: state.document,
-            proposed,
-            linked,
-            conflicts,
-        })
+        import_preview(id, state, incoming, linked, &BTreeMap::new())
+    }
+
+    pub(crate) async fn resolve_workspace_import(
+        &self,
+        id: WorkspaceId,
+        revision: u64,
+        incoming: WorkspaceDocument,
+        linked: bool,
+        resolutions: BTreeMap<String, ConflictChoice>,
+    ) -> Result<WorkspaceImportPreview, ProtoError> {
+        let state = self.workbench(id).await?;
+        if state.revision != revision {
+            return Err(ProtoError::InvalidRequest(
+                "The workspace changed. Preview the import again.".into(),
+            ));
+        }
+        self.check_linked_import(id, &incoming, linked).await?;
+        import_preview(id, state, incoming, linked, &resolutions)
+    }
+
+    async fn check_linked_import(
+        &self,
+        id: WorkspaceId,
+        incoming: &WorkspaceDocument,
+        linked: bool,
+    ) -> Result<(), ProtoError> {
+        if linked && self.read_repo_workbench(id).await? != *incoming {
+            return Err(ProtoError::InvalidRequest(
+                "The repo workspace file changed. Preview the import again.".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) async fn apply_workspace_import(
@@ -146,11 +169,7 @@ impl Registry {
         if state.revision != revision {
             return Ok(Change::Conflict(state));
         }
-        if linked && self.read_repo_workbench(id).await? != incoming {
-            return Err(ProtoError::InvalidRequest(
-                "The repo workspace file changed. Preview the import again.".into(),
-            ));
-        }
+        self.check_linked_import(id, &incoming, linked).await?;
         let (document, conflicts) = reconcile(&state, &incoming, linked, &resolutions)?;
         if !conflicts.is_empty() {
             let fields = conflicts
@@ -205,6 +224,25 @@ async fn read_workspace_path(path: &std::path::Path) -> Result<WorkspaceDocument
         .await
         .map_err(|error| ProtoError::IoError(format!("{}: {error}", path.display())))?;
     parse_workspace(&text).map_err(document_error)
+}
+
+fn import_preview(
+    id: WorkspaceId,
+    state: WorkbenchState,
+    incoming: WorkspaceDocument,
+    linked: bool,
+    resolutions: &BTreeMap<String, ConflictChoice>,
+) -> Result<WorkspaceImportPreview, ProtoError> {
+    let (proposed, conflicts) = reconcile(&state, &incoming, linked, resolutions)?;
+    Ok(WorkspaceImportPreview {
+        workspace_id: id,
+        revision: state.revision,
+        incoming,
+        current: state.document,
+        proposed,
+        linked,
+        conflicts,
+    })
 }
 
 fn reconcile(

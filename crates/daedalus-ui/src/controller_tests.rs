@@ -105,7 +105,7 @@ fn widget_lifecycle_creates_a_slot_and_removal_keeps_its_terminal() {
         Some("Health API · No terminal")
     );
 
-    workbench.app.state.register_pane(service.clone(), None);
+    workbench.app.state.register_pane(service.clone(), false);
     let settings = &mut workbench.app.state.settings;
     let remove = settings
         .control_order()
@@ -712,9 +712,10 @@ fn dormant_workspaces_spawn_once_and_failure_forwarding_revalidates_agent_choice
     assert_eq!(w.app.state.focused_pane_id(), Some(agent));
     let mut second = failed.panes[0].clone();
     second.id = PaneId::new();
+    second.launch_preset = Some("claude".into());
     w.app.handle_daemon_event(UiEvent::PaneSpawned {
         summary: second,
-        agent_preset: Some(AgentPreset::Claude),
+        select_tab: true,
     });
     w.app.handle_ui_action(UiAction::ForwardFailureToAgent);
     let choices = w.app.state.failure_recipients.take().unwrap();
@@ -2365,6 +2366,101 @@ fn draggable_gutters_resize_terminal_cells_without_changing_focus() {
 }
 
 #[test]
+fn native_workspace_selection_disambiguates_names_restores_focus_and_rejects_stale_controls() {
+    use accesskit::{Action, ActionRequest, TreeId};
+
+    let mut w = Workbench::new();
+    let mut first = workspace("Same name");
+    first.root_dir = "/first".into();
+    let selected_pane = first.panes[1].id;
+    let mut second = workspace("Same name");
+    second.root_dir = "/second".into();
+    w.app.handle_daemon_event(UiEvent::WorkspacesLoaded(vec![
+        first.clone(),
+        second.clone(),
+    ]));
+    w.app.state.select_workspace(first.id);
+    w.app
+        .state
+        .select_session(first.id, PaneRole::Service, selected_pane);
+    let tree =
+        accessibility::workbench_tree(&w.app.state, 1200., 700., 1., &mut w.app.terminal_controls);
+    let node = |path| {
+        tree.nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(path))
+            .unwrap()
+            .0
+    };
+    let first_node = node("Same name · /first");
+    let second_node = node("Same name · /second");
+    let click = |target_node| ActionRequest {
+        target_tree: TreeId::ROOT,
+        target_node,
+        action: Action::Click,
+        data: None,
+    };
+    for (node, workspace) in [(second_node, second.id), (first_node, first.id)] {
+        let action = accessibility::action(&w.app.state, &click(node), &w.app.terminal_controls)
+            .expect("workspace action missing");
+        w.app.handle_ui_action(action);
+        assert_eq!(w.app.state.active_workspace_id, Some(workspace));
+    }
+    assert_eq!(w.app.state.focused_pane_id(), Some(selected_pane));
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![first]));
+    assert!(
+        accessibility::action(&w.app.state, &click(second_node), &w.app.terminal_controls)
+            .is_none()
+    );
+}
+
+#[test]
+fn image_preview_button_does_not_report_terminal_motion() {
+    use daedalus_proto::{Cell, GridRow, MouseTracking};
+    use daedalus_ui::selection::{CellPos, Selection};
+
+    let mut w = Workbench::new();
+    let ws = workspace("Preview");
+    let pane = ws.panes[0].id;
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+    let view = w.app.state.panes.get_mut(&pane).unwrap();
+    view.terminal_modes.mouse = MouseTracking::Any;
+    view.terminal_modes.sgr_mouse = true;
+    view.selection = Some(Selection::new(CellPos::new(0, 0), CellPos::new(8, 0)));
+    view.viewport_rows = vec![GridRow {
+        row_index: 0,
+        abs_row: 0,
+        wraps: false,
+        links: vec![],
+        cells: "image.png"
+            .chars()
+            .map(|c| Cell {
+                text: c.to_string(),
+                ..Default::default()
+            })
+            .collect(),
+    }];
+    let metrics = ViewportMetrics {
+        size: (1200, 700).into(),
+        scale_factor: 1.,
+        cell: (8., 16.),
+    };
+    let button = w
+        .app
+        .layout_for(metrics)
+        .preview_button(&w.app.state, 1.)
+        .unwrap();
+    w.app
+        .move_pointer(button.x + 2., button.y + 2., Some(metrics));
+    assert!(w.idle(), "the image button sent terminal input");
+    w.app
+        .move_pointer(button.x - 10., button.y + 2., Some(metrics));
+    assert!(matches!(w.command(), UiCommand::SendInput { pane_id, .. } if pane_id == pane));
+}
+
+#[test]
 fn selected_png_preview_preserves_terminal_focus_selection_and_scroll() {
     use daedalus_proto::{Cell, GridRow, rpc::ImagePreview};
     use daedalus_ui::selection::{CellPos, Selection};
@@ -2585,7 +2681,7 @@ fn cargo_bar_runs_on_the_selected_workspace_without_taking_agent_focus() {
         let pane = runner.id;
         w.app.handle_daemon_event(UiEvent::PaneSpawned {
             summary: runner,
-            agent_preset: None,
+            select_tab: false,
         });
         w.app.handle_daemon_event(UiEvent::AssignmentStarted {
             workspace_id: id,

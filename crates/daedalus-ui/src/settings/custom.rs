@@ -98,11 +98,16 @@ impl SettingsDialog {
                 .as_ref()
                 .is_some_and(|state| state.document.widgets.len() > 1),
             CustomMove => self.custom.selected > 0,
-            CustomApplyImport => self.next_import_conflict().is_none(),
+            CustomApplyImport => self.can_apply_import(),
+            CustomResolve | CustomResolveIncoming => {
+                !self.custom.is_reviewing_import() && self.next_import_conflict().is_some()
+            }
             CustomExportTemplate => self.custom.selected().is_some(),
             CustomDetail(_) => false,
             CustomDetailPrev => self.custom.detail_page > 0,
-            CustomDetailNext => (self.custom.detail_page + 1) * 8 < self.detail_line_count(),
+            CustomDetailNext => {
+                (self.custom.detail_page + 1) * self.detail_page_size() < self.detail_line_count()
+            }
             _ => true,
         }
     }
@@ -133,9 +138,11 @@ impl SettingsDialog {
 
     pub(super) fn custom_field(&mut self) -> Option<&mut String> {
         if self.focus == CustomPath {
+            self.custom.clear_import_review();
             return Some(&mut self.custom.path);
         }
         if self.focus == CustomRoot {
+            self.custom.clear_import_review();
             return Some(&mut self.custom.new_root);
         }
         if self.focus == CustomDefinition {
@@ -164,12 +171,24 @@ impl SettingsDialog {
     pub(super) fn apply_custom_control(&mut self, control: Control) -> SettingsAction {
         match self.custom_command(control) {
             Ok(Some(request)) => {
-                let operation = match control {
-                    CustomSave => WorkbenchOperation::WidgetEdit,
-                    CustomApplyImport => WorkbenchOperation::Import,
-                    CustomExport | CustomExportTemplate => WorkbenchOperation::Export(
-                        std::path::PathBuf::from(self.custom.path.trim()),
+                let operation = match &request {
+                    ClientMessage::PreviewWidget {
+                        name, definition, ..
+                    } => WorkbenchOperation::WidgetPreview(
+                        self.custom.start_widget_test(name, definition),
                     ),
+                    ClientMessage::PreviewWorkspaceImport { .. }
+                    | ClientMessage::PreviewWorkspaceCreation { .. }
+                    | ClientMessage::ResolveWorkspaceImport { .. } => {
+                        WorkbenchOperation::ImportPreview(self.custom.start_import_review())
+                    }
+                    _ if control == CustomSave => WorkbenchOperation::WidgetEdit,
+                    _ if control == CustomApplyImport => WorkbenchOperation::Import,
+                    _ if matches!(control, CustomExport | CustomExportTemplate) => {
+                        WorkbenchOperation::Export(std::path::PathBuf::from(
+                            self.custom.path.trim(),
+                        ))
+                    }
                     _ => WorkbenchOperation::Read,
                 };
                 SettingsAction::Workbench {
@@ -204,16 +223,14 @@ impl SettingsDialog {
             CustomNext => editor.move_selection(1),
             CustomSharing => {
                 editor.sharing = true;
-                editor.preview = None;
+                editor.clear_import_review();
             }
             CustomBack => {
                 editor.sharing = false;
                 editor.showing_details = false;
                 editor.advanced = false;
                 editor.draft = None;
-                editor.preview = None;
-                editor.import = None;
-                editor.creation = None;
+                editor.clear_import_review();
                 self.focus = CustomNew;
             }
             CustomName | CustomExecutable | CustomArguments | CustomInterval | CustomPublish

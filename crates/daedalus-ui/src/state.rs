@@ -85,6 +85,10 @@ impl AgentPreset {
             .into_iter()
             .find(|preset| preset.short_name() == canonical)
     }
+
+    pub(crate) fn from_executable(program: &str) -> Option<Self> {
+        daedalus_proto::agent_launch_preset(program).and_then(Self::from_cli_name)
+    }
 }
 
 fn remove_last_grapheme(text: &mut String) -> bool {
@@ -372,7 +376,7 @@ impl AppState {
         true
     }
 
-    fn workspaces_in_sidebar_order(&self) -> Vec<&WorkspaceView> {
+    pub fn workspaces_in_sidebar_order(&self) -> Vec<&WorkspaceView> {
         crate::sidebar_content::repository_groups(&self.workspaces)
             .into_iter()
             .flat_map(|(_, indices)| indices)
@@ -399,6 +403,12 @@ impl AppState {
 
     /// Cycles the active workspace forward (`delta > 0`) or backward (`delta < 0`), wrapping cleanly.
     pub fn cycle_workspace(&mut self, delta: isize) -> Option<WorkspaceId> {
+        let next = self.adjacent_workspace(delta)?;
+        self.select_workspace(next);
+        Some(next)
+    }
+
+    pub fn adjacent_workspace(&self, delta: isize) -> Option<WorkspaceId> {
         let order = self.workspaces_in_sidebar_order();
         let len = order.len();
         if len == 0 {
@@ -412,9 +422,7 @@ impl AppState {
             None if delta < 0 => len - 1,
             None => 0,
         };
-        let next_id = order[next_idx].id;
-        self.select_workspace(next_id);
-        Some(next_id)
+        Some(order[next_idx].id)
     }
 
     pub fn select_workspace(&mut self, id: WorkspaceId) {
@@ -912,6 +920,9 @@ impl AppState {
                 {
                     view.cargo_preset = Some(preset);
                 }
+                if let Some(preset) = PaneViewState::agent_launch_preset(&summary) {
+                    view.agent_preset = Some(preset);
+                }
                 view.summary = summary;
                 view
             }
@@ -919,7 +930,7 @@ impl AppState {
     }
 
     /// Records the new pane in workspace order and preserves an existing terminal grid.
-    pub fn register_pane(&mut self, summary: PaneSummary, agent_preset: Option<AgentPreset>) {
+    pub fn register_pane(&mut self, summary: PaneSummary, select_tab: bool) {
         if let Some(ws) = self
             .workspaces
             .iter_mut()
@@ -928,14 +939,10 @@ impl AppState {
         {
             ws.panes.push(summary.id);
         }
-        if agent_preset.is_some() {
-            self.selected_panes
-                .insert((summary.workspace_id, summary.role), summary.id);
+        if select_tab {
+            self.select_role_pane(summary.workspace_id, summary.role, summary.id);
         }
-        let entry = self.cache_pane(summary);
-        if let Some(preset) = agent_preset {
-            entry.agent_preset = Some(preset);
-        }
+        self.cache_pane(summary);
     }
 
     fn invalidate_history_search(&mut self, pane_id: PaneId) {

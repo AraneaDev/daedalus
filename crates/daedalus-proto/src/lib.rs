@@ -32,6 +32,27 @@ pub fn canonical_agent_preset(name: &str) -> Option<&'static str> {
         .find(|preset| name.trim().eq_ignore_ascii_case(preset))
 }
 
+/// Identifies a direct agent executable, including daemon-side paths and Windows suffixes.
+pub fn agent_launch_preset(program: &str) -> Option<&'static str> {
+    let executable = program.rsplit(['/', '\\']).next()?;
+    let name = executable
+        .rsplit_once('.')
+        .filter(|(_, extension)| {
+            extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("cmd")
+        })
+        .map_or(executable, |(stem, _)| stem);
+    canonical_agent_preset(name)
+}
+
+#[cfg(test)]
+#[test]
+fn agent_launch_identity_accepts_platform_paths_and_known_executables() {
+    assert_eq!(agent_launch_preset("/usr/local/bin/claude"), Some("claude"));
+    assert_eq!(agent_launch_preset(r"C:\tools\Codex.EXE"), Some("codex"));
+    assert_eq!(agent_launch_preset("agy.cmd"), Some("agy"));
+    assert_eq!(agent_launch_preset("./claude-wrapper"), None);
+}
+
 pub const CARGO_TEST_PRESET: &str = "cargo-test";
 pub const CARGO_CHECK_PRESET: &str = "cargo-check";
 

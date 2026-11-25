@@ -76,6 +76,17 @@ pub(super) async fn dispatch(
                 .apply_workspace_import(workspace_id, revision, incoming, linked, resolutions)
                 .await?,
         )),
+        ClientMessage::ResolveWorkspaceImport {
+            workspace_id,
+            revision,
+            incoming,
+            linked,
+            resolutions,
+        } => Ok(ResponsePayload::WorkspaceImportPreview(
+            registry
+                .resolve_workspace_import(workspace_id, revision, incoming, linked, resolutions)
+                .await?,
+        )),
         ClientMessage::ExportWorkspace { workspace_id } => Ok(ResponsePayload::WorkbenchToml(
             registry.export_workbench(workspace_id).await?,
         )),

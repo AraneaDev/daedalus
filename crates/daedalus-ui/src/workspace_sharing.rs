@@ -6,6 +6,7 @@ use daedalus_ui::state::ConnectionState;
 use daedalus_ui::workspace_widgets::{self, WorkspaceWidgets};
 use std::time::{Duration, Instant};
 
+mod import_review;
 mod replies;
 
 impl DaedalusApp {
@@ -94,6 +95,19 @@ impl DaedalusApp {
         response: Result<ResponsePayload, String>,
     ) {
         let settings = self.state.settings.open && self.state.settings.widget_workspace == Some(id);
+        match operation {
+            WorkbenchOperation::WidgetPreview(token) => {
+                if !settings || !self.state.settings.custom.finish_widget_test(token) {
+                    return;
+                }
+            }
+            WorkbenchOperation::ImportPreview(token) => {
+                if !settings || !self.state.settings.custom.finish_import_review(token) {
+                    return;
+                }
+            }
+            _ => {}
+        }
         let previous: Vec<_> = if settings {
             self.state.settings.control_order().collect()
         } else {
@@ -137,13 +151,10 @@ impl DaedalusApp {
         match operation {
             WorkbenchOperation::WidgetEdit if editor.draft_matches_saved_widget() => {
                 editor.draft = None;
-                editor.preview = None;
+                editor.clear_preview();
             }
             WorkbenchOperation::Import if editor.sharing => {
-                editor.import = None;
-                editor.creation = None;
-                editor.preview = None;
-                editor.resolutions.clear();
+                editor.clear_import_review();
             }
             _ => {}
         }

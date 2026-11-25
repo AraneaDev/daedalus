@@ -3589,6 +3589,114 @@ async fn next_event_until(
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn manifest_wrapped_agents_keep_identity_across_clients() {
+    let dir = TempDir::new().unwrap();
+    let wrapper = dir.path().join("agent-wrapper");
+    let codex = dir.path().join("codex");
+    for executable in [&wrapper, &codex] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(executable, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(
+        dir.path().join(".daedalus.toml"),
+        "[agent]\npreset = 'Claude'\ncommand = ['./agent-wrapper', 'project agent']\n",
+    )
+    .unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let server = DaemonServer::bind_with_supervisor(
+        socket.clone(),
+        dir.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let (shutdown, rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(async {
+        let _ = rx.await;
+    }));
+    let mut client = IpcStream::connect(&socket).await.unwrap();
+    let ResponsePayload::WorkspaceCreated(workspace) = send_rpc(
+        &mut client,
+        1,
+        ClientMessage::CreateWorkspace {
+            name: "Agent test".into(),
+            root_dir: dir.path().into(),
+            env: HashMap::new(),
+        },
+    )
+    .await
+    else {
+        panic!("expected a workspace");
+    };
+    let ResponsePayload::PaneSpawned(manifest_agent) = send_rpc(
+        &mut client,
+        2,
+        ClientMessage::EnsureDefaultPane {
+            workspace_id: workspace.id,
+            role: PaneRole::Agent,
+            command: workspace.manifest.unwrap().agent_command,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    else {
+        panic!("expected the manifest agent");
+    };
+    assert_eq!(manifest_agent.launch_preset.as_deref(), Some("claude"));
+
+    let mut fresh_client = IpcStream::connect(&socket).await.unwrap();
+    let ResponsePayload::Workspaces(workspaces) =
+        send_rpc(&mut fresh_client, 1, ClientMessage::ListWorkspaces).await
+    else {
+        panic!("expected a fresh workspace list");
+    };
+    let existing = workspaces[0]
+        .panes
+        .iter()
+        .find(|pane| pane.id == manifest_agent.id)
+        .unwrap();
+    assert_eq!(existing.launch_preset.as_deref(), Some("claude"));
+
+    for (index, (command, expected)) in [
+        (Some(vec!["./codex".into()]), Some("codex")),
+        (
+            Some(vec!["./agent-wrapper".into(), "different argv".into()]),
+            None,
+        ),
+        (None, Some("shell")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ResponsePayload::PaneSpawned(pane) = send_rpc(
+            &mut client,
+            (index + 3) as u64,
+            ClientMessage::SpawnPane {
+                workspace_id: workspace.id,
+                role: PaneRole::Agent,
+                command,
+                cols: 80,
+                rows: 24,
+                shell: None,
+                env: HashMap::new(),
+            },
+        )
+        .await
+        else {
+            panic!("expected agent pane");
+        };
+        assert_eq!(pane.launch_preset.as_deref(), expected);
+    }
+    drop(client);
+    drop(fresh_client);
+    let _ = shutdown.send(());
+    task.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn cargo_widget_snapshots_survive_reconnect_and_process_exit() {
     let dir = TempDir::new().unwrap();

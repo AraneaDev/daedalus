@@ -409,15 +409,32 @@ impl DaedalusApp {
     }
 
     fn switch_workspace_by(&mut self, delta: isize) {
-        let prev_id = self.state.active_workspace_id;
-        if let Some(next_id) = self.state.cycle_workspace(delta) {
-            self.ensure_active_workspace_panes();
-            if Some(next_id) != prev_id {
-                self.reveal_active_workspace();
-                self.schedule_resize_flush();
+        if let Some(next) = self.state.adjacent_workspace(delta) {
+            if self.state.active_workspace_id == Some(next) {
+                self.ensure_active_workspace_panes();
+                self.request_redraw();
+            } else {
+                self.activate_workspace(next);
             }
-            self.request_redraw();
         }
+    }
+
+    fn activate_workspace(&mut self, id: WorkspaceId) {
+        if self.state.active_workspace_id == Some(id)
+            || !self
+                .state
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == id)
+        {
+            return;
+        }
+        self.state.select_workspace(id);
+        self.state.close_search();
+        self.ensure_active_workspace_panes();
+        self.reveal_active_workspace();
+        self.schedule_resize_flush();
+        self.request_redraw();
     }
 
     fn submit_worktree_modal(&mut self) {
@@ -749,6 +766,7 @@ impl DaedalusApp {
             }
             UiAction::SwitchWorkspaceNext => self.switch_workspace_by(1),
             UiAction::SwitchWorkspacePrev => self.switch_workspace_by(-1),
+            UiAction::SelectWorkspace(id) => self.activate_workspace(id),
             UiAction::PreviewImage => self.preview_image(),
             UiAction::CopySelection => self.copy_focused_selection(),
             UiAction::PasteClipboard => self.paste_clipboard_to_focused(),

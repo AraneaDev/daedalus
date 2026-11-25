@@ -5,12 +5,7 @@ use daedalus_proto::{ClientMessage, WorkspaceId};
 impl SettingsDialog {
     pub(super) fn detail_rows(&self, pages: Vec<Control>) -> Vec<Vec<Control>> {
         let mut rows = vec![pages];
-        let lines = self.detail_line_count();
-        let start = self.custom.detail_page * 8;
-        rows.extend((start..(start + 8).min(lines)).map(|index| vec![CustomDetail(index)]));
-        if lines > 8 {
-            rows.push(vec![CustomDetailPrev, CustomDetailNext]);
-        }
+        self.append_detail_rows(&mut rows);
         if let Some(definition) = self.selected_widget_definition() {
             rows.extend(
                 (0..definition.actions.len().min(4)).map(|index| vec![CustomViewAction(index)]),
@@ -26,6 +21,12 @@ impl SettingsDialog {
             CustomRefresh => "Refresh widget".into(),
             CustomDetailPrev => "‹ Previous lines".into(),
             CustomDetailNext => "Next lines ›".into(),
+            CustomDetail(index) if self.custom.sharing => self
+                .custom
+                .import_lines()
+                .get(index)
+                .cloned()
+                .unwrap_or_default(),
             CustomDetail(index) => self
                 .custom
                 .preview
@@ -99,7 +100,10 @@ impl SettingsDialog {
             .widget_definition(self.custom.selected()?)
     }
 
-    pub(super) fn detail_line_count(&self) -> usize {
+    pub(in crate::settings) fn detail_line_count(&self) -> usize {
+        if self.custom.sharing {
+            return self.custom.import_lines().len();
+        }
         self.custom.preview.as_ref().map_or(0, |result| {
             result
                 .details
@@ -107,5 +111,19 @@ impl SettingsDialog {
                 .map(|(_, value)| value.lines().count())
                 .sum()
         })
+    }
+
+    pub(in crate::settings) fn detail_page_size(&self) -> usize {
+        if self.custom.sharing { 6 } else { 8 }
+    }
+
+    pub(super) fn append_detail_rows(&self, rows: &mut Vec<Vec<Control>>) {
+        let lines = self.detail_line_count();
+        let page_size = self.detail_page_size();
+        let start = self.custom.detail_page * page_size;
+        rows.extend((start..(start + page_size).min(lines)).map(|index| vec![CustomDetail(index)]));
+        if lines > page_size {
+            rows.push(vec![CustomDetailPrev, CustomDetailNext]);
+        }
     }
 }
