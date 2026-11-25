@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.17](https://github.com/AraneaDev/daedalus/compare/v0.0.16...v0.0.17) (2026-11-25)
+
+
+### Features
+
+* expose split controls and Cargo presets in the workbench ([#48](https://github.com/AraneaDev/daedalus/issues/48)) ([bf82a0f](https://github.com/AraneaDev/daedalus/commit/bf82a0fc8b589e9acf7424a769d1fb4dc398634c))
+
 ## [0.0.16](https://github.com/AraneaDev/daedalus/compare/v0.0.15...v0.0.16) (2026-11-24)
 
 
