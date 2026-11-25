@@ -34,6 +34,7 @@ pub enum UiAction {
     OpenFailedRun(WorkspaceId),
     OpenNextFailedRun,
     RunTests,
+    RunCargo(crate::assignments::CargoPreset),
     FontZoomIn,
     FontZoomOut,
     FontZoomReset,

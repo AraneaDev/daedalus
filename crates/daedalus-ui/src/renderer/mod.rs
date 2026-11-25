@@ -430,6 +430,22 @@ fn collect_prepared_quads(
 
     if let Some(toggle) = layout.sidebar_toggle {
         quads.push(QuadInstance::new(toggle, theme.bg_header));
+        if let Some(button) = layout.layout_button {
+            let surface = Rect::new(
+                button.x,
+                button.y + 4. * s,
+                button.width - 2. * s,
+                button.height - 8. * s,
+            );
+            quads.push(QuadInstance::new(surface, theme.bg_sidebar).rounded(5. * s, 0., 0.));
+        }
+    }
+
+    if let Some(bar) = layout.cargo_bar {
+        quads.push(QuadInstance::new(bar, theme.bg_header));
+        for (_, button) in layout.cargo_buttons(s) {
+            quads.push(QuadInstance::new(button, theme.bg_sidebar).rounded(5. * s, 0., 0.));
+        }
     }
 
     // 2. Top disconnect / toast banner.
@@ -486,6 +502,45 @@ fn collect_prepared_quads(
                     theme.border_focused,
                 )
                 .rounded(s, 0.0, 0.0),
+            );
+        }
+    }
+
+    if state.active_workspace_id.is_some()
+        && let [agent, service, runner] = layout.panes.as_slice()
+    {
+        let agent = agent.outer;
+        let service = service.outer;
+        let runner = runner.outer;
+        let length = 24. * s;
+        let thickness = 2. * s;
+        let mut horizontal_grip = |x: f32, y: f32| {
+            quads.push(
+                QuadInstance::from_xywh(
+                    x - length / 2.,
+                    y - thickness / 2.,
+                    length,
+                    thickness,
+                    theme.text_muted,
+                )
+                .rounded(thickness / 2., 0., 0.),
+            );
+        };
+        let right_center = service.x + service.width / 2.;
+        if layout.stacked {
+            horizontal_grip(right_center, service.y);
+            horizontal_grip(right_center, runner.y);
+        } else {
+            horizontal_grip(right_center, (service.bottom() + runner.y) / 2.);
+            quads.push(
+                QuadInstance::from_xywh(
+                    (agent.right() + service.x - thickness) / 2.,
+                    agent.y + (agent.height - length) / 2.,
+                    thickness,
+                    length,
+                    theme.text_muted,
+                )
+                .rounded(thickness / 2., 0., 0.),
             );
         }
     }

@@ -168,6 +168,19 @@ impl TextRenderer {
         self.build_compact_recap_text(state, layout, theme);
         self.build_banner_text(state, layout, theme);
         let s = self.scale_factor;
+        for (preset, button) in layout.cargo_buttons(s) {
+            self.push_chrome_button(ChromeLineSpec {
+                text: preset.label(),
+                bounds: button,
+                left: button.x + 4. * s,
+                top: button.y + (button.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                max_w: (button.width - 8. * s).max(1.),
+                font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                color: theme.border_focused,
+                bold: true,
+            });
+        }
         for &(role, rect) in &layout.insight_rows {
             if let Some(text) = state.focused_widget_label(role) {
                 self.push_chrome_line(ChromeLineSpec {
@@ -235,6 +248,22 @@ impl TextRenderer {
                     run.x
                 } else {
                     button.x
+                };
+                let left = if let Some(view) = layout.layout_button {
+                    self.push_chrome_button(ChromeLineSpec {
+                        text: if state.zoomed { "Split" } else { "Focus" },
+                        bounds: view,
+                        left: view.x + 3. * s,
+                        top: view.y + (view.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                        max_w: view.width - 6. * s,
+                        font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+                        line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                        color: theme.border_focused,
+                        bold: true,
+                    });
+                    view.x
+                } else {
+                    left
                 };
                 toggle.width = (left - toggle.x).max(0.);
             } else if let Some((up, _)) = arrows {

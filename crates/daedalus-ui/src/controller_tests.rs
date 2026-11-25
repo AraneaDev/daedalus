@@ -2159,3 +2159,52 @@ fn terminal_activity_restores_title_and_only_marks_new_background_attention() {
     }));
     assert!(!w.app.state.panes[&agent].unread_attention);
 }
+
+#[test]
+fn cargo_bar_runs_on_the_selected_workspace_without_taking_agent_focus() {
+    use daedalus_ui::assignments::CargoPreset;
+
+    let mut w = Workbench::new();
+    let mut ws = workspace("Rust project");
+    let id = ws.id;
+    let agent = ws.panes[0].id;
+
+    w.app.state.set_workspaces(vec![ws.clone()]);
+    w.app
+        .handle_ui_action(UiAction::RunCargo(CargoPreset::Test));
+    assert!(w.idle());
+
+    ws.project.tools.push("Cargo".into());
+    w.app.state.set_workspaces(vec![ws]);
+    for preset in CargoPreset::ALL {
+        w.app.handle_ui_action(UiAction::RunCargo(preset));
+        let UiCommand::LaunchAssignment {
+            workspace_id,
+            assignment,
+            ..
+        } = w.command()
+        else {
+            panic!("expected Cargo runner launch");
+        };
+        assert_eq!(workspace_id, id);
+        assert_eq!(assignment.argv, ["cargo", preset.command(), "--workspace"]);
+
+        let mut runner = workspace("Runner").panes.remove(0);
+        runner.workspace_id = id;
+        runner.role = PaneRole::Runner;
+        let pane = runner.id;
+        w.app.handle_daemon_event(UiEvent::PaneSpawned {
+            summary: runner,
+            agent_preset: None,
+        });
+        w.app.handle_daemon_event(UiEvent::AssignmentStarted {
+            workspace_id: id,
+            pane_id: pane,
+            assignment,
+        });
+
+        assert_eq!(w.app.state.focused_pane_id(), Some(agent));
+        assert_eq!(w.app.state.pane_id_for_role(PaneRole::Runner), Some(pane));
+        assert_eq!(w.app.state.panes[&pane].cargo_preset, Some(preset));
+    }
+}

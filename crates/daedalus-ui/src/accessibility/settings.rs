@@ -64,6 +64,8 @@ pub(super) fn fields(
                     Control::Agy => "Add Agy".into(),
                     Control::Claude => "Add Claude".into(),
                     Control::Codex => "Add Codex".into(),
+                    Control::CargoTest => "Add Cargo Test runner".into(),
+                    Control::CargoCheck => "Add Cargo Check runner".into(),
                     _ => settings.label(control),
                 };
                 let mut button = named(Role::Button, label);
