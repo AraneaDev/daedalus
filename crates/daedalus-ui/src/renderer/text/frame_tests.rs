@@ -350,3 +350,23 @@ fn start_screen_lists_recent_projects_above_the_new_project_form() {
     assert_eq!(labels[0], "Set up workspace · Choose project");
     assert!(!labels.iter().any(|line| line == "Recent projects"));
 }
+
+#[test]
+fn cargo_bar_and_layout_switch_keep_their_visible_labels() {
+    let mut frame = Frame::new();
+    frame.layout.cargo_bar = Some(Rect::new(0., 766., 1200., 34.));
+    frame.layout.enable_layout_button(1.);
+    for (zoomed, expected) in [(true, "Split"), (false, "Focus")] {
+        frame.state.zoomed = zoomed;
+        frame.labels(1200., 800.);
+        let labels: Vec<_> = frame
+            .renderer
+            .chrome_items
+            .iter()
+            .map(|item| item.buffer.lines[0].text())
+            .collect();
+        for label in [expected, "Cargo Test", "Cargo Check"] {
+            assert!(labels.contains(&label), "{label} missing from {labels:?}");
+        }
+    }
+}

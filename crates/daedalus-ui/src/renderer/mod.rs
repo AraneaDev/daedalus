@@ -2033,6 +2033,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cargo_bar_and_split_handles_have_visible_surfaces_in_both_layouts() {
+        let (state, _) = make_state_with_agent_row();
+        let theme = Theme::dark();
+        for width in [450., 1200.] {
+            let mut layout = compute_layout(&LayoutInput {
+                window_w: width,
+                window_h: 766.,
+                scale_factor: 1.,
+                cell_w: 8.,
+                cell_h: 19.,
+                sidebar_override: None,
+                has_top_banner: false,
+                zoomed: false,
+                focused_role: PaneRole::Agent,
+                runner_has_failure: false,
+            });
+            layout.cargo_bar = Some(Rect::new(0., 766., width, 34.));
+            layout.enable_layout_button(1.);
+            let (quads, _) = collect_quads(&state, &layout, &theme, width, 800., 1., (8., 19.));
+            for (_, rect) in layout.cargo_buttons(1.) {
+                assert!(quads.iter().any(|quad| quad.rect
+                    == [rect.x, rect.y, rect.width, rect.height]
+                    && quad.color == theme.bg_sidebar.to_array()));
+            }
+            let grips: Vec<_> = quads
+                .iter()
+                .filter(|quad| {
+                    quad.color == theme.text_muted.to_array()
+                        && matches!((quad.rect[2], quad.rect[3]), (24., 2.) | (2., 24.))
+                })
+                .collect();
+            assert_eq!(grips.len(), 2);
+            assert_eq!(grips.iter().all(|grip| grip.rect[3] == 2.), layout.stacked);
+        }
+    }
+
+    #[test]
     fn setup_forms_outline_the_control_with_keyboard_focus() {
         let (mut state, layout) = make_state_with_agent_row();
         let (w, h) = (1200., 800.);
