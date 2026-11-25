@@ -50,7 +50,8 @@ daedalus-ui --dir . --agent shell
 The UI starts the local daemon and opens the agent terminal. Select a named tab to switch terminals.
 Choose **Split** or press `Ctrl+Shift+Z`, then drag the dividers to resize the panes.
 Use the shell preset to try the workbench immediately. To use Claude, Codex or agy, install the
-corresponding CLI and choose its preset with the agent picker. Press `Shift+Enter` in the picker to start an
+corresponding CLI and choose its preset with the agent picker.
+Press `Shift+Enter` in the picker to start an
 additional agent in this workspace. Docker and Compose are needed only for container workflows.
 
 Choose **+ Workspace** to enter a name and a project folder on the daemon host. If the daemon
