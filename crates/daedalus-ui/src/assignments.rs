@@ -31,6 +31,19 @@ impl CargoPreset {
         }
     }
 
+    pub const fn launch_tag(self) -> &'static str {
+        match self {
+            Self::Test => daedalus_proto::CARGO_TEST_PRESET,
+            Self::Check => daedalus_proto::CARGO_CHECK_PRESET,
+        }
+    }
+
+    pub fn from_launch_tag(tag: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.launch_tag() == tag)
+    }
+
     pub const fn command(self) -> &'static str {
         match self {
             Self::Test => "test",

@@ -153,7 +153,11 @@ or repeat the shortcut to close it. The preview supports regular PNG files up to
 | `Ctrl+Shift+T` | Launch the saved setup test command in the current workspace. |
 | `Ctrl+Shift+R` | Open a failed runner. Repeat to visit the next failing workspace. |
 | `Ctrl+Shift+E` | Forward latest `Runner` failure trace to `Agent` (bracketed paste) |
-| `Ctrl+Shift+C` / `V` | Copy selection / Bracketed-paste clipboard |
+| `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selected terminal text or paste from the clipboard. |
+| `Ctrl+C` / `Ctrl+V` (Windows) | Copy selected terminal text or paste from the clipboard. |
+| `Ctrl+.` (Windows) | Send an interrupt to the focused terminal. |
+| `Shift+Arrow` | Send a modified arrow key to the focused terminal. |
+| `Shift` + drag | Select terminal text while the terminal program tracks mouse input. |
 | `Ctrl+Shift+I` | Preview the selected workspace PNG path, or close its preview. |
 | `Ctrl+Shift+F` | Search the focused pane. Enter advances, Shift+Enter goes back, and Esc closes search. The search bar also has previous and next controls and a match-case toggle (F4). |
 | `Shift+PageUp` / `PageDown` / `End` | Scrollback navigation |

@@ -4,7 +4,7 @@
 
 typedef struct {
     uint16_t cols, rows, x, y;
-    bool visible, alternate;
+    bool visible, alternate, bracketed_paste;
     size_t history;
 } DdInfo;
 
@@ -111,6 +111,9 @@ void dd_ghostty_info(DdTerminal *t, DdInfo *i) {
     ghostty_terminal_get(t->vt, GHOSTTY_TERMINAL_DATA_CURSOR_X, &i->x);
     ghostty_terminal_get(t->vt, GHOSTTY_TERMINAL_DATA_CURSOR_Y, &i->y);
     ghostty_terminal_get(t->vt, GHOSTTY_TERMINAL_DATA_CURSOR_VISIBLE, &i->visible);
+    GhosttyTerminalModeConfig bracketed_paste = {.mode = GHOSTTY_MODE_BRACKETED_PASTE};
+    ghostty_terminal_get(t->vt, GHOSTTY_TERMINAL_DATA_MODE, &bracketed_paste);
+    i->bracketed_paste = bracketed_paste.value;
     ghostty_terminal_get(t->vt, GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS, &i->history);
 }
 

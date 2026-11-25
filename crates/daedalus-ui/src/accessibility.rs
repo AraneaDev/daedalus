@@ -2,6 +2,7 @@ mod setup_review;
 pub(super) use setup_review::setup_action;
 mod settings;
 mod terminals;
+mod worktree;
 pub(super) use settings::settings_action;
 pub(super) use terminals::TerminalControls;
 
@@ -12,10 +13,9 @@ use accesskit::{
 use daedalus_proto::{AgentState, PaneRole, PaneStatus};
 use daedalus_ui::input::{UiAction, filter_modal_text};
 use daedalus_ui::layout::Rect;
-use daedalus_ui::layout::overlays::{
-    worktree_button_rects, worktree_input_rect, worktree_modal_rect,
-};
-use daedalus_ui::state::{AppState, ConnectionState};
+#[cfg(test)]
+use daedalus_ui::layout::overlays::{worktree_input_rect, worktree_modal_rect};
+use daedalus_ui::state::{ActiveOverlay, AppState, ConnectionState};
 use daedalus_ui::workspace_form::{Control, WorkspaceForm, WorkspaceFormAction};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -75,10 +75,7 @@ pub(super) fn workspace_action(
     state: &mut AppState,
     request: &ActionRequest,
 ) -> Option<WorkspaceFormAction> {
-    if state.setup_review.open
-        || !state.workspace_form.open
-        || state.settings.open
-        || state.failure_recipients.is_some()
+    if state.active_overlay() != Some(ActiveOverlay::WorkspaceForm)
         || request.target_tree != TreeId::ROOT
     {
         return None;
@@ -113,7 +110,7 @@ pub(super) fn action(
 ) -> Option<UiAction> {
     if request.target_tree == TreeId::ROOT
         && request.action == Action::Click
-        && overlay(state).is_none()
+        && state.active_overlay().is_none()
     {
         match request.target_node {
             TOGGLE_LAYOUT if state.active_workspace().is_some() => {
@@ -141,13 +138,7 @@ pub(super) fn action(
             _ => {}
         }
     }
-    if state.setup_review.open
-        || !state.worktree_modal.open
-        || state.workspace_form.open
-        || state.settings.open
-        || state.failure_recipients.is_some()
-        || state.picker.open
-        || state.action_palette.open
+    if state.active_overlay() != Some(ActiveOverlay::Worktree)
         || request.target_tree != TreeId::ROOT
     {
         return None;
@@ -183,7 +174,10 @@ fn named(role: Role, name: impl Into<String>) -> Node {
 }
 
 fn overlay(state: &AppState) -> Option<(NodeId, Node)> {
-    let (id, label, description) = if let Some(choices) = &state.failure_recipients {
+    let overlay = state.active_overlay();
+    let (id, label, description) = if overlay == Some(ActiveOverlay::FailureRecipients)
+        && let Some(choices) = &state.failure_recipients
+    {
         (
             NodeId(16),
             "Send failure to agent",
@@ -194,7 +188,7 @@ fn overlay(state: &AppState) -> Option<(NodeId, Node)> {
                 choices.agents.len()
             ),
         )
-    } else if state.setup_review.open {
+    } else if overlay == Some(ActiveOverlay::SetupReview) {
         (
             SETUP_REVIEW,
             "Review environment",
@@ -205,9 +199,9 @@ fn overlay(state: &AppState) -> Option<(NodeId, Node)> {
                 state.setup_review.detail()
             ),
         )
-    } else if state.settings.open {
+    } else if overlay == Some(ActiveOverlay::Settings) {
         (SETTINGS, "Workspace settings", state.settings.heading())
-    } else if state.workspace_form.open {
+    } else if overlay == Some(ActiveOverlay::WorkspaceForm) {
         (
             NEW_WORKSPACE,
             "Set up workspace · Choose project",
@@ -219,7 +213,7 @@ fn overlay(state: &AppState) -> Option<(NodeId, Node)> {
                 "Enter a project folder. The workspace name defaults to the folder name. Enter reviews the environment. Escape cancels.".into()
             },
         )
-    } else if state.picker.open {
+    } else if overlay == Some(ActiveOverlay::AgentPicker) {
         (
             PICKER,
             "Select agent preset",
@@ -228,19 +222,19 @@ fn overlay(state: &AppState) -> Option<(NodeId, Node)> {
                 state.picker.selected_preset().label()
             ),
         )
-    } else if state.action_palette.open {
+    } else if overlay == Some(ActiveOverlay::ActionPalette) {
         let selection = state.active_actions().get(state.action_palette.selected_index).map_or_else(
             || "No actions configured for this workspace.".to_string(),
             |action| format!("Selected {}. Use Up and Down to choose, Enter to run, or Escape to cancel.", action.label),
         );
         (ACTIONS, "Action palette", selection)
-    } else if state.worktree_modal.open {
+    } else if overlay == Some(ActiveOverlay::Worktree) {
         (
             WORKTREE,
             "New Git worktree",
             "Enter to create. Escape to cancel.".to_owned(),
         )
-    } else if state.close_modal.open {
+    } else if overlay == Some(ActiveOverlay::CloseWorkspace) {
         let modal = &state.close_modal;
         let mut detail = vec![modal.workspace_name.clone()];
         if modal.is_dirty {
@@ -509,52 +503,7 @@ pub(super) fn workbench_tree(
                 state.workspace_form.modal_rect(width, height, scale),
             );
         } else if id == WORKTREE {
-            let (branch, cancel, create) = worktree_controls(state);
-            let modal = worktree_modal_rect(width, height, scale);
-            node.set_bounds(bounds(modal));
-            let mut field = named(Role::TextInput, "Branch name");
-            field.set_bounds(bounds(worktree_input_rect(modal, scale)));
-            let run = text_run(&state.worktree_modal.branch_input);
-            let caret = TextPosition {
-                node: BRANCH_TEXT,
-                character_index: run.character_lengths().len(),
-            };
-            field.push_child(BRANCH_TEXT);
-            field.set_text_selection(TextSelection {
-                anchor: caret,
-                focus: caret,
-            });
-            nodes.push((BRANCH_TEXT, run));
-            field.set_required();
-            field.add_action(Action::SetValue);
-            if state.worktree_modal.missing_branch() {
-                field.set_invalid(Invalid::True);
-                field.set_error_message(VALIDATION);
-            }
-            node.push_child(branch);
-            nodes.push((branch, field));
-            focus = branch;
-            let (cancel_rect, create_rect) = worktree_button_rects(modal, scale);
-            for (button_id, name, enabled, rect) in [
-                (cancel, "Cancel", true, cancel_rect),
-                (create, "Create", state.can_create_worktree(), create_rect),
-            ] {
-                let mut button = named(Role::Button, name);
-                button.set_bounds(bounds(rect));
-                if enabled {
-                    button.add_action(Action::Click);
-                } else {
-                    button.set_disabled();
-                }
-                node.push_child(button_id);
-                nodes.push((button_id, button));
-            }
-            if state.worktree_modal.missing_branch() {
-                let mut alert = named(Role::Alert, "Enter a branch name");
-                alert.set_live(Live::Assertive);
-                node.push_child(VALIDATION);
-                nodes.push((VALIDATION, alert));
-            }
+            focus = worktree::append_fields(state, &mut node, &mut nodes, width, height, scale);
         }
         root.push_child(id);
         nodes.push((id, node));

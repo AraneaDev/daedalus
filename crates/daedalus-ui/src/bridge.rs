@@ -3,6 +3,7 @@ mod launch;
 mod negotiation_tests;
 mod rpc;
 mod setup;
+mod terminal;
 mod workspace;
 
 use std::path::PathBuf;
@@ -24,7 +25,6 @@ use workspace::{
     replace_agent_preset, workspace_name_from_dir,
 };
 
-use crate::input::format_failure_trace_prompt;
 use crate::state::AgentPreset;
 
 const DEFAULT_PANE_COLS: u16 = 120;
@@ -94,6 +94,11 @@ pub enum UiCommand {
         workspace_id: WorkspaceId,
         assignments: Vec<crate::assignments::Assignment>,
     },
+    SaveWorkspaceSettings {
+        workspace_id: WorkspaceId,
+        assignments: Vec<crate::assignments::Assignment>,
+        request_id: u64,
+    },
     ReadActivity {
         workspace_id: WorkspaceId,
         cursor: Option<daedalus_proto::ActivityCursor>,
@@ -145,6 +150,10 @@ pub enum UiCommand {
         action_id: String,
     },
     SendInput {
+        pane_id: PaneId,
+        data: Vec<u8>,
+    },
+    Paste {
         pane_id: PaneId,
         data: Vec<u8>,
     },
@@ -219,6 +228,11 @@ pub enum UiEvent {
     ProjectSetupSaveFailed {
         workspace_id: WorkspaceId,
         message: String,
+    },
+    WorkspaceSettingsSaved {
+        workspace_id: WorkspaceId,
+        request_id: u64,
+        result: Result<(), String>,
     },
     ActivityRead {
         token: u64,
@@ -395,6 +409,12 @@ async fn run_bridge(
                         session_loop(&mut conn, &sink, &mut cmd_rx).await;
                     }
                     Err(RpcError::Disconnected) => {}
+                    Err(RpcError::TimedOut) => {
+                        sink.emit(UiEvent::Toast {
+                            message: "Daemon setup timed out. Reconnecting.".into(),
+                            is_error: true,
+                        });
+                    }
                     Err(RpcError::Proto(err)) => {
                         warn!(error = %err, "session initialization RPC failed");
                         sink.emit(UiEvent::Toast {
@@ -477,6 +497,7 @@ async fn initialize_session(
         recent_projects_supported,
         project_setup_supported,
         image_preview_supported,
+        paste_supported,
         home_dir,
         ..
     } = conn.call(ClientMessage::Ping).await?
@@ -489,6 +510,7 @@ async fn initialize_session(
     conn.recent_projects_supported = recent_projects_supported;
     conn.image_preview_supported = image_preview_supported;
     conn.project_setup_supported = project_setup_supported;
+    conn.paste_supported = paste_supported;
     let _ = conn
         .call(ClientMessage::Subscribe {
             pane_ids: None,
@@ -570,9 +592,14 @@ async fn session_loop(
                 };
                 match handle_command(conn, sink, cmd).await {
                     Ok(()) => {}
-                    Err(RpcError::Disconnected) => {
+                    Err(failure @ (RpcError::Disconnected | RpcError::TimedOut)) => {
+                        let message = if matches!(failure, RpcError::TimedOut) {
+                            "Daemon response timed out. Command outcome is unknown."
+                        } else {
+                            "Connection lost before the daemon confirmed the command."
+                        };
                         sink.emit(UiEvent::Toast {
-                            message: "Connection lost before the daemon confirmed the command.".into(),
+                            message: message.into(),
                             is_error: true,
                         });
                         return;
@@ -625,6 +652,14 @@ async fn handle_command(
         } => {
             setup::save_project_setup(conn, sink, workspace_id, assignments).await?;
         }
+        UiCommand::SaveWorkspaceSettings {
+            workspace_id,
+            assignments,
+            request_id,
+        } => {
+            setup::save_workspace_settings(conn, sink, workspace_id, assignments, request_id)
+                .await?;
+        }
         UiCommand::ReadActivity {
             workspace_id,
             cursor,
@@ -640,7 +675,7 @@ async fn handle_command(
                 Ok(ResponsePayload::Activity(page)) if page.workspace_id == workspace_id => {
                     sink.emit(UiEvent::ActivityRead { token, page })
                 }
-                Err(RpcError::Disconnected) => return Err(RpcError::Disconnected),
+                Err(err @ (RpcError::Disconnected | RpcError::TimedOut)) => return Err(err),
                 _ => sink.emit(UiEvent::ActivityReadFailed(token)),
             }
         }
@@ -649,24 +684,7 @@ async fn handle_command(
             name,
             root_dir,
         } => {
-            let event = match conn
-                .call(ClientMessage::CreateManualWorkspace { name, root_dir })
-                .await
-            {
-                Ok(ResponsePayload::WorkspaceCreated(workspace)) => {
-                    UiEvent::ManualWorkspaceCreated { session, workspace }
-                }
-                Ok(_) => UiEvent::ManualWorkspaceFailed {
-                    session,
-                    message: "Unexpected reply to workspace creation.".into(),
-                },
-                Err(RpcError::Proto(error)) => UiEvent::ManualWorkspaceFailed {
-                    session,
-                    message: error.to_string(),
-                },
-                Err(RpcError::Disconnected) => return Err(RpcError::Disconnected),
-            };
-            sink.emit(event);
+            workspace::create_manual_workspace(conn, sink, session, name, root_dir).await?;
         }
         UiCommand::CreateWorkspace {
             name,
@@ -710,27 +728,15 @@ async fn handle_command(
             remove_worktree,
             force_remove_worktree,
         } => {
-            let close = conn
-                .call(ClientMessage::CloseWorkspace {
-                    id,
-                    compose_down,
-                    remove_worktree,
-                    force_remove_worktree,
-                })
-                .await;
-            if matches!(close, Err(RpcError::Disconnected)) {
-                return Err(RpcError::Disconnected);
-            }
-            if let ResponsePayload::Workspaces(ws) =
-                conn.call(ClientMessage::ListWorkspaces).await?
-            {
-                if close.is_ok() {
-                    sink.emit(UiEvent::WorkspacesLoaded(ws));
-                } else {
-                    sink.emit(UiEvent::WorkspaceCloseFailed(ws));
-                }
-            }
-            close?;
+            workspace::close_workspace(
+                conn,
+                sink,
+                id,
+                compose_down,
+                remove_worktree,
+                force_remove_worktree,
+            )
+            .await?;
         }
         UiCommand::LaunchAssignment {
             workspace_id,
@@ -746,20 +752,7 @@ async fn handle_command(
             cols,
             rows,
         } => {
-            let response = conn
-                .call(ClientMessage::SpawnPane {
-                    workspace_id,
-                    role: daedalus_proto::PaneRole::Agent,
-                    command: preset.command(),
-                    shell: None,
-                    env: Default::default(),
-                    cols,
-                    rows,
-                })
-                .await?;
-            if let ResponsePayload::PaneSpawned(summary) = response {
-                workspace::publish_pane(conn, sink, summary, Some(preset)).await?;
-            }
+            workspace::add_agent(conn, sink, workspace_id, preset, cols, rows).await?;
         }
         UiCommand::ReplaceAgentPreset {
             workspace_id,
@@ -775,25 +768,7 @@ async fn handle_command(
             pane_id,
             path,
         } => {
-            if !conn.image_preview_supported {
-                sink.emit(UiEvent::Toast {
-                    message: "This daemon does not support workspace image previews".into(),
-                    is_error: true,
-                });
-            } else {
-                match conn
-                    .call(ClientMessage::PreviewImage { workspace_id, path })
-                    .await?
-                {
-                    ResponsePayload::ImagePreview(image) if image.valid() => {
-                        sink.emit(UiEvent::ImagePreview { pane_id, image })
-                    }
-                    _ => sink.emit(UiEvent::Toast {
-                        message: "Invalid preview received".into(),
-                        is_error: true,
-                    }),
-                }
-            }
+            terminal::preview_image(conn, sink, workspace_id, pane_id, path).await?;
         }
         UiCommand::RunWorkspaceAction {
             workspace_id,
@@ -810,6 +785,9 @@ async fn handle_command(
                 .call(ClientMessage::SendInput { pane_id, data })
                 .await?;
         }
+        UiCommand::Paste { pane_id, data } => {
+            terminal::paste(conn, pane_id, data).await?;
+        }
         UiCommand::ResizePane {
             pane_id,
             cols,
@@ -824,11 +802,7 @@ async fn handle_command(
                 .await?;
         }
         UiCommand::RequestSnapshot { pane_id } => {
-            if let ResponsePayload::Snapshot(snapshot) =
-                conn.call(ClientMessage::GetSnapshot { pane_id }).await?
-            {
-                sink.emit(UiEvent::Snapshot(snapshot));
-            }
+            terminal::snapshot(conn, sink, pane_id).await?;
         }
         UiCommand::RequestScrollback {
             pane_id,
@@ -836,25 +810,8 @@ async fn handle_command(
             offset_from_bottom,
             count,
         } => {
-            if let ResponsePayload::ScrollbackRows {
-                pane_id,
-                total_scrollback,
-                rows,
-            } = conn
-                .call(ClientMessage::GetScrollback {
-                    pane_id,
-                    offset_from_bottom,
-                    count,
-                })
-                .await?
-            {
-                sink.emit(UiEvent::ScrollbackLoaded {
-                    pane_id,
-                    generation,
-                    total_scrollback,
-                    rows,
-                });
-            }
+            terminal::scrollback(conn, sink, pane_id, generation, offset_from_bottom, count)
+                .await?;
         }
         UiCommand::SearchPane {
             pane_id,
@@ -862,30 +819,7 @@ async fn handle_command(
             case_sensitive,
             generation,
         } => {
-            match conn
-                .call(ClientMessage::SearchPane {
-                    pane_id,
-                    query,
-                    case_sensitive,
-                })
-                .await?
-            {
-                ResponsePayload::SearchMatches {
-                    pane_id,
-                    total_scrollback,
-                    matches,
-                } => {
-                    sink.emit(UiEvent::SearchResults {
-                        pane_id,
-                        generation,
-                        total_scrollback,
-                        matches,
-                    });
-                }
-                other => {
-                    warn!(response = ?other, "unexpected response to SearchPane");
-                }
-            }
+            terminal::search(conn, sink, pane_id, query, case_sensitive, generation).await?;
         }
         UiCommand::EnsureWorkspacePanes {
             workspace_id,
@@ -907,36 +841,7 @@ async fn handle_command(
             runner_pane_id,
             agent_pane_id,
         } => {
-            match conn
-                .call(ClientMessage::GetFailureTrace {
-                    pane_id: runner_pane_id,
-                })
-                .await?
-            {
-                ResponsePayload::FailureTrace(Some(trace)) => {
-                    let exit_code = trace.exit_code;
-                    let data = format_failure_trace_prompt(&trace);
-                    let _ = conn
-                        .call(ClientMessage::SendInput {
-                            pane_id: agent_pane_id,
-                            data,
-                        })
-                        .await?;
-                    sink.emit(UiEvent::Toast {
-                        message: format!("Sent failure trace (exit {exit_code}) to Agent"),
-                        is_error: false,
-                    });
-                }
-                ResponsePayload::FailureTrace(None) => {
-                    sink.emit(UiEvent::Toast {
-                        message: "No failure trace captured in Runner pane yet".to_string(),
-                        is_error: true,
-                    });
-                }
-                other => {
-                    warn!(response = ?other, "unexpected response to GetFailureTrace");
-                }
-            }
+            terminal::forward_failure(conn, sink, runner_pane_id, agent_pane_id).await?;
         }
         UiCommand::Shutdown => {}
     }

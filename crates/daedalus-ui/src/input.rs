@@ -304,10 +304,10 @@ pub fn translate_key_for_platform(
             NamedKey::Tab => Some(if shift { b"\x1b[Z" } else { b"\t" }),
             NamedKey::Escape => Some(b"\x1b"),
             NamedKey::Space => Some(b" "),
-            NamedKey::ArrowUp => Some(b"\x1b[A"),
-            NamedKey::ArrowDown => Some(b"\x1b[B"),
-            NamedKey::ArrowRight => Some(b"\x1b[C"),
-            NamedKey::ArrowLeft => Some(b"\x1b[D"),
+            NamedKey::ArrowUp => Some(if shift { b"\x1b[1;2A" } else { b"\x1b[A" }),
+            NamedKey::ArrowDown => Some(if shift { b"\x1b[1;2B" } else { b"\x1b[B" }),
+            NamedKey::ArrowRight => Some(if shift { b"\x1b[1;2C" } else { b"\x1b[C" }),
+            NamedKey::ArrowLeft => Some(if shift { b"\x1b[1;2D" } else { b"\x1b[D" }),
             NamedKey::Home => Some(b"\x1b[H"),
             NamedKey::End => Some(b"\x1b[F"),
             NamedKey::Insert => Some(b"\x1b[2~"),
@@ -337,6 +337,22 @@ pub fn translate_key_for_platform(
     }
 
     UiAction::Ignore
+}
+
+/// Windows clipboard shortcuts in the terminal viewport.
+pub fn windows_terminal_shortcut(key: &Key, mods: ModifiersState) -> Option<UiAction> {
+    if mods != ModifiersState::CONTROL {
+        return None;
+    }
+    let Key::Character(key) = key else {
+        return None;
+    };
+    match key.as_str() {
+        "c" | "C" => Some(UiAction::CopySelection),
+        "v" | "V" => Some(UiAction::PasteClipboard),
+        "." => Some(UiAction::SendBytes(vec![0x03])),
+        _ => None,
+    }
 }
 
 fn translate_primary_shift_char(ch: &str) -> UiAction {
@@ -650,6 +666,19 @@ mod tests {
 
     fn t_macos(key: &Key, text: Option<&str>, mods: ModifiersState) -> UiAction {
         translate_key_for_platform(key, text, mods, false, false, false, false, true)
+    }
+
+    #[test]
+    fn windows_clipboard_shortcuts_are_separate_from_interrupt() {
+        let control = ModifiersState::CONTROL;
+        let shortcut = |key, mods| windows_terminal_shortcut(&char_key(key), mods);
+        assert_eq!(shortcut("c", control), Some(UiAction::CopySelection));
+        assert_eq!(shortcut("v", control), Some(UiAction::PasteClipboard));
+        assert_eq!(shortcut(".", control), Some(UiAction::SendBytes(vec![3])));
+        assert_eq!(shortcut("d", control), None);
+        assert_eq!(shortcut("c", control | ModifiersState::SHIFT), None);
+        assert_eq!(shortcut("v", control | ModifiersState::ALT), None);
+        assert_eq!(shortcut("c", ModifiersState::empty()), None);
     }
 
     #[test]
@@ -973,6 +1002,21 @@ mod tests {
             t(&named_key(NamedKey::Shift), None, ModifiersState::SHIFT),
             UiAction::Ignore
         );
+    }
+
+    #[test]
+    fn shift_arrows_forward_xterm_modifier_sequences() {
+        for (key, expected) in [
+            (NamedKey::ArrowUp, b"\x1b[1;2A"),
+            (NamedKey::ArrowDown, b"\x1b[1;2B"),
+            (NamedKey::ArrowRight, b"\x1b[1;2C"),
+            (NamedKey::ArrowLeft, b"\x1b[1;2D"),
+        ] {
+            assert_eq!(
+                t(&named_key(key), None, ModifiersState::SHIFT),
+                UiAction::SendBytes(expected.to_vec())
+            );
+        }
     }
 
     #[test]

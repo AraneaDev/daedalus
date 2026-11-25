@@ -2,5 +2,7 @@
 Type=Application
 Name=Daedalus
 Exec=daedalus-ui
+Icon=daedalus
+StartupWMClass=daedalus
 Categories=Development;TerminalEmulator;
 Terminal=false

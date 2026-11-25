@@ -15,7 +15,7 @@ use winit::window::Window;
 
 use crate::layout::{PaneRect, Rect, WorkspaceLayout, sidebar_workspace_close_rect};
 use crate::state::ConnectionState;
-use crate::state::{AppState, WorkspaceView};
+use crate::state::{ActiveOverlay, AppState, WorkspaceView};
 use crate::theme::{Rgba, Theme};
 
 use self::quads::{QuadInstance, QuadPipeline, rgba_to_wgpu_clear_color};
@@ -758,7 +758,10 @@ fn collect_overlay_quads(
     border_w: f32,
 ) {
     let (screen_w, screen_h) = screen;
-    if let Some(choices) = &state.failure_recipients {
+    let overlay = state.active_overlay();
+    if overlay == Some(ActiveOverlay::FailureRecipients)
+        && let Some(choices) = &state.failure_recipients
+    {
         let (modal, visible) = action_palette_layout(
             screen_w,
             screen_h,
@@ -785,7 +788,7 @@ fn collect_overlay_quads(
         }
         return;
     }
-    if state.setup_review.open {
+    if overlay == Some(ActiveOverlay::SetupReview) {
         let modal = crate::setup_review::modal_rect(screen_w, screen_h, s);
         push_modal_frame(quads, modal, screen, theme, border_w, modal.height * 0.14);
         for (control, rect) in state.setup_review.controls(modal) {
@@ -815,7 +818,7 @@ fn collect_overlay_quads(
         }
         return;
     }
-    if state.workspace_form.open {
+    if overlay == Some(ActiveOverlay::WorkspaceForm) {
         let form = &state.workspace_form;
         let modal = form.modal_rect(screen_w, screen_h, s);
         let heading = form
@@ -849,7 +852,7 @@ fn collect_overlay_quads(
         }
         return;
     }
-    if state.settings.open {
+    if overlay == Some(ActiveOverlay::Settings) {
         push_modal_frame(
             quads,
             state.settings.modal_rect(screen_w, screen_h, s),
@@ -889,8 +892,11 @@ fn collect_overlay_quads(
         return;
     }
     // 4. Centered Agent preset picker modal overlay (rendered after base text).
-    if state.picker.open || state.action_palette.open {
-        let (modal, selected) = if state.action_palette.open {
+    if matches!(
+        overlay,
+        Some(ActiveOverlay::AgentPicker | ActiveOverlay::ActionPalette)
+    ) {
+        let (modal, selected) = if overlay == Some(ActiveOverlay::ActionPalette) {
             let idx = state.action_palette.selected_index;
             let (modal, visible) =
                 action_palette_layout(screen_w, screen_h, s, state.active_actions().len(), idx);
@@ -914,7 +920,7 @@ fn collect_overlay_quads(
             let selected_rect = picker_item_rect(modal, selected, s);
             push_chrome_badge(quads, selected_rect, theme, border_w, theme.border_focused);
         }
-    } else if state.worktree_modal.open {
+    } else if overlay == Some(ActiveOverlay::Worktree) {
         let modal = worktree_modal_rect(screen_w, screen_h, s);
         push_modal_frame(
             quads,
@@ -965,7 +971,7 @@ fn collect_overlay_quads(
             border_w,
             6.0 * s,
         );
-    } else if state.close_modal.open {
+    } else if overlay == Some(ActiveOverlay::CloseWorkspace) {
         let modal = close_workspace_modal_rect(screen_w, screen_h, s);
         let metrics = close_modal_metrics(modal, s);
         push_modal_frame(
@@ -1363,13 +1369,7 @@ impl GpuRenderer {
             self.text_renderer.render_base(&mut render_pass);
 
             // Overlay pass (same render pass): active modal or search bar above base text
-            if total_quad_count > base_quad_count
-                || state.action_palette.open
-                || state.picker.open
-                || state.worktree_modal.open
-                || state.close_modal.open
-                || state.search.is_some()
-            {
+            if total_quad_count > base_quad_count || state.has_input_overlay() {
                 self.quad_pipeline
                     .render_range(&mut render_pass, base_quad_count..total_quad_count);
                 self.text_renderer.render_modal(&mut render_pass);
@@ -1470,6 +1470,7 @@ pub(crate) mod tests {
 
         let pane = state.panes.get_mut(&agent_id).unwrap();
         pane.apply_snapshot(GridSnapshot {
+            terminal_modes: Default::default(),
             activity: None,
             insight: None,
             pane_id: agent_id,

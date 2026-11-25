@@ -260,6 +260,113 @@ async fn wait_for_command_finished(
 
 #[cfg(unix)]
 #[tokio::test]
+async fn terminal_paste_uses_the_current_pty_mode() {
+    use ResponsePayload::{Ok, PaneSpawned, WorkspaceCreated};
+
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let server = DaemonServer::bind_with_supervisor(
+        socket.clone(),
+        dir.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let (shutdown, shutdown_rx) = oneshot::channel::<()>();
+    let daemon = tokio::spawn(server.serve(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut client = IpcStream::connect(&socket).await.unwrap();
+    let WorkspaceCreated(workspace) = send_rpc(
+        &mut client,
+        1,
+        ClientMessage::CreateWorkspace {
+            name: "terminal-paste".into(),
+            root_dir: dir.path().to_owned(),
+            env: HashMap::new(),
+        },
+    )
+    .await
+    else {
+        panic!("expected workspace");
+    };
+    let PaneSpawned(pane) = send_rpc(
+        &mut client,
+        2,
+        ClientMessage::SpawnPane {
+            workspace_id: workspace.id,
+            role: PaneRole::Agent,
+            command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "stty raw -echo; printf '\\033[?2004h'; dd bs=1 count=15 of=wrapped 2>/dev/null; \
+                 printf '\\033[?2004l'; dd bs=1 count=3 of=plain 2>/dev/null"
+                    .into(),
+            ]),
+            shell: None,
+            cols: 80,
+            rows: 24,
+            env: HashMap::new(),
+        },
+    )
+    .await
+    else {
+        panic!("expected pane");
+    };
+
+    for (enabled, path, expected) in [
+        (true, "wrapped", &b"\x1b[200~a\nb\x1b[201~"[..]),
+        (false, "plain", &b"a b"[..]),
+    ] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response = send_rpc(
+                    &mut client,
+                    3,
+                    ClientMessage::GetSnapshot { pane_id: pane.id },
+                )
+                .await;
+                let ResponsePayload::Snapshot(snapshot) = response else {
+                    panic!("expected grid snapshot");
+                };
+                if snapshot.terminal_modes.bracketed_paste == enabled {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("terminal paste mode did not update");
+        assert!(matches!(
+            send_rpc(
+                &mut client,
+                4,
+                ClientMessage::Paste {
+                    pane_id: pane.id,
+                    data: b"a\x1b[201~\nb".to_vec(),
+                },
+            )
+            .await,
+            Ok
+        ));
+        let path = dir.path().join(path);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if std::fs::read(&path).is_ok_and(|bytes| bytes == expected) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("unexpected bytes in {path:?}: {:?}", std::fs::read(&path)));
+    }
+    let _ = shutdown.send(());
+    daemon.await.unwrap().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn bash_osc133_captures_failure_trace_and_survives_client_reconnect() {
     let dir = TempDir::new().unwrap();
     let sock = dir.path().join("daedalusd.sock");
@@ -2625,6 +2732,58 @@ command = "echo SVC_ACTION_OK"
     .unwrap_err();
     assert!(matches!(missing_pane_err, ProtoError::InvalidRequest(_)));
 
+    #[cfg(unix)]
+    let exit = ["/bin/sh", "-c", "exit 0"];
+    #[cfg(windows)]
+    let exit = ["cmd.exe", "/C", "exit"];
+    let ResponsePayload::PaneSpawned(exited_runner) = send_rpc(
+        &mut client,
+        20,
+        ClientMessage::SpawnPane {
+            workspace_id: ws.id,
+            role: PaneRole::Runner,
+            command: Some(exit.into_iter().map(String::from).collect()),
+            shell: None,
+            cols: 120,
+            rows: 20,
+            env: HashMap::new(),
+        },
+    )
+    .await
+    else {
+        panic!("expected runner to spawn");
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let ResponsePayload::Workspaces(workspaces) =
+                send_rpc(&mut client, 21, ClientMessage::ListWorkspaces).await
+            else {
+                panic!("expected workspace list");
+            };
+            if workspaces[0].panes.iter().any(|pane| {
+                pane.id == exited_runner.id
+                    && matches!(pane.status, daedalus_proto::PaneStatus::Exited { .. })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("runner should remain listed after exiting");
+    assert!(matches!(
+        send_rpc_result(
+            &mut client,
+            22,
+            ClientMessage::RunWorkspaceAction {
+                workspace_id: ws.id,
+                action_id: "runner-echo".into(),
+            },
+        )
+        .await,
+        Err(ProtoError::InvalidRequest(message)) if message.contains("no live runner")
+    ));
+
     let runner_pane = match send_rpc(
         &mut client,
         4,
@@ -2685,7 +2844,7 @@ command = "echo SVC_ACTION_OK"
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            if text.contains("RUNNER_ACTION_OK") {
+            if text.lines().any(|line| line.trim() == "RUNNER_ACTION_OK") {
                 return text;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -3423,7 +3582,27 @@ async fn cargo_widget_snapshots_survive_reconnect_and_process_exit() {
         else {
             panic!("expected runner")
         };
-        client = IpcStream::connect(&socket).await.unwrap();
+        let preset = match command {
+            "test" => daedalus_proto::CARGO_TEST_PRESET,
+            "check" => daedalus_proto::CARGO_CHECK_PRESET,
+            _ => unreachable!(),
+        };
+        assert_eq!(pane.launch_preset.as_deref(), Some(preset));
+        let mut fresh_client = IpcStream::connect(&socket).await.unwrap();
+        for connection in [&mut client, &mut fresh_client] {
+            let ResponsePayload::Workspaces(workspaces) =
+                send_rpc(connection, 3, ClientMessage::ListWorkspaces).await
+            else {
+                panic!("expected workspace list")
+            };
+            let refreshed = workspaces
+                .iter()
+                .find(|workspace| workspace.id == ws.id)
+                .and_then(|workspace| workspace.panes.iter().find(|p| p.id == pane.id))
+                .expect("runner appears in both workspace lists");
+            assert_eq!(refreshed.launch_preset.as_deref(), Some(preset));
+        }
+        client = fresh_client;
         let insight = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let ResponsePayload::Snapshot(s) = send_rpc(

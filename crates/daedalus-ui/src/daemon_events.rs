@@ -1,0 +1,336 @@
+use super::{DaedalusApp, play_notification_ping};
+use daedalus_proto::{PaneId, PaneRole, ServerEvent, WorkspaceId, WorkspaceInfo};
+use daedalus_ui::{
+    bridge::{UiCommand, UiEvent},
+    state::ConnectionState,
+};
+
+impl DaedalusApp {
+    pub(super) fn handle_daemon_event(&mut self, event: UiEvent) {
+        let previous_workspace = self.state.active_workspace_id;
+        let search_generation = self.state.search.as_ref().map(|search| search.generation);
+        self.state
+            .recap
+            .observe(&event, &self.state.workspaces, &self.state.panes);
+        if let Some(id) = self.history_workspace_for_event(&event) {
+            self.history.changed(id);
+        }
+        self.sync_history_visit();
+        match event {
+            UiEvent::ImagePreview { pane_id, image } => {
+                if self.state.focused_pane_id() == Some(pane_id) && image.valid() {
+                    self.state.image_preview = Some((pane_id, image));
+                }
+            }
+            UiEvent::JournalCapability(supported) => self.history.connection(supported),
+            UiEvent::DaemonCapabilities {
+                home_dir,
+                project_setups,
+                recent_projects,
+            } => {
+                self.daemon_home = home_dir;
+                self.project_setups.set_daemon_backed(project_setups);
+                if !recent_projects {
+                    // Rows from the previous daemon would name folders this one never saw.
+                    self.state.workspace_form.set_recent(Vec::new());
+                }
+            }
+            UiEvent::RecentProjectsLoaded(projects) => {
+                self.hide_open_recent_projects();
+                self.state.workspace_form.set_recent(projects);
+            }
+            UiEvent::ProjectSetupChanged {
+                root_dir,
+                assignments,
+            } => self.project_setup_changed(&root_dir, assignments),
+            UiEvent::ProjectSetupSaveFailed {
+                workspace_id,
+                message,
+            } => {
+                self.project_setups.rejected(workspace_id);
+                self.refresh_workspace_setup(workspace_id);
+                self.show_toast(message, true);
+            }
+            UiEvent::WorkspaceSettingsSaved {
+                workspace_id,
+                request_id,
+                result,
+            } => {
+                self.workspace_settings_saved(workspace_id, request_id, result);
+            }
+            UiEvent::ActivityRead { token, page } => {
+                use daedalus_ui::activity_history::PageUpdate;
+                match self.history.received(token, &page) {
+                    Some(PageUpdate::Recap { first, gap }) => {
+                        self.state
+                            .recap
+                            .journal(&page, first, gap, &self.state.panes)
+                    }
+                    Some(PageUpdate::Foreground(count)) => self
+                        .state
+                        .recap
+                        .foreground_activity(page.workspace_id, count),
+                    None => {}
+                }
+            }
+            UiEvent::ActivityReadFailed(token) => self.history.failed(token),
+            UiEvent::Connected => {
+                self.state.connection = ConnectionState::Connected;
+                self.schedule_resize_flush();
+            }
+            UiEvent::Disconnected => {
+                self.setup_disconnected();
+                self.workspace_settings_disconnected();
+                self.history.connection(false);
+                self.state.connection = ConnectionState::Reconnecting;
+                self.state.workspace_list_loaded = false;
+                let form = &mut self.state.workspace_form;
+                form.finish_submission(
+                    form.session(),
+                    Some("Connection lost. Check the workspace list before retrying.".into()),
+                );
+                self.state.close_modal.submitting = false;
+                self.state.last_sent_sizes.clear();
+                self.state.spawning_workspaces.clear();
+                self.schedule_resize_flush();
+            }
+            UiEvent::WorkspaceCloseFinished(id) => {
+                if self.state.close_modal.workspace_id == Some(id) {
+                    self.state.close_modal.submitting = false;
+                }
+            }
+            UiEvent::WorkspaceCloseFailed(workspaces) => {
+                self.state.set_workspaces(workspaces);
+                self.schedule_resize_flush();
+            }
+            UiEvent::WorkspacesLoaded(workspaces) => self.apply_workspace_list(workspaces),
+            UiEvent::SetupInspected { session, result } => self.setup_inspected(session, result),
+            UiEvent::SetupInstallerStarted {
+                workspace_id,
+                pane_id,
+            } => self.setup_installer_started(workspace_id, pane_id),
+            UiEvent::SetupInstallerFinished(pane, code) => {
+                self.setup_installer_finished(pane, code)
+            }
+            UiEvent::SetupInstallerFailed {
+                workspace_id,
+                message,
+            } => self.setup_failed(workspace_id, message),
+            UiEvent::SetupApplied {
+                workspace_id,
+                error,
+            } => self.setup_applied(workspace_id, error),
+            UiEvent::ManualWorkspaceCreated { session, workspace } => {
+                self.setup_created(session, workspace);
+            }
+            UiEvent::ManualWorkspaceFailed { session, message } => {
+                self.setup_creation_failed(session, message)
+            }
+            UiEvent::WorkspaceCreated(ws) => {
+                let ws_id = ws.id;
+                self.project_setups.absorb(std::slice::from_ref(&ws));
+                self.state.upsert_workspace(ws);
+                self.state.select_workspace(ws_id);
+                self.state.close_search();
+                self.schedule_resize_flush();
+            }
+            UiEvent::WorkspacePanesEnsured {
+                workspace_id,
+                complete,
+            } => {
+                self.state.finish_workspace_spawning(workspace_id, complete);
+            }
+            UiEvent::PaneSpawned {
+                summary,
+                agent_preset,
+            } => {
+                self.state.register_pane(summary, agent_preset);
+                self.schedule_resize_flush();
+            }
+            UiEvent::AssignmentStarted {
+                workspace_id,
+                pane_id,
+                assignment,
+            } => self.assignment_started(workspace_id, pane_id, assignment),
+            UiEvent::PaneClosed { pane_id } => {
+                self.setup_installer_finished(pane_id, None);
+                self.state.remove_session(pane_id);
+                self.schedule_resize_flush();
+            }
+            UiEvent::Snapshot(snapshot) => {
+                let pane_id = snapshot.pane_id;
+                if let Some(pane_id) = self.state.apply_grid_snapshot(snapshot) {
+                    self.send_command(UiCommand::RequestSnapshot { pane_id });
+                } else {
+                    self.request_scrollback_if_needed(pane_id);
+                }
+            }
+            UiEvent::ScrollbackLoaded {
+                pane_id,
+                generation,
+                total_scrollback,
+                rows,
+            } => {
+                if let Some(pane) = self.state.panes.get_mut(&pane_id) {
+                    pane.apply_scrollback(generation, total_scrollback, rows);
+                }
+            }
+            UiEvent::SearchResults {
+                pane_id,
+                generation,
+                total_scrollback,
+                matches,
+            } => {
+                if self
+                    .state
+                    .apply_search_results(pane_id, generation, total_scrollback, matches)
+                {
+                    self.scroll_to_active_search_match();
+                }
+            }
+            UiEvent::AgentStateChanged {
+                workspace_id,
+                pane_id,
+                state,
+            } => {
+                self.state.apply_agent_state(workspace_id, pane_id, state);
+            }
+            UiEvent::WorkspaceRuntimeUpdated {
+                workspace_id,
+                bound_ports,
+                containers,
+                git_status,
+                git_branch,
+            } => {
+                self.state.apply_workspace_runtime(
+                    workspace_id,
+                    bound_ports,
+                    containers,
+                    git_status,
+                    git_branch,
+                );
+            }
+            UiEvent::ServerEvent(server_event) => self.apply_terminal_event(server_event),
+            UiEvent::Toast { message, is_error } => {
+                let had_banner = self.has_top_banner();
+                self.state.show_toast(message, is_error);
+                if !had_banner {
+                    self.schedule_resize_flush();
+                }
+            }
+        }
+
+        if let Some(search) = &self.state.search
+            && Some(search.generation) != search_generation
+        {
+            self.run_pane_search();
+        }
+        self.state.recap.select(self.state.active_workspace_id);
+        if previous_workspace != self.state.active_workspace_id {
+            self.reveal_active_workspace();
+        }
+        self.flush_due_resizes(false);
+        self.request_redraw();
+    }
+
+    fn apply_workspace_list(&mut self, workspaces: Vec<WorkspaceInfo>) {
+        self.project_setups.absorb(&workspaces);
+        for (workspace_id, assignments) in self.project_setups.migrations(&workspaces) {
+            if !self.send_command(UiCommand::SaveProjectSetup {
+                workspace_id,
+                assignments,
+            }) {
+                self.project_setups.rejected(workspace_id);
+            }
+        }
+        self.restore_session_names(&workspaces);
+        self.state.set_workspaces(workspaces);
+        self.reconcile_setup_installer();
+        self.offer_first_workspace();
+        self.ensure_active_workspace_panes();
+        self.schedule_resize_flush();
+    }
+
+    fn agent_output_pane(&self, event: &ServerEvent) -> Option<PaneId> {
+        match event {
+            ServerEvent::GridDelta(delta)
+                if !delta.dirty_rows.is_empty()
+                    && self
+                        .state
+                        .panes
+                        .get(&delta.pane_id)
+                        .is_some_and(|pane| pane.summary.role == PaneRole::Agent) =>
+            {
+                Some(delta.pane_id)
+            }
+            ServerEvent::ResyncRequired { pane_id } => Some(*pane_id),
+            _ => None,
+        }
+    }
+
+    fn history_workspace_for_event(&self, event: &UiEvent) -> Option<WorkspaceId> {
+        match event {
+            UiEvent::AgentStateChanged { workspace_id, .. }
+            | UiEvent::WorkspaceRuntimeUpdated { workspace_id, .. }
+            | UiEvent::ServerEvent(ServerEvent::ExternalStatusUpdated { workspace_id, .. }) => {
+                Some(*workspace_id)
+            }
+            UiEvent::ServerEvent(event) => {
+                let pane_id = match event {
+                    ServerEvent::CommandFinished { pane_id, .. }
+                    | ServerEvent::PaneExited { pane_id, .. } => Some(*pane_id),
+                    _ => self.agent_output_pane(event),
+                }?;
+                self.state
+                    .panes
+                    .get(&pane_id)
+                    .map(|pane| pane.summary.workspace_id)
+            }
+            _ => None,
+        }
+    }
+
+    fn apply_terminal_event(&mut self, server_event: ServerEvent) {
+        let ended = match &server_event {
+            ServerEvent::PaneExited { pane_id, exit_code } => Some((*pane_id, *exit_code)),
+            _ => None,
+        };
+        let changed_pane = self.agent_output_pane(&server_event);
+        let watch_attention = match &server_event {
+            ServerEvent::GridDelta(delta)
+                if self.ui_config.notification_ping
+                    && self
+                        .state
+                        .panes
+                        .get(&delta.pane_id)
+                        .is_some_and(|p| !p.unread_attention) =>
+            {
+                Some(delta.pane_id)
+            }
+            _ => None,
+        };
+        if let Some(resync_pane_id) = self.state.apply_server_event(server_event) {
+            self.send_command(UiCommand::RequestSnapshot {
+                pane_id: resync_pane_id,
+            });
+        }
+        self.sync_history_visit();
+        if let Some(id) = watch_attention
+            && self
+                .state
+                .panes
+                .get(&id)
+                .is_some_and(|p| p.unread_attention)
+            && let Some(window) = &self.window
+        {
+            play_notification_ping();
+            window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+        }
+        if let Some((id, code)) = ended {
+            self.setup_installer_finished(id, code);
+        }
+        if let Some(pane_id) = changed_pane {
+            self.request_scrollback_if_needed(pane_id);
+        }
+    }
+}

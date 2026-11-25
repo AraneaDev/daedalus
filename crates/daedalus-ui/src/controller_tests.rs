@@ -298,6 +298,7 @@ fn search_rejects_stale_results_and_routes_input_and_scrollback_to_the_selected_
     w.app.activate_session(HitTarget::SelectSession(pane));
     assert_eq!(w.app.state.focused_role, PaneRole::Service);
     w.app.handle_daemon_event(UiEvent::Snapshot(GridSnapshot {
+        terminal_modes: Default::default(),
         activity: None,
         insight: None,
         pane_id: pane,
@@ -1004,6 +1005,7 @@ fn terminal_dimensions_retry_rejected_commands_and_drag_selection_uses_absolute_
     w.app.resize_panes(&layout);
     assert!(w.idle());
     w.app.handle_daemon_event(UiEvent::Snapshot(GridSnapshot {
+        terminal_modes: Default::default(),
         activity: None,
         insight: None,
         pane_id: pane,
@@ -1038,6 +1040,97 @@ fn terminal_dimensions_retry_rejected_commands_and_drag_selection_uses_absolute_
     assert!(w.app.state.panes[&pane].selection.is_none());
     w.app.handle_daemon_event(UiEvent::Disconnected);
     assert!(w.app.state.last_sent_sizes.is_empty());
+}
+
+#[test]
+fn terminal_mouse_reports_live_clicks_and_shift_preserves_selection() {
+    use daedalus_proto::{
+        GridDelta, GridRow, GridSnapshot, MouseTracking, ServerEvent, TerminalModes,
+    };
+    use daedalus_ui::selection::{CellPos, Selection};
+    use winit::keyboard::KeyCode;
+
+    let mut w = Workbench::new();
+    let ws = workspace("mouse");
+    let pane = ws.panes[0].id;
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+    let metrics = ViewportMetrics {
+        size: (1440, 900).into(),
+        scale_factor: 1.,
+        cell: (8., 16.),
+    };
+    let layout = w.app.layout_for(metrics);
+    let agent = layout.pane(PaneRole::Agent).unwrap();
+    w.app.handle_daemon_event(UiEvent::Snapshot(GridSnapshot {
+        terminal_modes: TerminalModes {
+            mouse: MouseTracking::Button,
+            sgr_mouse: true,
+            ..TerminalModes::default()
+        },
+        activity: None,
+        insight: None,
+        pane_id: pane,
+        seq: 1,
+        cols: agent.cols,
+        rows: agent.rows,
+        cursor: Default::default(),
+        history_generation: 0,
+        scrollback_len: 0,
+        rows_data: vec![GridRow {
+            links: Vec::new(),
+            wraps: false,
+            row_index: 0,
+            abs_row: 0,
+            cells: vec![],
+        }],
+    }));
+    w.app.pointer.position = (agent.viewport.x + 8.5, agent.viewport.y + 1.);
+    w.app.click_at(metrics);
+    assert!(matches!(w.command(), UiCommand::SendInput { pane_id, data }
+        if pane_id == pane && data == b"\x1b[<0;2;1M"));
+    w.app.handle_left_mouse_up();
+    assert!(matches!(w.command(), UiCommand::SendInput { pane_id, data }
+        if pane_id == pane && data == b"\x1b[<0;2;1m"));
+    w.app
+        .key_pressed(KeyCode::Tab.into(), &Key::Named(NamedKey::Tab), None, false);
+    assert!(matches!(w.command(), UiCommand::SendInput { pane_id, data }
+        if pane_id == pane && data == b"\t"));
+
+    w.app.modifiers = winit::keyboard::ModifiersState::SHIFT;
+    w.app.click_at(metrics);
+    w.app.pointer.position = (agent.viewport.x + 24.5, agent.viewport.y + 1.);
+    w.app.drag_selection(metrics);
+    w.app.handle_left_mouse_up();
+    assert_eq!(
+        w.app.state.panes[&pane].selection,
+        Some(Selection::new(CellPos::new(1, 0), CellPos::new(3, 0)))
+    );
+    w.app
+        .handle_daemon_event(UiEvent::ServerEvent(ServerEvent::GridDelta(GridDelta {
+            terminal_modes: TerminalModes::default(),
+            activity: None,
+            insight: None,
+            pane_id: pane,
+            seq: 2,
+            cols: agent.cols,
+            rows: agent.rows,
+            cursor: Default::default(),
+            history_generation: 0,
+            scrollback_len: None,
+            dirty_rows: vec![],
+        })));
+    w.app.modifiers = winit::keyboard::ModifiersState::empty();
+    w.app.pointer.position = (agent.viewport.x + 40.5, agent.viewport.y + 1.);
+    w.app.click_at(metrics);
+    w.app.pointer.position = (agent.viewport.x + 56.5, agent.viewport.y + 1.);
+    w.app.drag_selection(metrics);
+    w.app.handle_left_mouse_up();
+    assert_eq!(
+        w.app.state.panes[&pane].selection,
+        Some(Selection::new(CellPos::new(5, 0), CellPos::new(7, 0)))
+    );
+    assert!(w.idle());
 }
 
 #[test]
@@ -1170,6 +1263,7 @@ fn daemon_activity_updates_the_visible_workspace_and_invalidates_a_search_when_h
     };
     w.app
         .handle_daemon_event(UiEvent::ServerEvent(ServerEvent::GridDelta(GridDelta {
+            terminal_modes: Default::default(),
             activity: None,
             insight: None,
             pane_id: agent,
@@ -1433,11 +1527,23 @@ fn daemon_backed_settings_save_sends_the_setup_and_follows_changes_from_the_daem
     assert!(w.idle());
     w.app
         .handle_settings_action(SettingsAction::Save(vec![entry.clone()]));
+    assert!(w.app.state.settings.open);
+    let UiCommand::SaveWorkspaceSettings {
+        workspace_id,
+        assignments,
+        request_id,
+    } = w.command()
+    else {
+        panic!("expected settings save");
+    };
+    assert_eq!(workspace_id, id);
+    assert_eq!(assignments, vec![entry]);
+    w.app.handle_daemon_event(UiEvent::WorkspaceSettingsSaved {
+        workspace_id: id,
+        request_id,
+        result: Ok(()),
+    });
     assert!(!w.app.state.settings.open);
-    assert!(
-        matches!(w.command(), UiCommand::SaveProjectSetup { workspace_id, assignments }
-            if workspace_id == id && assignments == vec![entry.clone()])
-    );
     let renamed = runner_entry("Renamed");
     w.app.handle_daemon_event(UiEvent::ProjectSetupChanged {
         root_dir: root,
@@ -1521,11 +1627,16 @@ fn rejected_or_unsent_setup_saves_fall_back_to_the_confirmed_setup() {
     w.app.handle_ui_action(UiAction::WorkspaceSettings);
     w.app
         .handle_settings_action(SettingsAction::Save(vec![denied.clone()]));
-    assert!(matches!(w.command(), UiCommand::SaveProjectSetup { .. }));
-    w.app.handle_daemon_event(UiEvent::ProjectSetupSaveFailed {
+    let UiCommand::SaveWorkspaceSettings { request_id, .. } = w.command() else {
+        panic!("expected settings save");
+    };
+    w.app.handle_daemon_event(UiEvent::WorkspaceSettingsSaved {
         workspace_id: id,
-        message: "no".into(),
+        request_id,
+        result: Err("disk full".into()),
     });
+    assert!(w.app.state.settings.open);
+    assert_eq!(w.app.state.settings.error.as_deref(), Some("disk full"));
     assert_eq!(
         w.app.project_setups.load(id).unwrap(),
         vec![confirmed.clone()]
@@ -1544,6 +1655,74 @@ fn rejected_or_unsent_setup_saves_fall_back_to_the_confirmed_setup() {
             .contains("Reconnect")
     );
     assert_eq!(w.app.project_setups.load(id).unwrap(), vec![confirmed]);
+}
+#[test]
+fn save_and_launch_waits_for_confirmation_and_preserves_failed_drafts() {
+    use daedalus_ui::settings::Control;
+    let mut w = Workbench::new();
+    daemon_capabilities(&mut w, true);
+    let ws = workspace("Retry");
+    let id = ws.id;
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+    let entry = runner_entry("Retry me");
+    w.app.state.settings.begin(vec![entry.clone()]);
+
+    let launch = w.app.state.settings.activate(Control::Launch);
+    w.app.handle_settings_action(launch);
+    let UiCommand::SaveWorkspaceSettings { request_id, .. } = w.command() else {
+        panic!("expected settings save");
+    };
+    assert!(w.app.state.settings.open);
+    assert!(w.app.state.settings.is_saving());
+    assert!(w.idle());
+
+    w.app.handle_daemon_event(UiEvent::WorkspaceSettingsSaved {
+        workspace_id: WorkspaceId::new(),
+        request_id,
+        result: Ok(()),
+    });
+    assert!(w.app.state.settings.is_saving());
+    assert!(w.idle());
+    w.app.handle_daemon_event(UiEvent::WorkspaceSettingsSaved {
+        workspace_id: id,
+        request_id,
+        result: Err("disk full".into()),
+    });
+    assert!(w.app.state.settings.open);
+    assert_eq!(w.app.state.settings.error.as_deref(), Some("disk full"));
+    assert_eq!(w.app.state.settings.value(Control::Name), Some("Retry me"));
+    assert!(w.idle());
+
+    let launch = w.app.state.settings.activate(Control::Launch);
+    w.app.handle_settings_action(launch);
+    let UiCommand::SaveWorkspaceSettings {
+        request_id: retry_id,
+        assignments,
+        ..
+    } = w.command()
+    else {
+        panic!("expected settings retry");
+    };
+    assert_ne!(request_id, retry_id);
+    assert_eq!(assignments, vec![entry.clone()]);
+    w.app.handle_daemon_event(UiEvent::WorkspaceSettingsSaved {
+        workspace_id: id,
+        request_id,
+        result: Ok(()),
+    });
+    assert!(w.idle());
+    w.app.handle_daemon_event(UiEvent::WorkspaceSettingsSaved {
+        workspace_id: id,
+        request_id: retry_id,
+        result: Ok(()),
+    });
+    assert!(!w.app.state.settings.open);
+    assert!(
+        matches!(w.command(), UiCommand::LaunchAssignment { workspace_id, assignment, .. }
+            if workspace_id == id && assignment == entry)
+    );
+    assert!(w.idle());
 }
 
 fn recent_project(name: &str, root: &str, has_setup: bool) -> daedalus_proto::RecentProject {
@@ -2105,6 +2284,7 @@ fn terminal_activity_restores_title_and_only_marks_new_background_attention() {
         })
     };
     let snapshot = GridSnapshot {
+        terminal_modes: Default::default(),
         pane_id: agent,
         seq: 1,
         cols: 80,
@@ -2123,6 +2303,7 @@ fn terminal_activity_restores_title_and_only_marks_new_background_attention() {
     assert_eq!(w.app.state.session_names[&agent], "Reviewer");
     let delta = |seq, attention| {
         UiEvent::ServerEvent(ServerEvent::GridDelta(GridDelta {
+            terminal_modes: Default::default(),
             pane_id: agent,
             seq,
             activity: activity(attention, "✳ Claude Code"),
@@ -2225,4 +2406,34 @@ fn cargo_bar_runs_on_the_selected_workspace_without_taking_agent_focus() {
         w.app.state.toast.as_ref().unwrap().0,
         "Reconnect to run Cargo"
     );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_copy_with_no_selection_never_sends_terminal_input() {
+    use winit::keyboard::{KeyCode, PhysicalKey};
+
+    let mut workbench = Workbench::new();
+    let workspace = workspace("Windows clipboard");
+    let pane_id = workspace.panes[0].id;
+    workbench.app.state.set_workspaces(vec![workspace]);
+    workbench.app.modifiers = ModifiersState::CONTROL;
+    workbench.app.key_pressed(
+        PhysicalKey::Code(KeyCode::KeyC),
+        &Key::Character("c".into()),
+        Some("\x03"),
+        false,
+    );
+    assert!(workbench.idle());
+
+    workbench.app.key_pressed(
+        PhysicalKey::Code(KeyCode::Period),
+        &Key::Character(".".into()),
+        None,
+        false,
+    );
+    assert!(matches!(
+        workbench.command(),
+        UiCommand::SendInput { pane_id: target, data } if target == pane_id && data == b"\x03"
+    ));
 }

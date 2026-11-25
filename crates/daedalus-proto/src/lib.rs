@@ -15,10 +15,11 @@ pub use rpc::{
 };
 pub use types::{
     AgentState, Cell, CellFlags, Color, ContainerHealth, CursorState, CustomAction, ExternalStatus,
-    FailureTrace, GitWorkspaceStatus, GitWorktreeInfo, GridDelta, GridRow, GridSnapshot, PaneId,
-    PaneRole, PaneStatus, PaneSummary, PortMapping, PortSource, ProjectInfo, RunnerInsight,
-    SearchMatch, SidebarWidget, StatusLevel, StatusProvider, WidgetConfig, WorkspaceId,
-    WorkspaceInfo, WorkspaceManifest, wrap_bracketed_paste,
+    FailureTrace, GitWorkspaceStatus, GitWorktreeInfo, GridDelta, GridRow, GridSnapshot,
+    MouseTracking, PaneId, PaneRole, PaneStatus, PaneSummary, PortMapping, PortSource, ProjectInfo,
+    RunnerInsight, SearchMatch, SidebarWidget, StatusLevel, StatusProvider, TerminalModes,
+    WidgetConfig, WorkspaceId, WorkspaceInfo, WorkspaceManifest, single_line_paste,
+    wrap_bracketed_paste,
 };
 
 use std::path::{Path, PathBuf};
@@ -28,6 +29,37 @@ pub fn canonical_agent_preset(name: &str) -> Option<&'static str> {
     ["agy", "claude", "codex", "shell"]
         .into_iter()
         .find(|preset| name.trim().eq_ignore_ascii_case(preset))
+}
+
+pub const CARGO_TEST_PRESET: &str = "cargo-test";
+pub const CARGO_CHECK_PRESET: &str = "cargo-check";
+
+/// Identifies an explicitly launched Cargo test or check, including executable paths.
+pub fn cargo_launch_preset(program: &str, subcommand: Option<&str>) -> Option<&'static str> {
+    let program = program.rsplit(['/', '\\']).next()?;
+    if !program.eq_ignore_ascii_case("cargo") && !program.eq_ignore_ascii_case("cargo.exe") {
+        return None;
+    }
+    match subcommand {
+        Some("test") => Some(CARGO_TEST_PRESET),
+        Some("check") => Some(CARGO_CHECK_PRESET),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn cargo_launch_identity_is_specific_to_test_or_check() {
+    assert_eq!(
+        cargo_launch_preset("/usr/bin/cargo", Some("test")),
+        Some(CARGO_TEST_PRESET)
+    );
+    assert_eq!(
+        cargo_launch_preset(r"C:\tools\Cargo.exe", Some("check")),
+        Some(CARGO_CHECK_PRESET)
+    );
+    assert_eq!(cargo_launch_preset("cargo", Some("build")), None);
+    assert_eq!(cargo_launch_preset("echo", Some("test")), None);
 }
 
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 96;

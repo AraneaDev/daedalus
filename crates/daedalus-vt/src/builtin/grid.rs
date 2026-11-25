@@ -72,6 +72,8 @@ impl StoredRow {
 }
 
 pub struct Grid {
+    pub(super) terminal_modes: daedalus_proto::TerminalModes,
+    last_emitted_modes: daedalus_proto::TerminalModes,
     cols: u16,
     rows: u16,
     scrollback_limit: usize,
@@ -108,6 +110,8 @@ impl Grid {
             });
         }
         Self {
+            terminal_modes: Default::default(),
+            last_emitted_modes: Default::default(),
             cols,
             rows,
             scrollback_limit,
@@ -527,6 +531,7 @@ impl Grid {
             })
             .collect();
         GridSnapshot {
+            terminal_modes: self.terminal_modes,
             activity: None,
             insight: None,
             pane_id,
@@ -593,12 +598,15 @@ impl Grid {
         if dirty_rows.is_empty()
             && self.last_emitted_cursor == Some(cursor)
             && self.last_emitted_history_generation == self.history_generation
+            && self.last_emitted_modes == self.terminal_modes
         {
             return None;
         }
         self.last_emitted_cursor = Some(cursor);
+        self.last_emitted_modes = self.terminal_modes;
         self.last_emitted_history_generation = self.history_generation;
         Some(GridDelta {
+            terminal_modes: self.terminal_modes,
             activity: None,
             insight: None,
             pane_id,

@@ -74,9 +74,13 @@ impl StateStore {
     }
 
     pub fn load(&self) -> io::Result<PersistedState> {
+        Ok(self.load_snapshot()?.unwrap_or_default())
+    }
+
+    pub(crate) fn load_snapshot(&self) -> io::Result<Option<PersistedState>> {
         let contents = match fs::read_to_string(&self.path) {
             Ok(raw) => raw,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(PersistedState::default()),
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
 
@@ -92,7 +96,7 @@ impl StateStore {
                 ),
             ));
         }
-        Ok(state)
+        Ok(Some(state))
     }
 
     pub fn save(&self, state: &PersistedState) -> io::Result<()> {

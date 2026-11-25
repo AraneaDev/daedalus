@@ -20,7 +20,7 @@ use glyphon::{
 use crate::config::clamp_font_size;
 use crate::layout::overlays::sanitize_scale;
 use crate::layout::{Rect, WorkspaceLayout};
-use crate::state::AppState;
+use crate::state::{ActiveOverlay, AppState};
 use crate::theme::{self, Theme};
 
 pub const FONT_SIZE_LOGICAL: f32 = 14.0;
@@ -608,22 +608,28 @@ impl TextRenderer {
                     .preview_button(state, self.scale_factor)
                     .map(|rect| (rect, "Preview image"))
             });
-        let modal_open = state.has_input_overlay() || preview.is_some();
+        let overlay = state.active_overlay();
+        let modal_open = overlay.is_some() || preview.is_some();
         self.has_modal_text = modal_open;
         if modal_open {
-            if let Some(choices) = &state.failure_recipients {
+            if overlay == Some(ActiveOverlay::FailureRecipients)
+                && let Some(choices) = &state.failure_recipients
+            {
                 self.build_failure_recipient_items(state, choices, theme, screen_w, screen_h);
-            } else if state.setup_review.open {
+            } else if overlay == Some(ActiveOverlay::SetupReview) {
                 self.build_setup_review_items(state, theme, screen_w, screen_h);
-            } else if state.workspace_form.open {
+            } else if overlay == Some(ActiveOverlay::WorkspaceForm) {
                 self.build_workspace_form_items(state, theme, screen_w, screen_h);
-            } else if state.settings.open {
+            } else if overlay == Some(ActiveOverlay::Settings) {
                 self.build_settings_items(state, theme, screen_w, screen_h);
-            } else if state.picker.open || state.action_palette.open {
+            } else if matches!(
+                overlay,
+                Some(ActiveOverlay::AgentPicker | ActiveOverlay::ActionPalette)
+            ) {
                 self.build_picker_items(state, theme, screen_w, screen_h);
-            } else if state.worktree_modal.open {
+            } else if overlay == Some(ActiveOverlay::Worktree) {
                 self.build_worktree_modal_items(state, theme, screen_w, screen_h);
-            } else if state.close_modal.open {
+            } else if overlay == Some(ActiveOverlay::CloseWorkspace) {
                 self.build_close_modal_items(state, theme, screen_w, screen_h);
             } else if let Some(ref search) = state.search {
                 self.build_search_bar_items(search, state, layout, theme);
@@ -898,6 +904,7 @@ mod tests {
         let mut changed = pane.viewport_rows[0].clone();
         changed.cells[0].text = "z".into();
         pane.apply_delta(GridDelta {
+            terminal_modes: Default::default(),
             activity: None,
             insight: None,
             pane_id: agent,

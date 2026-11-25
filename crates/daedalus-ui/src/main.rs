@@ -1,8 +1,11 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod accessibility;
+mod daemon_events;
 mod pointer;
 mod setup;
+mod terminal_commands;
+mod viewport;
 mod workspace_settings;
 
 use std::path::PathBuf;
@@ -10,21 +13,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use daedalus_proto::{PaneId, PaneRole, WorkspaceId, default_socket_path, wrap_bracketed_paste};
+use daedalus_proto::{PaneId, PaneRole, WorkspaceId, default_socket_path};
 use daedalus_ui::bridge::{BridgeConfig, DaemonBridge, UiCommand, UiEvent, UiEventSink};
 use daedalus_ui::config::UiConfig;
-use daedalus_ui::input::{KeyRepeatGuard, UiAction, filter_modal_text, translate_key};
-use daedalus_ui::layout::overlays::picker_row_stride;
-use daedalus_ui::layout::{
-    HitTarget, LayoutInput, WorkspaceLayout, compute_split_layout, hit_test,
+use daedalus_ui::input::{
+    KeyRepeatGuard, UiAction, filter_modal_text, translate_key, windows_terminal_shortcut,
 };
-use daedalus_ui::links::{browser_link_at, detect_link_in_row, open_link};
+use daedalus_ui::layout::overlays::picker_row_stride;
+use daedalus_ui::layout::{HitTarget, hit_test};
 use daedalus_ui::renderer::{GpuRenderer, RenderError};
-use daedalus_ui::selection::extract_selected_text;
-use daedalus_ui::state::{AgentPreset, AppState, ConnectionState};
+use daedalus_ui::state::{ActiveOverlay, AgentPreset, AppState, ConnectionState};
 use daedalus_ui::theme::Theme;
 use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
+use viewport::ViewportMetrics;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -34,7 +36,6 @@ use winit::window::{Window, WindowId};
 
 const INITIAL_WINDOW_WIDTH: f64 = 1440.0;
 const INITIAL_WINDOW_HEIGHT: f64 = 900.0;
-const RESIZE_DEBOUNCE: Duration = Duration::from_millis(32);
 const TOAST_TTL: Duration = Duration::from_secs(5);
 const WHEEL_SCROLL_LINES: isize = 3;
 const FALLBACK_PANE_COLS: u16 = 120;
@@ -126,13 +127,6 @@ impl UiEventSink for EventLoopProxySink {
     fn emit(&self, event: UiEvent) {
         let _ = self.0.send_event(AppEvent::Daemon(event));
     }
-}
-
-#[derive(Clone, Copy)]
-struct ViewportMetrics {
-    size: winit::dpi::PhysicalSize<u32>,
-    scale_factor: f32,
-    cell: (f32, f32),
 }
 
 struct DaedalusApp {
@@ -258,162 +252,6 @@ impl DaedalusApp {
         self.bridge.as_ref().is_some_and(|bridge| bridge(cmd))
     }
 
-    fn schedule_resize_flush(&mut self) {
-        self.pending_resize_flush_at = Some(Instant::now() + RESIZE_DEBOUNCE);
-    }
-
-    fn has_top_banner(&self) -> bool {
-        self.state.connection != ConnectionState::Connected || self.state.toast.is_some()
-    }
-
-    fn viewport_metrics(&self) -> Option<ViewportMetrics> {
-        let window = self.window.as_ref()?;
-        let size = window.inner_size();
-        if size.width == 0 || size.height == 0 {
-            return None;
-        }
-        Some(ViewportMetrics {
-            size,
-            scale_factor: window.scale_factor() as f32,
-            cell: self.renderer.as_ref()?.cell_size(),
-        })
-    }
-
-    fn compute_current_layout(&self) -> Option<WorkspaceLayout> {
-        Some(self.layout_for(self.viewport_metrics()?))
-    }
-
-    fn pane_geometry(&self, metrics: ViewportMetrics) -> WorkspaceLayout {
-        let ViewportMetrics {
-            size,
-            scale_factor,
-            cell: (cell_w, cell_h),
-        } = metrics;
-        let footer_height = daedalus_ui::layout::CARGO_BAR_LOGICAL_HEIGHT * scale_factor;
-        let show_footer = self.state.show_cargo_bar() && size.height as f32 >= footer_height * 5.;
-        let height = size.height as f32 - if show_footer { footer_height } else { 0. };
-        let mut layout = compute_split_layout(
-            &LayoutInput {
-                window_w: size.width as f32,
-                window_h: height,
-                scale_factor,
-                cell_w,
-                cell_h,
-                sidebar_override: self.state.sidebar_override,
-                has_top_banner: self.has_top_banner(),
-                zoomed: self.state.zoomed,
-                focused_role: self.state.focused_role,
-                runner_has_failure: self.state.runner_has_failure(),
-            },
-            &self.pointer.splits,
-        );
-        if show_footer {
-            layout.cargo_bar = Some(daedalus_ui::layout::Rect::new(
-                0.,
-                height,
-                size.width as f32,
-                footer_height,
-            ));
-        }
-        layout
-    }
-
-    fn layout_for(&self, metrics: ViewportMetrics) -> WorkspaceLayout {
-        let scale_factor = metrics.scale_factor;
-        let mut layout = self.pane_geometry(metrics);
-        if self.state.zoomed {
-            let roles: Vec<_> = [PaneRole::Service, PaneRole::Runner]
-                .into_iter()
-                .filter(|&role| self.state.pane_for_role(role).is_some())
-                .collect();
-            layout.reserve_insights(&roles, scale_factor, metrics.cell.1);
-        }
-        if self.state.workspaces.is_empty() {
-            for pane in &mut layout.panes {
-                pane.action_pill = None;
-            }
-        }
-        if self.state.zoomed
-            && let Some(ws) = self.state.active_workspace()
-        {
-            let entries = self.state.terminal_tabs(ws);
-            layout.set_named_tabs(&entries, self.state.focused_pane_id(), scale_factor);
-        }
-        layout.sidebar_first = self.state.sidebar_first;
-        if let Some(sidebar) = layout.sidebar {
-            use daedalus_ui::sidebar_content::{SidebarContent, SidebarRow};
-            let list = SidebarContent::for_workspaces(
-                &self.state.workspaces,
-                sidebar,
-                self.state.sidebar_first,
-                scale_factor,
-            );
-            for (row, rect) in list.rows[list.visible.clone()].iter().zip(&list.rects) {
-                if let SidebarRow::Workspace(index) = row {
-                    let ws = &self.state.workspaces[*index];
-                    if self.state.failed_runner(ws).is_some() {
-                        layout.failed_run_buttons.push((
-                            ws.id,
-                            daedalus_ui::layout::sidebar_failed_run_rect(*rect, scale_factor),
-                        ));
-                    }
-                }
-            }
-            layout.sidebar_content = Some(Arc::new(list));
-        }
-        if self.state.active_test_workspace().is_some() {
-            layout.enable_run_tests(scale_factor);
-        }
-        if self.state.active_workspace_id.is_some() {
-            layout.enable_layout_button(scale_factor);
-        }
-        layout
-    }
-
-    fn flush_due_resizes(&mut self, force: bool) {
-        if !force {
-            let Some(deadline) = self.pending_resize_flush_at else {
-                return;
-            };
-            if Instant::now() < deadline {
-                return;
-            }
-        }
-        self.pending_resize_flush_at = None;
-        if self.state.connection != ConnectionState::Connected {
-            return;
-        }
-
-        let Some(layout) = self.compute_current_layout() else {
-            return;
-        };
-
-        self.resize_panes(&layout);
-    }
-
-    fn resize_panes(&mut self, layout: &WorkspaceLayout) {
-        let mut pending = Vec::new();
-        for pane_rect in &layout.panes {
-            let Some(pane_id) = self.state.pane_id_for_role(pane_rect.role) else {
-                continue;
-            };
-            let target = (pane_rect.cols.max(1), pane_rect.rows.max(1));
-            if self.state.last_sent_sizes.get(&pane_id).copied() != Some(target) {
-                pending.push((pane_id, target.0, target.1));
-            }
-        }
-
-        for (pane_id, cols, rows) in pending {
-            if self.send_command(UiCommand::ResizePane {
-                pane_id,
-                cols,
-                rows,
-            }) {
-                self.state.last_sent_sizes.insert(pane_id, (cols, rows));
-            }
-        }
-    }
-
     fn expire_toast_if_due(&mut self, now: Instant) {
         let expired = self
             .state
@@ -436,97 +274,6 @@ impl DaedalusApp {
         if !had_banner {
             self.schedule_resize_flush();
         }
-        self.request_redraw();
-    }
-
-    fn ensure_clipboard(&mut self) -> Result<&mut arboard::Clipboard, String> {
-        if self.clipboard.is_none() {
-            let cb =
-                arboard::Clipboard::new().map_err(|err| format!("Clipboard unavailable: {err}"))?;
-            self.clipboard = Some(cb);
-        }
-        Ok(self.clipboard.as_mut().expect("clipboard initialized"))
-    }
-
-    fn preview_image(&mut self) {
-        let Some(pane_id) = self.state.focused_pane_id() else {
-            return;
-        };
-        if self
-            .state
-            .image_preview
-            .as_ref()
-            .is_some_and(|(id, _)| *id == pane_id)
-        {
-            self.state.image_preview = None;
-            self.request_redraw();
-            return;
-        }
-        let Some(pane) = self.state.panes.get(&pane_id) else {
-            return;
-        };
-        let Some(path) = self.state.selected_png_path() else {
-            self.show_toast(
-                "Select a workspace PNG path in the terminal to preview it",
-                false,
-            );
-            return;
-        };
-        self.send_command(UiCommand::PreviewImage {
-            workspace_id: pane.summary.workspace_id,
-            pane_id,
-            path,
-        });
-    }
-
-    fn copy_focused_selection(&mut self) {
-        let Some(pane_id) = self.state.focused_pane_id() else {
-            return;
-        };
-        let selected_text = self.state.panes.get(&pane_id).and_then(|pane| {
-            let sel = pane.selection?;
-            let text = extract_selected_text(pane.visible_rows(), &sel);
-            (!text.is_empty()).then_some(text)
-        });
-        let Some(text) = selected_text else {
-            return;
-        };
-
-        match self.ensure_clipboard().and_then(|cb| {
-            cb.set_text(text)
-                .map_err(|err| format!("Failed to copy to clipboard: {err}"))
-        }) {
-            Ok(()) => self.show_toast("Copied selection to clipboard", false),
-            Err(err) => self.show_toast(err, true),
-        }
-    }
-
-    fn clipboard_text(&mut self) -> Option<String> {
-        match self.ensure_clipboard().and_then(|cb| {
-            cb.get_text()
-                .map_err(|err| format!("Failed to read clipboard: {err}"))
-        }) {
-            Ok(text) => (!text.is_empty()).then_some(text),
-            Err(err) => {
-                self.show_toast(err, true);
-                None
-            }
-        }
-    }
-
-    fn paste_clipboard_to_focused(&mut self) {
-        let Some(pane_id) = self.state.focused_pane_id() else {
-            return;
-        };
-        let Some(text) = self.clipboard_text() else {
-            return;
-        };
-        if let Some(pane) = self.state.panes.get_mut(&pane_id) {
-            pane.reset_scroll();
-            pane.selection = None;
-        }
-        let data = wrap_bracketed_paste(text.as_bytes());
-        self.send_command(UiCommand::SendInput { pane_id, data });
         self.request_redraw();
     }
 
@@ -874,39 +621,6 @@ impl DaedalusApp {
         }
     }
 
-    fn clicked_link(
-        &self,
-        role: PaneRole,
-        col: u16,
-        row: u16,
-    ) -> Option<daedalus_ui::links::DetectedLink> {
-        let pane = self.state.pane_for_role(role)?;
-        let rows = pane.visible_rows();
-        browser_link_at(rows, row as usize, col as usize).or_else(|| {
-            if self.state.remote_host.is_some() {
-                return None;
-            }
-            let cwd = pane.summary.cwd.as_deref();
-            let root = self
-                .state
-                .active_workspace()
-                .map(|ws| ws.root_dir.as_path());
-            detect_link_in_row(rows.get(row as usize)?, col as usize, cwd, root)
-                .filter(|link| matches!(link, daedalus_ui::links::DetectedLink::File { .. }))
-        })
-    }
-
-    fn open_clicked_link(&mut self, role: PaneRole, col: u16, row: u16) {
-        let Some(link) = self.clicked_link(role, col, row) else {
-            return;
-        };
-
-        if let Err(err) = open_link(&link, self.ui_config.editor.as_deref()) {
-            warn!(error = %err, link = ?link, "failed to open clicked link");
-            self.show_toast(format!("Failed to open link: {err}"), true);
-        }
-    }
-
     fn confirm_workspace_action(&mut self) {
         let selected = self.state.action_palette.selected_index;
         if let (Some(workspace_id), Some(action)) = (
@@ -1170,7 +884,10 @@ impl DaedalusApp {
         text: Option<&str>,
         repeat: bool,
     ) {
-        if let Some(choices) = &mut self.state.failure_recipients {
+        let overlay = self.state.active_overlay();
+        if overlay == Some(ActiveOverlay::FailureRecipients)
+            && let Some(choices) = &mut self.state.failure_recipients
+        {
             self.key_repeats.suppress(physical_key);
             use winit::keyboard::{Key, NamedKey};
             match logical_key {
@@ -1187,17 +904,19 @@ impl DaedalusApp {
             self.request_redraw();
             return;
         }
-        if self.state.workspace_form.open
-            || self.state.settings.open
-            || self.state.setup_review.open
-        {
+        if matches!(
+            overlay,
+            Some(
+                ActiveOverlay::SetupReview | ActiveOverlay::WorkspaceForm | ActiveOverlay::Settings
+            )
+        ) {
             if self
                 .key_repeats
                 .form_press(physical_key, logical_key, repeat)
             {
-                if self.state.setup_review.open {
+                if overlay == Some(ActiveOverlay::SetupReview) {
                     self.setup_key(logical_key);
-                } else if self.state.workspace_form.open {
+                } else if overlay == Some(ActiveOverlay::WorkspaceForm) {
                     self.workspace_form_key(logical_key);
                 } else {
                     self.settings_key(logical_key);
@@ -1209,51 +928,64 @@ impl DaedalusApp {
             self.key_repeats.suppress(physical_key);
             return;
         }
-        let action = translate_key(
-            logical_key,
-            text,
-            self.modifiers,
-            self.state.picker.open,
-            self.state.worktree_modal.open,
-            self.state.close_modal.open,
-            self.state.search.is_some(),
-            self.state.action_palette.open,
-        );
+        let terminal_shortcut = if cfg!(target_os = "windows") && overlay.is_none() {
+            windows_terminal_shortcut(logical_key, self.modifiers)
+        } else {
+            None
+        };
+        let action = terminal_shortcut.unwrap_or_else(|| {
+            translate_key(
+                logical_key,
+                text,
+                self.modifiers,
+                overlay == Some(ActiveOverlay::AgentPicker),
+                overlay == Some(ActiveOverlay::Worktree),
+                overlay == Some(ActiveOverlay::CloseWorkspace),
+                overlay == Some(ActiveOverlay::Search),
+                overlay == Some(ActiveOverlay::ActionPalette),
+            )
+        });
         let action = self.key_repeats.press(physical_key, repeat, action);
         self.handle_ui_action(action);
     }
 
     fn commit_text(&mut self, text: String) {
-        if self.state.failure_recipients.is_some() || self.state.recap.keyboard_row.is_some() {
+        if self.state.recap.keyboard_row.is_some() {
             return;
         }
-        if self.state.setup_review.open {
-            self.state.setup_review.insert_text(&text);
-            self.request_redraw();
-            return;
-        }
-        if self.state.workspace_form.open {
-            self.state.workspace_form.insert_text(&text);
-            self.request_redraw();
-            return;
-        }
-        if self.state.settings.open {
-            self.state.settings.insert_text(&text);
-            self.request_redraw();
-            return;
-        }
-        if self.state.picker.open || self.state.close_modal.open || self.state.action_palette.open {
-            // Selection and confirmation modals swallow IME text.
-        } else if self.state.worktree_modal.open {
-            if let Some(cleaned) = filter_modal_text(&text, false) {
-                self.handle_ui_action(UiAction::WorktreeModalText(cleaned));
+        match self.state.active_overlay() {
+            Some(ActiveOverlay::SetupReview) => {
+                self.state.setup_review.insert_text(&text);
+                self.request_redraw();
             }
-        } else if self.state.search.is_some() {
-            if let Some(cleaned) = filter_modal_text(&text, true) {
-                self.handle_ui_action(UiAction::SearchText(cleaned));
+            Some(ActiveOverlay::WorkspaceForm) => {
+                self.state.workspace_form.insert_text(&text);
+                self.request_redraw();
             }
-        } else if !text.is_empty() && !text.chars().all(char::is_control) {
-            self.handle_ui_action(UiAction::SendBytes(text.into_bytes()));
+            Some(ActiveOverlay::Settings) => {
+                self.state.settings.insert_text(&text);
+                self.request_redraw();
+            }
+            Some(ActiveOverlay::Worktree) => {
+                if let Some(cleaned) = filter_modal_text(&text, false) {
+                    self.handle_ui_action(UiAction::WorktreeModalText(cleaned));
+                }
+            }
+            Some(ActiveOverlay::Search) => {
+                if let Some(cleaned) = filter_modal_text(&text, true) {
+                    self.handle_ui_action(UiAction::SearchText(cleaned));
+                }
+            }
+            Some(
+                ActiveOverlay::FailureRecipients
+                | ActiveOverlay::AgentPicker
+                | ActiveOverlay::ActionPalette
+                | ActiveOverlay::CloseWorkspace,
+            ) => {}
+            None if !text.is_empty() && !text.chars().all(char::is_control) => {
+                self.handle_ui_action(UiAction::SendBytes(text.into_bytes()));
+            }
+            None => {}
         }
     }
 
@@ -1478,331 +1210,6 @@ impl DaedalusApp {
     }
 }
 
-impl DaedalusApp {
-    fn handle_daemon_event(&mut self, event: UiEvent) {
-        let previous_workspace = self.state.active_workspace_id;
-        let search_generation = self.state.search.as_ref().map(|search| search.generation);
-        self.state
-            .recap
-            .observe(&event, &self.state.workspaces, &self.state.panes);
-        let changed = match &event {
-            UiEvent::AgentStateChanged { workspace_id, .. }
-            | UiEvent::WorkspaceRuntimeUpdated { workspace_id, .. } => Some(*workspace_id),
-            UiEvent::ServerEvent(daedalus_proto::ServerEvent::ExternalStatusUpdated {
-                workspace_id,
-                ..
-            }) => Some(*workspace_id),
-            UiEvent::ServerEvent(event) => {
-                let pane = match event {
-                    daedalus_proto::ServerEvent::GridDelta(delta)
-                        if !delta.dirty_rows.is_empty()
-                            && self
-                                .state
-                                .panes
-                                .get(&delta.pane_id)
-                                .is_some_and(|pane| pane.summary.role == PaneRole::Agent) =>
-                    {
-                        Some(delta.pane_id)
-                    }
-                    daedalus_proto::ServerEvent::ResyncRequired { pane_id } => Some(*pane_id),
-                    daedalus_proto::ServerEvent::CommandFinished { pane_id, .. }
-                    | daedalus_proto::ServerEvent::PaneExited { pane_id, .. } => Some(*pane_id),
-                    _ => None,
-                };
-                pane.and_then(|id| self.state.panes.get(&id))
-                    .map(|pane| pane.summary.workspace_id)
-            }
-            _ => None,
-        };
-        if let Some(id) = changed {
-            self.history.changed(id);
-        }
-        self.sync_history_visit();
-        match event {
-            UiEvent::ImagePreview { pane_id, image } => {
-                if self.state.focused_pane_id() == Some(pane_id) && image.valid() {
-                    self.state.image_preview = Some((pane_id, image));
-                }
-            }
-            UiEvent::JournalCapability(supported) => self.history.connection(supported),
-            UiEvent::DaemonCapabilities {
-                home_dir,
-                project_setups,
-                recent_projects,
-            } => {
-                self.daemon_home = home_dir;
-                self.project_setups.set_daemon_backed(project_setups);
-                if !recent_projects {
-                    // Rows from the previous daemon would name folders this one never saw.
-                    self.state.workspace_form.set_recent(Vec::new());
-                }
-            }
-            UiEvent::RecentProjectsLoaded(projects) => {
-                self.hide_open_recent_projects();
-                self.state.workspace_form.set_recent(projects);
-            }
-            UiEvent::ProjectSetupChanged {
-                root_dir,
-                assignments,
-            } => self.project_setup_changed(&root_dir, assignments),
-            UiEvent::ProjectSetupSaveFailed {
-                workspace_id,
-                message,
-            } => {
-                self.project_setups.rejected(workspace_id);
-                self.refresh_workspace_setup(workspace_id);
-                self.show_toast(message, true);
-            }
-            UiEvent::ActivityRead { token, page } => {
-                use daedalus_ui::activity_history::PageUpdate;
-                match self.history.received(token, &page) {
-                    Some(PageUpdate::Recap { first, gap }) => {
-                        self.state
-                            .recap
-                            .journal(&page, first, gap, &self.state.panes)
-                    }
-                    Some(PageUpdate::Foreground(count)) => self
-                        .state
-                        .recap
-                        .foreground_activity(page.workspace_id, count),
-                    None => {}
-                }
-            }
-            UiEvent::ActivityReadFailed(token) => self.history.failed(token),
-            UiEvent::Connected => {
-                self.state.connection = ConnectionState::Connected;
-                self.schedule_resize_flush();
-            }
-            UiEvent::Disconnected => {
-                self.setup_disconnected();
-                self.history.connection(false);
-                self.state.connection = ConnectionState::Reconnecting;
-                self.state.workspace_list_loaded = false;
-                let form = &mut self.state.workspace_form;
-                form.finish_submission(
-                    form.session(),
-                    Some("Connection lost. Check the workspace list before retrying.".into()),
-                );
-                self.state.close_modal.submitting = false;
-                self.state.last_sent_sizes.clear();
-                self.state.spawning_workspaces.clear();
-                self.schedule_resize_flush();
-            }
-            UiEvent::WorkspaceCloseFinished(id) => {
-                if self.state.close_modal.workspace_id == Some(id) {
-                    self.state.close_modal.submitting = false;
-                }
-            }
-            UiEvent::WorkspaceCloseFailed(workspaces) => {
-                self.state.set_workspaces(workspaces);
-                self.schedule_resize_flush();
-            }
-            UiEvent::WorkspacesLoaded(workspaces) => {
-                self.project_setups.absorb(&workspaces);
-                for (workspace_id, assignments) in self.project_setups.migrations(&workspaces) {
-                    if !self.send_command(UiCommand::SaveProjectSetup {
-                        workspace_id,
-                        assignments,
-                    }) {
-                        self.project_setups.rejected(workspace_id);
-                    }
-                }
-                self.restore_session_names(&workspaces);
-                self.state.set_workspaces(workspaces);
-                self.reconcile_setup_installer();
-                self.offer_first_workspace();
-                self.ensure_active_workspace_panes();
-                self.schedule_resize_flush();
-            }
-            UiEvent::SetupInspected { session, result } => self.setup_inspected(session, result),
-            UiEvent::SetupInstallerStarted {
-                workspace_id,
-                pane_id,
-            } => self.setup_installer_started(workspace_id, pane_id),
-            UiEvent::SetupInstallerFinished(pane, code) => {
-                self.setup_installer_finished(pane, code)
-            }
-            UiEvent::SetupInstallerFailed {
-                workspace_id,
-                message,
-            } => self.setup_failed(workspace_id, message),
-            UiEvent::SetupApplied {
-                workspace_id,
-                error,
-            } => self.setup_applied(workspace_id, error),
-            UiEvent::ManualWorkspaceCreated { session, workspace } => {
-                self.setup_created(session, workspace);
-            }
-            UiEvent::ManualWorkspaceFailed { session, message } => {
-                self.setup_creation_failed(session, message)
-            }
-            UiEvent::WorkspaceCreated(ws) => {
-                let ws_id = ws.id;
-                self.project_setups.absorb(std::slice::from_ref(&ws));
-                self.state.upsert_workspace(ws);
-                self.state.select_workspace(ws_id);
-                self.state.close_search();
-                self.schedule_resize_flush();
-            }
-            UiEvent::WorkspacePanesEnsured {
-                workspace_id,
-                complete,
-            } => {
-                self.state.finish_workspace_spawning(workspace_id, complete);
-            }
-            UiEvent::PaneSpawned {
-                summary,
-                agent_preset,
-            } => {
-                self.state.register_pane(summary, agent_preset);
-                self.schedule_resize_flush();
-            }
-            UiEvent::AssignmentStarted {
-                workspace_id,
-                pane_id,
-                assignment,
-            } => self.assignment_started(workspace_id, pane_id, assignment),
-            UiEvent::PaneClosed { pane_id } => {
-                self.setup_installer_finished(pane_id, None);
-                self.state.remove_session(pane_id);
-                self.schedule_resize_flush();
-            }
-            UiEvent::Snapshot(snapshot) => {
-                let pane_id = snapshot.pane_id;
-                if let Some(pane_id) = self.state.apply_grid_snapshot(snapshot) {
-                    self.send_command(UiCommand::RequestSnapshot { pane_id });
-                } else {
-                    self.request_scrollback_if_needed(pane_id);
-                }
-            }
-            UiEvent::ScrollbackLoaded {
-                pane_id,
-                generation,
-                total_scrollback,
-                rows,
-            } => {
-                if let Some(pane) = self.state.panes.get_mut(&pane_id) {
-                    pane.apply_scrollback(generation, total_scrollback, rows);
-                }
-            }
-            UiEvent::SearchResults {
-                pane_id,
-                generation,
-                total_scrollback,
-                matches,
-            } => {
-                if self
-                    .state
-                    .apply_search_results(pane_id, generation, total_scrollback, matches)
-                {
-                    self.scroll_to_active_search_match();
-                }
-            }
-            UiEvent::AgentStateChanged {
-                workspace_id,
-                pane_id,
-                state,
-            } => {
-                self.state.apply_agent_state(workspace_id, pane_id, state);
-            }
-            UiEvent::WorkspaceRuntimeUpdated {
-                workspace_id,
-                bound_ports,
-                containers,
-                git_status,
-                git_branch,
-            } => {
-                self.state.apply_workspace_runtime(
-                    workspace_id,
-                    bound_ports,
-                    containers,
-                    git_status,
-                    git_branch,
-                );
-            }
-            UiEvent::ServerEvent(server_event) => {
-                let ended = match &server_event {
-                    daedalus_proto::ServerEvent::PaneExited { pane_id, exit_code } => {
-                        Some((*pane_id, *exit_code))
-                    }
-                    _ => None,
-                };
-                let changed_pane = match &server_event {
-                    daedalus_proto::ServerEvent::GridDelta(delta)
-                        if !delta.dirty_rows.is_empty()
-                            && self
-                                .state
-                                .panes
-                                .get(&delta.pane_id)
-                                .is_some_and(|pane| pane.summary.role == PaneRole::Agent) =>
-                    {
-                        Some(delta.pane_id)
-                    }
-                    daedalus_proto::ServerEvent::ResyncRequired { pane_id } => Some(*pane_id),
-                    _ => None,
-                };
-                let watch_attention = match &server_event {
-                    daedalus_proto::ServerEvent::GridDelta(delta)
-                        if self.ui_config.notification_ping
-                            && self
-                                .state
-                                .panes
-                                .get(&delta.pane_id)
-                                .is_some_and(|p| !p.unread_attention) =>
-                    {
-                        Some(delta.pane_id)
-                    }
-                    _ => None,
-                };
-                if let Some(resync_pane_id) = self.state.apply_server_event(server_event) {
-                    self.send_command(UiCommand::RequestSnapshot {
-                        pane_id: resync_pane_id,
-                    });
-                }
-                self.sync_history_visit();
-                if let Some(id) = watch_attention
-                    && self
-                        .state
-                        .panes
-                        .get(&id)
-                        .is_some_and(|p| p.unread_attention)
-                    && let Some(window) = &self.window
-                {
-                    play_notification_ping();
-                    window.request_user_attention(Some(
-                        winit::window::UserAttentionType::Informational,
-                    ));
-                }
-                if let Some((id, code)) = ended {
-                    self.setup_installer_finished(id, code);
-                }
-                if let Some(pane_id) = changed_pane {
-                    self.request_scrollback_if_needed(pane_id);
-                }
-            }
-            UiEvent::Toast { message, is_error } => {
-                let had_banner = self.has_top_banner();
-                self.state.show_toast(message, is_error);
-                if !had_banner {
-                    self.schedule_resize_flush();
-                }
-            }
-        }
-
-        if let Some(search) = &self.state.search
-            && Some(search.generation) != search_generation
-        {
-            self.run_pane_search();
-        }
-        self.state.recap.select(self.state.active_workspace_id);
-        if previous_workspace != self.state.active_workspace_id {
-            self.reveal_active_workspace();
-        }
-        self.flush_due_resizes(false);
-        self.request_redraw();
-    }
-}
-
 impl ApplicationHandler<AppEvent> for DaedalusApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -1820,18 +1227,28 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 INITIAL_WINDOW_HEIGHT,
             ));
 
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         let attrs = {
-            use winit::platform::windows::WindowAttributesExtWindows;
             let icon = winit::window::Icon::from_rgba(
                 include_bytes!("../../../packaging/window-icon.rgba").to_vec(),
                 64,
                 64,
             )
             .expect("embedded 64px Daedalus window icon");
-            attrs
-                .with_window_icon(Some(icon.clone()))
-                .with_taskbar_icon(Some(icon))
+            #[cfg(windows)]
+            {
+                use winit::platform::windows::WindowAttributesExtWindows;
+                attrs
+                    .with_window_icon(Some(icon.clone()))
+                    .with_taskbar_icon(Some(icon))
+            }
+            #[cfg(target_os = "linux")]
+            {
+                use winit::platform::wayland::WindowAttributesExtWayland;
+                attrs
+                    .with_name("daedalus", "daedalus")
+                    .with_window_icon(Some(icon))
+            }
         };
 
         let window = match event_loop.create_window(attrs) {
@@ -1997,6 +1414,7 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 self.wheel_scroll = WheelScroll::default();
                 self.modifiers = ModifiersState::empty();
                 self.key_repeats = KeyRepeatGuard::default();
+                self.handle_left_mouse_up();
                 self.pointer.cancel_gestures();
             }
             WindowEvent::KeyboardInput {
@@ -2028,9 +1446,7 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 ..
             } => match state {
                 ElementState::Pressed => self.handle_left_mouse_down(),
-                ElementState::Released => {
-                    self.pointer.end_drag();
-                }
+                ElementState::Released => self.handle_left_mouse_up(),
             },
             WindowEvent::MouseWheel { delta, phase, .. } => {
                 if phase == TouchPhase::Started {

@@ -7,6 +7,7 @@ use daedalus_proto::{
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tracing::{debug, warn};
@@ -14,8 +15,12 @@ use tracing::{debug, warn};
 #[derive(Debug)]
 pub(super) enum RpcError {
     Disconnected,
+    TimedOut,
     Proto(ProtoError),
 }
+
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const WORKTREE_RPC_TIMEOUT: Duration = Duration::from_secs(120);
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<ResponsePayload, ProtoError>>>>>;
 
@@ -24,9 +29,11 @@ pub(super) struct RpcConnection {
     pub(super) recent_projects_supported: bool,
     pub(super) image_preview_supported: bool,
     pub(super) project_setup_supported: bool,
+    pub(super) paste_supported: bool,
     write_tx: mpsc::UnboundedSender<Request>,
     pending: PendingMap,
     next_id: AtomicU64,
+    disconnect_tx: watch::Sender<bool>,
     disconnect_rx: watch::Receiver<bool>,
     reader_task: TokioJoinHandle<()>,
     writer_task: TokioJoinHandle<()>,
@@ -56,7 +63,7 @@ impl RpcConnection {
         });
 
         let reader_pending = Arc::clone(&pending);
-        let reader_disconnect = disconnect_tx;
+        let reader_disconnect = disconnect_tx.clone();
         let reader_task = tokio::spawn(async move {
             loop {
                 match read_frame::<_, ServerMessage>(&mut reader).await {
@@ -132,9 +139,11 @@ impl RpcConnection {
             recent_projects_supported: false,
             project_setup_supported: false,
             image_preview_supported: false,
+            paste_supported: false,
             write_tx,
             pending,
             next_id: AtomicU64::new(1),
+            disconnect_tx,
             disconnect_rx,
             reader_task,
             writer_task,
@@ -142,6 +151,19 @@ impl RpcConnection {
     }
 
     pub(super) async fn call(&self, payload: ClientMessage) -> Result<ResponsePayload, RpcError> {
+        let timeout = match payload {
+            ClientMessage::CreateWorktreeWorkspace { .. }
+            | ClientMessage::CloseWorkspace { .. } => WORKTREE_RPC_TIMEOUT,
+            _ => RPC_TIMEOUT,
+        };
+        self.call_with_timeout(payload, timeout).await
+    }
+
+    async fn call_with_timeout(
+        &self,
+        payload: ClientMessage,
+        timeout: Duration,
+    ) -> Result<ResponsePayload, RpcError> {
         let mut disconnect_rx = self.disconnect_rx.clone();
         if *disconnect_rx.borrow() {
             return Err(RpcError::Disconnected);
@@ -162,21 +184,25 @@ impl RpcConnection {
             return Err(RpcError::Disconnected);
         }
 
-        tokio::select! {
+        let response = tokio::select! {
             biased;
             res = rx => match res {
                 Ok(Ok(resp)) => Ok(resp),
                 Ok(Err(proto_err)) => Err(RpcError::Proto(proto_err)),
                 Err(_) => Err(RpcError::Disconnected),
             },
-            _ = disconnect_rx.wait_for(|&disconnected| disconnected) => {
-                self.pending
-                    .lock()
-                    .expect("pending mutex poisoned")
-                    .remove(&id);
-                Err(RpcError::Disconnected)
+            _ = disconnect_rx.wait_for(|&disconnected| disconnected) => Err(RpcError::Disconnected),
+            _ = tokio::time::sleep(timeout) => {
+                // The daemon may have committed the request without delivering its response.
+                self.disconnect_tx.send_replace(true);
+                Err(RpcError::TimedOut)
             }
-        }
+        };
+        self.pending
+            .lock()
+            .expect("pending mutex poisoned")
+            .remove(&id);
+        response
     }
 
     pub(super) async fn disconnected(&mut self) {
@@ -203,7 +229,31 @@ impl RpcConnection {
 mod tests {
     use super::super::test_support::{NoopSink, ipc_pair};
     use super::*;
-    use std::time::Duration;
+    #[tokio::test]
+    async fn a_peer_that_stays_open_without_reply_invalidates_the_connection() {
+        let (client_stream, mut peer) = ipc_pair().await;
+        let mut conn = RpcConnection::new(client_stream, Arc::new(NoopSink));
+
+        let (response, request) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                conn.call_with_timeout(ClientMessage::Ping, Duration::from_millis(50)),
+                read_frame::<_, Request>(&mut peer),
+            )
+        })
+        .await
+        .expect("the first RPC must reach the peer and then time out");
+        assert_eq!(request.unwrap().unwrap().payload, ClientMessage::Ping);
+        assert!(matches!(response, Err(RpcError::TimedOut)));
+        assert!(conn.pending.lock().unwrap().is_empty());
+        conn.disconnected().await;
+        assert!(matches!(
+            conn.call(ClientMessage::Ping).await,
+            Err(RpcError::Disconnected)
+        ));
+        conn.close().await;
+        assert!(read_frame::<_, Request>(&mut peer).await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn rpc_call_fails_immediately_when_disconnected_before_or_during_call() {
         // Case 1: peer closes before `call()` is invoked

@@ -7,12 +7,13 @@ url='https://github.com/AraneaDev/daedalus'
 license=('MIT')
 depends=('glibc' 'gcc-libs' 'libxkbcommon' 'libxkbcommon-x11' 'libx11' 'libxcb' 'wayland' 'git')
 options=('!strip' '!debug')
-source=('daedalus-ui' 'daedalus-ctl' 'daedalusd' 'daedalus.desktop' 'LICENSE')
+source=('daedalus-ui' 'daedalus-ctl' 'daedalusd' 'daedalus.desktop' 'daedalus.png' 'LICENSE')
 
 package() {
     for program in daedalus-ui daedalus-ctl daedalusd; do
         install -Dm755 "$srcdir/$program" "$pkgdir/usr/bin/$program"
     done
     install -Dm644 "$srcdir/daedalus.desktop" "$pkgdir/usr/share/applications/daedalus.desktop"
+    install -Dm644 "$srcdir/daedalus.png" "$pkgdir/usr/share/icons/hicolor/256x256/apps/daedalus.png"
     install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

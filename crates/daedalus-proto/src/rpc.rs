@@ -139,6 +139,10 @@ pub enum ClientMessage {
         pane_id: PaneId,
         data: Vec<u8>,
     },
+    Paste {
+        pane_id: PaneId,
+        data: Vec<u8>,
+    },
     ResizePane {
         pane_id: PaneId,
         cols: u16,
@@ -208,6 +212,8 @@ pub enum ResponsePayload {
         project_setup_supported: bool,
         #[serde(default)]
         image_preview_supported: bool,
+        #[serde(default)]
+        paste_supported: bool,
         #[serde(default)]
         home_dir: Option<PathBuf>,
     },
@@ -325,11 +331,13 @@ mod tests {
             ResponsePayload::Pong {
                 recent_projects_supported,
                 project_setup_supported,
+                paste_supported,
                 home_dir,
                 ..
             } => {
                 assert!(!recent_projects_supported);
                 assert!(!project_setup_supported);
+                assert!(!paste_supported);
                 assert_eq!(home_dir, None);
             }
             other => panic!("unexpected payload: {other:?}"),

@@ -9,6 +9,7 @@ use native::{Info, Terminal};
 
 pub struct GhosttyVt {
     terminal: Terminal,
+    modes: crate::terminal_modes::ModeObserver,
     info: Info,
     limit: usize,
     first_primary: u64,
@@ -25,6 +26,7 @@ impl GhosttyVt {
         let info = terminal.info();
         Self {
             terminal,
+            modes: crate::terminal_modes::ModeObserver::new(),
             info,
             limit: config.scrollback_limit,
             first_primary: 0,
@@ -106,6 +108,7 @@ impl GhosttyVt {
 
 impl VtEngine for GhosttyVt {
     fn feed(&mut self, bytes: &[u8]) -> Vec<SemanticEvent> {
+        self.modes.feed(bytes);
         for chunk in bytes.chunks(256) {
             self.feed_chunk(chunk);
         }
@@ -122,6 +125,7 @@ impl VtEngine for GhosttyVt {
 
     fn snapshot(&self, pane_id: PaneId, seq: u64) -> GridSnapshot {
         GridSnapshot {
+            terminal_modes: self.terminal_modes(),
             activity: None,
             insight: None,
             pane_id,
@@ -133,6 +137,12 @@ impl VtEngine for GhosttyVt {
             scrollback_len: self.scrollback_len(),
             history_generation: self.generation,
         }
+    }
+
+    fn terminal_modes(&self) -> daedalus_proto::TerminalModes {
+        let mut modes = self.modes.modes();
+        modes.bracketed_paste = self.info.bracketed_paste;
+        modes
     }
 
     fn scrollback_len(&self) -> usize {
@@ -175,7 +185,8 @@ impl VtEngine for GhosttyVt {
             .collect();
         if dirty_rows.is_empty()
             && old.as_ref().is_some_and(|old| {
-                old.cursor == new.cursor
+                old.terminal_modes == new.terminal_modes
+                    && old.cursor == new.cursor
                     && old.history_generation == new.history_generation
                     && old.scrollback_len == new.scrollback_len
                     && old.rows == new.rows
@@ -185,6 +196,7 @@ impl VtEngine for GhosttyVt {
             return None;
         }
         Some(GridDelta {
+            terminal_modes: new.terminal_modes,
             activity: None,
             insight: None,
             pane_id,

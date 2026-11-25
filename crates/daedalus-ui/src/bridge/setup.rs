@@ -27,8 +27,8 @@ pub(super) async fn inspect(
             .await
         {
             Ok(ResponsePayload::SetupInspection(report)) => Ok(report),
-            Err(RpcError::Disconnected) => return Err(RpcError::Disconnected),
             Err(RpcError::Proto(err)) => Err(err.to_string()),
+            Err(err) => return Err(err),
             Ok(_) => Err("Unexpected reply to project inspection.".into()),
         }
     };
@@ -122,9 +122,12 @@ async fn store_on_daemon(
         })
         .await
     {
-        Ok(_) => Ok(Ok(())),
-        Err(RpcError::Disconnected) => Err(RpcError::Disconnected),
+        Ok(ResponsePayload::Ok) => Ok(Ok(())),
+        Ok(other) => Ok(Err(format!(
+            "Unexpected reply while saving settings: {other:?}"
+        ))),
         Err(RpcError::Proto(err)) => Ok(Err(err.to_string())),
+        Err(err) => Err(err),
     }
 }
 
@@ -146,6 +149,26 @@ pub(super) async fn save_project_setup(
     Ok(())
 }
 
+pub(super) async fn save_workspace_settings(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+    workspace_id: WorkspaceId,
+    entries: Vec<Assignment>,
+    request_id: u64,
+) -> Result<(), RpcError> {
+    let result = if conn.project_setup_supported {
+        store_on_daemon(conn, workspace_id, &entries).await?
+    } else {
+        Err("This daemon does not support saving project settings.".into())
+    };
+    sink.emit(UiEvent::WorkspaceSettingsSaved {
+        workspace_id,
+        request_id,
+        result,
+    });
+    Ok(())
+}
+
 pub(super) async fn refresh_recent_projects(
     conn: &RpcConnection,
     sink: &Arc<dyn UiEventSink>,
@@ -157,8 +180,8 @@ pub(super) async fn refresh_recent_projects(
         Ok(ResponsePayload::RecentProjects(projects)) => {
             sink.emit(UiEvent::RecentProjectsLoaded(projects));
         }
-        Err(RpcError::Disconnected) => return Err(RpcError::Disconnected),
-        Err(error) => warn!("listing recent projects failed: {error:?}"),
+        Err(RpcError::Proto(error)) => warn!("listing recent projects failed: {error:?}"),
+        Err(error) => return Err(error),
         Ok(other) => warn!("unexpected reply to ListRecentProjects: {other:?}"),
     }
     Ok(())
@@ -200,8 +223,8 @@ pub(super) async fn apply(
         .await
         {
             Ok(()) => {}
-            Err(RpcError::Disconnected) => return Err(RpcError::Disconnected),
             Err(RpcError::Proto(err)) => failures.push(format!("{name}: {err}")),
+            Err(err) => return Err(err),
         }
     }
     sink.emit(UiEvent::SetupApplied {
@@ -273,7 +296,7 @@ pub(super) async fn install(
             workspace_id,
             message: err.to_string(),
         }),
-        Err(RpcError::Disconnected) => return Err(RpcError::Disconnected),
+        Err(err) => return Err(err),
     }
     Ok(())
 }

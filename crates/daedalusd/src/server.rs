@@ -94,7 +94,9 @@ impl DaemonServer {
             }
             None => None,
         };
-        registry.restore_persisted_workspaces().await;
+        if let Err(err) = registry.restore_persisted_workspaces().await {
+            warn!(error = %err, "workspace persistence disabled; preserving the existing state snapshot until daemon restart");
+        }
         let bound_endpoint = listener.local_endpoint();
         info!(socket = %bound_endpoint.display(), "daedalusd listening");
 
@@ -236,14 +238,24 @@ async fn handle_client(stream: IpcStream, registry: Arc<Registry>, auth_token: O
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMessage>(CLIENT_OUTBOUND_CAPACITY);
     let filter = Arc::new(RwLock::new(SubscriptionFilter::default()));
     let (done_tx, mut done_rx) = watch::channel(false);
+    let (lag_tx, mut reader_lag) = watch::channel(false);
+    let mut writer_lag = reader_lag.clone();
+    let event_lag = lag_tx.clone();
 
     let writer_fut = async move {
-        while let Some(msg) = out_rx.recv().await {
-            if let Err(e) = write_frame(&mut writer, &msg).await {
-                debug!(error = %e, "client write failed");
-                break;
+        let write_messages = async {
+            while let Some(msg) = out_rx.recv().await {
+                if let Err(e) = write_frame(&mut writer, &msg).await {
+                    debug!(error = %e, "client write failed");
+                    break;
+                }
             }
-        }
+        };
+        tokio::select! {
+            biased;
+            _ = wait_for_done(&mut writer_lag) => {}
+            _ = write_messages => {}
+        };
     };
 
     let event_rx = registry.subscribe_events();
@@ -251,7 +263,11 @@ async fn handle_client(stream: IpcStream, registry: Arc<Registry>, auth_token: O
     let sub_filter = Arc::clone(&filter);
     let event_fut = async move {
         tokio::select! {
-            _ = forward_subscriber_events(event_rx, sub_out_tx, sub_filter) => {}
+            exit = forward_subscriber_events(event_rx, sub_out_tx, sub_filter) => {
+                if exit == SubscriberExit::Lagged {
+                    event_lag.send_replace(true);
+                }
+            }
             _ = wait_for_done(&mut done_rx) => {}
         }
     };
@@ -259,7 +275,13 @@ async fn handle_client(stream: IpcStream, registry: Arc<Registry>, auth_token: O
     let reader_fut = async move {
         let mut authenticated = auth_token.is_none();
         loop {
-            match read_frame::<_, Request>(&mut reader).await {
+            // Finish an in-flight mutation before closing. Only cancel idle reads.
+            let frame = tokio::select! {
+                biased;
+                _ = wait_for_done(&mut reader_lag) => break,
+                frame = read_frame::<_, Request>(&mut reader) => frame,
+            };
+            match frame {
                 Ok(Some(req)) => {
                     let result = match req.payload {
                         ClientMessage::Authenticate { token } => match &auth_token {
@@ -296,6 +318,7 @@ async fn handle_client(stream: IpcStream, registry: Arc<Registry>, auth_token: O
     };
 
     tokio::join!(reader_fut, writer_fut, event_fut);
+    drop(lag_tx);
 }
 
 async fn dispatch_request(
@@ -317,6 +340,7 @@ async fn dispatch_request(
                 recent_projects_supported: true,
                 project_setup_supported: true,
                 image_preview_supported: cfg!(unix),
+                paste_supported: true,
                 home_dir: std::env::home_dir(),
             })
         }
@@ -460,6 +484,10 @@ async fn dispatch_request(
             registry.get_pane(pane_id).await?.send_input(data).await?;
             Ok(ResponsePayload::Ok)
         }
+        ClientMessage::Paste { pane_id, data } => {
+            registry.get_pane(pane_id).await?.paste(data).await?;
+            Ok(ResponsePayload::Ok)
+        }
         ClientMessage::ResizePane {
             pane_id,
             cols,
@@ -577,11 +605,17 @@ fn drain_pending_resync(
     DrainResult::Drained
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SubscriberExit {
+    Closed,
+    Lagged,
+}
+
 async fn forward_subscriber_events(
     mut event_rx: broadcast::Receiver<ServerEvent>,
     sub_out_tx: mpsc::Sender<ServerMessage>,
     sub_filter: Arc<RwLock<SubscriptionFilter>>,
-) {
+) -> SubscriberExit {
     let mut pending_resync: HashSet<PaneId> = HashSet::new();
 
     loop {
@@ -651,11 +685,19 @@ async fn forward_subscriber_events(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!(skipped, "event subscriber lagged");
+                if sub_filter.read().await.active {
+                    // Missing updates may affect any pane or workspace.
+                    warn!(
+                        skipped,
+                        "event subscriber lagged; disconnecting stale client"
+                    );
+                    return SubscriberExit::Lagged;
+                }
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+    SubscriberExit::Closed
 }
 
 #[cfg(test)]
@@ -672,6 +714,7 @@ mod tests {
         ServerEvent::GridDelta(GridDelta {
             activity: None,
             insight: None,
+            terminal_modes: Default::default(),
             pane_id,
             seq,
             cols: 80,
@@ -748,6 +791,100 @@ mod tests {
             .await
             .expect("forwarder did not exit on broadcast close")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn broadcast_lag_ends_subscription_instead_of_forwarding_incomplete_state() {
+        let (events, receiver) = broadcast::channel(2);
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let filter = Arc::new(RwLock::new(SubscriptionFilter {
+            active: true,
+            ..Default::default()
+        }));
+        let skipped_pane = PaneId::new();
+        let retained_pane = PaneId::new();
+        events.send(dummy_delta(skipped_pane, 1)).unwrap();
+        events
+            .send(ServerEvent::ProjectSetupChanged {
+                root_dir: PathBuf::from("/workspace"),
+                assignments: Vec::new(),
+            })
+            .unwrap();
+        events.send(dummy_delta(retained_pane, 1)).unwrap();
+        events.send(dummy_delta(retained_pane, 2)).unwrap();
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(1),
+            forward_subscriber_events(receiver, out_tx, filter),
+        )
+        .await
+        .expect("a lagged stream cannot continue with a partial view");
+        assert_eq!(exit, SubscriberExit::Lagged);
+        assert!(out_rx.recv().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lagged_subscriber_closes_the_transport_even_without_peer_eof() {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("lag.sock");
+        let mut listener = IpcListener::bind(&socket).await.unwrap();
+        let (stream, peer) = tokio::join!(listener.accept(), IpcStream::connect(&socket));
+        let mut peer = peer.unwrap();
+        let (events, _) = broadcast::channel(2);
+        let registry = Arc::new(Registry::new_with_state_store(
+            Supervisor::with_mode(IsolationMode::PgidFallback),
+            ShellIntegration::prepare(dir.path()).unwrap(),
+            events.clone(),
+            None,
+        ));
+        let mut connection = std::pin::pin!(handle_client(stream.unwrap(), registry, None));
+
+        let subscribe = async {
+            write_frame(
+                &mut peer,
+                &Request {
+                    id: 1,
+                    payload: ClientMessage::Subscribe {
+                        pane_ids: None,
+                        project_setup_events: true,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            read_frame::<_, ServerMessage>(&mut peer).await.unwrap()
+        };
+        let reply = tokio::select! {
+            _ = &mut connection => panic!("client closed before its subscription was active"),
+            reply = tokio::time::timeout(Duration::from_secs(1), subscribe) => reply.unwrap(),
+        };
+        assert_eq!(
+            reply,
+            Some(ServerMessage::Response {
+                id: 1,
+                result: Ok(ResponsePayload::Ok),
+            })
+        );
+
+        // Leave the pinned client unpolled while filling its broadcast receiver.
+        let pane = PaneId::new();
+        for seq in 1..=3 {
+            events.send(dummy_delta(pane, seq)).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), &mut connection)
+            .await
+            .expect("the lagged server connection must not wait for the reader's EOF");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                read_frame::<_, ServerMessage>(&mut peer)
+            )
+            .await
+            .expect("peer must observe the closed socket")
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[tokio::test]

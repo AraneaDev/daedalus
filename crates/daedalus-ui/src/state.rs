@@ -119,6 +119,19 @@ impl FailureRecipients {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveOverlay {
+    FailureRecipients,
+    SetupReview,
+    WorkspaceForm,
+    Settings,
+    ActionPalette,
+    AgentPicker,
+    Worktree,
+    CloseWorkspace,
+    Search,
+}
+
 /// Top-level UI application state shared between input handling, daemon bridge events, and rendering.
 #[derive(Debug)]
 pub struct AppState {
@@ -176,16 +189,28 @@ impl AppState {
         .then(|| path.to_owned())
     }
 
+    /// Frontmost input surface in the same order as visual overlays.
+    pub fn active_overlay(&self) -> Option<ActiveOverlay> {
+        [
+            (
+                self.failure_recipients.is_some(),
+                ActiveOverlay::FailureRecipients,
+            ),
+            (self.setup_review.open, ActiveOverlay::SetupReview),
+            (self.workspace_form.open, ActiveOverlay::WorkspaceForm),
+            (self.settings.open, ActiveOverlay::Settings),
+            (self.action_palette.open, ActiveOverlay::ActionPalette),
+            (self.picker.open, ActiveOverlay::AgentPicker),
+            (self.worktree_modal.open, ActiveOverlay::Worktree),
+            (self.close_modal.open, ActiveOverlay::CloseWorkspace),
+            (self.search.is_some(), ActiveOverlay::Search),
+        ]
+        .into_iter()
+        .find_map(|(open, overlay)| open.then_some(overlay))
+    }
+
     pub fn has_input_overlay(&self) -> bool {
-        self.failure_recipients.is_some()
-            || self.setup_review.open
-            || self.workspace_form.open
-            || self.settings.open
-            || self.action_palette.open
-            || self.picker.open
-            || self.worktree_modal.open
-            || self.close_modal.open
-            || self.search.is_some()
+        self.active_overlay().is_some()
     }
 
     pub fn can_create_worktree(&self) -> bool {
@@ -574,7 +599,11 @@ impl AppState {
                 _ => "Agent",
             },
             PaneRole::Service => "Service",
-            PaneRole::Runner => "Runner",
+            PaneRole::Runner => self
+                .panes
+                .get(&pane.id)
+                .and_then(|view| view.cargo_preset)
+                .map_or("Runner", crate::assignments::CargoPreset::label),
         };
         let mut totals = HashMap::new();
         let mut ordinals = HashMap::new();
@@ -848,6 +877,14 @@ impl AppState {
                 if view.grid_received {
                     summary.cols = view.summary.cols;
                     summary.rows = view.summary.rows;
+                }
+                if summary.role == PaneRole::Runner
+                    && let Some(preset) = summary
+                        .launch_preset
+                        .as_deref()
+                        .and_then(crate::assignments::CargoPreset::from_launch_tag)
+                {
+                    view.cargo_preset = Some(preset);
                 }
                 view.summary = summary;
                 view

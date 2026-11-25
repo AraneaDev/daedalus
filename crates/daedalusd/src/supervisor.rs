@@ -177,14 +177,17 @@ impl Supervisor {
             .map_err(|e| format!("take master writer failed: {e}"))?;
 
         let program = launch.program.rsplit(['/', '\\']).next().unwrap_or("");
-        let launch_preset = (role == PaneRole::Agent)
-            .then(|| {
-                daedalus_proto::canonical_agent_preset(
-                    program.trim_end_matches(".exe").trim_end_matches(".cmd"),
-                )
-            })
-            .flatten()
-            .map(str::to_owned);
+        let launch_preset = match role {
+            PaneRole::Agent => daedalus_proto::canonical_agent_preset(
+                program.trim_end_matches(".exe").trim_end_matches(".cmd"),
+            ),
+            PaneRole::Runner if launch.direct => daedalus_proto::cargo_launch_preset(
+                program,
+                launch.args.first().map(String::as_str),
+            ),
+            _ => None,
+        }
+        .map(str::to_owned);
         Ok(SpawnedPty {
             direct: launch.direct,
             launch_preset,

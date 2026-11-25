@@ -3,8 +3,11 @@ pub mod builtin;
 pub mod ghostty;
 mod runner;
 pub mod semantic;
+mod terminal_modes;
 
-use daedalus_proto::{CursorState, GridDelta, GridRow, GridSnapshot, PaneId, SearchMatch};
+use daedalus_proto::{
+    CursorState, GridDelta, GridRow, GridSnapshot, PaneId, SearchMatch, TerminalModes,
+};
 use std::path::PathBuf;
 
 pub use builtin::BuiltinVt;
@@ -68,6 +71,7 @@ pub trait VtEngine: Send {
     fn feed(&mut self, bytes: &[u8]) -> Vec<SemanticEvent>;
     fn resize(&mut self, cols: u16, rows: u16);
     fn snapshot(&self, pane_id: PaneId, seq: u64) -> GridSnapshot;
+    fn terminal_modes(&self) -> TerminalModes;
     fn scrollback_len(&self) -> usize;
     fn scrollback_window(&self, offset_from_bottom: usize, count: usize) -> Vec<GridRow>;
     fn search(&self, query: &str, case_sensitive: bool) -> Vec<SearchMatch>;
@@ -603,5 +607,47 @@ mod tests {
         assert_eq!(matches.len(), MAX_SEARCH_MATCHES);
         assert_eq!(matches[0].start_col, 0);
         assert_eq!(matches[0].end_col, 6);
+    }
+}
+
+#[cfg(test)]
+mod input_mode_tests {
+    use super::*;
+    use daedalus_proto::{MouseTracking, TerminalModes};
+
+    #[test]
+    fn mode_changes_emit_empty_deltas_and_survive_chunk_boundaries() {
+        fn exercise(mut vt: Box<dyn VtEngine>) {
+            let pane = PaneId::new();
+            vt.take_dirty_delta(pane, 0);
+            vt.feed(b"\x1b[?100");
+            assert!(vt.take_dirty_delta(pane, 1).is_none());
+            vt.feed(b"0;1006;2004h");
+            let delta = vt.take_dirty_delta(pane, 1).unwrap();
+            assert!(delta.dirty_rows.is_empty());
+            assert_eq!(
+                delta.terminal_modes,
+                TerminalModes {
+                    mouse: MouseTracking::Button,
+                    sgr_mouse: true,
+                    bracketed_paste: true,
+                }
+            );
+            assert_eq!(vt.snapshot(pane, 1).terminal_modes, delta.terminal_modes);
+            assert!(vt.take_dirty_delta(pane, 2).is_none());
+            vt.feed(b"\x1b[?1000l\x1b[?1002h");
+            assert_eq!(
+                vt.take_dirty_delta(pane, 2).unwrap().terminal_modes.mouse,
+                MouseTracking::Drag
+            );
+            vt.feed(b"\x1b[?1002;1006;2004l");
+            assert_eq!(
+                vt.take_dirty_delta(pane, 3).unwrap().terminal_modes,
+                TerminalModes::default()
+            );
+        }
+        exercise(Box::new(BuiltinVt::new(VtConfig::default())));
+        #[cfg(feature = "ghostty-vt")]
+        exercise(Box::new(ghostty::GhosttyVt::new(VtConfig::default())));
     }
 }

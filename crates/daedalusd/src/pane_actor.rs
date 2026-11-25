@@ -2,7 +2,7 @@ use crate::agent_detector::AgentStateDetector;
 use crate::supervisor::SpawnedPty;
 use daedalus_proto::{
     AgentState, FailureTrace, GridRow, GridSnapshot, PaneId, PaneRole, PaneSummary, ProtoError,
-    SearchMatch, ServerEvent, WorkspaceId,
+    SearchMatch, ServerEvent, WorkspaceId, single_line_paste, wrap_bracketed_paste,
 };
 use daedalus_vt::{CommandTracker, VtConfig, create_vt_engine};
 use portable_pty::PtySize;
@@ -13,6 +13,10 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 #[derive(Debug)]
 enum PaneCmd {
     SendInput {
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<(), ProtoError>>,
+    },
+    Paste {
         data: Vec<u8>,
         reply: oneshot::Sender<Result<(), ProtoError>>,
     },
@@ -153,22 +157,34 @@ impl PaneHandle {
             })
             .expect("failed to spawn PTY writer thread");
 
-        tokio::spawn(run_pane_actor(
-            direct,
-            launch_preset,
+        let size = PtySize {
+            cols: cols.max(1),
+            rows: rows.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let output = PaneOutput::new(
             workspace_id,
             pane_id,
             role,
-            cols,
-            rows,
-            master,
-            write_tx,
+            size.cols,
+            size.rows,
+            event_tx,
+            journal,
+        );
+        tokio::spawn(run_pane_actor(
+            direct,
+            output,
+            PaneCommands {
+                master,
+                write_tx,
+                launch_preset,
+                size,
+            },
             writer_handle,
             proc_handle,
             pty_rx,
             cmd_rx,
-            event_tx,
-            journal,
         ));
 
         Self {
@@ -209,6 +225,15 @@ impl PaneHandle {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(PaneCmd::SendInput { data, reply: tx })
+            .await
+            .map_err(|_| ProtoError::PaneNotFound(self.id))?;
+        rx.await.map_err(|_| ProtoError::PaneNotFound(self.id))?
+    }
+
+    pub async fn paste(&self, data: Vec<u8>) -> Result<(), ProtoError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(PaneCmd::Paste { data, reply: tx })
             .await
             .map_err(|_| ProtoError::PaneNotFound(self.id))?;
         rx.await.map_err(|_| ProtoError::PaneNotFound(self.id))?
@@ -497,28 +522,144 @@ async fn next_pty_output(
     receiver.recv().await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_pane_actor(
-    direct: bool,
-    launch_preset: Option<String>,
-    workspace_id: WorkspaceId,
-    pane_id: PaneId,
-    role: PaneRole,
-    cols: u16,
-    rows: u16,
+struct PaneCommands {
     master: Box<dyn portable_pty::MasterPty + Send>,
     write_tx: mpsc::Sender<WriteRequest>,
+    launch_preset: Option<String>,
+    size: PtySize,
+}
+
+impl PaneCommands {
+    fn queue_input(&self, data: Vec<u8>, reply: oneshot::Sender<Result<(), ProtoError>>) {
+        if let Err(err) = self.write_tx.try_send(WriteRequest { data, reply }) {
+            let (msg, request) = match err {
+                mpsc::error::TrySendError::Full(req) => ("PTY input queue full", req),
+                mpsc::error::TrySendError::Closed(req) => ("PTY writer closed", req),
+            };
+            let _ = request.reply.send(Err(ProtoError::IoError(msg.into())));
+        }
+    }
+
+    fn handle(&mut self, output: &mut PaneOutput, command: PaneCmd) -> Option<oneshot::Sender<()>> {
+        match command {
+            PaneCmd::SendInput { data, reply } => self.queue_input(data, reply),
+            PaneCmd::Paste { data, reply } => {
+                let data = if output.tracker.engine().terminal_modes().bracketed_paste {
+                    wrap_bracketed_paste(&data)
+                } else {
+                    single_line_paste(&data)
+                };
+                self.queue_input(data, reply);
+            }
+            PaneCmd::Resize { cols, rows, reply } => {
+                self.size.cols = cols.max(1);
+                self.size.rows = rows.max(1);
+                let result = self
+                    .master
+                    .resize(self.size)
+                    .map_err(|err| ProtoError::IoError(err.to_string()));
+                output
+                    .tracker
+                    .engine_mut()
+                    .resize(self.size.cols, self.size.rows);
+                output.dirty = true;
+                let _ = reply.send(result);
+            }
+            PaneCmd::GetSnapshot { reply } => {
+                // A snapshot and journal anchor with the same sequence must describe the same frame.
+                output.flush_delta();
+                let mut snapshot = output.tracker.engine().snapshot(output.pane_id, output.seq);
+                snapshot.activity = output.tracker.activity().cloned();
+                snapshot.insight = output.tracker.runner_insight();
+                let _ = reply.send(snapshot);
+            }
+            PaneCmd::GetScrollback {
+                offset_from_bottom,
+                count,
+                reply,
+            } => {
+                let engine = output.tracker.engine();
+                let _ = reply.send((
+                    engine.scrollback_len(),
+                    engine.scrollback_window(offset_from_bottom, count),
+                ));
+            }
+            PaneCmd::Search {
+                query,
+                case_sensitive,
+                reply,
+            } => {
+                let engine = output.tracker.engine();
+                let _ = reply.send((
+                    engine.scrollback_len(),
+                    engine.search(&query, case_sensitive),
+                ));
+            }
+            PaneCmd::GetFailureTrace { reply } => {
+                let _ = reply.send(output.tracker.last_failure_trace().cloned());
+            }
+            PaneCmd::GetSummary { reply } => {
+                let _ = reply.send(PaneSummary {
+                    id: output.pane_id,
+                    workspace_id: output.workspace_id,
+                    role: output.role,
+                    status: output.tracker.status(),
+                    cols: self.size.cols,
+                    rows: self.size.rows,
+                    cwd: output.tracker.cwd().cloned(),
+                    last_exit_code: output.tracker.last_exit_code(),
+                    has_failure_trace: output.tracker.last_failure_trace().is_some(),
+                    launch_preset: self.launch_preset.clone(),
+                    agent_state: output.detector.as_ref().map(AgentStateDetector::state),
+                });
+            }
+            PaneCmd::SetAgentState { state, reply } => {
+                let result = if let Some(detector) = output.detector.as_mut() {
+                    let update =
+                        detector.set_override(state, Instant::now(), Duration::from_secs(30));
+                    output.emit_agent_state(update);
+                    Ok(())
+                } else {
+                    Err(ProtoError::InvalidRequest(format!(
+                        "pane {} is not an agent pane",
+                        output.pane_id
+                    )))
+                };
+                let _ = reply.send(result);
+            }
+            PaneCmd::Close { reply } => return Some(reply),
+        }
+        None
+    }
+}
+
+async fn finish_pty_output(
+    output: &mut PaneOutput,
+    process: &mut crate::supervisor::ProcessHandle,
+    observed_exit: Option<i32>,
+) {
+    let mut exit_code = observed_exit.or_else(|| process.try_wait_exit());
+    for _ in 0..20 {
+        if exit_code.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        exit_code = process.try_wait_exit();
+    }
+    output.finish(exit_code);
+}
+
+async fn run_pane_actor(
+    direct: bool,
+    mut output: PaneOutput,
+    mut commands: PaneCommands,
     writer_handle: std::thread::JoinHandle<()>,
     mut proc_handle: crate::supervisor::ProcessHandle,
     mut pty_rx: mpsc::Receiver<PtyOutput>,
     mut cmd_rx: mpsc::Receiver<PaneCmd>,
-    event_tx: broadcast::Sender<ServerEvent>,
-    journal: crate::journal::Journal,
 ) {
-    let mut cols = cols.max(1);
-    let mut rows = rows.max(1);
     let mut child_exit: Option<(i32, tokio::time::Instant)> = None;
-    let mut output = PaneOutput::new(workspace_id, pane_id, role, cols, rows, event_tx, journal);
+    let role = output.role;
     if direct && role != PaneRole::Agent {
         output.tracker.start_direct_command();
     }
@@ -534,24 +675,14 @@ async fn run_pane_actor(
         t
     };
 
-    loop {
+    let close_reply = loop {
         tokio::select! {
             maybe_out = next_pty_output(&mut pty_rx, child_exit.map(|(_, deadline)| deadline)), if pty_open => {
                 match maybe_out {
-                    Some(PtyOutput::Bytes(bytes)) => {
-                        output.feed(&bytes, &write_tx);
-                    }
+                    Some(PtyOutput::Bytes(bytes)) => output.feed(&bytes, &commands.write_tx),
                     Some(PtyOutput::Closed) | None => {
                         pty_open = false;
-                        let mut exit_code = child_exit.map(|(code, _)| code).or_else(|| proc_handle.try_wait_exit());
-                        for _ in 0..20 {
-                            if exit_code.is_some() {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                            exit_code = proc_handle.try_wait_exit();
-                        }
-                        output.finish(exit_code);
+                        finish_pty_output(&mut output, &mut proc_handle, child_exit.map(|(code, _)| code)).await;
                     }
                 }
             }
@@ -582,113 +713,26 @@ async fn run_pane_actor(
                 }
             }
             maybe_cmd = cmd_rx.recv() => {
-                match maybe_cmd {
-                    Some(PaneCmd::SendInput { data, reply }) => {
-                        if let Err(err) = write_tx.try_send(WriteRequest { data, reply }) {
-                            let (msg, reply) = match err {
-                                mpsc::error::TrySendError::Full(req) => {
-                                    ("PTY input queue full".to_string(), req.reply)
-                                }
-                                mpsc::error::TrySendError::Closed(req) => {
-                                    ("PTY writer closed".to_string(), req.reply)
-                                }
-                            };
-                            let _ = reply.send(Err(ProtoError::IoError(msg)));
-                        }
-                    }
-                    Some(PaneCmd::Resize { cols: new_cols, rows: new_rows, reply }) => {
-                        cols = new_cols.max(1);
-                        rows = new_rows.max(1);
-                        let res = master.resize(PtySize {
-                                rows,
-                                cols,
-                                pixel_width: 0,
-                                pixel_height: 0,
-                            })
-                            .map_err(|e| ProtoError::IoError(e.to_string()));
-                        output.tracker.engine_mut().resize(cols, rows);
-                        output.dirty = true;
-                        let _ = reply.send(res);
-                    }
-                    Some(PaneCmd::GetSnapshot { reply }) => {
-                        // A snapshot and journal anchor with the same sequence must describe the same frame.
-                        output.flush_delta();
-                        let mut snapshot = output.tracker.engine().snapshot(pane_id, output.seq);
-                        snapshot.activity = output.tracker.activity().cloned();
-                        snapshot.insight = output.tracker.runner_insight();
-                        let _ = reply.send(snapshot);
-                    }
-                    Some(PaneCmd::GetScrollback {
-                        offset_from_bottom,
-                        count,
-                        reply,
-                    }) => {
-                        let engine = output.tracker.engine();
-                        let _ = reply.send((
-                            engine.scrollback_len(),
-                            engine.scrollback_window(offset_from_bottom, count),
-                        ));
-                    }
-                    Some(PaneCmd::Search {
-                        query,
-                        case_sensitive,
-                        reply,
-                    }) => {
-                        let engine = output.tracker.engine();
-                        let _ = reply.send((
-                            engine.scrollback_len(),
-                            engine.search(&query, case_sensitive),
-                        ));
-                    }
-                    Some(PaneCmd::GetFailureTrace { reply }) => {
-                        let _ = reply.send(output.tracker.last_failure_trace().cloned());
-                    }
-                    Some(PaneCmd::GetSummary { reply }) => {
-                        let summary = PaneSummary {
-                            id: pane_id,
-                            workspace_id,
-                            role,
-                            status: output.tracker.status(),
-                            cols,
-                            rows,
-                            cwd: output.tracker.cwd().cloned(),
-                            last_exit_code: output.tracker.last_exit_code(),
-                            has_failure_trace: output.tracker.last_failure_trace().is_some(),
-                            launch_preset: launch_preset.clone(),
-                            agent_state: output.detector.as_ref().map(AgentStateDetector::state),
-                        };
-                        let _ = reply.send(summary);
-                    }
-                    Some(PaneCmd::SetAgentState { state, reply }) => {
-                        let res = if let Some(det) = output.detector.as_mut() {
-                            let update = det.set_override(
-                                state,
-                                Instant::now(),
-                                Duration::from_secs(30),
-                            );
-                            output.emit_agent_state(update);
-                            Ok(())
-                        } else {
-                            Err(ProtoError::InvalidRequest(format!(
-                                "pane {pane_id} is not an agent pane"
-                            )))
-                        };
-                        let _ = reply.send(res);
-                    }
-                    Some(PaneCmd::Close { reply }) => {
-                        pty_rx.close();
-                        teardown_pane(write_tx, master, writer_handle, proc_handle).await;
-                        let _ = reply.send(());
-                        break;
-                    }
-                    None => {
-                        pty_rx.close();
-                        teardown_pane(write_tx, master, writer_handle, proc_handle).await;
-                        break;
-                    }
+                let Some(command) = maybe_cmd else {
+                    break None;
+                };
+                if let Some(reply) = commands.handle(&mut output, command) {
+                    break Some(reply);
                 }
             }
         }
+    };
+
+    pty_rx.close();
+    teardown_pane(
+        commands.write_tx,
+        commands.master,
+        writer_handle,
+        proc_handle,
+    )
+    .await;
+    if let Some(reply) = close_reply {
+        let _ = reply.send(());
     }
 }
 
@@ -770,6 +814,37 @@ mod output_tests {
             panic!("missing attention delta")
         };
         assert_eq!(delta.activity.unwrap().attention_seq, 2);
+    }
+
+    #[test]
+    fn terminal_mode_changes_publish_a_grid_event_without_cells() {
+        let (events, mut receiver) = broadcast::channel(16);
+        let (writer, _) = mpsc::channel(1);
+        let mut output = PaneOutput::new(
+            WorkspaceId::new(),
+            PaneId::new(),
+            PaneRole::Service,
+            8,
+            2,
+            events,
+            Default::default(),
+        );
+        output.feed(b"seed", &writer);
+        output.flush_delta();
+        let _ = receiver.try_recv().unwrap();
+
+        output.feed(b"\x1b[?1000;1006h", &writer);
+        output.flush_delta();
+        let Ok(ServerEvent::GridDelta(delta)) = receiver.try_recv() else {
+            panic!("missing mode delta");
+        };
+        assert_eq!(delta.seq, 2);
+        assert!(delta.dirty_rows.is_empty());
+        assert_eq!(
+            delta.terminal_modes.mouse,
+            daedalus_proto::MouseTracking::Button
+        );
+        assert!(delta.terminal_modes.sgr_mouse);
     }
 
     #[tokio::test]

@@ -2,7 +2,8 @@ use crate::{
     assignments::{Assignment, CargoPreset},
     layout::Rect,
 };
-use daedalus_proto::PaneRole;
+use daedalus_proto::{PaneRole, WorkspaceId};
+use std::sync::atomic::{AtomicU64, Ordering};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 #[derive(Debug)]
@@ -74,10 +75,20 @@ impl Control {
     }
 }
 
+static NEXT_SAVE_REQUEST: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug)]
+struct PendingSave {
+    request_id: u64,
+    workspace_id: WorkspaceId,
+    launch: Option<Assignment>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SettingsDialog {
     pub open: bool,
     pub error: Option<String>,
+    pending_save: Option<PendingSave>,
     drafts: Vec<Draft>,
     selected: usize,
     argument_page: usize,
@@ -90,6 +101,39 @@ pub struct SettingsDialog {
 }
 
 impl SettingsDialog {
+    pub fn is_saving(&self) -> bool {
+        self.pending_save.is_some()
+    }
+
+    pub fn start_save(&mut self, workspace_id: WorkspaceId, launch: Option<Assignment>) -> u64 {
+        let request_id = NEXT_SAVE_REQUEST.fetch_add(1, Ordering::Relaxed);
+        self.error = None;
+        self.pending_save = Some(PendingSave {
+            request_id,
+            workspace_id,
+            launch,
+        });
+        request_id
+    }
+
+    pub fn finish_save(
+        &mut self,
+        workspace_id: WorkspaceId,
+        request_id: u64,
+    ) -> Option<Option<Assignment>> {
+        let pending = self.pending_save.as_ref()?;
+        if pending.workspace_id != workspace_id || pending.request_id != request_id {
+            return None;
+        }
+        self.pending_save.take().map(|pending| pending.launch)
+    }
+
+    pub fn fail_pending_save(&mut self, message: String) {
+        if self.pending_save.take().is_some() {
+            self.error = Some(message);
+        }
+    }
+
     fn logical_height(&self) -> f32 {
         112.0 + self.rows().len() as f32 * 40.0
     }
@@ -222,7 +266,9 @@ impl SettingsDialog {
         if self.select_all && self.focus.field_label().is_some() {
             description.push_str(" All text selected.");
         }
-        if let Some(error) = &self.error {
+        if self.is_saving() {
+            description.push_str(" Saving workspace settings.");
+        } else if let Some(error) = &self.error {
             description.push(' ');
             description.push_str(error);
         }
@@ -244,7 +290,9 @@ impl SettingsDialog {
     }
 
     pub(crate) fn hint(&self) -> &str {
-        if let Some(error) = &self.error {
+        if self.is_saving() {
+            "Saving workspace settings…"
+        } else if let Some(error) = &self.error {
             error
         } else if self.select_all && self.field_has_text() {
             "All text selected · Type to replace"
@@ -271,6 +319,9 @@ impl SettingsDialog {
     }
 
     pub fn enabled(&self, c: Control) -> bool {
+        if self.is_saving() {
+            return false;
+        }
         match c {
             Prev | Next => self.drafts.len() > 1,
             PreviousArguments => self.argument_page > 0,
@@ -288,6 +339,9 @@ impl SettingsDialog {
     }
 
     fn field(&mut self) -> Option<&mut String> {
+        if self.is_saving() {
+            return None;
+        }
         let draft = self.drafts.get_mut(self.selected)?;
         match self.focus {
             Name => Some(&mut draft.name),
@@ -518,6 +572,9 @@ impl SettingsDialog {
     }
 
     pub fn key(&mut self, key: &Key, mods: ModifiersState) -> SettingsAction {
+        if self.is_saving() {
+            return SettingsAction::None;
+        }
         match key {
             Key::Named(NamedKey::Escape) => return SettingsAction::Cancel,
             Key::Named(NamedKey::Enter) => return self.activate(self.focus),

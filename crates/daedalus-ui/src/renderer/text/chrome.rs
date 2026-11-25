@@ -1093,6 +1093,7 @@ mod tests {
         let pane_id = ws.panes[0];
         let event = |seq, text: &str| {
             UiEvent::ServerEvent(ServerEvent::GridDelta(GridDelta {
+                terminal_modes: Default::default(),
                 activity: None,
                 insight: None,
                 pane_id,

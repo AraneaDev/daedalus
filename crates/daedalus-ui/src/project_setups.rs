@@ -2,7 +2,6 @@
 //! folder, when it supports that, and in local files otherwise.
 
 use crate::assignments::{self, Assignment};
-use crate::bridge::UiCommand;
 use daedalus_proto::{WorkspaceId, types::Workspace, validate_assignments};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -114,38 +113,19 @@ impl ProjectSetups {
         assignments::load_from(&self.local_path(id), defaults)
     }
 
-    /// Daemon-backed saves return the command to send; local saves are written immediately.
+    /// Daemon-backed saves return validated assignments to send without changing the cache.
+    /// Older daemons use local files, which are saved synchronously.
     pub fn save(
-        &mut self,
+        &self,
         id: WorkspaceId,
         entries: Vec<Assignment>,
-    ) -> Result<Option<UiCommand>, String> {
+    ) -> Result<Option<Vec<Assignment>>, String> {
         if !self.daemon_backed {
             assignments::save_to(&self.local_path(id), &entries)?;
             return Ok(None);
         }
         validate_assignments(&entries)?;
-        self.store(id, entries.clone());
-        Ok(Some(UiCommand::SaveProjectSetup {
-            workspace_id: id,
-            assignments: entries,
-        }))
-    }
-
-    fn store(&mut self, id: WorkspaceId, entries: Vec<Assignment>) {
-        let siblings: Vec<_> = match self.roots.get(&id) {
-            Some(root) => self
-                .roots
-                .iter()
-                .filter(|(_, other)| *other == root)
-                .map(|(other, _)| *other)
-                .collect(),
-            None => Vec::new(),
-        };
-        for sibling in siblings {
-            self.cache.insert(sibling, entries.clone());
-        }
-        self.cache.insert(id, entries);
+        Ok(Some(entries))
     }
 
     /// Local setups the daemon does not have yet. Each workspace, and each project folder, is
@@ -257,18 +237,16 @@ mod tests {
     }
 
     #[test]
-    fn daemon_backed_save_updates_cache_and_returns_command() {
+    fn daemon_backed_save_waits_for_confirmation_before_updating_cache() {
         let (dir, mut store) = store();
         let ws = info("/p", None);
         store.set_daemon_backed(true);
         store.absorb(std::slice::from_ref(&ws));
-        let command = store.save(ws.id, vec![entry("a")]).unwrap();
-        assert!(
-            matches!(command, Some(UiCommand::SaveProjectSetup { workspace_id, assignments })
-            if workspace_id == ws.id && assignments == vec![entry("a")])
-        );
-        assert_eq!(store.load(ws.id).unwrap(), vec![entry("a")]);
+        let pending = store.save(ws.id, vec![entry("a")]).unwrap();
+        assert_eq!(pending, Some(vec![entry("a")]));
+        assert!(store.load(ws.id).unwrap().is_empty());
         assert!(store.save(ws.id, vec![entry("b"), entry("b")]).is_err());
+        store.changed(Path::new("/p"), pending.unwrap(), std::slice::from_ref(&ws));
         assert_eq!(store.load(ws.id).unwrap(), vec![entry("a")]);
         assert!(!dir.path().join("assignments").exists());
     }
@@ -355,7 +333,7 @@ mod tests {
         store.set_daemon_backed(true);
         store.absorb(&all);
         store.save(a.id, vec![entry("denied")]).unwrap();
-        assert_eq!(store.load(b.id).unwrap(), vec![entry("denied")]);
+        assert_eq!(store.load(b.id).unwrap(), vec![entry("kept")]);
         store.rejected(a.id);
         assert_eq!(store.load(a.id).unwrap(), vec![entry("kept")]);
         assert_eq!(store.load(b.id).unwrap(), vec![entry("kept")]);

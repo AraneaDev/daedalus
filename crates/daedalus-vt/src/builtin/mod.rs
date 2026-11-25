@@ -50,6 +50,10 @@ impl VtEngine for BuiltinVt {
         self.state.grid.snapshot(pane_id, seq)
     }
 
+    fn terminal_modes(&self) -> daedalus_proto::TerminalModes {
+        self.state.grid.terminal_modes
+    }
+
     fn scrollback_len(&self) -> usize {
         self.state.grid.scrollback_len()
     }
@@ -104,6 +108,13 @@ impl Perform for PerformerState {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        crate::terminal_modes::apply_dec_mode(
+            &mut self.grid.terminal_modes,
+            params,
+            intermediates,
+            ignore,
+            action,
+        );
         if !ignore && intermediates.is_empty() {
             let mut args = params.iter();
             let first = args.next();
@@ -186,6 +197,15 @@ impl Perform for PerformerState {
                 flat.clear();
             }
         }
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        crate::terminal_modes::reset_on_ris(
+            &mut self.grid.terminal_modes,
+            intermediates,
+            ignore,
+            byte,
+        );
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
