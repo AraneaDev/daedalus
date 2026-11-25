@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.19](https://github.com/AraneaDev/daedalus/compare/v0.0.18...v0.0.19) (2026-11-25)
+
+
+### Features
+
+* configure workspace widgets and highlight waiting agents ([#52](https://github.com/AraneaDev/daedalus/issues/52)) ([7cdea0a](https://github.com/AraneaDev/daedalus/commit/7cdea0a3f00c3bffdf7b4dae758ebe37fb89290c))
+
 ## [0.0.18](https://github.com/AraneaDev/daedalus/compare/v0.0.17...v0.0.18) (2026-11-25)
 
 
