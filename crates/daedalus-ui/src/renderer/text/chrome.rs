@@ -5,7 +5,7 @@ use super::{
     CHROME_SUB_FONT_SIZE_LOGICAL, CHROME_SUB_LINE_HEIGHT_LOGICAL, ChromeLineSpec, Rect, Theme,
     WorkspaceLayout, truncate_right_with_ellipsis,
 };
-use crate::layout::{PaneRect, sidebar_workspace_close_rect};
+use crate::layout::{PaneRect, sidebar_workspace_close_rect, tab_label_padding};
 use crate::renderer::sidebar::{Badge, BadgeKind, Card};
 use crate::renderer::{
     SidebarCards, active_external_detail_preview, agent_state_badge, banner_appearance,
@@ -800,7 +800,7 @@ impl TextRenderer {
                 if let Some((_, button)) = close {
                     self.push_chrome_button(ChromeLineSpec {
                         text: "×",
-                        left: button.x + 3. * s,
+                        left: button.x,
                         top: button.y + (button.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
                         max_w: button.width,
                         bounds: button,
@@ -811,6 +811,7 @@ impl TextRenderer {
                     });
                 }
                 let mark = super::super::agent_tab_mark(state, *id, label, *rect, s);
+                let padding = tab_label_padding(*rect, s);
                 let mut inset = if mark.is_some() { 22. * s } else { 0. };
                 if mark.is_some()
                     || (!matches!(label.as_str(), "‹" | "›" | "‹ Prev" | "Next ›")
@@ -823,7 +824,7 @@ impl TextRenderer {
                     {
                         self.push_chrome_line(ChromeLineSpec {
                             text: &indicator.to_string(),
-                            left: rect.x + inset + 2. * s,
+                            left: rect.x + padding + inset,
                             top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
                             max_w: 14. * s,
                             bounds: *rect,
@@ -836,10 +837,11 @@ impl TextRenderer {
                     inset += 14. * s;
                 }
                 let max_w =
-                    (rect.width - inset - close.map_or(0., |(_, b)| b.width) - 8. * s).max(1.);
+                    (rect.width - inset - close.map_or(0., |(_, b)| b.width) - 2. * padding)
+                        .max(1.);
                 self.push_chrome_line(ChromeLineSpec {
                     text: label,
-                    left: rect.x + inset + 4. * s,
+                    left: rect.x + inset + padding,
                     top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
                     max_w,
                     bounds: *rect,
@@ -857,6 +859,7 @@ impl TextRenderer {
         } else if state.zoomed {
             let tabs = crate::layout::session_tabs(pane_rect, s);
             for (role, rect) in tabs {
+                let padding = tab_label_padding(rect, s);
                 let label = match role {
                     PaneRole::Agent => "Agent",
                     PaneRole::Service => "Service",
@@ -864,9 +867,9 @@ impl TextRenderer {
                 };
                 self.push_chrome_line(ChromeLineSpec {
                     text: label,
-                    left: rect.x + 4. * s,
+                    left: rect.x + padding,
                     top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                    max_w: (rect.width - 4. * s).max(1.),
+                    max_w: (rect.width - 2. * padding).max(1.),
                     bounds: rect,
                     font_size_logical: CHROME_FONT_SIZE_LOGICAL,
                     line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,

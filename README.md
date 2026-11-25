@@ -117,6 +117,13 @@ Direct Cargo test and check manifest commands select their preset automatically.
 summaries accumulate across crates. Final status follows command completion. The `service` preset
 includes an observed workspace port when available. Choose `command` for process status alone.
 
+Open **Settings → Widgets** to choose service and runner presets, set labels, and control runner
+duration and warnings. **Save widgets** applies the changes to this workspace on the current
+computer. Default values and blank labels inherit the project configuration.
+When an agent asks for input, its workspace is highlighted in amber with a **Needs reply** badge.
+
+![Workspace Widgets settings with service and runner presets and details](docs/images/workspace-widgets.png)
+
 ## Terminal links, activity and image previews
 
 Hover over an HTTP or HTTPS link to see its destination. Ctrl-click opens the destination in the

@@ -6,7 +6,7 @@ const APPROVAL_WINDOW_BYTES: usize = 384;
 const APPROVAL_WINDOW_LINES: usize = 4;
 const QUIET_IDLE_DURATION: Duration = Duration::from_millis(1500);
 
-const APPROVAL_PATTERNS: &[&str] = &[
+const INPUT_PROMPT_PATTERNS: &[&str] = &[
     "(y/n)",
     "[y/n]",
     "[y/n/a]",
@@ -20,6 +20,10 @@ const APPROVAL_PATTERNS: &[&str] = &[
     "permission?",
     "permission required",
     "grant permission",
+    "submit answers",
+    "answer the questions to continue",
+    "waiting for your answer",
+    "waiting for your input",
 ];
 
 const SPINNER_GLYPHS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -80,9 +84,9 @@ pub fn strip_ansi_csi_osc(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn contains_approval_pattern(text: &str) -> bool {
+fn contains_input_prompt(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    APPROVAL_PATTERNS.iter().any(|pat| lower.contains(pat))
+    INPUT_PROMPT_PATTERNS.iter().any(|pat| lower.contains(pat))
 }
 
 fn contains_spinner_or_thinking(text: &str) -> bool {
@@ -176,15 +180,15 @@ impl AgentStateDetector {
 
         self.last_output = now;
 
-        let clean_has_approval = contains_approval_pattern(&clean);
+        let clean_has_prompt = contains_input_prompt(&clean);
         let clean_has_active_marker = contains_spinner_or_thinking(&clean);
         let clean_has_substantive = clean.chars().any(|c| !c.is_whitespace());
 
-        // Once the agent resumes spinning/thinking after an approval prompt, clear the old
+        // Once the agent resumes spinning/thinking after a prompt, clear the old
         // tail window so the previous prompt does not keep re-triggering WaitingForApproval.
         if self.state == AgentState::WaitingForApproval
             && clean_has_active_marker
-            && !clean_has_approval
+            && !clean_has_prompt
         {
             self.tail.clear();
         }
@@ -198,7 +202,7 @@ impl AgentStateDetector {
         }
 
         let window = recent_tail_window(&self.tail);
-        let next_state = if contains_approval_pattern(window) {
+        let next_state = if contains_input_prompt(window) {
             AgentState::WaitingForApproval
         } else if clean_has_active_marker || clean_has_substantive {
             AgentState::Thinking
@@ -335,6 +339,7 @@ mod tests {
             "Confirm? [enter]",
             "Press Enter to continue",
             "Allow once for this session",
+            "Answer the questions to continue.",
         ] {
             let mut det = AgentStateDetector::with_now(t0);
             assert_eq!(
@@ -355,6 +360,26 @@ mod tests {
         assert_eq!(det.observe_exit(Some(1)), None);
         assert_eq!(det.observe_exit(Some(0)), Some(AgentState::Idle));
         assert_eq!(det.observe_exit(Some(0)), None);
+    }
+
+    #[test]
+    fn interactive_question_waits_for_a_reply_and_clears_when_work_resumes() {
+        let now = Instant::now();
+        let mut detector = AgentStateDetector::with_now(now);
+        assert_eq!(
+            detector.observe_output(b"Which setting fits best?", now),
+            Some(AgentState::Thinking)
+        );
+        assert_eq!(detector.observe_output(b"\nSubmit ans", now), None);
+        assert_eq!(
+            detector.observe_output(b"wers", now),
+            Some(AgentState::WaitingForApproval)
+        );
+        assert_eq!(detector.observe_tick(now + Duration::from_secs(10)), None);
+        assert_eq!(
+            detector.observe_output("⠙ Working".as_bytes(), now + Duration::from_secs(11)),
+            Some(AgentState::Thinking)
+        );
     }
 
     #[test]

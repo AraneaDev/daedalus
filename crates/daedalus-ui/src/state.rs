@@ -152,6 +152,7 @@ pub struct AppState {
     pub setup_review: crate::setup_review::SetupReview,
     pub workspace_form: crate::workspace_form::WorkspaceForm,
     pub settings: crate::settings::SettingsDialog,
+    pub workspace_widgets: HashMap<WorkspaceId, crate::workspace_widgets::WorkspaceWidgets>,
     pub recap: crate::recap::Recap,
     pub test_workspaces: HashSet<WorkspaceId>,
     pub reduced_motion: bool,
@@ -237,6 +238,7 @@ impl AppState {
             setup_review: Default::default(),
             workspace_form: Default::default(),
             settings: Default::default(),
+            workspace_widgets: HashMap::new(),
             recap: Default::default(),
             test_workspaces: HashSet::new(),
             reduced_motion: false,
@@ -460,12 +462,22 @@ impl AppState {
             .filter_map(|id| self.panes.get(id).map(|pane| &pane.summary))
     }
 
-    /// Returns the most recently added Agent pane's state for this workspace.
+    /// Prioritizes any live agent awaiting input over the latest agent's state.
     pub fn workspace_agent_state(&self, ws: &WorkspaceView) -> Option<AgentState> {
-        self.workspace_panes(ws)
+        let mut agents = self
+            .workspace_panes(ws)
             .rev()
-            .find(|pane| pane.role == PaneRole::Agent)
-            .and_then(|pane| pane.agent_state)
+            .filter(|pane| pane.role == PaneRole::Agent);
+        if agents.clone().any(|pane| {
+            !matches!(pane.status, PaneStatus::Exited { .. })
+                && pane.agent_state == Some(AgentState::WaitingForApproval)
+        }) {
+            return Some(AgentState::WaitingForApproval);
+        }
+        agents
+            .next()?
+            .agent_state
+            .filter(|state| *state != AgentState::WaitingForApproval)
     }
 
     pub fn apply_agent_state(

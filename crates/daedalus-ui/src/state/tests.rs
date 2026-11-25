@@ -984,6 +984,29 @@ fn close_workspace_modal_defaults_toggles_and_mutual_exclusion() {
 }
 
 #[test]
+fn a_waiting_agent_has_priority_in_its_background_workspace() {
+    let (active, _, _, _) = make_workspace_with_three_panes();
+    let (mut background, waiting, _, _) = make_workspace_with_three_panes();
+    let mut later = background.panes[0].clone();
+    later.id = PaneId::new();
+    later.agent_state = Some(AgentState::Thinking);
+    background.panes.push(later);
+    let id = background.id;
+    let mut state = AppState::new();
+    state.set_workspaces(vec![active, background]);
+    state.apply_agent_state(id, waiting, AgentState::WaitingForApproval);
+    assert_eq!(
+        state.workspace_agent_state(&state.workspaces[1]),
+        Some(AgentState::WaitingForApproval)
+    );
+    state.panes.get_mut(&waiting).unwrap().summary.status = PaneStatus::Exited { code: None };
+    assert_eq!(
+        state.workspace_agent_state(&state.workspaces[1]),
+        Some(AgentState::Thinking)
+    );
+}
+
+#[test]
 fn agent_state_and_workspace_runtime_updates_sync_state() {
     let mut state = AppState::new();
     let (ws, agent_id, _, _) = make_workspace_with_three_panes();
@@ -1133,6 +1156,7 @@ fn cycle_workspace_wraps_cleanly_forward_and_backward() {
 #[test]
 fn runner_overrides_and_failure_details_leave_agent_selected() {
     let (mut ws, agent, _, runner) = make_workspace_with_three_panes();
+    let id = ws.id;
     ws.manifest = Some(daedalus_proto::WorkspaceManifest {
         runner_widget: Some(daedalus_proto::WidgetConfig {
             label: Some("Compiler".into()),
@@ -1161,6 +1185,22 @@ fn runner_overrides_and_failure_details_leave_agent_selected() {
         Some("‹  error[E0308]")
     );
     assert_eq!(state.focused_pane_id(), Some(agent));
+    state.workspace_widgets.insert(
+        id,
+        crate::workspace_widgets::WorkspaceWidgets {
+            runner: daedalus_proto::WidgetConfig {
+                label: Some("Type check".into()),
+                show_warnings: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    // The local name and warnings override the manifest while its duration setting stays in effect.
+    assert_eq!(
+        state.widget_label(PaneRole::Runner).as_deref(),
+        Some("Type check · Failed · 2 warnings")
+    );
 }
 
 #[test]

@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -224,6 +225,35 @@ def exercise(binaries, scratch, screen):
             until(
                 "on-demand test", lambda: runs.exists() and runs.read_text() == "ran\n"
             )
+            ui.shortcut("s")
+            ui.wait_dialog((395, 214))
+            ui.click(850, 284)  # Widgets page
+            ui.wait_dialog((395, 254))
+            ui.click(720, 365)  # Service preset
+            ui.click(630, 404)  # Service label
+            ui.key("a")
+            ui.key("p")
+            ui.key("i")
+            ui.click(720, 445)  # Cargo Test
+            ui.click(720, 445)  # Cargo Check
+            ui.click(530, 525)  # Show duration
+            ui.click(530, 525)  # Hide duration
+            ui.click(890, 525)  # Show warnings
+            ui.key("Control_L", "s")
+
+            def widget_settings():
+                files = list((scratch / "config").glob("*/config.widgets/*.toml"))
+                return tomllib.loads(files[0].read_text()) if files else None
+
+            saved = until("saved widget settings", widget_settings)
+            assert saved["service"] == {"preset": "service", "label": "api"}
+            assert saved["runner"] == {
+                "preset": "cargo-check",
+                "show_duration": False,
+                "show_warnings": True,
+            }
+            ui.key("Escape")
+            ui.wait_dialog((395, 254), visible=False)
             ui.close(client)
 
         # Reconnect to the daemon and run the saved assignment again.

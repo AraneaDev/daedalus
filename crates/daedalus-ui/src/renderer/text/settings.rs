@@ -40,7 +40,11 @@ impl TextRenderer {
         let heading = row(0.0, 48.0 * unit);
         let count_width = (105.0 * scale).min(heading.width * 0.30);
         line(
-            "Workspace assignments",
+            if dialog.widgets_page {
+                "Workspace widgets"
+            } else {
+                "Workspace assignments"
+            },
             Rect::new(
                 heading.x,
                 heading.y,
@@ -66,7 +70,7 @@ impl TextRenderer {
             true,
         );
         for (c, r) in dialog.controls(modal) {
-            let active = dialog.focus == c;
+            let active = dialog.focus == c || dialog.page_selected(c);
 
             if let Some(caption) = c
                 .field_label()

@@ -126,7 +126,7 @@ convert -size 240x128 xc:'#17242c' -fill '#afc9c1' -font DejaVu-Sans -pointsize 
     PNG32:health-report.png
 touch .git/preview
 sleep .4
-xdotool mousemove --window "$window" 9 59 mousedown 1 mousemove --window "$window" 175 59 mouseup 1
+xdotool mousemove --window "$window" 9 67 mousedown 1 mousemove --window "$window" 175 67 mouseup 1
 xdotool key ctrl+shift+i
 xdotool mousemove 1439 899
 capture image-preview
@@ -148,7 +148,7 @@ xdotool key Escape
 xdotool key ctrl+shift+s
 sleep .4
 # Add a real preset so the screenshot shows editable configuration.
-xdotool mousemove --window "$window" 734 153 click 1
+xdotool mousemove --window "$window" 734 173 click 1
 xdotool key ctrl+a
 xdotool type --delay 30 'Reviewer'
 xdotool mousemove 1439 899
