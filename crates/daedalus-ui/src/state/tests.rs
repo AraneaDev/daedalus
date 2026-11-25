@@ -1233,3 +1233,29 @@ fn service_widget_only_advertises_ports_while_live() {
         );
     }
 }
+
+#[test]
+fn bottom_bar_cargo_runs_use_the_launched_presets_warning_defaults() {
+    use crate::assignments::CargoPreset;
+    let (ws, _, _, runner) = make_workspace_with_three_panes();
+    let mut state = AppState::new();
+    state.set_workspaces(vec![ws]);
+    for (preset, expected) in [
+        (CargoPreset::Test, "Workspace tests · Compiling · 4s"),
+        (CargoPreset::Check, "Compiler · Compiling · 2 warnings · 4s"),
+    ] {
+        let pane = state.panes.get_mut(&runner).unwrap();
+        pane.cargo_preset = Some(preset);
+        pane.summary.status = PaneStatus::Busy;
+        pane.insight = Some(daedalus_proto::RunnerInsight {
+            phase: "Compiling".into(),
+            warnings: 2,
+            elapsed_secs: 4,
+            ..Default::default()
+        });
+        assert_eq!(
+            state.widget_label(PaneRole::Runner).as_deref(),
+            Some(expected)
+        );
+    }
+}
