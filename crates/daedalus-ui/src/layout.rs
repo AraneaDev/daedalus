@@ -5,6 +5,9 @@ use daedalus_proto::{PaneId, PaneRole, WorkspaceId};
 pub const SIDEBAR_LOGICAL_WIDTH: f32 = 240.0;
 pub const CARGO_BAR_LOGICAL_HEIGHT: f32 = 34.;
 pub const HEADER_LOGICAL_HEIGHT: f32 = 26.0;
+const FOCUSED_HEADER_LOGICAL_HEIGHT: f32 = 34.0;
+const TAB_LABEL_PADDING: f32 = 10.0;
+const TAB_CLOSE_LOGICAL_WIDTH: f32 = 28.0;
 pub const BANNER_LOGICAL_HEIGHT: f32 = 24.0;
 pub const VIEWPORT_LOGICAL_PAD: f32 = 6.0;
 pub const AGENT_WIDTH_RATIO: f32 = 0.55;
@@ -117,7 +120,7 @@ impl PaneRect {
     /// sits below this row and leaves its full width available for navigation.
     pub fn tab_strip(&self, scale: f32) -> Rect {
         let mut strip = self.header;
-        strip.height = strip.height.min(HEADER_LOGICAL_HEIGHT * scale);
+        strip.height = strip.height.min(FOCUSED_HEADER_LOGICAL_HEIGHT * scale);
         if let Some(pill) = self.action_pill
             && pill.y < strip.bottom()
         {
@@ -127,12 +130,16 @@ impl PaneRect {
     }
 }
 
+pub(crate) fn tab_label_padding(tab: Rect, scale: f32) -> f32 {
+    (TAB_LABEL_PADDING * scale).min(tab.width * 0.14)
+}
+
 /// Bounds shared by painting and pointer input for the focused terminal's role tabs.
 pub fn session_tabs(pane: &PaneRect, scale: f32) -> [(PaneRole, Rect); 3] {
     let strip = pane.tab_strip(scale);
     let left = strip.x + 4.0 * scale;
     let right = strip.right();
-    let width = ((right - left) / 3.0).clamp(0.0, 72.0 * scale);
+    let width = ((right - left) / 3.0).clamp(0.0, 84.0 * scale);
     [PaneRole::Agent, PaneRole::Service, PaneRole::Runner].map(|role| {
         let index = match role {
             PaneRole::Agent => 0.,
@@ -346,8 +353,21 @@ impl WorkspaceLayout {
         let width = if compact {
             (available - 2. * arrow_width) / visible as f32
         } else {
-            (available / capacity as f32).min(132. * scale)
+            (available / capacity as f32).min(148. * scale)
         };
+        let preferred_extra = |label: &str, close_width: f32| {
+            let text_width = unicode_width::UnicodeWidthStr::width(label) as f32 * 9.;
+            let preferred = (text_width + 2. * TAB_LABEL_PADDING + 36. + close_width).min(240.);
+            (preferred * scale - width).max(0.)
+        };
+        // Keep the selected tab readable first, then fit longer labels into any spare width.
+        let mut spare = (available - width * capacity as f32).max(0.);
+        let selected_extra = if !overflow && focused == Some(entries[index].0) {
+            preferred_extra(&entries[index].1, TAB_CLOSE_LOGICAL_WIDTH).min(spare)
+        } else {
+            0.
+        };
+        spare -= selected_extra;
         let mut x = left;
         let mut push = |id, label: String, w| {
             self.named_tabs
@@ -362,18 +382,16 @@ impl WorkspaceLayout {
             );
         }
         for (id, label) in &entries[start..start + visible] {
-            let tab_width = if !overflow && Some(*id) == focused {
-                let spare = (available - width * capacity as f32).max(0.);
-                // Leave space for the close control and keep long assignment names bounded.
-                let desired = (unicode_width::UnicodeWidthStr::width(label.as_str()) as f32 * 9.
-                    + 32.)
-                    .min(240.)
-                    * scale;
-                desired.clamp(width, width + spare)
+            let extra = if overflow {
+                0.
+            } else if Some(*id) == focused {
+                selected_extra
             } else {
-                width
+                let extra = preferred_extra(label, 0.).min(spare);
+                spare -= extra;
+                extra
             };
-            push(*id, label.clone(), tab_width);
+            push(*id, label.clone(), width + extra);
         }
         if overflow {
             push(
@@ -386,7 +404,7 @@ impl WorkspaceLayout {
             && let Some((_, _, rect)) = self.named_tabs.iter().rev().find(|(tab, _, _)| *tab == id)
             && rect.width >= 52. * scale
         {
-            let width = 22. * scale;
+            let width = (TAB_CLOSE_LOGICAL_WIDTH * scale).min(rect.width - 30. * scale);
             self.close_tab = Some((
                 id,
                 Rect::new(rect.right() - width, rect.y, width, rect.height),
@@ -458,17 +476,19 @@ fn build_pane_rect(
         PaneRole::Service | PaneRole::Runner => None,
     };
 
-    let narrow = zoomed && outer.width < 420. * metrics.scale_factor;
-    let wrap_action = narrow
-        && pill_logical_w.is_some()
-        && outer.width < 200. * metrics.scale_factor
-        && outer.height >= metrics.header_height * 3.;
-    let header_rows = if wrap_action { 2. } else { 1. };
-    let header_row_height = if !zoomed && outer.height >= 200.0 * metrics.scale_factor {
+    let header_row_height = if zoomed {
+        FOCUSED_HEADER_LOGICAL_HEIGHT * metrics.scale_factor
+    } else if outer.height >= 200.0 * metrics.scale_factor {
         36.0 * metrics.scale_factor
     } else {
         metrics.header_height
     };
+    let narrow = zoomed && outer.width < 420. * metrics.scale_factor;
+    let wrap_action = narrow
+        && pill_logical_w.is_some()
+        && outer.width < 200. * metrics.scale_factor
+        && outer.height >= header_row_height * 3.;
+    let header_rows = if wrap_action { 2. } else { 1. };
     let header_h = (header_row_height * header_rows).min(outer.height.max(0.0));
     let header = Rect::new(outer.x, outer.y, outer.width.max(0.0), header_h);
     let action_pill = pill_logical_w.and_then(|logical_w| {
@@ -578,8 +598,11 @@ pub fn compute_split_layout(input: &LayoutInput, splits: &PaneSplits) -> Workspa
             } else {
                 0.0
             };
-            let terminal_h =
-                (window_h - banner - metrics.header_height - 2.0 * metrics.viewport_pad).max(1.0);
+            let terminal_h = (window_h
+                - banner
+                - FOCUSED_HEADER_LOGICAL_HEIGHT * metrics.scale_factor
+                - 2.0 * metrics.viewport_pad)
+                .max(1.0);
             let required_width = (window_w * window_h * (2.0 / 3.0) / terminal_h).ceil();
             w = w.min((window_w - required_width - 2.0 * metrics.viewport_pad).max(0.0));
         }
@@ -626,7 +649,7 @@ pub fn compute_split_layout(input: &LayoutInput, splits: &PaneSplits) -> Workspa
         if input.zoomed && sidebar.is_none() && input.sidebar_override != Some(false) {
             let terminal_width = (canvas_w - 2. * metrics.viewport_pad).max(1.);
             let required_height = window_w * window_h * (2. / 3.) / terminal_width
-                + metrics.header_height
+                + FOCUSED_HEADER_LOGICAL_HEIGHT * metrics.scale_factor
                 + 2. * metrics.viewport_pad;
             let height = (canvas_h - required_height).min(window_h * 0.19).max(0.);
             canvas_h -= height;
@@ -1083,6 +1106,32 @@ mod tests {
         let height = runner.bottom() - agent.y;
         assert!((agent.height - height * 0.35).abs() < 0.01);
         assert!((runner.height - height * 0.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn focused_tabs_have_room_for_labels_and_the_close_button() {
+        for scale in [1., 1.5, 2.] {
+            let entries = [
+                (PaneId::new(), "Claude".into()),
+                (PaneId::new(), "Codex".into()),
+                (PaneId::new(), "Exited 0 · Cargo Test".into()),
+            ];
+            let mut layout = compute_layout(&LayoutInput {
+                window_w: 1000. * scale,
+                window_h: 600. * scale,
+                scale_factor: scale,
+                zoomed: true,
+                ..default_input()
+            });
+            layout.set_named_tabs(&entries, Some(entries[1].0), scale);
+            let (_, _, active) = layout.named_tabs[1];
+            let (_, close) = layout.close_tab.unwrap();
+            assert_eq!(active.height, 34. * scale);
+            assert_eq!(close.width, 28. * scale);
+            assert!(layout.named_tabs[2].2.width >= 180. * scale);
+            assert_eq!(close.right(), active.right());
+            assert!(layout.named_tabs[2].2.right() <= layout.panes[0].tab_strip(scale).right());
+        }
     }
 
     #[test]

@@ -54,6 +54,7 @@ impl SidebarCards {
 pub(super) struct Card {
     pub rect: Rect,
     pub dot: Rgba,
+    pub needs_reply: bool,
     pub full: bool,
     pub title_width: f32,
     pub subtitle_width: Option<f32>,
@@ -96,6 +97,7 @@ impl Card {
         let mut card = Self {
             rect,
             dot,
+            needs_reply: agent == Some(AgentState::WaitingForApproval),
             full: rect.height >= crate::sidebar_content::workspace_card_height(ws) * s,
             title_width: (rect.right() - left - 24.0 * s).max(1.0),
             subtitle_width: None,
@@ -184,7 +186,11 @@ impl Card {
     ) {
         let mut reserve = 0.0;
         if let Some(agent) = agent {
-            let (label, color) = agent_state_badge(agent, theme);
+            let (label, color) = if self.needs_reply {
+                ("Needs reply", theme.status_busy)
+            } else {
+                agent_state_badge(agent, theme)
+            };
             let mut rect = sidebar_agent_state_pill_rect(self.rect, label, s);
             if ws.containers.is_empty() {
                 rect.y = self.rect.y + 62.0 * s;

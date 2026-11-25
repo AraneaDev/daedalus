@@ -592,7 +592,7 @@ fn agent_tab_mark(
         pane.agent_preset
             .unwrap_or(crate::state::AgentPreset::Shell),
         Rect::new(
-            rect.x + 6. * scale,
+            rect.x + crate::layout::tab_label_padding(rect, scale),
             rect.y + (rect.height - size) * 0.5,
             size,
             size,
@@ -623,9 +623,36 @@ fn collect_sidebar_quads(
         let ws = &state.workspaces[idx];
         let row_rect = card.rect;
         let is_active = state.active_workspace_id == Some(ws.id);
-        if is_active {
+        if card.needs_reply {
+            quads.push(QuadInstance::new(row_rect, theme.bg_header).rounded(8.0 * s, 0.0, 0.));
+            quads.push(
+                QuadInstance::new(
+                    row_rect,
+                    theme
+                        .status_busy
+                        .with_alpha(if is_active { 0.20 } else { 0.12 }),
+                )
+                .rounded(8.0 * s, 0.0, 0.),
+            );
+            quads.push(
+                QuadInstance::new(row_rect, theme.status_busy.with_alpha(0.75)).rounded(
+                    8.0 * s,
+                    border_w,
+                    0.,
+                ),
+            );
+        } else if is_active {
             quads.push(QuadInstance::new(row_rect, theme.bg_header).rounded(8.0 * s, 0.0, 0.38));
-            // Left accent stripe
+        } else {
+            quads.push(
+                QuadInstance::new(row_rect, theme.bg_pane.with_alpha(0.55)).rounded(
+                    8.0 * s,
+                    0.0,
+                    0.0,
+                ),
+            );
+        }
+        if is_active {
             quads.push(
                 QuadInstance::from_xywh(
                     row_rect.x,
@@ -635,14 +662,6 @@ fn collect_sidebar_quads(
                     theme.border_focused,
                 )
                 .rounded(1.5 * s, 0.0, 0.0),
-            );
-        } else {
-            quads.push(
-                QuadInstance::new(row_rect, theme.bg_pane.with_alpha(0.55)).rounded(
-                    8.0 * s,
-                    0.0,
-                    0.0,
-                ),
             );
         }
 
@@ -879,6 +898,8 @@ fn collect_overlay_quads(
             let fill =
                 if control == crate::settings::Control::Save && state.settings.enabled(control) {
                     theme.border_focused
+                } else if state.settings.page_selected(control) {
+                    theme.border_focused.with_alpha(0.12)
                 } else if control.field_label().is_some() {
                     theme.bg_pane
                 } else {
@@ -1992,9 +2013,14 @@ pub(crate) mod tests {
             collect_quads(&state, &layout, &theme, 1200.0, 800.0, 1.0, (8.0, 19.0));
         assert_eq!(base_count as usize, quads.len());
 
-        let sidebar = sidebar_workspace_rect(layout.sidebar.unwrap(), 0, 1.0);
-        let mut sidebar_pill = sidebar_agent_state_pill_rect(sidebar, "Approval", 1.0);
+        let cards = SidebarCards::new(&state, layout.sidebar.unwrap(), 1.0, &theme, None);
+        let sidebar = cards.cards[0].rect;
+        let mut sidebar_pill = sidebar_agent_state_pill_rect(sidebar, "Needs reply", 1.0);
         sidebar_pill.y = sidebar.y + 62.0;
+        assert!(quads.iter().any(|quad| quad.rect
+            == [sidebar.x, sidebar.y, sidebar.width, sidebar.height]
+            && quad.color == theme.status_busy.with_alpha(0.75).to_array()
+            && quad.style[1] > 0.0));
         let header_pill =
             pane_agent_state_pill_rect(layout.pane(PaneRole::Agent).unwrap(), "Approval", 1.0)
                 .unwrap();
@@ -2052,7 +2078,7 @@ pub(crate) mod tests {
             assert!(
                 quads
                     .iter()
-                    .any(|quad| quad.style[0] == expected && quad.rect == [18., 5.5, 15., 15.])
+                    .any(|quad| quad.style[0] == expected && quad.rect == [22., 5.5, 15., 15.])
             );
         }
         layout.named_tabs[0].2.width = 60.;

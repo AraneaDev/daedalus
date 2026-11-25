@@ -12,6 +12,72 @@ struct Workbench {
     root: TempDir,
 }
 
+#[test]
+fn widget_page_updates_the_current_workspace_and_saves_per_profile() {
+    use daedalus_ui::settings::Control;
+
+    let mut workbench = Workbench::new();
+    let workspace = workspace("Widgets");
+    let id = workspace.id;
+    workbench.app.state.set_workspaces(vec![workspace]);
+    workbench.app.open_workspace_settings();
+
+    let settings = &mut workbench.app.state.settings;
+    settings.activate(Control::WidgetsPage);
+    settings.set_value(Control::ServiceLabel, "  API on WSL  ");
+    settings.activate(Control::ServicePreset);
+    settings.activate(Control::RunnerWarnings);
+    settings.activate(Control::RunnerWarnings);
+    let action = settings.activate(Control::Save);
+    workbench.app.handle_settings_action(action);
+
+    assert!(workbench.app.state.settings.open);
+    assert!(workbench.app.state.settings.widgets_saved);
+    assert_eq!(workbench.app.state.settings.label(Control::Cancel), "Done");
+    assert!(
+        workbench
+            .app
+            .state
+            .widget_label(PaneRole::Service)
+            .unwrap()
+            .starts_with("API on WSL · ")
+    );
+    let persisted = daedalus_ui::workspace_widgets::load_all(&workbench.app.widget_directory);
+    assert_eq!(persisted[&id], workbench.app.state.workspace_widgets[&id]);
+    assert_eq!(persisted[&id].runner.show_warnings, Some(false));
+    assert!(workbench.idle());
+}
+
+#[test]
+fn failed_widget_save_keeps_the_previous_configuration_and_the_draft() {
+    use daedalus_ui::settings::Control;
+    use daedalus_ui::workspace_widgets::WorkspaceWidgets;
+
+    let mut workbench = Workbench::new();
+    let workspace = workspace("Widgets");
+    let id = workspace.id;
+    workbench.app.state.set_workspaces(vec![workspace]);
+    let mut previous = WorkspaceWidgets::default();
+    previous.runner.label = Some("Original".into());
+    workbench
+        .app
+        .state
+        .workspace_widgets
+        .insert(id, previous.clone());
+    std::fs::write(&workbench.app.widget_directory, "not a directory").unwrap();
+    workbench.app.open_workspace_settings();
+    let settings = &mut workbench.app.state.settings;
+    settings.activate(Control::WidgetsPage);
+    settings.set_value(Control::RunnerLabel, "Edited");
+    let action = settings.activate(Control::Save);
+    workbench.app.handle_settings_action(action);
+
+    let settings = &workbench.app.state.settings;
+    assert!(settings.open && settings.error.is_some());
+    assert_eq!(settings.value(Control::RunnerLabel), Some("Edited"));
+    assert_eq!(workbench.app.state.workspace_widgets[&id], previous);
+}
+
 impl Workbench {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();

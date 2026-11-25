@@ -81,10 +81,18 @@ impl DaedalusApp {
             .load_or(ws.id, initial_assignments(ws, self.config.default_agent))
         {
             Ok(entries) => {
+                let id = ws.id;
                 self.state.close_search();
                 self.state.action_palette.close();
                 self.state.picker.close();
                 self.state.settings.begin(entries);
+                self.state.settings.widget_workspace = Some(id);
+                self.state.settings.widgets = self
+                    .state
+                    .workspace_widgets
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default();
             }
             Err(err) => self.show_toast(err, true),
         }
@@ -107,6 +115,28 @@ impl DaedalusApp {
             }
             SettingsAction::Save(entries) => (entries, None),
             SettingsAction::Launch(entries, id) => (entries, Some(id)),
+            SettingsAction::SaveWidgets(widgets) => {
+                let workspace = self
+                    .state
+                    .settings
+                    .widget_workspace
+                    .filter(|id| self.state.workspaces.iter().any(|ws| ws.id == *id));
+                if let Some(id) = workspace {
+                    match daedalus_ui::workspace_widgets::save(&self.widget_directory, id, &widgets)
+                    {
+                        Ok(()) => {
+                            self.state.workspace_widgets.insert(id, widgets.clone());
+                            self.state.settings.widgets = widgets;
+                            self.state.settings.widgets_saved = true;
+                        }
+                        Err(error) => self.state.settings.error = Some(error),
+                    }
+                } else {
+                    self.state.settings.error = Some("This workspace is no longer open.".into());
+                }
+                self.request_redraw();
+                return;
+            }
         };
         let Some(workspace) = self.state.active_workspace_id else {
             self.state.settings.open = false;

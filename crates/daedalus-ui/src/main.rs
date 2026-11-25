@@ -133,6 +133,7 @@ struct DaedalusApp {
     config: BridgeConfig,
     ui_config: UiConfig,
     project_setups: daedalus_ui::project_setups::ProjectSetups,
+    widget_directory: PathBuf,
     daemon_home: Option<PathBuf>,
     setup: setup::SetupFlow,
     history: daedalus_ui::activity_history::ActivityHistory,
@@ -192,8 +193,11 @@ impl DaedalusApp {
     ) -> Self {
         let mut state = AppState::new();
         state.reduced_motion = ui_config.reduced_motion;
+        let widget_directory = profile.with_extension("widgets");
+        state.workspace_widgets = daedalus_ui::workspace_widgets::load_all(&widget_directory);
         Self {
             project_setups: Default::default(),
+            widget_directory,
             daemon_home: None,
             setup: Default::default(),
             history: daedalus_ui::activity_history::ActivityHistory::new(

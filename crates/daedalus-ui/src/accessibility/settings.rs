@@ -34,8 +34,8 @@ pub(super) fn fields(
     for (index, (control, rect)) in settings.controls(modal).enumerate() {
         let enabled = settings.enabled(control);
         let mut node = match control {
-            Control::Name | Control::Executable | Control::Argument(_) => {
-                let label = control.field_label().unwrap();
+            field if field.field_label().is_some() => {
+                let label = field.field_label().unwrap();
                 let mut field = if enabled {
                     editable_field(
                         &label,

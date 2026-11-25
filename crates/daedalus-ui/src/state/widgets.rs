@@ -1,7 +1,23 @@
 use super::AppState;
-use daedalus_proto::{PaneRole, PaneStatus};
+use daedalus_proto::{PaneRole, PaneStatus, WidgetConfig};
 
 impl AppState {
+    fn widget_configs(&self, role: PaneRole) -> impl Iterator<Item = &WidgetConfig> + Clone {
+        let workspace = self.active_workspace();
+        let overrides = workspace
+            .and_then(|ws| self.workspace_widgets.get(&ws.id))
+            .and_then(|widgets| widgets.for_role(role));
+        let defaults =
+            workspace
+                .and_then(|ws| ws.manifest.as_ref())
+                .and_then(|manifest| match role {
+                    PaneRole::Runner => manifest.runner_widget.as_ref(),
+                    PaneRole::Service => manifest.service_widget.as_ref(),
+                    _ => None,
+                });
+        [overrides, defaults].into_iter().flatten()
+    }
+
     pub fn show_cargo_bar(&self) -> bool {
         self.active_workspace()
             .is_some_and(|ws| ws.project.tools.iter().any(|tool| tool == "Cargo"))
@@ -12,27 +28,25 @@ impl AppState {
         let ws = self.active_workspace()?;
         let pane = self.pane_for_role(role)?;
         let manifest = ws.manifest.as_ref();
-        let (config, command) = match role {
-            PaneRole::Runner => (
-                manifest.and_then(|m| m.runner_widget.as_ref()),
-                manifest.and_then(|m| m.runner_command.as_ref()),
-            ),
-            PaneRole::Service => (
-                manifest.and_then(|m| m.service_widget.as_ref()),
-                manifest.and_then(|m| m.service_command.as_ref()),
-            ),
+        let command = match role {
+            PaneRole::Runner => manifest.and_then(|m| m.runner_command.as_ref()),
+            PaneRole::Service => manifest.and_then(|m| m.service_command.as_ref()),
             _ => return None,
         };
-        let preset = config.and_then(|c| c.preset.as_deref()).or_else(|| {
-            if let Some(preset) = pane.cargo_preset {
-                return Some(preset.launch_tag());
-            }
-            let args = command?;
-            daedalus_proto::cargo_launch_preset(args.first()?, args.get(1).map(String::as_str))
-        });
-        let name = config
-            .and_then(|c| c.label.as_deref())
-            .filter(|s| !s.trim().is_empty())
+        let configs = self.widget_configs(role);
+        let preset = configs
+            .clone()
+            .find_map(|c| c.preset.as_deref())
+            .or_else(|| {
+                if let Some(preset) = pane.cargo_preset {
+                    return Some(preset.launch_tag());
+                }
+                let args = command?;
+                daedalus_proto::cargo_launch_preset(args.first()?, args.get(1).map(String::as_str))
+            });
+        let name = configs
+            .clone()
+            .find_map(|c| c.label.as_deref().filter(|s| !s.trim().is_empty()))
             .or_else(|| self.session_names.get(&pane.summary.id).map(String::as_str))
             .or_else(|| {
                 pane.cargo_preset
@@ -79,15 +93,21 @@ impl AppState {
                 if info.failed > 0 {
                     text.push_str(&format!(" · {} failed", info.failed));
                 }
-                if config
-                    .and_then(|c| c.show_warnings)
+                if configs
+                    .clone()
+                    .find_map(|c| c.show_warnings)
                     .unwrap_or(preset != Some("cargo-test"))
                     && info.warnings > 0
                 {
                     text.push_str(&format!(" · {} warnings", info.warnings));
                 }
             }
-            if config.and_then(|c| c.show_duration).unwrap_or(true) && info.elapsed_secs > 0 {
+            if configs
+                .clone()
+                .find_map(|c| c.show_duration)
+                .unwrap_or(true)
+                && info.elapsed_secs > 0
+            {
                 text.push_str(&format!(" · {}s", info.elapsed_secs));
             }
         } else {
@@ -98,11 +118,8 @@ impl AppState {
 
     pub fn widget_diagnostic(&self) -> Option<&str> {
         if self
-            .active_workspace()?
-            .manifest
-            .as_ref()
-            .and_then(|m| m.runner_widget.as_ref())
-            .and_then(|w| w.preset.as_deref())
+            .widget_configs(PaneRole::Runner)
+            .find_map(|w| w.preset.as_deref())
             == Some("command")
         {
             return None;
