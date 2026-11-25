@@ -2033,6 +2033,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn named_agent_tabs_draw_distinct_marks_and_keep_compact_tabs_clear() {
+        use crate::state::AgentPreset;
+        let (mut state, mut layout) = make_state_with_agent_row();
+        let id = state.focused_pane_id().unwrap();
+        let theme = Theme::dark();
+        let rect = Rect::new(12., 0., 132., 26.);
+        layout.named_tabs = vec![(id, "Agent".into(), rect)];
+        for (preset, expected) in [
+            (Some(AgentPreset::Claude), -1.),
+            (Some(AgentPreset::Codex), -2.),
+            (Some(AgentPreset::Agy), -3.),
+            (None, -4.),
+        ] {
+            state.panes.get_mut(&id).unwrap().agent_preset = preset;
+            let (quads, _) = collect_quads(&state, &layout, &theme, 1200., 800., 1., (8., 19.));
+            assert!(
+                quads
+                    .iter()
+                    .any(|quad| quad.style[0] == expected && quad.rect == [18., 5.5, 15., 15.])
+            );
+        }
+        layout.named_tabs[0].2.width = 60.;
+        let (quads, _) = collect_quads(&state, &layout, &theme, 1200., 800., 1., (8., 19.));
+        assert!(quads.iter().all(|quad| quad.style[0] >= 0.));
+    }
+
+    #[test]
     fn cargo_bar_and_split_handles_have_visible_surfaces_in_both_layouts() {
         let (state, _) = make_state_with_agent_row();
         let theme = Theme::dark();
