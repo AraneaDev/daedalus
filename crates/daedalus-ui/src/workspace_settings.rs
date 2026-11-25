@@ -170,6 +170,17 @@ impl DaedalusApp {
         }
     }
 
+    pub(super) fn run_cargo_preset(&mut self, preset: assignments::CargoPreset) {
+        if !self.state.show_cargo_bar() {
+            return;
+        }
+        if let Some(workspace) = self.state.active_workspace_id
+            && !self.launch_saved_assignment(workspace, preset.assignment())
+        {
+            self.show_toast("Reconnect to run Cargo", true);
+        }
+    }
+
     fn launch_saved_assignment(&self, workspace_id: WorkspaceId, assignment: Assignment) -> bool {
         let (cols, rows) = self
             .compute_current_layout()
@@ -286,10 +297,21 @@ impl DaedalusApp {
         pane: PaneId,
         assignment: Assignment,
     ) {
-        self.state.select_session(workspace, assignment.role, pane);
         self.state.session_names.insert(pane, assignment.name);
-        if let Err(err) = assignments::bind(workspace, pane, &assignment.id) {
-            self.show_toast(err, true);
+        let cargo_preset = assignments::CargoPreset::ALL
+            .into_iter()
+            .find(|preset| preset.id() == assignment.id && assignment.role == PaneRole::Runner);
+        if let Some(preset) = cargo_preset {
+            if let Some(view) = self.state.panes.get_mut(&pane) {
+                view.cargo_preset = Some(preset);
+            }
+            self.state
+                .select_role_pane(workspace, assignment.role, pane);
+        } else {
+            self.state.select_session(workspace, assignment.role, pane);
+            if let Err(err) = assignments::bind(workspace, pane, &assignment.id) {
+                self.show_toast(err, true);
+            }
         }
         self.schedule_resize_flush();
     }

@@ -1,4 +1,7 @@
-use crate::{assignments::Assignment, layout::Rect};
+use crate::{
+    assignments::{Assignment, CargoPreset},
+    layout::Rect,
+};
 use daedalus_proto::PaneRole;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -19,6 +22,19 @@ struct Draft {
     args: Vec<String>,
 }
 
+impl From<Assignment> for Draft {
+    fn from(assignment: Assignment) -> Self {
+        let mut argv = assignment.argv.into_iter();
+        Self {
+            id: assignment.id,
+            name: assignment.name,
+            role: assignment.role,
+            executable: argv.next().unwrap_or_default(),
+            args: argv.collect(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Control {
     Prev,
@@ -27,6 +43,8 @@ pub enum Control {
     Agy,
     Claude,
     Codex,
+    CargoTest,
+    CargoCheck,
     Remove,
     #[default]
     Name,
@@ -90,6 +108,7 @@ impl SettingsDialog {
         let mut rows = vec![
             vec![Prev, Next, Remove],
             vec![Add, Agy, Claude, Codex],
+            vec![CargoTest, CargoCheck],
             vec![Name],
             vec![Role],
             vec![Executable],
@@ -158,16 +177,7 @@ impl SettingsDialog {
         *self = Self {
             open: true,
             revision: self.revision.wrapping_add(1),
-            drafts: entries
-                .into_iter()
-                .map(|a| Draft {
-                    id: a.id,
-                    name: a.name,
-                    role: a.role,
-                    executable: a.argv.first().cloned().unwrap_or_default(),
-                    args: a.argv.into_iter().skip(1).collect(),
-                })
-                .collect(),
+            drafts: entries.into_iter().map(Draft::from).collect(),
             ..Default::default()
         };
         if self.drafts.is_empty() {
@@ -199,6 +209,8 @@ impl SettingsDialog {
             Agy => "+ Agy".into(),
             Claude => "+ Claude".into(),
             Codex => "+ Codex".into(),
+            CargoTest => "+ Cargo Test".into(),
+            CargoCheck => "+ Cargo Check".into(),
             Cancel => "Cancel".into(),
             Save => "Save".into(),
             Launch => "Save & launch".into(),
@@ -374,25 +386,33 @@ impl SettingsDialog {
         match c {
             Prev => self.selected = (self.selected + self.drafts.len() - 1) % self.drafts.len(),
             Next => self.selected = (self.selected + 1) % self.drafts.len(),
-            Add | Agy | Claude | Codex => {
-                let preset = match c {
-                    Agy => "agy",
-                    Claude => "claude",
-                    Codex => "codex",
-                    _ => "",
+            Add | Agy | Claude | Codex | CargoTest | CargoCheck => {
+                let id = uuid::Uuid::new_v4().to_string();
+                let mut template = match c {
+                    CargoTest => CargoPreset::Test.assignment(),
+                    CargoCheck => CargoPreset::Check.assignment(),
+                    _ => {
+                        let executable = match c {
+                            Agy => "agy",
+                            Claude => "claude",
+                            Codex => "codex",
+                            _ => "",
+                        };
+                        Assignment {
+                            id: String::new(),
+                            name: executable.into(),
+                            role: if c == Add {
+                                PaneRole::Runner
+                            } else {
+                                PaneRole::Agent
+                            },
+                            argv: vec![executable.into()],
+                        }
+                    }
                 };
+                template.id = id;
                 self.selected = self.drafts.len();
-                self.drafts.push(Draft {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    name: preset.into(),
-                    role: if c == Add {
-                        PaneRole::Runner
-                    } else {
-                        PaneRole::Agent
-                    },
-                    executable: preset.into(),
-                    args: Vec::new(),
-                });
+                self.drafts.push(Draft::from(template));
                 self.focus = Name;
                 self.select_all = true;
             }
@@ -574,6 +594,23 @@ impl SettingsDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_templates_create_editable_runner_assignments() {
+        let mut dialog = SettingsDialog::default();
+        dialog.begin(Vec::new());
+        dialog.activate(CargoTest);
+        dialog.activate(CargoCheck);
+        dialog.set_value(Argument(1), "--all-targets");
+        let SettingsAction::Launch(entries, id) = dialog.activate(Launch) else {
+            panic!("expected launch");
+        };
+        assert_eq!(entries[0].role, PaneRole::Runner);
+        assert_eq!(entries[0].argv, ["cargo", "test", "--workspace"]);
+        assert_eq!(entries[1].role, PaneRole::Runner);
+        assert_eq!(entries[1].argv, ["cargo", "check", "--all-targets"]);
+        assert_eq!(entries[1].id, id);
+    }
 
     #[test]
     fn editing_preserves_argument_boundaries_and_selection() {

@@ -2,6 +2,11 @@ use super::AppState;
 use daedalus_proto::{PaneRole, PaneStatus};
 
 impl AppState {
+    pub fn show_cargo_bar(&self) -> bool {
+        self.active_workspace()
+            .is_some_and(|ws| ws.project.tools.iter().any(|tool| tool == "Cargo"))
+    }
+
     /// Single-line summary shared by terminal headers, the focused view and accessibility.
     pub fn widget_label(&self, role: PaneRole) -> Option<String> {
         let ws = self.active_workspace()?;
@@ -19,6 +24,12 @@ impl AppState {
             _ => return None,
         };
         let preset = config.and_then(|c| c.preset.as_deref()).or_else(|| {
+            if let Some(preset) = pane.cargo_preset {
+                return Some(match preset {
+                    crate::assignments::CargoPreset::Test => "cargo-test",
+                    crate::assignments::CargoPreset::Check => "cargo-check",
+                });
+            }
             let args = command?;
             if args.first()?.rsplit(['/', '\\']).next()? != "cargo" {
                 return None;

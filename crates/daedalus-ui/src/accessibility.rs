@@ -32,6 +32,11 @@ const SEARCH: NodeId = NodeId(11);
 const SETUP_REVIEW: NodeId = NodeId(19);
 const SETTINGS: NodeId = NodeId(14);
 const OPEN_SETTINGS: NodeId = NodeId(17);
+const TOGGLE_LAYOUT: NodeId = NodeId(20);
+const CARGO_BUTTONS: [(NodeId, daedalus_ui::assignments::CargoPreset); 2] = [
+    (NodeId(21), daedalus_ui::assignments::CargoPreset::Test),
+    (NodeId(22), daedalus_ui::assignments::CargoPreset::Check),
+];
 const NEW_WORKSPACE: NodeId = NodeId(15);
 const VALIDATION: NodeId = NodeId(12);
 const BRANCH_TEXT: NodeId = NodeId(13);
@@ -111,6 +116,9 @@ pub(super) fn action(
         && overlay(state).is_none()
     {
         match request.target_node {
+            TOGGLE_LAYOUT if state.active_workspace().is_some() => {
+                return Some(UiAction::ToggleZoom);
+            }
             OPEN_SETTINGS if state.active_workspace().is_some() => {
                 return Some(UiAction::WorkspaceSettings);
             }
@@ -118,6 +126,11 @@ pub(super) fn action(
                 return Some(UiAction::NewWorkspace);
             }
             node if state.workspace_list_loaded => {
+                if state.show_cargo_bar()
+                    && let Some((_, preset)) = CARGO_BUTTONS.iter().find(|(id, _)| *id == node)
+                {
+                    return Some(UiAction::RunCargo(*preset));
+                }
                 if controls.is_run_tests(state, node) {
                     return Some(UiAction::RunTests);
                 }
@@ -568,6 +581,25 @@ pub(super) fn workbench_tree(
         workspace.set_description(description.join(". "));
         let mut open_settings = named(Role::Button, "Workspace settings");
         open_settings.add_action(Action::Click);
+        let mut toggle_layout = named(
+            Role::Button,
+            if state.zoomed {
+                "Split view"
+            } else {
+                "Focus view"
+            },
+        );
+        toggle_layout.add_action(Action::Click);
+        workspace.push_child(TOGGLE_LAYOUT);
+        nodes.push((TOGGLE_LAYOUT, toggle_layout));
+        if state.show_cargo_bar() {
+            for (id, preset) in CARGO_BUTTONS {
+                let mut button = named(Role::Button, preset.label());
+                button.add_action(Action::Click);
+                workspace.push_child(id);
+                nodes.push((id, button));
+            }
+        }
         workspace.push_child(OPEN_SETTINGS);
         nodes.push((OPEN_SETTINGS, open_settings));
         root.push_child(WORKSPACE);
@@ -1145,6 +1177,48 @@ mod tests {
         );
         state.remove_session(failed);
         assert_eq!(super::action(&state, &request, &controls), None);
+    }
+
+    #[test]
+    fn cargo_accessibility_actions_require_a_cargo_workspace_and_no_modal() {
+        let mut state = agent_workspace();
+        let controls = TerminalControls::default();
+        let click = |node| ActionRequest {
+            action: Action::Click,
+            target_node: node,
+            target_tree: TreeId::ROOT,
+            data: None,
+        };
+        assert_eq!(
+            super::action(&state, &click(TOGGLE_LAYOUT), &controls),
+            Some(UiAction::ToggleZoom)
+        );
+        for (id, _) in CARGO_BUTTONS {
+            assert_eq!(super::action(&state, &click(id), &controls), None);
+        }
+        state
+            .active_workspace_mut()
+            .unwrap()
+            .project
+            .tools
+            .push("Cargo".into());
+        let current = tree(&state);
+        for (id, preset) in CARGO_BUTTONS {
+            assert!(
+                current
+                    .nodes
+                    .iter()
+                    .any(|(node_id, node)| *node_id == id && node.label() == Some(preset.label()))
+            );
+            assert_eq!(
+                super::action(&state, &click(id), &controls),
+                Some(UiAction::RunCargo(preset))
+            );
+        }
+        state.worktree_modal.open();
+        for (id, _) in CARGO_BUTTONS {
+            assert_eq!(super::action(&state, &click(id), &controls), None);
+        }
     }
 
     #[test]

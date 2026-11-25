@@ -346,6 +346,7 @@ impl DaedalusApp {
                     );
                 }
             }
+            HitTarget::ToggleLayout => self.handle_ui_action(UiAction::ToggleZoom),
             HitTarget::ToggleSidebar => self.handle_ui_action(UiAction::ToggleSidebar),
             HitTarget::SidebarFailedRun(workspace) => {
                 self.handle_ui_action(UiAction::OpenFailedRun(workspace));
@@ -371,6 +372,7 @@ impl DaedalusApp {
                 self.activate_session(target)
             }
             HitTarget::SessionTab(role) => self.handle_ui_action(UiAction::FocusRole(role)),
+            HitTarget::RunCargo(preset) => self.handle_ui_action(UiAction::RunCargo(preset)),
             HitTarget::RunTests => self.handle_ui_action(UiAction::RunTests),
             HitTarget::WorkspaceSettings => self.open_workspace_settings(),
             HitTarget::SidebarNewWorkspace => self.create_new_workspace(),

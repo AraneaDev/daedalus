@@ -430,6 +430,22 @@ fn collect_prepared_quads(
 
     if let Some(toggle) = layout.sidebar_toggle {
         quads.push(QuadInstance::new(toggle, theme.bg_header));
+        if let Some(button) = layout.layout_button {
+            let surface = Rect::new(
+                button.x,
+                button.y + 4. * s,
+                button.width - 2. * s,
+                button.height - 8. * s,
+            );
+            quads.push(QuadInstance::new(surface, theme.bg_sidebar).rounded(5. * s, 0., 0.));
+        }
+    }
+
+    if let Some(bar) = layout.cargo_bar {
+        quads.push(QuadInstance::new(bar, theme.bg_header));
+        for (_, button) in layout.cargo_buttons(s) {
+            quads.push(QuadInstance::new(button, theme.bg_sidebar).rounded(5. * s, 0., 0.));
+        }
     }
 
     // 2. Top disconnect / toast banner.
@@ -486,6 +502,45 @@ fn collect_prepared_quads(
                     theme.border_focused,
                 )
                 .rounded(s, 0.0, 0.0),
+            );
+        }
+    }
+
+    if state.active_workspace_id.is_some()
+        && let [agent, service, runner] = layout.panes.as_slice()
+    {
+        let agent = agent.outer;
+        let service = service.outer;
+        let runner = runner.outer;
+        let length = 24. * s;
+        let thickness = 2. * s;
+        let mut horizontal_grip = |x: f32, y: f32| {
+            quads.push(
+                QuadInstance::from_xywh(
+                    x - length / 2.,
+                    y - thickness / 2.,
+                    length,
+                    thickness,
+                    theme.text_muted,
+                )
+                .rounded(thickness / 2., 0., 0.),
+            );
+        };
+        let right_center = service.x + service.width / 2.;
+        if layout.stacked {
+            horizontal_grip(right_center, service.y);
+            horizontal_grip(right_center, runner.y);
+        } else {
+            horizontal_grip(right_center, (service.bottom() + runner.y) / 2.);
+            quads.push(
+                QuadInstance::from_xywh(
+                    (agent.right() + service.x - thickness) / 2.,
+                    agent.y + (agent.height - length) / 2.,
+                    thickness,
+                    length,
+                    theme.text_muted,
+                )
+                .rounded(thickness / 2., 0., 0.),
             );
         }
     }
@@ -1975,6 +2030,43 @@ pub(crate) mod tests {
         assert!(worktree.bottom() <= force.y);
         assert!(force.bottom() <= cancel.y);
         assert!(cancel.right() <= confirm.x);
+    }
+
+    #[test]
+    fn cargo_bar_and_split_handles_have_visible_surfaces_in_both_layouts() {
+        let (state, _) = make_state_with_agent_row();
+        let theme = Theme::dark();
+        for width in [450., 1200.] {
+            let mut layout = compute_layout(&LayoutInput {
+                window_w: width,
+                window_h: 766.,
+                scale_factor: 1.,
+                cell_w: 8.,
+                cell_h: 19.,
+                sidebar_override: None,
+                has_top_banner: false,
+                zoomed: false,
+                focused_role: PaneRole::Agent,
+                runner_has_failure: false,
+            });
+            layout.cargo_bar = Some(Rect::new(0., 766., width, 34.));
+            layout.enable_layout_button(1.);
+            let (quads, _) = collect_quads(&state, &layout, &theme, width, 800., 1., (8., 19.));
+            for (_, rect) in layout.cargo_buttons(1.) {
+                assert!(quads.iter().any(|quad| quad.rect
+                    == [rect.x, rect.y, rect.width, rect.height]
+                    && quad.color == theme.bg_sidebar.to_array()));
+            }
+            let grips: Vec<_> = quads
+                .iter()
+                .filter(|quad| {
+                    quad.color == theme.text_muted.to_array()
+                        && matches!((quad.rect[2], quad.rect[3]), (24., 2.) | (2., 24.))
+                })
+                .collect();
+            assert_eq!(grips.len(), 2);
+            assert_eq!(grips.iter().all(|grip| grip.rect[3] == 2.), layout.stacked);
+        }
     }
 
     #[test]

@@ -289,10 +289,13 @@ impl DaedalusApp {
             scale_factor,
             cell: (cell_w, cell_h),
         } = metrics;
-        compute_split_layout(
+        let footer_height = daedalus_ui::layout::CARGO_BAR_LOGICAL_HEIGHT * scale_factor;
+        let show_footer = self.state.show_cargo_bar() && size.height as f32 >= footer_height * 5.;
+        let height = size.height as f32 - if show_footer { footer_height } else { 0. };
+        let mut layout = compute_split_layout(
             &LayoutInput {
                 window_w: size.width as f32,
-                window_h: size.height as f32,
+                window_h: height,
                 scale_factor,
                 cell_w,
                 cell_h,
@@ -303,7 +306,16 @@ impl DaedalusApp {
                 runner_has_failure: self.state.runner_has_failure(),
             },
             &self.pointer.splits,
-        )
+        );
+        if show_footer {
+            layout.cargo_bar = Some(daedalus_ui::layout::Rect::new(
+                0.,
+                height,
+                size.width as f32,
+                footer_height,
+            ));
+        }
+        layout
     }
 
     fn layout_for(&self, metrics: ViewportMetrics) -> WorkspaceLayout {
@@ -351,6 +363,9 @@ impl DaedalusApp {
         }
         if self.state.active_test_workspace().is_some() {
             layout.enable_run_tests(scale_factor);
+        }
+        if self.state.active_workspace_id.is_some() {
+            layout.enable_layout_button(scale_factor);
         }
         layout
     }
@@ -993,6 +1008,7 @@ impl DaedalusApp {
                 }
             }
             UiAction::RunTests => self.run_saved_tests(),
+            UiAction::RunCargo(preset) => self.run_cargo_preset(preset),
             UiAction::WorkspaceSettings => self.open_workspace_settings(),
             UiAction::NewWorkspace => self.create_new_workspace(),
             UiAction::OpenFailedRun(workspace) => self.open_failed_run(workspace),

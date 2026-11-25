@@ -648,8 +648,12 @@ impl AppState {
         }
     }
 
-    pub fn select_session(&mut self, workspace: WorkspaceId, role: PaneRole, pane: PaneId) {
+    pub fn select_role_pane(&mut self, workspace: WorkspaceId, role: PaneRole, pane: PaneId) {
         self.selected_panes.insert((workspace, role), pane);
+    }
+
+    pub fn select_session(&mut self, workspace: WorkspaceId, role: PaneRole, pane: PaneId) {
+        self.select_role_pane(workspace, role, pane);
         if self.active_workspace_id == Some(workspace) {
             self.focused_role = role;
             self.close_search();

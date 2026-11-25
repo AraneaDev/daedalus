@@ -148,7 +148,7 @@ xdotool key Escape
 xdotool key ctrl+shift+s
 sleep .4
 # Add a real preset so the screenshot shows editable configuration.
-xdotool mousemove --window "$window" 734 173 click 1
+xdotool mousemove --window "$window" 734 153 click 1
 xdotool key ctrl+a
 xdotool type --delay 30 'Reviewer'
 xdotool mousemove 1439 899
@@ -181,14 +181,6 @@ xdotool type --delay 2 "$PWD"
 xdotool key Return
 capture environment-setup
 
-# Show each dialog at its native resolution without clipped background text.
-for entry in 'workspace-settings 650x392' 'environment-setup 700x500' 'new-worktree 420x184'; do
-    read -r name size <<< "$entry"
-    convert "$scratch/$name.png" -gravity center -crop "$size+0+0" +repage "$scratch/detail.png"
-    mv "$scratch/detail.png" "$scratch/$name.png"
-done
-convert "$scratch/failed-run.png" -crop 1000x184+0+0 +repage "$scratch/failure.png"
-mv "$scratch/failure.png" "$scratch/failed-run.png"
 for name in workbench focused-workbench image-preview new-worktree workspace-settings environment-setup failed-run; do
     install -m644 "$scratch/$name.png" "$out/$name.png"
 done

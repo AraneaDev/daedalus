@@ -3,6 +3,7 @@ pub mod overlays;
 use daedalus_proto::{PaneId, PaneRole, WorkspaceId};
 
 pub const SIDEBAR_LOGICAL_WIDTH: f32 = 240.0;
+pub const CARGO_BAR_LOGICAL_HEIGHT: f32 = 34.;
 pub const HEADER_LOGICAL_HEIGHT: f32 = 26.0;
 pub const BANNER_LOGICAL_HEIGHT: f32 = 24.0;
 pub const VIEWPORT_LOGICAL_PAD: f32 = 6.0;
@@ -169,6 +170,8 @@ pub struct WorkspaceLayout {
     pub named_tabs: Vec<(PaneId, String, Rect)>,
     pub stacked: bool,
     pub run_tests_button: Option<Rect>,
+    pub layout_button: Option<Rect>,
+    pub cargo_bar: Option<Rect>,
     pub failed_run_buttons: Vec<(WorkspaceId, Rect)>,
     pub sidebar_first: usize,
     pub sidebar_content: Option<std::sync::Arc<crate::sidebar_content::SidebarContent>>,
@@ -246,6 +249,45 @@ impl WorkspaceLayout {
                 role,
                 Rect::new(pane.outer.x + dx, pane.outer.bottom() + dy, width, height),
             ));
+        }
+    }
+
+    pub fn cargo_buttons(
+        &self,
+        scale: f32,
+    ) -> impl Iterator<Item = (crate::assignments::CargoPreset, Rect)> {
+        self.cargo_bar.into_iter().flat_map(move |bar| {
+            let width = ((bar.width - 24. * scale) / 2.).clamp(0., 112. * scale);
+            crate::assignments::CargoPreset::ALL
+                .into_iter()
+                .enumerate()
+                .map(move |(index, preset)| {
+                    (
+                        preset,
+                        Rect::new(
+                            bar.x + 8. * scale + index as f32 * (width + 8. * scale),
+                            bar.y + 4. * scale,
+                            width,
+                            (bar.height - 8. * scale).max(0.),
+                        ),
+                    )
+                })
+        })
+    }
+
+    pub fn enable_layout_button(&mut self, scale: f32) {
+        let Some(header) = self.sidebar_toggle else {
+            return;
+        };
+        let settings = settings_button(
+            header,
+            self.sidebar_content.as_ref().and_then(|list| list.arrows),
+            scale,
+        );
+        let right = self.run_tests_button.unwrap_or(settings).x;
+        let width = 52. * scale;
+        if right - header.x >= width + 32. * scale {
+            self.layout_button = Some(Rect::new(right - width, header.y, width, header.height));
         }
     }
 
@@ -361,6 +403,8 @@ impl WorkspaceLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
     ToggleSidebar,
+    ToggleLayout,
+    RunCargo(crate::assignments::CargoPreset),
     WorkspaceSettings,
     SidebarPageUp,
     SidebarPageDown,
@@ -677,6 +721,8 @@ pub fn compute_split_layout(input: &LayoutInput, splits: &PaneSplits) -> Workspa
         named_tabs: Vec::new(),
         sidebar_toggle,
         run_tests_button: None,
+        layout_button: None,
+        cargo_bar: None,
         failed_run_buttons: Vec::new(),
         sidebar_first: 0,
         sidebar_content: None,
@@ -843,6 +889,12 @@ pub fn hit_test(
     y: f32,
 ) -> HitTarget {
     use crate::sidebar_content::{SidebarContent, SidebarRow};
+    if let Some((preset, _)) = layout
+        .cargo_buttons(scale_factor)
+        .find(|(_, rect)| rect.contains(x, y))
+    {
+        return HitTarget::RunCargo(preset);
+    }
     if let Some((role, _)) = layout.insight_rows.iter().find(|(_, r)| r.contains(x, y)) {
         return HitTarget::Widget(*role);
     }
@@ -860,6 +912,12 @@ pub fn hit_test(
         if down.contains(x, y) {
             return HitTarget::SidebarPageDown;
         }
+    }
+    if layout
+        .layout_button
+        .is_some_and(|button| button.contains(x, y))
+    {
+        return HitTarget::ToggleLayout;
     }
     if layout
         .run_tests_button
@@ -1044,6 +1102,44 @@ mod tests {
         assert!(tab.width >= 160.);
         assert!(tab.right() <= layout.panes[0].tab_strip(1.).right());
         assert_eq!(layout.close_tab.unwrap().1.right(), tab.right());
+    }
+
+    #[test]
+    fn cargo_bar_buttons_map_to_their_own_presets() {
+        let mut layout = compute_layout(&default_input());
+        layout.cargo_bar = Some(Rect::new(0., 800., 480., CARGO_BAR_LOGICAL_HEIGHT));
+        let buttons = layout.cargo_buttons(1.).collect::<Vec<_>>();
+        assert_eq!(buttons.len(), 2);
+        assert!(buttons[0].1.right() < buttons[1].1.x);
+        for (preset, rect) in buttons {
+            assert_eq!(
+                hit_test(&layout, 1, 1., 8., 16., rect.x + 4., rect.y + 4.),
+                HitTarget::RunCargo(preset)
+            );
+        }
+    }
+
+    #[test]
+    fn layout_switch_has_a_separate_header_target_in_both_views() {
+        for (zoomed, scale) in [(true, 1.), (false, 1.5)] {
+            let mut layout = compute_layout(&LayoutInput {
+                window_w: 1200. * scale,
+                window_h: 700. * scale,
+                scale_factor: scale,
+                zoomed,
+                ..default_input()
+            });
+            layout.enable_run_tests(scale);
+            layout.enable_layout_button(scale);
+            let view = layout.layout_button.unwrap();
+            let run = layout.run_tests_button.unwrap();
+            assert!(view.right() <= run.x);
+            assert_eq!(
+                hit_test(&layout, 1, scale, 8., 16., view.x + 1., view.y + 1.),
+                HitTarget::ToggleLayout
+            );
+            assert_eq!(layout.panes.len(), if zoomed { 1 } else { 3 });
+        }
     }
 
     #[test]

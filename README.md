@@ -48,9 +48,10 @@ daedalus-ui --dir . --agent shell
 ```
 
 The UI starts the local daemon and opens the agent terminal. Select a named tab to switch terminals.
-Use `Ctrl+Shift+Z` for a split view, then drag the dividers to resize the panes. Use the shell
-preset to try the workbench immediately. To use Claude, Codex or agy, install the corresponding CLI
-and choose its preset with the agent picker. Press `Shift+Enter` in the picker to start an
+Choose **Split** or press `Ctrl+Shift+Z`, then drag the dividers to resize the panes.
+Use the shell preset to try the workbench immediately. To use Claude, Codex or agy, install the
+corresponding CLI and choose its preset with the agent picker.
+Press `Shift+Enter` in the picker to start an
 additional agent in this workspace. Docker and Compose are needed only for container workflows.
 
 Choose **+ Workspace** to enter a name and a project folder on the daemon host. If the daemon
@@ -86,11 +87,15 @@ open its terminal. When Cargo reports a diagnostic, **View failure** reveals it 
 the agent selected. In split view the same information appears in the pane header. Recognized Codex
 and Claude sessions have distinct tab marks alongside their session names.
 
-![Codex and Claude tabs in the Windows workbench](docs/images/windows-agent-tabs.png)
-
 ![Focused agent terminal with compact service and runner summaries](docs/images/focused-workbench.png)
 
-Configure project defaults in the daemon checkout’s `.daedalus.toml`. For example:
+In Cargo workspaces, choose **Cargo Test** or **Cargo Check** in the bottom bar to run the preset
+on the workspace host while keeping your agent in view. In workspace **Settings**, use
+**+ Cargo Test** or **+ Cargo Check** to save an editable runner command.
+
+![Full Windows workbench with Codex and Claude tabs, terminal output, and the Cargo bottom bar](docs/images/windows-agent-tabs.png)
+
+Configure project widget defaults in the daemon checkout’s `.daedalus.toml`. For example:
 
 ```toml
 [runner]

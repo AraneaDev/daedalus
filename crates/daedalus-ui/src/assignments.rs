@@ -8,6 +8,46 @@ use uuid::Uuid;
 
 pub use daedalus_proto::Assignment;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CargoPreset {
+    Test,
+    Check,
+}
+
+impl CargoPreset {
+    pub const ALL: [Self; 2] = [Self::Test, Self::Check];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Test => "Cargo Test",
+            Self::Check => "Cargo Check",
+        }
+    }
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Test => "workbench-cargo-test",
+            Self::Check => "workbench-cargo-check",
+        }
+    }
+
+    pub const fn command(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Check => "check",
+        }
+    }
+
+    pub fn assignment(self) -> Assignment {
+        Assignment {
+            id: self.id().into(),
+            name: self.label().into(),
+            role: PaneRole::Runner,
+            argv: vec!["cargo".into(), self.command().into(), "--workspace".into()],
+        }
+    }
+}
+
 pub fn setup_runner(entries: &[Assignment]) -> Option<&Assignment> {
     entries
         .iter()
