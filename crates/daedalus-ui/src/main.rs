@@ -1113,64 +1113,74 @@ impl DaedalusApp {
         self.scroll_at(self.viewport_metrics(), delta);
     }
 
-    fn scroll_at(&mut self, metrics: Option<ViewportMetrics>, delta: MouseScrollDelta) {
-        let scale_factor = metrics.map_or(1., |m| m.scale_factor);
-        if let Some(choices) = &mut self.state.failure_recipients {
-            let steps = self.wheel_scroll.steps(
-                ScrollTarget::Recipients,
-                delta,
-                picker_row_stride(scale_factor),
-            );
-            choices.advance(steps.saturating_neg());
-            self.request_redraw();
-            return;
-        }
-        if self.state.settings.open {
-            let steps = self.wheel_scroll.steps(ScrollTarget::Settings, delta, 30.);
-            if steps != 0 {
-                self.state.settings.scroll(steps as f32);
-                self.request_redraw();
+    fn scroll_overlay(
+        &mut self,
+        overlay: ActiveOverlay,
+        metrics: Option<ViewportMetrics>,
+        delta: MouseScrollDelta,
+    ) {
+        let scale = metrics.map_or(1., |metrics| metrics.scale_factor);
+        match overlay {
+            ActiveOverlay::FailureRecipients => {
+                if let Some(choices) = &mut self.state.failure_recipients {
+                    let steps = self.wheel_scroll.steps(
+                        ScrollTarget::Recipients,
+                        delta,
+                        picker_row_stride(scale),
+                    );
+                    choices.advance(steps.saturating_neg());
+                    self.request_redraw();
+                }
             }
-            return;
+            ActiveOverlay::Settings => {
+                let steps = self.wheel_scroll.steps(ScrollTarget::Settings, delta, 30.);
+                if steps != 0 {
+                    self.state.settings.scroll(steps as f32);
+                    self.request_redraw();
+                }
+            }
+            ActiveOverlay::ActionPalette | ActiveOverlay::AgentPicker if metrics.is_some() => {
+                let (target, count, selected) = if overlay == ActiveOverlay::AgentPicker {
+                    (
+                        ScrollTarget::Presets,
+                        AgentPreset::ALL.len(),
+                        &mut self.state.picker.selected_index,
+                    )
+                } else {
+                    (
+                        ScrollTarget::Actions,
+                        self.state.active_actions().len(),
+                        &mut self.state.action_palette.selected_index,
+                    )
+                };
+                let steps = self
+                    .wheel_scroll
+                    .steps(target, delta, picker_row_stride(scale));
+                let next = selected
+                    .saturating_add_signed(steps.saturating_neg())
+                    .min(count.saturating_sub(1));
+                if next != *selected {
+                    *selected = next;
+                    self.request_redraw();
+                }
+            }
+            _ => self.wheel_scroll = WheelScroll::default(),
         }
-        if self.state.workspace_form.open
-            || self.state.setup_review.open
-            || self.state.worktree_modal.open
-            || self.state.close_modal.open
+    }
+
+    fn scroll_at(&mut self, metrics: Option<ViewportMetrics>, delta: MouseScrollDelta) {
+        if let Some(overlay) = self
+            .state
+            .active_overlay()
+            .filter(|overlay| *overlay != ActiveOverlay::Search)
         {
-            self.wheel_scroll = WheelScroll::default();
+            self.scroll_overlay(overlay, metrics, delta);
             return;
         }
         let Some(metrics) = metrics else {
             return;
         };
-
-        if self.state.picker.open || self.state.action_palette.open {
-            let (target, count, selected) = if self.state.picker.open {
-                (
-                    ScrollTarget::Presets,
-                    AgentPreset::ALL.len(),
-                    &mut self.state.picker.selected_index,
-                )
-            } else {
-                (
-                    ScrollTarget::Actions,
-                    self.state.active_actions().len(),
-                    &mut self.state.action_palette.selected_index,
-                )
-            };
-            let steps = self
-                .wheel_scroll
-                .steps(target, delta, picker_row_stride(scale_factor));
-            let next = selected
-                .saturating_add_signed(steps.saturating_neg())
-                .min(count.saturating_sub(1));
-            if next != *selected {
-                *selected = next;
-                self.request_redraw();
-            }
-            return;
-        }
+        let scale_factor = metrics.scale_factor;
         let (cell_w, cell_h) = metrics.cell;
         let layout = self.layout_for(metrics);
 
@@ -1621,6 +1631,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_targets_only_the_frontmost_overlay() {
+        let profile = tempfile::tempdir().unwrap();
+        let mut app = DaedalusApp::new(
+            BridgeConfig {
+                socket_path: profile.path().join("daemon.sock"),
+                auth_token: None,
+                initial_dir: PathBuf::new(),
+                bootstrap_explicit_dir: false,
+                default_agent: AgentPreset::Shell,
+                auto_spawn_daemon: false,
+            },
+            UiConfig::default(),
+            None,
+            &profile.path().join("config.toml"),
+        );
+        let metrics = ViewportMetrics {
+            size: (1200, 720).into(),
+            scale_factor: 1.,
+            cell: (8., 16.),
+        };
+        let scroll = MouseScrollDelta::LineDelta(0., -1.);
+        app.state.settings.open = true;
+        app.state.workspace_form.open = true;
+        app.scroll_at(Some(metrics), scroll);
+        assert!(app.wheel_scroll.target.is_none());
+
+        app.state.workspace_form.open = false;
+        app.state.settings.open = false;
+        app.state.picker.open = true;
+        app.state.action_palette.open = true;
+        app.scroll_at(Some(metrics), scroll);
+        assert!(app.wheel_scroll.target == Some(ScrollTarget::Actions));
+        assert_eq!(app.state.picker.selected_index, 0);
+    }
 
     #[test]
     fn precision_scrolling_moves_by_rendered_rows_and_keeps_fractional_remainders_local() {

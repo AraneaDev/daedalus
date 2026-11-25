@@ -118,8 +118,9 @@ summaries accumulate across crates. Final status follows command completion. The
 includes an observed workspace port when available. Choose `command` for process status alone.
 
 Open **Settings → Widgets** to add or remove a service or runner widget, choose presets, set labels,
-and control runner duration and warnings. **Save widgets** applies the changes to this workspace
-on the current computer. Default values and blank labels inherit the project configuration.
+and control runner duration and warnings. **Save widgets** saves the overrides to the daemon for
+this workspace. Older daemons use local settings. Default values and blank labels inherit the
+project configuration.
 Removing a widget leaves its terminal running.
 When an agent asks for input, its workspace is highlighted in amber with a **Needs reply** badge.
 

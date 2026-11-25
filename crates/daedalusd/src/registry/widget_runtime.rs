@@ -1,13 +1,19 @@
 use super::Registry;
-use crate::workbench::command;
+use crate::pane_actor::PaneHandle;
 use crate::workbench::documents::validate_definition;
 use crate::workbench::runtime::{SourceFields, WidgetInputs, evaluate_widget};
 use crate::workbench::scheduler::Trigger;
+use crate::workbench::{command, sources};
 use daedalus_proto::workbench::{
     CommandOutput, WidgetAction, WidgetActionResult, WidgetDefinition, WidgetResult,
     WidgetSnapshot, WidgetSource, WorkspaceCommand,
 };
-use daedalus_proto::{PaneRole, PaneStatus, ProtoError, StatusLevel, WorkspaceId, WorkspaceInfo};
+use daedalus_proto::{PaneRole, ProtoError, WorkspaceId, WorkspaceInfo};
+
+struct WidgetWorkspace {
+    info: WorkspaceInfo,
+    handles: Vec<PaneHandle>,
+}
 
 impl Registry {
     pub(crate) async fn invoke_widget_action(
@@ -37,6 +43,7 @@ impl Registry {
         let spec = match &action.action {
             WidgetAction::Terminal { role } | WidgetAction::Logs { role } => {
                 return workspace
+                    .info
                     .panes
                     .iter()
                     .rev()
@@ -52,7 +59,12 @@ impl Registry {
             },
             WidgetAction::Command { command } => command.clone(),
         };
-        let fields = command::run(&workspace, &spec, &CommandOutput::Text { contains: None }).await;
+        let fields = command::run(
+            &workspace.info,
+            &spec,
+            &CommandOutput::Text { contains: None },
+        )
+        .await;
         let inputs = WidgetInputs::from([("command".into(), fields)]);
         Ok(WidgetActionResult::Output(evaluate_widget(
             &WidgetDefinition::default(),
@@ -117,8 +129,9 @@ impl Registry {
     }
 
     pub(crate) async fn refresh_scheduled_widgets(
-        self: &std::sync::Arc<Self>,
+        &self,
         runner: Option<WorkspaceId>,
+        jobs: &mut tokio::task::JoinSet<()>,
     ) {
         let trigger = if runner.is_some() {
             Trigger::Runner
@@ -133,7 +146,6 @@ impl Registry {
             .filter(|workspace| runner.is_none_or(|id| workspace.id == id))
             .map(|workspace| workspace.to_info(Vec::new()))
             .collect::<Vec<_>>();
-        let mut jobs = tokio::task::JoinSet::new();
         for workspace in workspaces {
             let Ok(state) = self.workbench(workspace.id).await else {
                 continue;
@@ -147,26 +159,19 @@ impl Registry {
                     continue;
                 };
                 for source in &definition.sources {
-                    if !matches!(source.source, WidgetSource::Command { .. }) {
-                        continue;
-                    }
-                    let registry = self.clone();
-                    let workspace = workspace.clone();
-                    let id = widget.id.clone();
-                    let source = source.clone();
-                    jobs.spawn(async move {
-                        registry
-                            .widget_commands
-                            .fields(&workspace, &id, &source, trigger)
-                            .await;
-                    });
+                    self.widget_commands.schedule(
+                        workspace.clone(),
+                        &widget.id,
+                        source,
+                        trigger,
+                        jobs,
+                    );
                 }
             }
         }
-        while jobs.join_next().await.is_some() {}
     }
 
-    async fn widget_workspace(&self, id: WorkspaceId) -> Result<WorkspaceInfo, ProtoError> {
+    async fn widget_workspace(&self, id: WorkspaceId) -> Result<WidgetWorkspace, ProtoError> {
         let (info, handles) = {
             let workspaces = self.workspaces.read().await;
             let panes = self.panes.read().await;
@@ -175,12 +180,13 @@ impl Registry {
                 .ok_or(ProtoError::WorkspaceNotFound(id))?
                 .snapshot_handles(&panes)
         };
-        Ok(Self::with_pane_summaries(info, handles).await)
+        let info = Self::with_pane_summaries(info, handles.clone()).await;
+        Ok(WidgetWorkspace { info, handles })
     }
 
     async fn widget_result(
         &self,
-        workspace: &WorkspaceInfo,
+        workspace: &WidgetWorkspace,
         definition: &WidgetDefinition,
         name: &str,
         saved: Option<(&str, Trigger)>,
@@ -188,41 +194,23 @@ impl Registry {
         let mut inputs = WidgetInputs::new();
         for named in &definition.sources {
             let fields = match &named.source {
-                WidgetSource::Git => git_fields(workspace).await,
-                WidgetSource::Port { port, service } => {
-                    let port = workspace.bound_ports.iter().find(|mapping| {
-                        port.is_none_or(|port| mapping.host_port == port)
-                            && service
-                                .as_ref()
-                                .is_none_or(|name| mapping.service.as_ref() == Some(name))
-                    });
-                    match port {
-                        Some(port) => SourceFields::from([
-                            ("label".into(), format!("Ready · :{}", port.host_port)),
-                            ("port".into(), port.host_port.to_string()),
-                            ("level".into(), "ok".into()),
-                        ]),
-                        None => SourceFields::from([("label".into(), "No listener".into())]),
-                    }
+                WidgetSource::Git => {
+                    let root = workspace.info.root_dir.clone();
+                    let observation = tokio::task::spawn_blocking(move || {
+                        crate::worktree::git_observation(&root)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    sources::git_fields(observation)
                 }
-                WidgetSource::Container { name } => container_fields(workspace, name.as_deref()),
-                WidgetSource::Published { key } => workspace
-                    .external_statuses
-                    .iter()
-                    .find(|status| &status.source == key)
-                    .map_or_else(
-                        || SourceFields::from([("label".into(), "No report".into())]),
-                        |status| {
-                            let mut fields = SourceFields::from([
-                                ("label".into(), status.label.clone()),
-                                ("level".into(), level_name(status.level).into()),
-                            ]);
-                            if let Some(detail) = &status.detail {
-                                fields.insert("detail".into(), detail.clone());
-                            }
-                            fields
-                        },
-                    ),
+                WidgetSource::Port { port, service } => {
+                    sources::port_fields(&workspace.info, *port, service.as_deref())
+                }
+                WidgetSource::Container { name } => {
+                    sources::container_fields(&workspace.info, name.as_deref())
+                }
+                WidgetSource::Published { key } => sources::published_fields(&workspace.info, key),
                 WidgetSource::Command {
                     command: spec,
                     output,
@@ -230,146 +218,439 @@ impl Registry {
                 } => match saved {
                     Some((widget, trigger)) => {
                         self.widget_commands
-                            .fields(workspace, widget, named, trigger)
+                            .fields(&workspace.info, widget, named, trigger)
                             .await
                     }
-                    None => command::run(workspace, spec, output).await,
+                    None => command::run(&workspace.info, spec, output).await,
                 },
-                WidgetSource::Runner { assignment: _ } => {
-                    self.pane_fields(workspace, PaneRole::Runner).await
+                WidgetSource::Runner { assignment } => {
+                    workspace
+                        .pane_fields(PaneRole::Runner, assignment.as_deref())
+                        .await
                 }
-                WidgetSource::Pane { role, config: _ } => self.pane_fields(workspace, *role).await,
+                WidgetSource::Pane { role, config: _ } => workspace.pane_fields(*role, None).await,
             };
             inputs.insert(named.id.clone(), fields);
         }
         evaluate_widget(definition, &inputs, name)
     }
-
-    async fn pane_fields(&self, workspace: &WorkspaceInfo, role: PaneRole) -> SourceFields {
-        let Some(pane) = workspace.panes.iter().rev().find(|pane| pane.role == role) else {
-            return SourceFields::from([("label".into(), "No terminal".into())]);
-        };
-        let status = match pane.status {
-            PaneStatus::Starting => "Starting",
-            PaneStatus::Idle => "Idle",
-            PaneStatus::Busy => "Running",
-            PaneStatus::Exited { code: Some(0) } => "Passed",
-            PaneStatus::Exited { .. } => "Exited",
-        };
-        let mut fields = SourceFields::from([
-            ("label".into(), status.into()),
-            ("phase".into(), status.into()),
-        ]);
-        if let Some(code) = pane.last_exit_code {
-            fields.insert("exit_code".into(), code.to_string());
-            fields.insert(
-                "level".into(),
-                if code == 0 { "ok" } else { "error" }.into(),
-            );
-        }
-        if role == PaneRole::Runner
-            && let Ok(handle) = self.get_pane(pane.id).await
-            && let Ok(snapshot) = handle.snapshot().await
-            && let Some(insight) = snapshot.insight
+}
+impl WidgetWorkspace {
+    async fn pane_fields(&self, role: PaneRole, assignment: Option<&str>) -> SourceFields {
+        let (pane, handle) = self
+            .info
+            .panes
+            .iter()
+            .rev()
+            .filter(|pane| pane.role == role)
+            .find_map(|pane| {
+                let handle = self.handles.iter().find(|handle| handle.id() == pane.id)?;
+                assignment
+                    .is_none_or(|assignment| handle.assignment_id() == Some(assignment))
+                    .then_some((Some(pane), Some(handle)))
+            })
+            .unwrap_or_default();
+        let insight = if role == PaneRole::Runner
+            && let Some(handle) = handle
         {
-            fields.extend([
-                ("phase".into(), insight.phase),
-                ("passed".into(), insight.passed.to_string()),
-                ("failed".into(), insight.failed.to_string()),
-                ("warnings".into(), insight.warnings.to_string()),
-                ("elapsed_secs".into(), insight.elapsed_secs.to_string()),
-            ]);
-            if let Some(diagnostic) = insight.diagnostic {
-                fields.insert("diagnostic".into(), diagnostic);
-            }
-        }
-        fields
+            handle
+                .snapshot()
+                .await
+                .ok()
+                .and_then(|snapshot| snapshot.insight)
+        } else {
+            None
+        };
+        sources::pane_fields(pane, insight, assignment)
     }
 }
 
-async fn git_fields(workspace: &WorkspaceInfo) -> SourceFields {
-    let root = workspace.root_dir.clone();
-    let observation = tokio::task::spawn_blocking(move || crate::worktree::git_observation(&root))
-        .await
-        .ok()
-        .flatten();
-    let Some(git) = observation else {
-        return SourceFields::from([("label".into(), "Git unavailable".into())]);
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::shell_integration::ShellIntegration;
+    use crate::supervisor::{IsolationMode, Supervisor};
+    use daedalus_proto::workbench::{
+        NamedAction, NamedSource, RefreshPolicy, WidgetDisplay, WidgetField, WidgetInstance,
     };
-    let mut fields = SourceFields::from([
-        (
-            "branch".into(),
-            git.branch.unwrap_or_else(|| "detached".into()),
-        ),
-        ("changed_files".into(), git.changes.to_string()),
-        (
-            "changes".into(),
-            if git.changes == 0 {
-                "Clean".into()
-            } else {
-                format!("{} changed", git.changes)
-            },
-        ),
-        ("dirty".into(), git.status.dirty.to_string()),
-    ]);
-    if git.upstream {
-        fields.extend([
-            ("ahead".into(), git.status.ahead.to_string()),
-            ("behind".into(), git.status.behind.to_string()),
-        ]);
-        if git.status.ahead != 0 || git.status.behind != 0 {
-            fields.insert(
-                "upstream".into(),
-                format!("↑{} ↓{}", git.status.ahead, git.status.behind),
-            );
+    use daedalus_proto::{Assignment, PaneStatus, StatusLevel};
+    use std::path::Path;
+
+    fn test_registry(path: &Path) -> Registry {
+        let (events, _) = tokio::sync::broadcast::channel(32);
+        Registry::new(
+            Supervisor::with_mode(IsolationMode::PgidFallback),
+            ShellIntegration::prepare(path).unwrap(),
+            events,
+        )
+    }
+
+    fn action(id: &str, action: WidgetAction) -> NamedAction {
+        NamedAction {
+            id: id.into(),
+            label: id.into(),
+            action,
         }
     }
-    fields
-}
 
-fn container_fields(workspace: &WorkspaceInfo, name: Option<&str>) -> SourceFields {
-    let matching = workspace.containers.iter().filter(|container| {
-        name.is_none_or(|name| container.name == name || container.service.as_deref() == Some(name))
-    });
-    let total = matching.clone().count();
-    let healthy = matching
-        .filter(|container| {
-            container
-                .health
-                .as_deref()
-                .map_or(container.state == "running", |health| health == "healthy")
-        })
-        .count();
-    SourceFields::from([
-        (
-            "label".into(),
-            if total == 0 {
-                "No containers".into()
-            } else {
-                format!("{healthy}/{total} healthy")
+    async fn install_actions(
+        registry: &Registry,
+        root: &Path,
+        actions: Vec<NamedAction>,
+    ) -> WorkspaceId {
+        let workspace = registry
+            .create_workspace("Action fixture".into(), root.into(), Default::default())
+            .await
+            .unwrap();
+        let mut document = registry.workbench(workspace.id).await.unwrap().document;
+        document.widgets.push(WidgetInstance {
+            id: "report".into(),
+            name: "Report".into(),
+            pinned: true,
+            template: None,
+            definition: Some(WidgetDefinition {
+                actions,
+                ..WidgetDefinition::default()
+            }),
+        });
+        registry
+            .update_workbench(workspace.id, Some(0), document)
+            .await
+            .unwrap();
+        workspace.id
+    }
+
+    fn command_action(argv: &[&str]) -> WidgetAction {
+        WidgetAction::Command {
+            command: WorkspaceCommand {
+                argv: argv.iter().map(|arg| (*arg).into()).collect(),
+                env: Vec::new(),
+                timeout_seconds: Some(3),
             },
-        ),
-        ("healthy".into(), healthy.to_string()),
-        ("total".into(), total.to_string()),
-        (
-            "level".into(),
-            if total == 0 {
-                "info"
-            } else if total == healthy {
-                "ok"
-            } else {
-                "warn"
-            }
-            .into(),
-        ),
-    ])
-}
+        }
+    }
 
-fn level_name(value: StatusLevel) -> &'static str {
-    match value {
-        StatusLevel::Info => "info",
-        StatusLevel::Ok => "ok",
-        StatusLevel::Warn => "warn",
-        StatusLevel::Error => "error",
+    #[tokio::test]
+    async fn widget_command_and_diff_run_in_the_workspace_and_return_displayable_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let result = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "git error: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(
+            repo.join("tracked.txt"),
+            "before
+",
+        )
+        .unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-qm", "Initial fixture"]);
+        std::fs::write(
+            repo.join("tracked.txt"),
+            "after
+",
+        )
+        .unwrap();
+
+        let registry = test_registry(dir.path());
+        let workspace = install_actions(&registry, &repo, vec![
+            action("command", command_action(&[
+                "/bin/sh", "-c", "printf 'Local result: '; cat tracked.txt; printf 'check failed\n' >&2; exit 7",
+            ])),
+            action("diff", WidgetAction::Diff),
+            action("missing-program", command_action(&["./missing-executable"])),
+        ]).await;
+
+        let WidgetActionResult::Output(result) = registry
+            .invoke_widget_action(workspace, "report", "command")
+            .await
+            .unwrap()
+        else {
+            panic!("expected command output");
+        };
+        assert_eq!(result.label, "Local result: after");
+        assert_eq!(result.level, StatusLevel::Error);
+        assert_eq!(
+            result.details,
+            [
+                ("Output".into(), "Local result: after".into()),
+                (
+                    "stderr".into(),
+                    "check failed
+"
+                    .into()
+                ),
+            ]
+        );
+
+        let WidgetActionResult::Output(result) = registry
+            .invoke_widget_action(workspace, "report", "diff")
+            .await
+            .unwrap()
+        else {
+            panic!("expected Git diff");
+        };
+        assert_eq!(result.label, "diff --git a/tracked.txt b/tracked.txt");
+        assert_eq!(result.level, StatusLevel::Ok);
+        let diff = &result.details[0];
+        assert_eq!(diff.0, "Output");
+        assert!(
+            diff.1.contains(
+                "-before
++after"
+            ),
+            "{diff:?}"
+        );
+
+        let WidgetActionResult::Output(result) = registry
+            .invoke_widget_action(workspace, "report", "missing-program")
+            .await
+            .unwrap()
+        else {
+            panic!("expected launch error");
+        };
+        assert_eq!(result.label, "missing-program");
+        assert_eq!(result.level, StatusLevel::Error);
+        assert!(
+            matches!(result.details.as_slice(), [(key, value)] if key == "command" && value.contains("missing-executable"))
+        );
+    }
+
+    #[tokio::test]
+    async fn widget_action_checks_owned_widget_action_and_terminal_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = test_registry(dir.path());
+        let workspace = install_actions(
+            &registry,
+            dir.path(),
+            vec![
+                action(
+                    "logs",
+                    WidgetAction::Logs {
+                        role: PaneRole::Service,
+                    },
+                ),
+                action(
+                    "terminal",
+                    WidgetAction::Terminal {
+                        role: PaneRole::Agent,
+                    },
+                ),
+                action(
+                    "url",
+                    WidgetAction::OpenUrl {
+                        url: "https://example.invalid/report".into(),
+                    },
+                ),
+            ],
+        )
+        .await;
+
+        for (widget, action, expected) in [
+            ("missing", "url", "No widget with ID 'missing'"),
+            ("report", "missing", "No action with ID 'missing'"),
+            ("report", "logs", "No service terminal"),
+            ("report", "terminal", "No agent terminal"),
+        ] {
+            assert!(matches!(
+                registry.invoke_widget_action(workspace, widget, action).await,
+                Err(ProtoError::InvalidRequest(message)) if message == expected
+            ));
+        }
+        assert!(matches!(
+            registry.widget_results(workspace, Some("missing".into())).await,
+            Err(ProtoError::InvalidRequest(message)) if message == "No widget with ID 'missing'"
+        ));
+        assert_eq!(
+            registry
+                .invoke_widget_action(workspace, "report", "url")
+                .await
+                .unwrap(),
+            WidgetActionResult::OpenUrl("https://example.invalid/report".into())
+        );
+
+        let service = registry
+            .spawn_pane(
+                workspace,
+                PaneRole::Service,
+                Some(vec!["/bin/sh".into(), "-c".into(), "exec sleep 5".into()]),
+                None,
+                80,
+                24,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .invoke_widget_action(workspace, "report", "logs")
+                .await
+                .unwrap(),
+            WidgetActionResult::Pane(service.id)
+        );
+        registry
+            .close_workspace(workspace, false, false, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn preview_runs_the_draft_command_and_rejects_unknown_template_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = test_registry(dir.path());
+        let workspace = install_actions(&registry, dir.path(), Vec::new()).await;
+        let mut definition = WidgetDefinition {
+            sources: vec![NamedSource {
+                id: "check".into(),
+                source: WidgetSource::Command {
+                    command: WorkspaceCommand {
+                        argv: vec!["/bin/sh".into(), "-c".into(), "echo Preview-only".into()],
+                        env: Vec::new(),
+                        timeout_seconds: Some(3),
+                    },
+                    refresh: RefreshPolicy::default(),
+                    output: CommandOutput::Text { contains: None },
+                },
+            }],
+            ..WidgetDefinition::default()
+        };
+        let result = registry
+            .preview_widget(workspace, "Draft".into(), definition.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.label, "Preview-only");
+        assert_eq!(result.level, StatusLevel::Ok);
+        definition.display.summary.push(WidgetField {
+            source: "not-configured".into(),
+            field: "label".into(),
+            label: None,
+        });
+        assert!(matches!(
+            registry.preview_widget(workspace, "Draft".into(), definition).await,
+            Err(ProtoError::InvalidRequest(message)) if message.contains("unknown source 'not-configured'")
+        ));
+        assert_eq!(
+            registry
+                .workbench(workspace)
+                .await
+                .unwrap()
+                .document
+                .widgets
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_widget_tracks_only_its_saved_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = test_registry(dir.path());
+        let workspace = registry
+            .create_workspace(
+                "Runner inputs".into(),
+                dir.path().into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let mut document = registry.workbench(workspace.id).await.unwrap().document;
+        document.assignments = [("unit", 0), ("integration", 7)]
+            .into_iter()
+            .map(|(id, code)| Assignment {
+                id: id.into(),
+                name: id.into(),
+                role: PaneRole::Runner,
+                argv: vec!["/bin/sh".into(), "-c".into(), format!("exit {code}")],
+            })
+            .collect();
+        for (id, assignment) in [
+            ("unit", Some("unit")),
+            ("integration", Some("integration")),
+            ("missing", Some("missing")),
+            ("latest", None),
+        ] {
+            document.widgets.push(WidgetInstance {
+                id: id.into(),
+                name: id.into(),
+                pinned: true,
+                template: None,
+                definition: Some(WidgetDefinition {
+                    sources: vec![NamedSource {
+                        id: "run".into(),
+                        source: WidgetSource::Runner {
+                            assignment: assignment.map(str::to_owned),
+                        },
+                    }],
+                    display: WidgetDisplay {
+                        summary: vec![WidgetField {
+                            source: "run".into(),
+                            field: "exit_code".into(),
+                            label: None,
+                        }],
+                        ..WidgetDisplay::default()
+                    },
+                    ..WidgetDefinition::default()
+                }),
+            });
+        }
+        registry
+            .update_workbench(workspace.id, Some(0), document)
+            .await
+            .unwrap();
+        for (id, code) in [("unit", 0), ("integration", 7)] {
+            let runner = registry
+                .launch_runner_assignment(workspace.id, id, 80, 24)
+                .await
+                .unwrap();
+            let handle = registry.get_pane(runner.id).await.unwrap();
+            assert_eq!(handle.assignment_id(), Some(id));
+            tokio::time::timeout(std::time::Duration::from_secs(4), async {
+                loop {
+                    if handle.summary().await.unwrap().status
+                        == (PaneStatus::Exited { code: Some(code) })
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        let widgets = registry.widget_results(workspace.id, None).await.unwrap();
+        let summaries = widgets
+            .iter()
+            .map(|widget| (widget.id.as_str(), widget.result.label.as_str()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(summaries["unit"], "0");
+        assert_eq!(summaries["integration"], "7");
+        assert_eq!(summaries["missing"], "Runner 'missing' unavailable");
+        assert_eq!(summaries["latest"], "7");
+        registry
+            .close_workspace(workspace.id, false, false, false)
+            .await
+            .unwrap();
     }
 }

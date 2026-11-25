@@ -1,11 +1,11 @@
 """Drive the Linux workbench under Xvfb with a disposable daemon and package manager."""
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 import time
-import tomllib
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -85,7 +85,10 @@ class Workbench:
         self.screen.sync()
 
     def pixel(self, x, y):
-        return self.window.get_image(x, y, 1, 1, X.ZPixmap, 0xFFFFFFFF).data[:3]
+        return self.pixels(x, y, 1, 1)[:3]
+
+    def pixels(self, x, y, width, height):
+        return self.window.get_image(x, y, width, height, X.ZPixmap, 0xFFFFFFFF).data
 
     def wait_dialog(self, position, visible=True):
         # Sample the straight top edge, clear of the rounded corner.
@@ -96,7 +99,10 @@ class Workbench:
     def review_ready(self):
         # During installation the terminal can temporarily occupy these coordinates.
         # The enabled Open workspace button has a green fill in the review dialog.
-        blue, green, red = self.pixel(820, 663)
+        return self.action_enabled(820, 663)
+
+    def action_enabled(self, x, y):
+        blue, green, red = self.pixel(x, y)
         return green > 180 and green > red + 50 and green > blue + 30
 
     def close(self, process):
@@ -251,11 +257,21 @@ def exercise(binaries, scratch, screen):
             ui.click(530, 525)  # Show duration
             ui.click(530, 525)  # Hide duration
             ui.click(890, 525)  # Show warnings
+            first_label = ui.pixels(430, 603, 70, 18)
             ui.key("Control_L", "s")
 
             def widget_settings():
-                files = list((scratch / "config").glob("*/config.widgets/*.toml"))
-                return tomllib.loads(files[0].read_text()) if files else None
+                result = cli("workspace", "configure", "--dir", project, "--json")
+                assert result.returncode == 0, result.stderr
+                widgets = json.loads(result.stdout)["document"].get("pane_widgets")
+                if widgets:
+                    for role in ("service", "runner"):
+                        widgets[role] = {
+                            key: value
+                            for key, value in widgets[role].items()
+                            if value is not None
+                        }
+                return widgets
 
             saved = until("saved widget settings", widget_settings)
             assert saved["service_enabled"] is True
@@ -265,8 +281,16 @@ def exercise(binaries, scratch, screen):
                 "show_duration": False,
                 "show_warnings": True,
             }
+            until(
+                "widget save acknowledged",
+                lambda: (
+                    ui.action_enabled(1000, 603)
+                    and ui.pixels(430, 603, 70, 18) != first_label
+                ),
+            )
             ui.click(910, 365)  # Remove service widget
             ui.wait_dialog((395, 274))
+            second_label = ui.pixels(430, 583, 70, 18)
             ui.key("Control_L", "s")
             until(
                 "removed service widget",
@@ -274,6 +298,14 @@ def exercise(binaries, scratch, screen):
             )
             assert widget_settings()["service"] == {}
             assert widget_settings()["runner"] == saved["runner"]
+            assert not list((scratch / "config").glob("*/config.widgets/*.toml"))
+            until(
+                "widget removal acknowledged",
+                lambda: (
+                    ui.action_enabled(1000, 583)
+                    and ui.pixels(430, 583, 70, 18) != second_label
+                ),
+            )
             ui.key("Escape")
             ui.wait_dialog((395, 274), visible=False)
             ui.shortcut("s")

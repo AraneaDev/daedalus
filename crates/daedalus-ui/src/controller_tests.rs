@@ -1,5 +1,6 @@
 use super::*;
 use daedalus_proto::{PaneStatus, PaneSummary, SetupInspection, WorkspaceInfo};
+use daedalus_ui::bridge::WorkbenchOperation;
 use daedalus_ui::setup_review::SetupAction;
 use daedalus_ui::workspace_form::WorkspaceFormAction;
 use std::sync::mpsc::{Receiver, channel};
@@ -11,6 +12,11 @@ struct Workbench {
     commands: Receiver<UiCommand>,
     root: TempDir,
 }
+
+mod membership;
+mod settings_workflows;
+mod widget_library;
+mod widget_viewport;
 
 #[test]
 fn widget_editor_builds_previews_and_saves_a_daemon_definition() {
@@ -30,9 +36,11 @@ fn widget_editor_builds_previews_and_saves_a_daemon_definition() {
         document: WorkspaceDocument::new("Widget editor".into()),
         repo_baseline: None,
     };
-    workbench
-        .app
-        .workbench_response(id, false, Ok(ResponsePayload::Workbench(state)));
+    workbench.app.workbench_response(
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(state)),
+    );
     while workbench.commands.try_recv().is_ok() {}
     let settings = &mut workbench.app.state.settings;
     settings.activate(Control::CustomWidgetsPage);
@@ -775,7 +783,7 @@ fn settings_persist_bindings_restore_names_and_launch_saved_tests_in_an_isolated
     ));
     assert!(!w.app.state.settings.open);
     assert!(
-        matches!(w.command(), UiCommand::LaunchAssignment { workspace_id, assignment, cols, rows}
+        matches!(w.command(), UiCommand::LaunchAssignment { workspace_id, assignment, cols, rows, ..}
             if workspace_id == id && assignment == entry && (cols, rows) == (FALLBACK_PANE_COLS, FALLBACK_PANE_ROWS))
     );
     w.app.handle_daemon_event(UiEvent::AssignmentStarted {

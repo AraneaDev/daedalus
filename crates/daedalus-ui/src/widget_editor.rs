@@ -21,7 +21,6 @@ pub struct WidgetEditor {
     pub path: String,
     pub new_root: String,
     pub creation: Option<daedalus_proto::workbench::WorkspaceCreationPreview>,
-    pub export_path: Option<String>,
     pub import: Option<WorkspaceImportPreview>,
     pub resolutions: std::collections::BTreeMap<String, daedalus_proto::workbench::ConflictChoice>,
 }
@@ -107,6 +106,42 @@ impl WidgetEditor {
             revision: state.revision,
             document,
         })
+    }
+
+    pub fn accept_snapshot(&mut self, snapshot: WorkbenchState) {
+        if let Some(previous) = &self.state
+            && let Some(draft) = &mut self.draft
+            && draft.revision == previous.revision
+        {
+            let before = previous
+                .document
+                .widgets
+                .iter()
+                .find(|w| w.id == draft.widget.id);
+            let after = snapshot
+                .document
+                .widgets
+                .iter()
+                .find(|w| w.id == draft.widget.id);
+            if before == after
+                && before.and_then(|w| previous.document.widget_definition(w))
+                    == after.and_then(|w| snapshot.document.widget_definition(w))
+            {
+                draft.revision = snapshot.revision;
+            }
+        }
+        self.selected = self
+            .selected
+            .min(snapshot.document.widgets.len().saturating_sub(1));
+        self.state = Some(snapshot);
+    }
+
+    pub fn draft_matches_saved_widget(&self) -> bool {
+        self.draft
+            .as_ref()
+            .and_then(|draft| draft.build().ok())
+            .zip(self.state.as_ref())
+            .is_some_and(|(widget, state)| state.document.widgets.contains(&widget))
     }
 
     pub fn save(&self, id: WorkspaceId) -> Result<ClientMessage, String> {

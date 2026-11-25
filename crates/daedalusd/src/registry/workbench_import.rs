@@ -219,12 +219,15 @@ fn reconcile(
     ),
     ProtoError,
 > {
-    if linked && let Some(base) = &state.repo_baseline {
-        return merge_workspace(base, &state.document, incoming, resolutions).map_err(|error| {
+    let (document, conflicts) = if linked && let Some(base) = &state.repo_baseline {
+        merge_workspace(base, &state.document, incoming, resolutions).map_err(|error| {
             ProtoError::InvalidRequest(format!("Merged workspace is invalid: {error}"))
-        });
-    }
-    Ok((incoming.clone(), Vec::new()))
+        })?
+    } else {
+        (incoming.clone(), Vec::new())
+    };
+    validate_workspace(&document).map_err(document_error)?;
+    Ok((document, conflicts))
 }
 
 pub(crate) fn document_error(error: crate::workbench::documents::DocumentError) -> ProtoError {

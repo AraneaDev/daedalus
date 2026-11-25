@@ -77,6 +77,7 @@ pub enum ClientMessage {
         env: HashMap<String, String>,
     },
     ListWorkspaces,
+    WatchWorkspaceMembership,
     ReadActivity {
         workspace_id: WorkspaceId,
         cursor: Option<ActivityCursor>,
@@ -143,6 +144,12 @@ pub enum ClientMessage {
     SendInput {
         pane_id: PaneId,
         data: Vec<u8>,
+    },
+    LaunchRunnerAssignment {
+        workspace_id: WorkspaceId,
+        assignment_id: String,
+        cols: u16,
+        rows: u16,
     },
     Paste {
         pane_id: PaneId,
@@ -288,6 +295,10 @@ pub enum ResponsePayload {
         #[serde(default)]
         workbench_supported: bool,
         #[serde(default)]
+        workspace_membership_supported: bool,
+        #[serde(default)]
+        runner_assignment_supported: bool,
+        #[serde(default)]
         home_dir: Option<PathBuf>,
     },
     ImagePreview(ImagePreview),
@@ -372,6 +383,7 @@ pub enum ServerEvent {
         root_dir: PathBuf,
         assignments: Vec<Assignment>,
     },
+    WorkspaceMembershipChanged,
     WorkbenchChanged {
         workspace_id: WorkspaceId,
         revision: u64,
@@ -422,12 +434,16 @@ mod tests {
                 recent_projects_supported,
                 project_setup_supported,
                 paste_supported,
+                workspace_membership_supported,
+                runner_assignment_supported,
                 home_dir,
                 ..
             } => {
                 assert!(!recent_projects_supported);
                 assert!(!project_setup_supported);
                 assert!(!paste_supported);
+                assert!(!workspace_membership_supported);
+                assert!(!runner_assignment_supported);
                 assert_eq!(home_dir, None);
             }
             other => panic!("unexpected payload: {other:?}"),

@@ -1,4 +1,7 @@
-use daedalus_proto::workbench::{ConflictChoice, MergeConflict, WorkspaceDocument};
+use daedalus_proto::workbench::{
+    ConflictChoice, MergeConflict, WidgetDefinition, WorkspaceDocument,
+};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -8,18 +11,19 @@ pub fn merge_workspace(
     incoming: &WorkspaceDocument,
     resolutions: &BTreeMap<String, ConflictChoice>,
 ) -> Result<(WorkspaceDocument, Vec<MergeConflict>), serde_json::Error> {
-    let base = serde_json::to_value(base)?;
-    let local = serde_json::to_value(local)?;
-    let incoming = serde_json::to_value(incoming)?;
     let mut merge = Merge {
         resolutions,
         conflicts: Vec::new(),
     };
-    let value = merge.value("", Some(&base), Some(&local), Some(&incoming));
-    Ok((
-        serde_json::from_value(value.unwrap_or(Value::Null))?,
-        merge.conflicts,
-    ))
+    let value = merge.value(
+        "",
+        Some(&serde_json::to_value(base)?),
+        Some(&serde_json::to_value(local)?),
+        Some(&serde_json::to_value(incoming)?),
+    );
+    let mut document = serde_json::from_value(value.unwrap_or(Value::Null))?;
+    merge.references(&mut document, base, local, incoming);
+    Ok((document, merge.conflicts))
 }
 
 struct Merge<'a> {
@@ -28,6 +32,145 @@ struct Merge<'a> {
 }
 
 impl Merge<'_> {
+    fn side<T: Serialize>(
+        &mut self,
+        path: String,
+        base: Option<&T>,
+        local: Option<&T>,
+        incoming: Option<&T>,
+    ) -> ConflictChoice {
+        if let Some(choice) = self.resolutions.get(&path) {
+            return *choice;
+        }
+        let display = |value: Option<&T>| value.and_then(|value| serde_json::to_string(value).ok());
+        self.conflicts.push(MergeConflict {
+            path,
+            base: display(base),
+            local: display(local),
+            incoming: display(incoming),
+        });
+        ConflictChoice::Local
+    }
+
+    fn references(
+        &mut self,
+        document: &mut WorkspaceDocument,
+        base: &WorkspaceDocument,
+        local: &WorkspaceDocument,
+        incoming: &WorkspaceDocument,
+    ) {
+        let widget_path = |id: &str| child("/widgets", id);
+        // Reconcile template references per widget. Run in original order so the
+        // same missing reference always yields the same choice in preview and apply.
+        let available_templates: BTreeSet<_> =
+            document.templates.iter().map(|t| &t.id).cloned().collect();
+        let needs_repair =
+            |widget: &daedalus_proto::workbench::WidgetInstance| match &widget.template {
+                Some(id) => !available_templates.contains(id),
+                None => widget.definition.is_none(),
+            };
+        document.widgets.retain_mut(|widget| {
+            if !needs_repair(widget) {
+                return true;
+            }
+            let path = child(&widget_path(&widget.id), "$template_reference");
+            let base_widget = base.widgets.iter().find(|w| w.id == widget.id);
+            let local_widget = local.widgets.iter().find(|w| w.id == widget.id);
+            let incoming_widget = incoming.widgets.iter().find(|w| w.id == widget.id);
+            let (side, replacement) =
+                match self.side(path, base_widget, local_widget, incoming_widget) {
+                    ConflictChoice::Local => (local, local_widget),
+                    ConflictChoice::Incoming => (incoming, incoming_widget),
+                };
+            let Some(replacement) = replacement else {
+                return false;
+            };
+            widget.template.clone_from(&replacement.template);
+            if widget.template.is_none() {
+                widget.definition.clone_from(&replacement.definition);
+            }
+            if let Some(id) = &widget.template
+                && !document.templates.iter().any(|template| template.id == *id)
+                && let Some(template) = side.templates.iter().find(|template| template.id == *id)
+            {
+                document.templates.push(template.clone());
+            }
+            true
+        });
+
+        for template in &mut document.templates {
+            let lookup = |document: &'_ WorkspaceDocument| {
+                document.templates.iter().position(|t| t.id == template.id)
+            };
+            self.source_references(
+                child(&child("/templates", &template.id), "definition"),
+                &mut template.definition,
+                lookup(base).map(|i| &base.templates[i].definition),
+                lookup(local).map(|i| &local.templates[i].definition),
+                lookup(incoming).map(|i| &incoming.templates[i].definition),
+            );
+        }
+        for widget in &mut document.widgets {
+            let Some(definition) = &mut widget.definition else {
+                continue;
+            };
+            let lookup = |document: &'_ WorkspaceDocument| {
+                document.widgets.iter().position(|w| w.id == widget.id)
+            };
+            self.source_references(
+                child(&widget_path(&widget.id), "definition"),
+                definition,
+                lookup(base).and_then(|i| base.widgets[i].definition.as_ref()),
+                lookup(local).and_then(|i| local.widgets[i].definition.as_ref()),
+                lookup(incoming).and_then(|i| incoming.widgets[i].definition.as_ref()),
+            );
+        }
+    }
+
+    fn source_references(
+        &mut self,
+        path: String,
+        definition: &mut WidgetDefinition,
+        base: Option<&WidgetDefinition>,
+        local: Option<&WidgetDefinition>,
+        incoming: Option<&WidgetDefinition>,
+    ) {
+        let has_dangling = definition
+            .display
+            .summary
+            .iter()
+            .chain(&definition.display.details)
+            .chain(definition.rules.iter().map(|rule| &rule.field))
+            .any(|field| {
+                !definition
+                    .sources
+                    .iter()
+                    .any(|source| source.id == field.source)
+            });
+        if !has_dangling {
+            return;
+        }
+        let chosen = match self.side(child(&path, "$source_references"), base, local, incoming) {
+            ConflictChoice::Local => local,
+            ConflictChoice::Incoming => incoming,
+        };
+        if let Some(chosen) = chosen {
+            definition.sources.clone_from(&chosen.sources);
+            definition.display.clone_from(&chosen.display);
+            definition.rules.clone_from(&chosen.rules);
+        } else {
+            let known = |field: &daedalus_proto::workbench::WidgetField| {
+                definition
+                    .sources
+                    .iter()
+                    .any(|source| source.id == field.source)
+            };
+            definition.display.summary.retain(&known);
+            definition.display.details.retain(&known);
+            definition.rules.retain(|rule| known(&rule.field));
+        }
+    }
+
     fn value(
         &mut self,
         path: &str,
@@ -60,18 +203,9 @@ impl Merge<'_> {
         {
             return Some(Value::Array(self.collection(path, base, local, incoming)));
         }
-        match self.resolutions.get(path) {
-            Some(ConflictChoice::Local) => local.cloned(),
-            Some(ConflictChoice::Incoming) => incoming.cloned(),
-            None => {
-                self.conflicts.push(MergeConflict {
-                    path: path.into(),
-                    base: base.map(Value::to_string),
-                    local: local.map(Value::to_string),
-                    incoming: incoming.map(Value::to_string),
-                });
-                local.cloned()
-            }
+        match self.side(path.into(), base, local, incoming) {
+            ConflictChoice::Local => local.cloned(),
+            ConflictChoice::Incoming => incoming.cloned(),
         }
     }
 

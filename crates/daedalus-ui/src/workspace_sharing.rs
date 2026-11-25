@@ -1,20 +1,34 @@
 use super::DaedalusApp;
-use daedalus_proto::workbench::{WidgetActionResult, WidgetResult, WorkbenchState};
+use daedalus_proto::workbench::WorkbenchState;
 use daedalus_proto::{ClientMessage, ResponsePayload, WorkspaceId};
-use daedalus_ui::bridge::UiCommand;
+use daedalus_ui::bridge::{UiCommand, WorkbenchOperation};
 use daedalus_ui::state::ConnectionState;
+use daedalus_ui::workspace_widgets::{self, WorkspaceWidgets};
 use std::time::{Duration, Instant};
+
+mod replies;
 
 impl DaedalusApp {
     pub(super) fn request_workbench(&mut self, id: WorkspaceId, request: ClientMessage) {
-        if !self.send_command(UiCommand::Workbench {
+        self.request_workbench_as(id, WorkbenchOperation::Read, request);
+    }
+
+    pub(super) fn request_workbench_as(
+        &mut self,
+        id: WorkspaceId,
+        operation: WorkbenchOperation,
+        request: ClientMessage,
+    ) -> bool {
+        let queued = self.send_command(UiCommand::Workbench {
             workspace_id: id,
+            operation,
             request: Box::new(request),
-        }) && self.state.settings.widget_workspace == Some(id)
-        {
+        });
+        if !queued && self.state.settings.widget_workspace == Some(id) {
             self.state.settings.error =
                 Some("Reconnect to the daemon to configure widgets.".into());
         }
+        queued
     }
 
     pub(super) fn prepare_workbench_settings(&mut self, id: WorkspaceId) {
@@ -76,7 +90,7 @@ impl DaedalusApp {
     pub(super) fn workbench_response(
         &mut self,
         id: WorkspaceId,
-        saved: bool,
+        operation: WorkbenchOperation,
         response: Result<ResponsePayload, String>,
     ) {
         let settings = self.state.settings.open && self.state.settings.widget_workspace == Some(id);
@@ -85,165 +99,32 @@ impl DaedalusApp {
         } else {
             Vec::new()
         };
-        match response {
-            Ok(ResponsePayload::Workbench(state)) => self.load_workbench(id, state, saved),
-            Ok(ResponsePayload::WorkspaceRepoStatus(status))
-                if self.state.active_workspace_id == Some(id) =>
-            {
-                let available = status == Some(true);
-                if available && !self.state.workbench_repo_update {
-                    self.show_toast("Shared workspace setup available in Settings → Custom widgets → Import / export.", false);
-                }
-                self.state.workbench_repo_update = available;
-            }
-            Ok(ResponsePayload::WorkbenchConflict(state)) => {
-                self.load_workbench(id, state, false);
-                if settings {
-                    self.state.settings.error = Some(
-                        "The workspace changed. Review the latest settings and try again.".into(),
-                    );
-                }
-            }
-            Ok(ResponsePayload::WidgetLibrary(library)) if settings => {
-                self.state.settings.custom.library = library
-            }
-            Ok(ResponsePayload::WidgetLibraryConflict(library)) if settings => {
-                self.state.settings.custom.library = library;
-                self.state.settings.error = Some("The template library changed. Try again.".into());
-            }
-            Ok(ResponsePayload::WidgetResult(result)) if settings => {
-                self.state.settings.custom.preview = Some(result)
-            }
-            Ok(ResponsePayload::WidgetResults(results))
-                if self.state.active_workspace_id == Some(id) =>
-            {
-                if settings
-                    && self.state.settings.custom.showing_details
-                    && !self.state.settings.custom.action_output
-                    && let Some(widget) = self.state.settings.custom.selected()
-                    && let Some(snapshot) = results.iter().find(|snapshot| snapshot.id == widget.id)
-                {
-                    self.state.settings.custom.preview = Some(snapshot.result.clone());
-                }
-                self.state.widget_results = results;
-            }
-            Ok(ResponsePayload::WorkspaceImportPreview(preview)) if settings => {
-                let mut details = Vec::new();
-                if preview.current.layout != preview.proposed.layout {
-                    details.push((
-                        "Layout".into(),
-                        if preview.proposed.layout.split_view {
-                            "Split view".into()
-                        } else {
-                            "Focused agent".into()
-                        },
-                    ));
-                }
-                details.extend(
-                    preview
-                        .proposed
-                        .assignments
-                        .iter()
-                        .map(|assignment| (assignment.name.clone(), assignment.argv.join(" "))),
-                );
-                for widget in &preview.proposed.widgets {
-                    if let Some(definition) = preview.proposed.widget_definition(widget) {
-                        for source in &definition.sources {
-                            if let daedalus_proto::workbench::WidgetSource::Command {
-                                command,
-                                refresh,
-                                ..
-                            } = &source.source
-                            {
-                                let schedule = refresh
-                                    .interval_seconds
-                                    .map(|seconds| format!(" · every {seconds}s"))
-                                    .unwrap_or_default();
-                                let completion = if refresh.on_runner_completion {
-                                    " · on runner completion"
-                                } else {
-                                    ""
-                                };
-                                details.push((
-                                    widget.name.clone(),
-                                    format!("{}{schedule}{completion}", command.argv.join(" ")),
-                                ));
-                            }
-                        }
+        if let WorkbenchOperation::PaneWidgets(token) = operation {
+            self.pane_widgets_response(id, token, response);
+        } else {
+            match response {
+                Ok(ResponsePayload::Workbench(state)) => {
+                    self.load_workbench(id, state);
+                    if settings {
+                        self.finish_workbench_operation(operation);
                     }
                 }
-                self.state.settings.custom.preview = Some(WidgetResult {
-                    label: format!(
-                        "{} · Assignments {} · Widgets {} · Templates {}",
-                        preview.proposed.name,
-                        preview.proposed.assignments.len(),
-                        preview.proposed.widgets.len(),
-                        preview.proposed.templates.len()
-                    ),
-                    level: daedalus_proto::StatusLevel::Info,
-                    details,
-                });
-                self.state.settings.custom.import = Some(preview);
-            }
-            Ok(ResponsePayload::WorkspaceCreationPreview(preview)) if settings => {
-                self.state.settings.custom.preview = Some(WidgetResult {
-                    label: format!(
-                        "Create {} in {}",
-                        preview.incoming.name,
-                        preview.root_dir.display()
-                    ),
-                    level: daedalus_proto::StatusLevel::Info,
-                    details: preview
-                        .incoming
-                        .assignments
-                        .iter()
-                        .map(|assignment| (assignment.name.clone(), assignment.argv.join(" ")))
-                        .collect(),
-                });
-                self.state.settings.custom.creation = Some(preview);
-            }
-            Ok(ResponsePayload::WorkbenchCreated(workspace)) => {
-                let new_id = workspace.id;
-                self.project_setups.absorb(std::slice::from_ref(&workspace));
-                self.state.upsert_workspace(workspace);
-                self.state.select_workspace(new_id);
-                self.state.settings.open = false;
-                self.ensure_active_workspace_panes();
-                self.schedule_resize_flush();
-            }
-            Ok(ResponsePayload::WidgetTemplate(template)) if settings => {
-                let library = &self.state.settings.custom.library;
-                if library
-                    .templates
-                    .iter()
-                    .any(|existing| existing.id == template.id)
-                {
-                    self.state.settings.error =
-                        Some(format!("Template '{}' already exists.", template.id));
-                } else {
-                    let mut templates = library.templates.clone();
-                    templates.push(template);
-                    self.request_workbench(
-                        id,
-                        ClientMessage::UpdateWidgetTemplates {
-                            revision: library.revision,
-                            templates,
-                        },
-                    );
-                }
-            }
-            Ok(ResponsePayload::WorkbenchToml(text)) if settings => {
-                if let Some(path) = self.state.settings.custom.export_path.take() {
-                    match std::fs::write(&path, text) {
-                        Ok(()) => self.show_toast(format!("Exported {path}"), false),
-                        Err(error) => self.state.settings.error = Some(error.to_string()),
+                Ok(ResponsePayload::WorkbenchConflict(state)) => {
+                    self.load_workbench(id, state);
+                    let message =
+                        "The workspace changed. Review the latest settings and try again.";
+                    if settings {
+                        self.state.settings.error = Some(message.into());
+                    } else if !matches!(operation, WorkbenchOperation::Migration) {
+                        self.show_toast(message, true);
                     }
                 }
+                Ok(response) => {
+                    self.workbench_auxiliary_response(id, settings, operation, response)
+                }
+                Err(error) if settings => self.state.settings.error = Some(error),
+                Err(error) => self.show_toast(error, true),
             }
-            Ok(ResponsePayload::WidgetAction(action)) => self.show_widget_action(id, action),
-            Err(error) if settings => self.state.settings.error = Some(error),
-            Err(error) => self.show_toast(error, true),
-            _ => {}
         }
         if settings && self.state.settings.open {
             self.state.settings.reconcile_controls(&previous);
@@ -251,37 +132,121 @@ impl DaedalusApp {
         self.request_redraw();
     }
 
-    fn load_workbench(&mut self, id: WorkspaceId, state: WorkbenchState, saved: bool) {
-        if state.revision == 0
-            && let Some(legacy) = self.state.workspace_widgets.get(&id).cloned()
-            && self.seeded_workbench.insert(id)
-        {
-            let mut document = state.document.clone();
-            document.pane_widgets = Some(legacy.into());
-            document.layout = self.pointer.splits.portable(!self.state.zoomed);
-            self.request_workbench(
-                id,
-                ClientMessage::SeedLegacyWorkbench {
-                    workspace_id: id,
-                    document,
-                },
-            );
-        } else if state.revision > 0
-            && let Some(widgets) = state.document.pane_widgets.clone()
-        {
-            self.state.workspace_widgets.insert(id, widgets.into());
-        }
-        if self.state.settings.open && self.state.settings.widget_workspace == Some(id) {
-            let editor = &mut self.state.settings.custom;
-            editor.selected = editor
-                .selected
-                .min(state.document.widgets.len().saturating_sub(1));
-            editor.state = Some(state.clone());
-            if saved {
+    fn finish_workbench_operation(&mut self, operation: WorkbenchOperation) {
+        let editor = &mut self.state.settings.custom;
+        match operation {
+            WorkbenchOperation::WidgetEdit if editor.draft_matches_saved_widget() => {
                 editor.draft = None;
-                editor.import = None;
                 editor.preview = None;
             }
+            WorkbenchOperation::Import if editor.sharing => {
+                editor.import = None;
+                editor.creation = None;
+                editor.preview = None;
+                editor.resolutions.clear();
+            }
+            _ => {}
+        }
+    }
+
+    fn pane_widgets_response(
+        &mut self,
+        id: WorkspaceId,
+        token: u64,
+        response: Result<ResponsePayload, String>,
+    ) {
+        if !self.state.settings.finish_pane_widget_save(id, token) {
+            return;
+        }
+        match response {
+            Ok(ResponsePayload::Workbench(state)) => {
+                self.load_workbench(id, state);
+                self.state.settings.widgets = self
+                    .state
+                    .workspace_widgets
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default();
+                self.state.settings.widgets_saved = true;
+            }
+            Ok(ResponsePayload::WorkbenchConflict(state)) => {
+                self.load_workbench(id, state);
+                self.state.settings.error =
+                    Some("The widget settings changed. Review the latest values and retry.".into());
+            }
+            Err(error) => self.state.settings.error = Some(error),
+            Ok(_) => self.state.settings.error = Some("Unexpected widget settings reply.".into()),
+        }
+    }
+
+    fn load_workbench(&mut self, id: WorkspaceId, state: WorkbenchState) {
+        if !self
+            .state
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == id)
+        {
+            return;
+        }
+        let settings = self.state.settings.open && self.state.settings.widget_workspace == Some(id);
+        let current = if settings {
+            self.state.settings.custom.state.as_ref()
+        } else {
+            self.state
+                .workbench
+                .as_ref()
+                .filter(|(workspace, _)| *workspace == id)
+                .map(|(_, state)| state)
+        };
+        if current.is_some_and(|current| current.revision > state.revision) {
+            return;
+        }
+
+        if state.revision == 0 && self.seeded_workbench.insert(id) {
+            match workspace_widgets::load(&self.widget_directory, id) {
+                Ok(Some(legacy)) => {
+                    let mut document = state.document.clone();
+                    document.pane_widgets = Some(legacy.into());
+                    if self.state.active_workspace_id == Some(id) {
+                        document.layout = self.pointer.splits.portable(!self.state.zoomed);
+                    }
+                    self.request_workbench_as(
+                        id,
+                        WorkbenchOperation::Migration,
+                        ClientMessage::SeedLegacyWorkbench {
+                            workspace_id: id,
+                            document,
+                        },
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => self.show_toast(
+                    format!("Could not read legacy widget settings: {error}"),
+                    true,
+                ),
+            }
+        }
+
+        let previous_widgets = self.state.workspace_widgets.remove(&id).unwrap_or_default();
+        let effective = state
+            .document
+            .pane_widgets
+            .clone()
+            .map(WorkspaceWidgets::from);
+        if let Some(widgets) = &effective {
+            self.state.workspace_widgets.insert(id, widgets.clone());
+        }
+        if settings {
+            let dialog = &mut self.state.settings;
+            if dialog.widgets == previous_widgets {
+                dialog.widgets = effective.unwrap_or_default();
+            }
+            dialog.custom.accept_snapshot(state.clone());
+        }
+        if state.revision > 0 {
+            self.project_setups
+                .workspace_changed(id, state.document.assignments.clone());
+            self.refresh_workspace_setup(id);
         }
         if self.state.active_workspace_id == Some(id) {
             if state.revision > 0
@@ -301,17 +266,6 @@ impl DaedalusApp {
                 self.state.zoomed = !state.document.layout.split_view;
                 self.pointer.splits =
                     daedalus_ui::layout::PaneSplits::from_portable(&state.document.layout);
-            }
-            if state.revision > 0
-                && previous.is_none_or(|previous| {
-                    previous.document.assignments != state.document.assignments
-                })
-                && let Some(root) = self
-                    .state
-                    .active_workspace()
-                    .map(|workspace| workspace.root_dir.clone())
-            {
-                self.project_setup_changed(&root, state.document.assignments.clone());
             }
             if state.revision > 0 {
                 self.request_workbench(
@@ -336,8 +290,9 @@ impl DaedalusApp {
             let layout = self.pointer.splits.portable(!self.state.zoomed);
             if document.layout != layout {
                 document.layout = layout;
-                self.request_workbench(
+                self.request_workbench_as(
                     *id,
+                    WorkbenchOperation::Layout,
                     ClientMessage::UpdateWorkbench {
                         workspace_id: *id,
                         revision: state.revision,
@@ -348,37 +303,12 @@ impl DaedalusApp {
         }
     }
 
-    pub(super) fn save_shared_pane_widgets(
-        &mut self,
-        id: WorkspaceId,
-        widgets: daedalus_ui::workspace_widgets::WorkspaceWidgets,
-    ) {
-        if let Some((_, state)) = self
-            .state
-            .workbench
-            .as_ref()
-            .filter(|(workspace, _)| *workspace == id)
-        {
-            let mut document = state.document.clone();
-            document.pane_widgets = Some(widgets.into());
-            document.layout = self.pointer.splits.portable(!self.state.zoomed);
-            self.request_workbench(
-                id,
-                ClientMessage::UpdateWorkbench {
-                    workspace_id: id,
-                    revision: state.revision,
-                    document,
-                },
-            );
-        }
-    }
-
     pub(super) fn open_widget_details(&mut self, index: Option<usize>) {
         self.open_workspace_settings();
         if !self.state.settings.open {
             return;
         }
-        self.state.settings.custom_page = true;
+        self.state.settings.open_custom_page();
         self.state.settings.focus = daedalus_ui::settings::Control::CustomNew;
         if let Some(index) = index {
             self.state.settings.custom.selected = index;
@@ -394,28 +324,5 @@ impl DaedalusApp {
                 });
         }
         self.request_redraw();
-    }
-
-    fn show_widget_action(&mut self, id: WorkspaceId, action: WidgetActionResult) {
-        match action {
-            WidgetActionResult::Pane(pane) => {
-                if let Some(role) = self.state.panes.get(&pane).map(|state| state.summary.role) {
-                    self.state.select_session(id, role, pane);
-                    self.state.settings.open = false;
-                }
-            }
-            WidgetActionResult::OpenUrl(url) => {
-                if let Err(error) =
-                    daedalus_ui::links::open_link(&daedalus_ui::links::DetectedLink::Url(url), None)
-                {
-                    self.show_toast(error.to_string(), true);
-                }
-            }
-            WidgetActionResult::Output(result) => {
-                self.state.settings.custom.action_output = true;
-                self.state.settings.custom.detail_page = 0;
-                self.state.settings.custom.preview = Some(result);
-            }
-        }
     }
 }

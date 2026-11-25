@@ -4,6 +4,7 @@ mod negotiation_tests;
 mod rpc;
 mod setup;
 mod terminal;
+mod widget_lane;
 mod workspace;
 
 use std::path::PathBuf;
@@ -66,13 +67,27 @@ impl std::fmt::Debug for BridgeConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WorkbenchOperation {
+    #[default]
+    Read,
+    Layout,
+    Migration,
+    PaneWidgets(u64),
+    WidgetEdit,
+    Import,
+    Export(PathBuf),
+}
+
 /// Commands sent from the UI thread to `DaemonBridge`.
 #[derive(Debug, Clone)]
 pub enum UiCommand {
     Workbench {
         workspace_id: WorkspaceId,
+        operation: WorkbenchOperation,
         request: Box<ClientMessage>,
     },
+    ReconcileWorkspaceMembership,
     PreviewImage {
         workspace_id: WorkspaceId,
         pane_id: PaneId,
@@ -133,6 +148,7 @@ pub enum UiCommand {
     LaunchAssignment {
         workspace_id: WorkspaceId,
         assignment: crate::assignments::Assignment,
+        saved_runner: bool,
         cols: u16,
         rows: u16,
     },
@@ -200,7 +216,7 @@ pub enum UiEvent {
     WorkbenchCapability(bool),
     Workbench {
         workspace_id: WorkspaceId,
-        saved: bool,
+        operation: WorkbenchOperation,
         response: Box<Result<ResponsePayload, String>>,
     },
     ImagePreview {
@@ -252,6 +268,7 @@ pub enum UiEvent {
     Connected,
     Disconnected,
     WorkspacesLoaded(Vec<WorkspaceInfo>),
+    WorkspaceMembershipLoaded(Vec<WorkspaceInfo>),
     WorkspaceCloseFailed(Vec<WorkspaceInfo>),
     WorkspaceCloseFinished(WorkspaceId),
     WorkspaceCreated(WorkspaceInfo),
@@ -397,7 +414,7 @@ async fn run_bridge(
 
     loop {
         match connect_endpoint(&config.socket_path).await {
-            Ok((stream, _tunnel)) => {
+            Ok((stream, tunnel)) => {
                 backoff = INITIAL_BACKOFF;
                 spawn_attempted = false;
                 let mut conn = RpcConnection::new(stream, Arc::clone(&sink));
@@ -416,7 +433,19 @@ async fn run_bridge(
                 .await;
                 match initialized {
                     Ok(()) => {
-                        session_loop(&mut conn, &sink, &mut cmd_rx).await;
+                        let endpoint = tunnel
+                            .as_ref()
+                            .map_or(config.socket_path.as_path(), |tunnel| {
+                                tunnel.local_endpoint()
+                            });
+                        session_loop(
+                            &mut conn,
+                            &sink,
+                            &mut cmd_rx,
+                            endpoint,
+                            config.auth_token.as_deref(),
+                        )
+                        .await;
                     }
                     Err(RpcError::Disconnected) => {}
                     Err(RpcError::TimedOut) => {
@@ -509,6 +538,8 @@ async fn initialize_session(
         image_preview_supported,
         paste_supported,
         workbench_supported,
+        workspace_membership_supported,
+        runner_assignment_supported,
         home_dir,
         ..
     } = conn.call(ClientMessage::Ping).await?
@@ -523,12 +554,16 @@ async fn initialize_session(
     conn.project_setup_supported = project_setup_supported;
     conn.paste_supported = paste_supported;
     conn.workbench_supported = workbench_supported;
+    conn.runner_assignment_supported = runner_assignment_supported;
     let _ = conn
         .call(ClientMessage::Subscribe {
             pane_ids: None,
             project_setup_events: project_setup_supported,
         })
         .await?;
+    if workspace_membership_supported {
+        conn.call(ClientMessage::WatchWorkspaceMembership).await?;
+    }
     session.send_replace(Some(cmd_tx));
     sink.emit(UiEvent::Connected);
     sink.emit(UiEvent::WorkbenchCapability(workbench_supported));
@@ -580,17 +615,40 @@ async fn initialize_session(
     Ok(())
 }
 
+async fn reconcile_membership(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+) -> Result<(), RpcError> {
+    if let ResponsePayload::Workspaces(workspaces) =
+        conn.call(ClientMessage::ListWorkspaces).await?
+    {
+        sink.emit(UiEvent::WorkspaceMembershipLoaded(workspaces));
+    }
+    Ok(())
+}
+
 /// Processes commands for a single connection until it closes.
 async fn session_loop(
     conn: &mut RpcConnection,
     sink: &Arc<dyn UiEventSink>,
     cmd_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
+    endpoint: &std::path::Path,
+    auth_token: Option<&str>,
 ) {
+    let membership = conn.membership_notifications();
+    let mut widgets = widget_lane::WidgetLane::new(endpoint, auth_token, sink);
     loop {
         tokio::select! {
             biased;
             _ = conn.disconnected() => {
                 return;
+            }
+            _ = widgets.join_next(), if widgets.has_jobs() => {}
+            _ = membership.notified() => {
+                if let Err(error) = reconcile_membership(conn, sink).await {
+                    debug!("membership reconciliation interrupted: {error:?}");
+                    return;
+                }
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else {
@@ -598,6 +656,9 @@ async fn session_loop(
                 };
                 if matches!(cmd, UiCommand::Shutdown) {
                     return;
+                }
+                if conn.workbench_supported && widgets.dispatch(&cmd) {
+                    continue;
                 }
                 let close_id = match &cmd {
                     UiCommand::CloseWorkspace { id, .. } => Some(*id),
@@ -694,15 +755,10 @@ async fn handle_command(
         }
         UiCommand::Workbench {
             workspace_id,
+            operation,
             request,
         } => {
             if conn.workbench_supported {
-                let saved = matches!(
-                    *request,
-                    ClientMessage::UpdateWorkbench { .. }
-                        | ClientMessage::ApplyWorkspaceImport { .. }
-                        | ClientMessage::SeedLegacyWorkbench { .. }
-                );
                 let response = match conn.call(*request).await {
                     Ok(response) => Ok(response),
                     Err(RpcError::Proto(error)) => Err(error.to_string()),
@@ -710,11 +766,12 @@ async fn handle_command(
                 };
                 sink.emit(UiEvent::Workbench {
                     workspace_id,
-                    saved,
+                    operation,
                     response: Box::new(response),
                 });
             }
         }
+        UiCommand::ReconcileWorkspaceMembership => reconcile_membership(conn, sink).await?,
         UiCommand::CreateManualWorkspace {
             session,
             name,
@@ -777,10 +834,20 @@ async fn handle_command(
         UiCommand::LaunchAssignment {
             workspace_id,
             assignment,
+            saved_runner,
             cols,
             rows,
         } => {
-            setup::launch_assignment(conn, sink, workspace_id, assignment, cols, rows).await?;
+            setup::launch_assignment(
+                conn,
+                sink,
+                workspace_id,
+                assignment,
+                saved_runner,
+                cols,
+                rows,
+            )
+            .await?;
         }
         UiCommand::AddAgent {
             workspace_id,

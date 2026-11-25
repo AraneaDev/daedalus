@@ -13,8 +13,8 @@ pub struct ProjectSetups {
     daemon_backed: bool,
     cache: HashMap<WorkspaceId, Vec<Assignment>>,
     roots: HashMap<WorkspaceId, PathBuf>,
-    /// Last setup the daemon confirmed per project folder.
-    confirmed: HashMap<PathBuf, Vec<Assignment>>,
+    /// Last setup the daemon confirmed for each workspace.
+    confirmed: HashMap<WorkspaceId, Vec<Assignment>>,
     migrated: HashSet<WorkspaceId>,
     migrated_roots: HashSet<PathBuf>,
 }
@@ -48,8 +48,7 @@ impl ProjectSetups {
         for info in workspaces {
             self.roots.insert(info.id, info.root_dir.clone());
             if let Some(setup) = &info.setup {
-                self.confirmed.insert(info.root_dir.clone(), setup.clone());
-                self.cache.insert(info.id, setup.clone());
+                self.workspace_changed(info.id, setup.clone());
             }
         }
     }
@@ -64,8 +63,6 @@ impl ProjectSetups {
         for info in workspaces {
             self.roots.insert(info.id, info.root_dir.clone());
         }
-        self.confirmed
-            .insert(root_dir.to_path_buf(), assignments.clone());
         let ids: Vec<_> = self
             .roots
             .iter()
@@ -73,28 +70,21 @@ impl ProjectSetups {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            self.cache.insert(id, assignments.clone());
+            self.workspace_changed(id, assignments.clone());
         }
     }
 
-    /// The daemon did not take the last save (or it could not be sent): fall back to the last
-    /// confirmed setup of the folder, or to nothing if none was confirmed.
+    pub fn workspace_changed(&mut self, id: WorkspaceId, assignments: Vec<Assignment>) {
+        self.confirmed.insert(id, assignments.clone());
+        self.cache.insert(id, assignments);
+    }
+
+    /// A rejected legacy migration restores only the workspace it was offered for.
     pub fn rejected(&mut self, id: WorkspaceId) {
-        let Some(root) = self.roots.get(&id).cloned() else {
+        if let Some(setup) = self.confirmed.get(&id) {
+            self.cache.insert(id, setup.clone());
+        } else {
             self.cache.remove(&id);
-            return;
-        };
-        let siblings: Vec<_> = self
-            .roots
-            .iter()
-            .filter(|(_, other)| **other == root)
-            .map(|(other, _)| *other)
-            .collect();
-        for sibling in siblings {
-            match self.confirmed.get(&root) {
-                Some(setup) => self.cache.insert(sibling, setup.clone()),
-                None => self.cache.remove(&sibling),
-            };
         }
     }
 
@@ -324,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_save_reverts_to_the_confirmed_setup_for_the_whole_folder() {
+    fn rejected_save_preserves_the_confirmed_setup_for_each_workspace() {
         let (_dir, mut store) = store();
         let a = info("/p", Some(vec![entry("kept")]));
         let b = info("/p", Some(vec![entry("kept")]));

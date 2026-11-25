@@ -356,6 +356,7 @@ impl Registry {
         let mut info = record.to_info(Vec::new());
         self.record_recent_project(&info.name, &info.root_dir).await;
         self.workspaces.write().await.insert(id, record);
+        self.notify_membership();
         drop(_create_guard);
         self.persist_state().await;
         self.attach_project_setup(&mut info).await;
@@ -506,6 +507,40 @@ impl Registry {
             pane_env,
             None,
             false,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn launch_runner_assignment(
+        &self,
+        workspace_id: WorkspaceId,
+        assignment_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<PaneSummary, ProtoError> {
+        let _lifecycle = self.lock_workspace_lifecycle(workspace_id).await?;
+        let assignment = self
+            .workbench(workspace_id)
+            .await?
+            .document
+            .assignments
+            .into_iter()
+            .find(|entry| entry.id == assignment_id && entry.role == PaneRole::Runner)
+            .ok_or_else(|| {
+                ProtoError::InvalidRequest(format!("No saved runner assignment '{assignment_id}'"))
+            })?;
+        self.install_pane(
+            workspace_id,
+            PaneRole::Runner,
+            Some(assignment.argv),
+            None,
+            cols,
+            rows,
+            HashMap::new(),
+            None,
+            false,
+            Some(assignment.id),
         )
         .await
     }
@@ -527,18 +562,24 @@ impl Registry {
         if matches!(&ws.default_panes, DefaultPanes::Pending(done) if !done.contains(&role)) {
             drop(workspaces);
             let workbench = self.workbench(workspace_id).await?;
-            let command = if workbench.revision > 0 {
-                let saved = workbench
-                    .document
-                    .assignments
-                    .into_iter()
-                    .find(|entry| entry.role == role)
-                    .map(|entry| entry.argv);
-                if role == PaneRole::Agent && saved.as_deref().is_some_and(|argv| argv == ["shell"])
-                {
+            let saved = (workbench.revision > 0)
+                .then(|| {
+                    workbench
+                        .document
+                        .assignments
+                        .into_iter()
+                        .find(|entry| entry.role == role)
+                })
+                .flatten();
+            let assignment_id = saved
+                .as_ref()
+                .filter(|_| role == PaneRole::Runner)
+                .map(|entry| entry.id.clone());
+            let command = if let Some(saved) = saved {
+                if role == PaneRole::Agent && saved.argv == ["shell"] {
                     None
                 } else {
-                    saved.or(command)
+                    Some(saved.argv)
                 }
             } else {
                 command
@@ -554,6 +595,7 @@ impl Registry {
                     HashMap::new(),
                     None,
                     true,
+                    assignment_id,
                 )
                 .await
                 .map(ResponsePayload::PaneSpawned);
@@ -617,6 +659,7 @@ impl Registry {
             HashMap::new(),
             old_pane_id,
             false,
+            None,
         )
         .await
     }
@@ -634,6 +677,7 @@ impl Registry {
         pane_env: HashMap<String, String>,
         old_pane_id: Option<PaneId>,
         is_default: bool,
+        assignment_id: Option<String>,
     ) -> Result<PaneSummary, ProtoError> {
         let (root_dir, mut merged_env, journal) = {
             let ws_map = self.workspaces.read().await;
@@ -676,7 +720,8 @@ impl Registry {
             spawned,
             self.event_tx.clone(),
             journal,
-        );
+        )
+        .with_assignment_id(assignment_id);
 
         let summary = match handle.summary().await {
             Ok(s) => s,
@@ -701,6 +746,7 @@ impl Registry {
             panes.insert(pane_id, handle);
             previous
         };
+        self.notify_membership();
         if let Some(previous) = previous {
             previous.close().await;
         }
@@ -734,8 +780,13 @@ impl Registry {
         {
             ws.pane_ids.retain(|id| *id != pane_id);
         }
+        self.notify_membership();
         handle.close().await;
         Ok(())
+    }
+
+    fn notify_membership(&self) {
+        let _ = self.event_tx.send(ServerEvent::WorkspaceMembershipChanged);
     }
 
     pub async fn close_workspace(
@@ -824,37 +875,66 @@ impl Registry {
             }
             handles
         };
+        let had_panes = !handles.is_empty();
         for handle in handles {
             handle.close().await;
         }
 
-        if compose_down && let Some(project) = project {
-            let root_dir = root_dir.clone();
-            tokio::task::spawn_blocking(move || isolation::run_compose_down(&root_dir, &project))
-                .await
-                .map_err(|err| ProtoError::Internal(format!(
-                    "panes stopped; workspace retained for retry after Compose teardown task failed: {err}"
-                )))?
-                .map_err(|err| ProtoError::IoError(format!(
-                    "panes stopped; workspace retained for retry after Compose teardown failed: {err}"
-                )))?;
-        }
-
-        if remove_worktree {
-            let removal = tokio::task::spawn_blocking(move || {
-                worktree::remove_worktree(&root_dir, force_remove_worktree)
-            })
-            .await
-            .map_err(|e| ProtoError::Internal(format!("worktree removal task failed: {e}")))?;
-
-            if let Err(err) = removal {
-                return Err(map_worktree_error(err));
+        let project = project.filter(|_| compose_down);
+        if let Err(error) = Self::remove_workspace_resources(
+            root_dir,
+            project,
+            remove_worktree,
+            force_remove_worktree,
+        )
+        .await
+        {
+            if had_panes {
+                self.notify_membership();
             }
+            return Err(error);
         }
 
         self.workspaces.write().await.remove(&workspace_id);
+        self.notify_membership();
         if persist {
             self.persist_state().await;
+        }
+        Ok(())
+    }
+
+    async fn remove_workspace_resources(
+        root_dir: PathBuf,
+        compose_project: Option<String>,
+        remove_worktree: bool,
+        force_remove_worktree: bool,
+    ) -> Result<(), ProtoError> {
+        if let Some(project) = compose_project {
+            let root_dir = root_dir.clone();
+            let cleanup =
+                tokio::task::spawn_blocking(move || isolation::run_compose_down(&root_dir, &project))
+                    .await
+                    .map_err(|error| {
+                        ProtoError::Internal(format!(
+                            "panes stopped; workspace retained for retry after Compose teardown task failed: {error}"
+                        ))
+                    })?;
+            cleanup.map_err(|error| {
+                ProtoError::IoError(format!(
+                    "panes stopped; workspace retained for retry after Compose teardown failed: {error}"
+                ))
+            })?;
+        }
+
+        if remove_worktree {
+            tokio::task::spawn_blocking(move || {
+                worktree::remove_worktree(&root_dir, force_remove_worktree)
+            })
+            .await
+            .map_err(|error| {
+                ProtoError::Internal(format!("worktree removal task failed: {error}"))
+            })?
+            .map_err(map_worktree_error)?;
         }
         Ok(())
     }

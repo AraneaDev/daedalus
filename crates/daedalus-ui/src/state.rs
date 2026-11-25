@@ -812,6 +812,9 @@ impl AppState {
     pub fn set_workspaces(&mut self, workspaces: Vec<WorkspaceInfo>) {
         self.workspace_list_loaded = true;
         let previous_focus = self.focused_pane_id();
+        let previously_empty = self
+            .active_workspace()
+            .is_some_and(|workspace| workspace.panes.is_empty());
         let workspaces: Vec<_> = workspaces
             .into_iter()
             .map(|ws| self.cache_workspace(ws))
@@ -846,13 +849,18 @@ impl AppState {
         {
             self.close_modal.close();
         }
-        let active_still_exists = self
+        let active = self
             .active_workspace_id
-            .is_some_and(|id| self.workspaces.iter().any(|ws| ws.id == id));
-        if active_still_exists && previous_focus.is_some_and(|id| !live_panes.contains(&id)) {
-            self.focus_available_session();
-        }
-        if !active_still_exists {
+            .filter(|id| self.workspaces.iter().any(|workspace| workspace.id == *id));
+        if let Some(workspace_id) = active {
+            if let Some(pane_id) = previous_focus.filter(|id| live_panes.contains(id)) {
+                // Keep the existing focus even if the user never explicitly selected
+                // this role's tab and the daemon appended a sibling.
+                self.select_role_pane(workspace_id, self.focused_role, pane_id);
+            } else if previous_focus.is_some() || previously_empty {
+                self.focus_available_session();
+            }
+        } else {
             self.settings.open = false;
             self.failure_recipients = None;
             self.action_palette.close();
@@ -1040,7 +1048,9 @@ impl AppState {
                 }
                 None
             }
-            ServerEvent::ProjectSetupChanged { .. } | ServerEvent::WorkbenchChanged { .. } => None,
+            ServerEvent::ProjectSetupChanged { .. }
+            | ServerEvent::WorkbenchChanged { .. }
+            | ServerEvent::WorkspaceMembershipChanged => None,
         }
     }
 

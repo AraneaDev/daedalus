@@ -88,6 +88,7 @@ pub struct PaneHandle {
     workspace_id: WorkspaceId,
     role: PaneRole,
     root_pid: Option<u32>,
+    assignment_id: Option<std::sync::Arc<str>>,
     cmd_tx: mpsc::Sender<PaneCmd>,
 }
 
@@ -192,6 +193,7 @@ impl PaneHandle {
             workspace_id,
             role,
             root_pid,
+            assignment_id: None,
             cmd_tx,
         }
     }
@@ -206,6 +208,15 @@ impl PaneHandle {
 
     pub fn role(&self) -> PaneRole {
         self.role
+    }
+
+    pub(crate) fn with_assignment_id(mut self, assignment_id: Option<String>) -> Self {
+        self.assignment_id = assignment_id.map(Into::into);
+        self
+    }
+
+    pub(crate) fn assignment_id(&self) -> Option<&str> {
+        self.assignment_id.as_deref()
     }
 
     pub fn root_pid(&self) -> Option<u32> {

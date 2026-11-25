@@ -1532,6 +1532,8 @@ async fn workspace_recent_reports_unsupported_daemon() {
                     image_preview_supported: false,
                     paste_supported: false,
                     workbench_supported: false,
+                    workspace_membership_supported: false,
+                    runner_assignment_supported: false,
                     home_dir: None,
                     recent_projects_supported: false,
                 }),

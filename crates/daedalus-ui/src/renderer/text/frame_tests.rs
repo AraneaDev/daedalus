@@ -370,3 +370,137 @@ fn cargo_bar_and_layout_switch_keep_their_visible_labels() {
         }
     }
 }
+
+#[test]
+fn custom_widget_chrome_renders_reports_icons_overflow_and_action_details() {
+    use daedalus_proto::StatusLevel;
+    use daedalus_proto::workbench::{
+        NamedAction, WidgetAction, WidgetDefinition, WidgetDisplay, WidgetInstance, WidgetResult,
+        WidgetSnapshot, WorkbenchState, WorkspaceDocument,
+    };
+
+    let mut frame = Frame::new();
+    let id = frame.state.active_workspace_id.unwrap();
+    let theme = Theme::dark();
+    let cases = [
+        (None, "Pending report", theme.text_primary),
+        (
+            Some(StatusLevel::Info),
+            "Status received",
+            theme.text_primary,
+        ),
+        (Some(StatusLevel::Ok), "Ready", theme.status_ok),
+        (
+            Some(StatusLevel::Warn),
+            "Needs attention",
+            theme.status_busy,
+        ),
+        (Some(StatusLevel::Error), "Failed", theme.status_err),
+    ];
+    let mut document = WorkspaceDocument::new("Widget reports".into());
+    frame.layout.widget_bar = Some(Rect::new(0., 766., 1200., 34.));
+    for (index, (level, label, _)) in cases.into_iter().enumerate() {
+        let widget = WidgetInstance {
+            id: format!("check-{index}"),
+            name: if level.is_none() {
+                label.into()
+            } else {
+                format!("Check {index}")
+            },
+            pinned: true,
+            template: None,
+            definition: Some(WidgetDefinition {
+                display: WidgetDisplay {
+                    icon: (index == 2).then(|| "★".into()),
+                    ..Default::default()
+                },
+                actions: vec![NamedAction {
+                    id: "details".into(),
+                    label: "Open logs".into(),
+                    action: WidgetAction::Logs {
+                        role: daedalus_proto::PaneRole::Runner,
+                    },
+                }],
+                ..Default::default()
+            }),
+        };
+        if let Some(level) = level {
+            frame.state.widget_results.push(WidgetSnapshot {
+                id: widget.id.clone(),
+                result: WidgetResult {
+                    label: label.into(),
+                    level,
+                    details: vec![],
+                },
+            });
+        }
+        document.widgets.push(widget);
+        frame.layout.widget_buttons.push((
+            Some(index),
+            Rect::new(5. + 195. * index as f32, 771., 190., 24.),
+        ));
+    }
+    frame
+        .layout
+        .widget_buttons
+        .push((None, Rect::new(980., 771., 190., 24.)));
+    let snapshot = WorkbenchState {
+        revision: 1,
+        document,
+        repo_baseline: None,
+    };
+    frame.state.workbench = Some((id, snapshot.clone()));
+    frame.state.settings.begin(Vec::new());
+    frame.state.settings.custom_supported = true;
+    frame.state.settings.open_custom_page();
+    frame.state.settings.custom.accept_snapshot(snapshot);
+    frame.state.settings.custom.showing_details = true;
+    frame.state.settings.custom.selected = 4;
+    frame.state.settings.custom.action_output = true;
+    frame.state.settings.custom.preview = Some(WidgetResult {
+        label: "Runner diagnostics".into(),
+        level: StatusLevel::Error,
+        details: vec![("Failure".into(), "compile error\ncheck the log".into())],
+    });
+    frame.state.settings.focus = Control::CustomRefresh;
+
+    let modal = frame.labels(1200., 800.);
+    for expected in [
+        "Check 4",
+        "Failure · compile error",
+        "check the log",
+        "Open logs",
+        "Refresh widget",
+        "Runner diagnostics",
+    ] {
+        assert!(
+            modal.iter().any(|label| label == expected),
+            "missing {expected}"
+        );
+    }
+    let footer_items: Vec<_> = frame
+        .renderer
+        .chrome_items
+        .iter()
+        .filter(|item| item.bounds.top == 771)
+        .map(|item| (item.buffer.lines[0].text(), item.default_color))
+        .collect();
+    assert_eq!(footer_items.len(), 6);
+    for (index, ((_, label, color), (text, actual_color))) in
+        cases.iter().zip(&footer_items).enumerate()
+    {
+        let expected = if index == 2 {
+            format!("★ {label}")
+        } else {
+            (*label).into()
+        };
+        assert_eq!(
+            (*text, *actual_color),
+            (expected.as_str(), color.to_glyphon_color())
+        );
+    }
+    assert_eq!(
+        footer_items[5],
+        ("More widgets", theme.text_primary.to_glyphon_color())
+    );
+}

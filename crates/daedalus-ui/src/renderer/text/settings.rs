@@ -39,11 +39,11 @@ impl TextRenderer {
         };
         let heading = row(0.0, 48.0 * unit);
         let count_width = (105.0 * scale).min(heading.width * 0.30);
-        let custom_heading = dialog.custom_page.then(|| dialog.heading());
+        let custom_heading = dialog.is_custom_page().then(|| dialog.heading());
         line(
             if let Some(title) = &custom_heading {
                 title
-            } else if dialog.widgets_page {
+            } else if dialog.is_pane_widgets_page() {
                 "Workspace widgets"
             } else {
                 "Workspace assignments"
@@ -79,7 +79,7 @@ impl TextRenderer {
                 .field_label()
                 .or_else(|| (c == crate::settings::Control::Role).then(|| "Pane".to_owned()))
             {
-                let caption_width = if dialog.custom_page {
+                let caption_width = if dialog.is_custom_page() {
                     ((caption.chars().count() as f32 * 8.0 + 24.0) * scale).min(r.width * 0.70)
                 } else {
                     (100.0 * scale).min(r.width * 0.38)

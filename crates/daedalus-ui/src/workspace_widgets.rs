@@ -71,11 +71,9 @@ pub fn load_all(directory: &Path) -> HashMap<WorkspaceId, WorkspaceWidgets> {
                 return None;
             }
             let id = WorkspaceId(uuid::Uuid::parse_str(path.file_stem()?.to_str()?).ok()?);
-            let result = fs::read_to_string(&path)
-                .map_err(|err| err.to_string())
-                .and_then(|contents| toml::from_str(&contents).map_err(|err| err.to_string()));
-            match result {
-                Ok(widgets) => Some((id, widgets)),
+            match load_from(&path) {
+                Ok(Some(widgets)) => Some((id, widgets)),
+                Ok(None) => None,
                 Err(err) => {
                     warn!(%err, path = %path.display(), "could not load workspace widgets");
                     None
@@ -83,6 +81,20 @@ pub fn load_all(directory: &Path) -> HashMap<WorkspaceId, WorkspaceWidgets> {
             }
         })
         .collect()
+}
+
+pub fn load(directory: &Path, id: WorkspaceId) -> Result<Option<WorkspaceWidgets>, String> {
+    load_from(&directory.join(format!("{id}.toml")))
+}
+
+fn load_from(path: &Path) -> Result<Option<WorkspaceWidgets>, String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => toml::from_str(&contents)
+            .map(Some)
+            .map_err(|err| err.to_string()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 pub fn save(

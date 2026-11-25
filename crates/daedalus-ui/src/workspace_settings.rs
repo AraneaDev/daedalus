@@ -2,7 +2,7 @@ use super::{DaedalusApp, FALLBACK_PANE_COLS, FALLBACK_PANE_ROWS};
 use daedalus_proto::{PaneId, PaneRole, WorkspaceId, WorkspaceInfo};
 use daedalus_ui::{
     assignments::{self, Assignment},
-    bridge::UiCommand,
+    bridge::{UiCommand, WorkbenchOperation},
     settings::SettingsAction,
     state::{AgentPreset, WorkspaceView},
 };
@@ -121,32 +121,13 @@ impl DaedalusApp {
             SettingsAction::Save(entries) => (entries, None),
             SettingsAction::Launch(entries, id) => (entries, Some(id)),
             SettingsAction::SaveWidgets(widgets) => {
-                let workspace = self
-                    .state
-                    .settings
-                    .widget_workspace
-                    .filter(|id| self.state.workspaces.iter().any(|ws| ws.id == *id));
-                if let Some(id) = workspace {
-                    match daedalus_ui::workspace_widgets::save(&self.widget_directory, id, &widgets)
-                    {
-                        Ok(()) => {
-                            self.state.workspace_widgets.insert(id, widgets.clone());
-                            self.state.settings.widgets = widgets.clone();
-                            self.state.settings.widgets_saved = true;
-                            self.save_shared_pane_widgets(id, widgets);
-                            self.schedule_resize_flush();
-                        }
-                        Err(error) => self.state.settings.error = Some(error),
-                    }
-                } else {
-                    self.state.settings.error = Some("This workspace is no longer open.".into());
-                }
+                self.save_pane_widgets(widgets);
                 self.request_redraw();
                 return;
             }
-            SettingsAction::Workbench(request) => {
+            SettingsAction::Workbench { operation, request } => {
                 if let Some(id) = self.state.settings.widget_workspace {
-                    self.request_workbench(id, *request);
+                    self.request_workbench_as(id, operation, *request);
                 }
                 self.request_redraw();
                 return;
@@ -174,6 +155,64 @@ impl DaedalusApp {
             Err(error) => self.state.settings.error = Some(error),
         }
         self.request_redraw();
+    }
+
+    fn save_pane_widgets(&mut self, widgets: daedalus_ui::workspace_widgets::WorkspaceWidgets) {
+        let Some(id) = self
+            .state
+            .settings
+            .widget_workspace
+            .filter(|id| self.state.workspaces.iter().any(|ws| ws.id == *id))
+        else {
+            self.state.settings.error = Some("This workspace is no longer open.".into());
+            return;
+        };
+
+        if self.workbench_capable || self.state.settings.custom_supported {
+            if self.state.connection != daedalus_ui::state::ConnectionState::Connected {
+                self.state.settings.error = Some("Reconnect to save the widget settings.".into());
+                return;
+            }
+            let Some((_, snapshot)) = self
+                .state
+                .workbench
+                .as_ref()
+                .filter(|(owner, _)| *owner == id)
+            else {
+                self.state.settings.error = Some("Workspace settings are still loading.".into());
+                return;
+            };
+            let mut document = snapshot.document.clone();
+            document.pane_widgets = Some(widgets.into());
+            let revision = snapshot.revision;
+            let token = self.state.settings.start_pane_widget_save(id);
+            if !self.request_workbench_as(
+                id,
+                WorkbenchOperation::PaneWidgets(token),
+                daedalus_proto::ClientMessage::UpdateWorkbench {
+                    workspace_id: id,
+                    revision,
+                    document,
+                },
+            ) {
+                self.state.settings.finish_pane_widget_save(id, token);
+            }
+            return;
+        }
+        match daedalus_ui::workspace_widgets::save(&self.widget_directory, id, &widgets) {
+            Ok(()) => {
+                self.state.workspace_widgets.insert(id, widgets.clone());
+                self.state.settings.widgets = widgets;
+                self.state.settings.widgets_saved = true;
+                self.schedule_resize_flush();
+            }
+            Err(error) => self.state.settings.error = Some(error),
+        }
+    }
+
+    pub(super) fn pane_widget_save_disconnected(&mut self) {
+        self.seeded_workbench.clear();
+        self.state.settings.fail_pane_widget_save();
     }
 
     pub(super) fn workspace_settings_saved(
@@ -205,7 +244,7 @@ impl DaedalusApp {
     ) {
         self.refresh_workspace_setup(workspace);
         if let Some(assignment) = launch
-            && !self.launch_saved_assignment(workspace, assignment)
+            && !self.launch_assignment(workspace, assignment, true)
         {
             self.state.settings.error =
                 Some("Settings saved. Reconnect to launch this terminal.".into());
@@ -243,7 +282,7 @@ impl DaedalusApp {
             self.show_toast("Test command is no longer configured", false);
             return;
         };
-        if !self.launch_saved_assignment(workspace_id, assignment) {
+        if !self.launch_assignment(workspace_id, assignment, true) {
             self.show_toast("Reconnect to run tests", true);
         }
     }
@@ -253,19 +292,25 @@ impl DaedalusApp {
             return;
         }
         if let Some(workspace) = self.state.active_workspace_id
-            && !self.launch_saved_assignment(workspace, preset.assignment())
+            && !self.launch_assignment(workspace, preset.assignment(), false)
         {
             self.show_toast("Reconnect to run Cargo", true);
         }
     }
 
-    fn launch_saved_assignment(&self, workspace_id: WorkspaceId, assignment: Assignment) -> bool {
+    fn launch_assignment(
+        &self,
+        workspace_id: WorkspaceId,
+        assignment: Assignment,
+        from_saved_setup: bool,
+    ) -> bool {
         let (cols, rows) = self
             .compute_current_layout()
             .and_then(|layout| layout.panes.first().map(|pane| (pane.cols, pane.rows)))
             .unwrap_or((FALLBACK_PANE_COLS, FALLBACK_PANE_ROWS));
         self.send_command(UiCommand::LaunchAssignment {
             workspace_id,
+            saved_runner: from_saved_setup && assignment.role == PaneRole::Runner,
             assignment,
             cols,
             rows,
