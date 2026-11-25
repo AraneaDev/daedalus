@@ -106,12 +106,13 @@ async fn daemon_bridge_bootstraps_three_panes_and_forwards_runner_failure_to_age
                 }
                 UiEvent::PaneSpawned {
                     summary,
-                    agent_preset,
+                    select_tab,
                 } => {
                     if summary.role == PaneRole::Agent {
-                        assert_eq!(agent_preset, Some(AgentPreset::Shell));
+                        assert_eq!(summary.launch_preset.as_deref(), Some("shell"));
+                        assert!(select_tab);
                     } else {
-                        assert_eq!(agent_preset, None);
+                        assert!(!select_tab);
                     }
                     panes_by_role.insert(summary.role, summary.id);
                 }
@@ -136,11 +137,12 @@ async fn daemon_bridge_bootstraps_three_panes_and_forwards_runner_failure_to_age
         loop {
             if let UiEvent::PaneSpawned {
                 summary,
-                agent_preset,
+                select_tab,
             } = evt_rx.recv().await.unwrap()
             {
                 assert_eq!(summary.role, PaneRole::Agent);
-                assert_eq!(agent_preset, Some(AgentPreset::Shell));
+                assert_eq!(summary.launch_preset.as_deref(), Some("shell"));
+                assert!(select_tab);
                 break summary.id;
             }
         }
@@ -988,6 +990,11 @@ async fn queued_terminal_input_stays_with_its_connection() {
                     project_setup_supported: false,
                     image_preview_supported: false,
                     paste_supported: false,
+                    workbench_supported: false,
+                    workspace_membership_supported: false,
+                    runner_assignment_supported: false,
+                    resolved_import_preview_supported: false,
+                    agent_launch_metadata_supported: false,
                     home_dir: None,
                 },
                 _ => ResponsePayload::Ok,
@@ -1369,6 +1376,7 @@ command = ["sh", "-c", "touch unexpected-manifest-launch"]
                 assert!(bridge.send(UiCommand::LaunchAssignment {
                     workspace_id: ws.id,
                     assignment: assignment.clone(),
+                    saved_runner: false,
                     cols: 80,
                     rows: 24
                 }));
@@ -1642,4 +1650,174 @@ async fn wizard_inspects_installs_and_launches_only_selected_roles() {
     .expect("wizard setup timed out");
     stop.send(()).unwrap();
     daemon.await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn held_widget_preview_does_not_delay_typing_or_paste() {
+    use daedalus_proto::workbench::{
+        CommandOutput, NamedSource, WidgetDefinition, WidgetSource, WorkspaceCommand,
+    };
+    use daedalus_ui::bridge::WorkbenchOperation;
+
+    async fn request(stream: &mut IpcStream, payload: ClientMessage) -> ResponsePayload {
+        write_frame(stream, &Request { id: 1, payload })
+            .await
+            .unwrap();
+        let Some(ServerMessage::Response { result, .. }) = read_frame(stream).await.unwrap() else {
+            panic!("expected daemon response");
+        };
+        result.unwrap()
+    }
+
+    const TOKEN: &str = "widget-lane-test-token";
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daemon.sock");
+    let server = DaemonServer::bind_with_supervisor(
+        sock.clone(),
+        dir.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap()
+    .with_auth_token(Some(TOKEN.into()));
+    let (stop, done) = oneshot::channel();
+    let server = tokio::spawn(server.serve(async {
+        let _ = done.await;
+    }));
+
+    let mut peer = IpcStream::connect(&sock).await.unwrap();
+    assert_eq!(
+        request(
+            &mut peer,
+            ClientMessage::Authenticate {
+                token: TOKEN.into()
+            }
+        )
+        .await,
+        ResponsePayload::Ok,
+    );
+    let ResponsePayload::WorkspaceCreated(workspace) = request(
+        &mut peer,
+        ClientMessage::CreateManualWorkspace {
+            name: "Widget input".into(),
+            root_dir: dir.path().to_path_buf(),
+        },
+    )
+    .await
+    else {
+        panic!("expected workspace");
+    };
+    let ResponsePayload::PaneSpawned(pane) = request(&mut peer, ClientMessage::SpawnPane {
+        workspace_id: workspace.id, role: PaneRole::Agent,
+        command: Some(vec!["sh".into(), "-c".into(),
+            "IFS= read -r typed; IFS= read -r pasted; printf '%s/%s' \"$typed\" \"$pasted\" > received".into()]),
+        cols: 80, rows: 24, shell: None, env: Default::default(),
+    }).await else { panic!("expected agent pane"); };
+
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let bridge = DaemonBridge::start(
+        BridgeConfig {
+            socket_path: sock,
+            initial_dir: dir.path().to_path_buf(),
+            bootstrap_explicit_dir: false,
+            default_agent: AgentPreset::Shell,
+            auto_spawn_daemon: false,
+            auth_token: Some(TOKEN.into()),
+        },
+        Arc::new(ChannelSink { tx }),
+    );
+
+    let preview = ClientMessage::PreviewWidget {
+        workspace_id: workspace.id,
+        name: "Held preview".into(),
+        definition: WidgetDefinition {
+            sources: vec![NamedSource {
+                id: "command".into(),
+                source: WidgetSource::Command {
+                    command: WorkspaceCommand {
+                        argv: vec![
+                            "sh".into(),
+                            "-c".into(),
+                            concat!(
+                                "touch widget-started; ",
+                                "while [ ! -f widget-release ]; do sleep .02; done; ",
+                                "printf 'ready'"
+                            )
+                            .into(),
+                        ],
+                        env: vec![],
+                        timeout_seconds: Some(20),
+                    },
+                    refresh: Default::default(),
+                    output: CommandOutput::Text { contains: None },
+                },
+            }],
+            ..Default::default()
+        },
+    };
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(events.recv().await.unwrap(), UiEvent::WorkspacesLoaded(_)) {}
+        assert!(bridge.send(UiCommand::Workbench {
+            workspace_id: workspace.id,
+            operation: WorkbenchOperation::Read,
+            request: Box::new(preview),
+        }));
+        while !dir.path().join("widget-started").is_file() {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert!(bridge.send(UiCommand::SendInput {
+            pane_id: pane.id,
+            data: b"typed\n".to_vec()
+        }));
+        assert!(bridge.send(UiCommand::Paste {
+            pane_id: pane.id,
+            data: b"pasted".to_vec()
+        }));
+        assert!(bridge.send(UiCommand::SendInput {
+            pane_id: pane.id,
+            data: b"\n".to_vec()
+        }));
+        while std::fs::read_to_string(dir.path().join("received"))
+            .as_deref()
+            .ok()
+            != Some("typed/pasted")
+        {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        std::fs::write(dir.path().join("widget-release"), "").unwrap();
+        loop {
+            match events.recv().await.unwrap() {
+                UiEvent::Workbench { response, .. } => {
+                    assert!(matches!(*response, Ok(ResponsePayload::WidgetResult(_))));
+                    break;
+                }
+                UiEvent::Disconnected => panic!("widget execution disconnected terminal input"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            request(&mut peer, ClientMessage::ClosePane { pane_id: pane.id }).await,
+            ResponsePayload::Ok
+        );
+        loop {
+            if let UiEvent::WorkspaceMembershipLoaded(workspaces) = events.recv().await.unwrap()
+                && workspaces
+                    .iter()
+                    .any(|updated| updated.id == workspace.id && updated.panes.is_empty())
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("terminal input or widget completion stalled");
+
+    drop(peer);
+    tokio::task::spawn_blocking(move || bridge.shutdown())
+        .await
+        .unwrap();
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
 }

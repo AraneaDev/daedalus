@@ -17,6 +17,12 @@ impl DaedalusApp {
         }
         self.sync_history_visit();
         match event {
+            UiEvent::WorkbenchCapability(supported) => self.workbench_capable = supported,
+            UiEvent::Workbench {
+                workspace_id,
+                operation,
+                response,
+            } => self.workbench_response(workspace_id, operation, *response),
             UiEvent::ImagePreview { pane_id, image } => {
                 if self.state.focused_pane_id() == Some(pane_id) && image.valid() {
                     self.state.image_preview = Some((pane_id, image));
@@ -42,7 +48,13 @@ impl DaedalusApp {
             UiEvent::ProjectSetupChanged {
                 root_dir,
                 assignments,
-            } => self.project_setup_changed(&root_dir, assignments),
+            } => {
+                if self.workbench_capable {
+                    self.send_command(UiCommand::ReconcileWorkspaceMembership);
+                } else {
+                    self.project_setup_changed(&root_dir, assignments);
+                }
+            }
             UiEvent::ProjectSetupSaveFailed {
                 workspace_id,
                 message,
@@ -75,12 +87,23 @@ impl DaedalusApp {
             }
             UiEvent::ActivityReadFailed(token) => self.history.failed(token),
             UiEvent::Connected => {
+                if self.state.connection == ConnectionState::Reconnecting {
+                    self.state.workbench = None;
+                }
                 self.state.connection = ConnectionState::Connected;
                 self.schedule_resize_flush();
             }
             UiEvent::Disconnected => {
+                self.pause_layout_saves();
+                self.watched_workbench = None;
+                self.widget_refresh_at = None;
                 self.setup_disconnected();
                 self.workspace_settings_disconnected();
+                self.pane_widget_save_disconnected();
+                if self.state.settings.custom.interrupt_previews() && self.state.settings.open {
+                    self.state.settings.error =
+                        Some("Connection lost. Run the preview again when reconnected.".into());
+                }
                 self.history.connection(false);
                 self.state.connection = ConnectionState::Reconnecting;
                 self.state.workspace_list_loaded = false;
@@ -101,9 +124,23 @@ impl DaedalusApp {
             }
             UiEvent::WorkspaceCloseFailed(workspaces) => {
                 self.state.set_workspaces(workspaces);
+                self.prune_layout_saves();
                 self.schedule_resize_flush();
             }
-            UiEvent::WorkspacesLoaded(workspaces) => self.apply_workspace_list(workspaces),
+            UiEvent::WorkspacesLoaded(workspaces) => self.apply_workspace_list(workspaces, true),
+            UiEvent::WorkspaceMembershipLoaded(workspaces) => {
+                let new_panes: Vec<_> = workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.panes)
+                    .filter_map(|pane| {
+                        (!self.state.panes.contains_key(&pane.id)).then_some(pane.id)
+                    })
+                    .collect();
+                self.apply_workspace_list(workspaces, false);
+                for pane_id in new_panes {
+                    self.send_command(UiCommand::RequestSnapshot { pane_id });
+                }
+            }
             UiEvent::SetupInspected { session, result } => self.setup_inspected(session, result),
             UiEvent::SetupInstallerStarted {
                 workspace_id,
@@ -142,9 +179,9 @@ impl DaedalusApp {
             }
             UiEvent::PaneSpawned {
                 summary,
-                agent_preset,
+                select_tab,
             } => {
-                self.state.register_pane(summary, agent_preset);
+                self.state.register_pane(summary, select_tab);
                 self.schedule_resize_flush();
             }
             UiEvent::AssignmentStarted {
@@ -210,6 +247,12 @@ impl DaedalusApp {
                     git_branch,
                 );
             }
+            UiEvent::ServerEvent(ServerEvent::WorkbenchChanged { workspace_id, .. }) => {
+                self.request_workbench(
+                    workspace_id,
+                    daedalus_proto::ClientMessage::GetWorkbench { workspace_id },
+                );
+            }
             UiEvent::ServerEvent(server_event) => self.apply_terminal_event(server_event),
             UiEvent::Toast { message, is_error } => {
                 let had_banner = self.has_top_banner();
@@ -233,7 +276,7 @@ impl DaedalusApp {
         self.request_redraw();
     }
 
-    fn apply_workspace_list(&mut self, workspaces: Vec<WorkspaceInfo>) {
+    fn apply_workspace_list(&mut self, workspaces: Vec<WorkspaceInfo>, initialize: bool) {
         self.project_setups.absorb(&workspaces);
         for (workspace_id, assignments) in self.project_setups.migrations(&workspaces) {
             if !self.send_command(UiCommand::SaveProjectSetup {
@@ -245,9 +288,13 @@ impl DaedalusApp {
         }
         self.restore_session_names(&workspaces);
         self.state.set_workspaces(workspaces);
+        self.prune_layout_saves();
         self.reconcile_setup_installer();
-        self.offer_first_workspace();
-        self.ensure_active_workspace_panes();
+        if initialize {
+            self.refresh_inactive_layout_saves();
+            self.offer_first_workspace();
+            self.ensure_active_workspace_panes();
+        }
         self.schedule_resize_flush();
     }
 

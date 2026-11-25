@@ -15,5 +15,6 @@ pub mod setup_tools;
 pub mod sidebar_content;
 pub mod state;
 pub mod theme;
+pub mod widget_editor;
 pub mod workspace_form;
 pub mod workspace_widgets;

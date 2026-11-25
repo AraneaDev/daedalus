@@ -7,16 +7,104 @@ use daedalus_ui::layout::HitTarget;
 use daedalus_ui::state::{AppState, ConnectionState, WorkspaceView};
 
 const TAB_LIST: NodeId = NodeId(18);
+const WORKSPACE_LIST: NodeId = NodeId(23);
 
 /// Platform requests can arrive after a pane closes. Allocate IDs once and never recycle them.
 #[derive(Default)]
 pub(crate) struct TerminalControls {
     serial: u64,
     run_tests: Option<(WorkspaceId, NodeId)>,
+    workspaces: HashMap<WorkspaceId, NodeId>,
     panes: HashMap<PaneId, u64>,
+    widgets: HashMap<(WorkspaceId, String), NodeId>,
 }
 
 impl TerminalControls {
+    pub(super) fn append_workspaces(
+        &mut self,
+        state: &AppState,
+        root: &mut Node,
+        nodes: &mut Vec<(NodeId, Node)>,
+    ) {
+        self.workspaces
+            .retain(|id, _| state.workspaces.iter().any(|workspace| workspace.id == *id));
+        if state.workspaces.is_empty() {
+            return;
+        }
+        let mut list = named(Role::ListBox, "Workspaces");
+        for workspace in state.workspaces_in_sidebar_order() {
+            let id = *self.workspaces.entry(workspace.id).or_insert_with(|| {
+                self.serial += 1;
+                NodeId((1 << 61) + self.serial * 8)
+            });
+            let mut duplicates = state
+                .workspaces
+                .iter()
+                .filter(|other| other.id != workspace.id && other.name == workspace.name)
+                .peekable();
+            let label = if duplicates.peek().is_some() {
+                let mut label = format!("{} · {}", workspace.name, workspace.root_dir.display());
+                if duplicates.any(|other| other.root_dir == workspace.root_dir) {
+                    label.push_str(&format!(" · {}", workspace.id.0.simple()));
+                }
+                label
+            } else {
+                workspace.name.clone()
+            };
+            let mut option = named(Role::ListBoxOption, label);
+            option.set_selected(state.active_workspace_id == Some(workspace.id));
+            option.add_action(Action::Click);
+            list.push_child(id);
+            nodes.push((id, option));
+        }
+        root.push_child(WORKSPACE_LIST);
+        nodes.push((WORKSPACE_LIST, list));
+    }
+
+    pub(super) fn workspace_for_node(
+        &self,
+        state: &AppState,
+        target: NodeId,
+    ) -> Option<WorkspaceId> {
+        state.workspaces.iter().find_map(|workspace| {
+            (self.workspaces.get(&workspace.id) == Some(&target)).then_some(workspace.id)
+        })
+    }
+
+    pub(super) fn append_widgets(
+        &mut self,
+        state: &AppState,
+        root: &mut Node,
+        nodes: &mut Vec<(NodeId, Node)>,
+    ) {
+        let Some((workspace, stored)) = &state.workbench else {
+            return;
+        };
+        if state.active_workspace_id != Some(*workspace) || stored.revision == 0 {
+            return;
+        }
+        self.widgets.retain(|(id, widget), _| {
+            *id == *workspace
+                && stored
+                    .document
+                    .widgets
+                    .iter()
+                    .any(|candidate| &candidate.id == widget)
+        });
+        for widget in &stored.document.widgets {
+            let node = *self
+                .widgets
+                .entry((*workspace, widget.id.clone()))
+                .or_insert_with(|| {
+                    self.serial += 1;
+                    NodeId((1 << 61) + self.serial * 8)
+                });
+            let mut control = named(Role::Button, format!("Open {} widget", widget.name));
+            control.add_action(Action::Click);
+            root.push_child(node);
+            nodes.push((node, control));
+        }
+    }
     fn pane_base(&mut self, pane: PaneId) -> u64 {
         *self.panes.entry(pane).or_insert_with(|| {
             self.serial += 1;
@@ -162,6 +250,15 @@ impl TerminalControls {
     pub(crate) fn action(&self, state: &AppState, request: &ActionRequest) -> Option<HitTarget> {
         if request.target_tree != TreeId::ROOT || overlay(state).is_some() {
             return None;
+        }
+        if request.action == Action::Click
+            && let Some((workspace, stored)) = &state.workbench
+            && Some(*workspace) == state.active_workspace_id
+            && let Some(index) = stored.document.widgets.iter().position(|widget| {
+                self.widgets.get(&(*workspace, widget.id.clone())) == Some(&request.target_node)
+            })
+        {
+            return Some(HitTarget::CustomWidget(Some(index)));
         }
         if state
             .pane_id_for_role(daedalus_proto::PaneRole::Runner)

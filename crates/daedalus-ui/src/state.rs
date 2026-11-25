@@ -85,6 +85,10 @@ impl AgentPreset {
             .into_iter()
             .find(|preset| preset.short_name() == canonical)
     }
+
+    pub(crate) fn from_executable(program: &str) -> Option<Self> {
+        daedalus_proto::agent_launch_preset(program).and_then(Self::from_cli_name)
+    }
 }
 
 fn remove_last_grapheme(text: &mut String) -> bool {
@@ -153,6 +157,9 @@ pub struct AppState {
     pub workspace_form: crate::workspace_form::WorkspaceForm,
     pub settings: crate::settings::SettingsDialog,
     pub workspace_widgets: HashMap<WorkspaceId, crate::workspace_widgets::WorkspaceWidgets>,
+    pub workbench: Option<(WorkspaceId, daedalus_proto::workbench::WorkbenchState)>,
+    pub widget_results: Vec<daedalus_proto::workbench::WidgetSnapshot>,
+    pub workbench_repo_update: bool,
     pub recap: crate::recap::Recap,
     pub test_workspaces: HashSet<WorkspaceId>,
     pub reduced_motion: bool,
@@ -239,6 +246,9 @@ impl AppState {
             workspace_form: Default::default(),
             settings: Default::default(),
             workspace_widgets: HashMap::new(),
+            workbench: None,
+            widget_results: Vec::new(),
+            workbench_repo_update: false,
             recap: Default::default(),
             test_workspaces: HashSet::new(),
             reduced_motion: false,
@@ -366,7 +376,7 @@ impl AppState {
         true
     }
 
-    fn workspaces_in_sidebar_order(&self) -> Vec<&WorkspaceView> {
+    pub fn workspaces_in_sidebar_order(&self) -> Vec<&WorkspaceView> {
         crate::sidebar_content::repository_groups(&self.workspaces)
             .into_iter()
             .flat_map(|(_, indices)| indices)
@@ -393,6 +403,12 @@ impl AppState {
 
     /// Cycles the active workspace forward (`delta > 0`) or backward (`delta < 0`), wrapping cleanly.
     pub fn cycle_workspace(&mut self, delta: isize) -> Option<WorkspaceId> {
+        let next = self.adjacent_workspace(delta)?;
+        self.select_workspace(next);
+        Some(next)
+    }
+
+    pub fn adjacent_workspace(&self, delta: isize) -> Option<WorkspaceId> {
         let order = self.workspaces_in_sidebar_order();
         let len = order.len();
         if len == 0 {
@@ -406,9 +422,7 @@ impl AppState {
             None if delta < 0 => len - 1,
             None => 0,
         };
-        let next_id = order[next_idx].id;
-        self.select_workspace(next_id);
-        Some(next_id)
+        Some(order[next_idx].id)
     }
 
     pub fn select_workspace(&mut self, id: WorkspaceId) {
@@ -806,6 +820,9 @@ impl AppState {
     pub fn set_workspaces(&mut self, workspaces: Vec<WorkspaceInfo>) {
         self.workspace_list_loaded = true;
         let previous_focus = self.focused_pane_id();
+        let previously_empty = self
+            .active_workspace()
+            .is_some_and(|workspace| workspace.panes.is_empty());
         let workspaces: Vec<_> = workspaces
             .into_iter()
             .map(|ws| self.cache_workspace(ws))
@@ -840,13 +857,18 @@ impl AppState {
         {
             self.close_modal.close();
         }
-        let active_still_exists = self
+        let active = self
             .active_workspace_id
-            .is_some_and(|id| self.workspaces.iter().any(|ws| ws.id == id));
-        if active_still_exists && previous_focus.is_some_and(|id| !live_panes.contains(&id)) {
-            self.focus_available_session();
-        }
-        if !active_still_exists {
+            .filter(|id| self.workspaces.iter().any(|workspace| workspace.id == *id));
+        if let Some(workspace_id) = active {
+            if let Some(pane_id) = previous_focus.filter(|id| live_panes.contains(id)) {
+                // Keep the existing focus even if the user never explicitly selected
+                // this role's tab and the daemon appended a sibling.
+                self.select_role_pane(workspace_id, self.focused_role, pane_id);
+            } else if previous_focus.is_some() || previously_empty {
+                self.focus_available_session();
+            }
+        } else {
             self.settings.open = false;
             self.failure_recipients = None;
             self.action_palette.close();
@@ -898,6 +920,9 @@ impl AppState {
                 {
                     view.cargo_preset = Some(preset);
                 }
+                if let Some(preset) = PaneViewState::agent_launch_preset(&summary) {
+                    view.agent_preset = Some(preset);
+                }
                 view.summary = summary;
                 view
             }
@@ -905,7 +930,7 @@ impl AppState {
     }
 
     /// Records the new pane in workspace order and preserves an existing terminal grid.
-    pub fn register_pane(&mut self, summary: PaneSummary, agent_preset: Option<AgentPreset>) {
+    pub fn register_pane(&mut self, summary: PaneSummary, select_tab: bool) {
         if let Some(ws) = self
             .workspaces
             .iter_mut()
@@ -914,14 +939,10 @@ impl AppState {
         {
             ws.panes.push(summary.id);
         }
-        if agent_preset.is_some() {
-            self.selected_panes
-                .insert((summary.workspace_id, summary.role), summary.id);
+        if select_tab {
+            self.select_role_pane(summary.workspace_id, summary.role, summary.id);
         }
-        let entry = self.cache_pane(summary);
-        if let Some(preset) = agent_preset {
-            entry.agent_preset = Some(preset);
-        }
+        self.cache_pane(summary);
     }
 
     fn invalidate_history_search(&mut self, pane_id: PaneId) {
@@ -1034,7 +1055,9 @@ impl AppState {
                 }
                 None
             }
-            ServerEvent::ProjectSetupChanged { .. } => None,
+            ServerEvent::ProjectSetupChanged { .. }
+            | ServerEvent::WorkbenchChanged { .. }
+            | ServerEvent::WorkspaceMembershipChanged => None,
         }
     }
 

@@ -1,7 +1,12 @@
-use std::borrow::Cow;
 use std::collections::HashSet;
 
-use daedalus_proto::{FailureTrace, PaneRole, WorkspaceId, wrap_bracketed_paste};
+use crate::state::ActiveOverlay;
+use daedalus_proto::{PaneRole, WorkspaceId};
+
+mod modal_keys;
+mod terminal_keys;
+pub use crate::bridge::terminal::format_failure_trace_prompt;
+pub use modal_keys::filter_modal_text;
 use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 
 pub use crate::state::FocusDirection;
@@ -27,6 +32,7 @@ pub enum UiAction {
     WorkspaceSettings,
     SwitchWorkspaceNext,
     SwitchWorkspacePrev,
+    SelectWorkspace(WorkspaceId),
     PreviewImage,
     CopySelection,
     PasteClipboard,
@@ -136,16 +142,6 @@ impl KeyRepeatGuard {
     }
 }
 
-/// Filters a composed text / IME slice for modal inputs, stripping control characters
-/// and optionally stripping whitespace (e.g. for Git branch names).
-pub fn filter_modal_text(raw: &str, allow_whitespace: bool) -> Option<String> {
-    let filtered: String = raw
-        .chars()
-        .filter(|ch| !ch.is_control() && (allow_whitespace || !ch.is_whitespace()))
-        .collect();
-    (!filtered.is_empty()).then_some(filtered)
-}
-
 /// Translates a `winit` key press into either a workbench UI action, a modal
 /// navigation/input event, or XTerm VT bytes to forward to the focused pane's PTY.
 #[allow(clippy::too_many_arguments)]
@@ -159,19 +155,17 @@ pub fn translate_key(
     search_open: bool,
     action_palette_open: bool,
 ) -> UiAction {
-    if action_palette_open {
-        return translate_palette_key(key, mods, cfg!(target_os = "macos"));
-    }
-    translate_key_for_platform(
-        key,
-        text,
-        mods,
-        picker_open,
-        worktree_modal_open,
-        close_modal_open,
-        search_open,
-        cfg!(target_os = "macos"),
-    )
+    let overlay = if action_palette_open {
+        Some(ActiveOverlay::ActionPalette)
+    } else {
+        legacy_overlay(
+            picker_open,
+            worktree_modal_open,
+            close_modal_open,
+            search_open,
+        )
+    };
+    translate_overlay_key(key, text, mods, overlay, cfg!(target_os = "macos"))
 }
 
 /// Platform-parameterized variant of [`translate_key`].
@@ -186,29 +180,60 @@ pub fn translate_key_for_platform(
     search_open: bool,
     is_macos: bool,
 ) -> UiAction {
-    if picker_open {
-        return translate_picker_key(key, mods, is_macos);
-    }
-    if worktree_modal_open {
-        return translate_worktree_modal_key(key, text, mods, is_macos);
-    }
-    if close_modal_open {
-        return translate_close_modal_key(key, mods);
-    }
-    if search_open {
-        return translate_search_key(key, text, mods, is_macos);
-    }
+    let overlay = legacy_overlay(
+        picker_open,
+        worktree_modal_open,
+        close_modal_open,
+        search_open,
+    );
+    translate_overlay_key(key, text, mods, overlay, is_macos)
+}
 
+fn legacy_overlay(
+    picker: bool,
+    worktree: bool,
+    close: bool,
+    search: bool,
+) -> Option<ActiveOverlay> {
+    [
+        (picker, ActiveOverlay::AgentPicker),
+        (worktree, ActiveOverlay::Worktree),
+        (close, ActiveOverlay::CloseWorkspace),
+        (search, ActiveOverlay::Search),
+    ]
+    .into_iter()
+    .find_map(|(open, overlay)| open.then_some(overlay))
+}
+
+pub fn translate_overlay_key(
+    key: &Key,
+    text: Option<&str>,
+    mods: ModifiersState,
+    overlay: Option<ActiveOverlay>,
+    is_macos: bool,
+) -> UiAction {
+    if let Some(overlay) = overlay {
+        return modal_keys::translate(overlay, key, text, mods, is_macos);
+    }
+    translate_workbench_shortcut(key, mods, is_macos)
+        .unwrap_or_else(|| terminal_keys::encode(key, text, mods))
+}
+
+fn translate_workbench_shortcut(
+    key: &Key,
+    mods: ModifiersState,
+    is_macos: bool,
+) -> Option<UiAction> {
     let ctrl = mods.control_key();
     let shift = mods.shift_key();
     let alt = mods.alt_key();
 
     if mods.super_key() {
         if is_macos && !ctrl && !alt {
-            return translate_macos_cmd(key, shift);
+            return Some(translate_macos_cmd(key, shift));
         }
         // Never leak OS / window-manager Super shortcuts into the terminal.
-        return UiAction::Ignore;
+        return Some(UiAction::Ignore);
     }
 
     // Workbench chords
@@ -218,21 +243,21 @@ pub fn translate_key_for_platform(
         && let Key::Character(ch) = key
     {
         match ch.as_str() {
-            "1" => return UiAction::FocusRole(PaneRole::Agent),
-            "2" => return UiAction::FocusRole(PaneRole::Service),
-            "3" => return UiAction::FocusRole(PaneRole::Runner),
+            "1" => return Some(UiAction::FocusRole(PaneRole::Agent)),
+            "2" => return Some(UiAction::FocusRole(PaneRole::Service)),
+            "3" => return Some(UiAction::FocusRole(PaneRole::Runner)),
             _ => {}
         }
     }
 
     if ctrl && shift && !alt {
         if matches!(key, Key::Named(NamedKey::Tab)) {
-            return UiAction::SwitchWorkspacePrev;
+            return Some(UiAction::SwitchWorkspacePrev);
         }
         if !is_macos && let Key::Character(ch) = key {
-            return translate_primary_shift_char(ch);
+            return Some(translate_primary_shift_char(ch));
         }
-        return UiAction::Ignore;
+        return Some(UiAction::Ignore);
     }
 
     if shift
@@ -241,102 +266,26 @@ pub fn translate_key_for_platform(
         && let Key::Named(named) = key
     {
         match named {
-            NamedKey::PageUp => return UiAction::ScrollPageUp,
-            NamedKey::PageDown => return UiAction::ScrollPageDown,
-            NamedKey::End => return UiAction::ScrollToBottom,
+            NamedKey::PageUp => return Some(UiAction::ScrollPageUp),
+            NamedKey::PageDown => return Some(UiAction::ScrollPageDown),
+            NamedKey::End => return Some(UiAction::ScrollToBottom),
             _ => {}
         }
     }
 
-    // Ctrl+<key> (without Shift/Alt) -> workspace cycling, font zoom chords (Linux), or single ASCII control byte
     if ctrl && !shift && !alt {
         return match key {
-            Key::Named(NamedKey::Tab) => UiAction::SwitchWorkspaceNext,
-            Key::Named(NamedKey::ArrowUp) => UiAction::SendBytes(b"\x1b[1;5A".to_vec()),
-            Key::Named(NamedKey::ArrowDown) => UiAction::SendBytes(b"\x1b[1;5B".to_vec()),
-            Key::Named(NamedKey::ArrowRight) => UiAction::SendBytes(b"\x1b[1;5C".to_vec()),
-            Key::Named(NamedKey::ArrowLeft) => UiAction::SendBytes(b"\x1b[1;5D".to_vec()),
-            Key::Named(NamedKey::Space) => UiAction::SendBytes(vec![0x00]),
-            Key::Character(ch) => {
-                if !is_macos {
-                    match ch.as_str() {
-                        "=" | "+" => return UiAction::FontZoomIn,
-                        "-" => return UiAction::FontZoomOut,
-                        "0" => return UiAction::FontZoomReset,
-                        _ => {}
-                    }
-                }
-                match encode_ctrl_char(ch) {
-                    Some(byte) => UiAction::SendBytes(vec![byte]),
-                    None => UiAction::Ignore,
-                }
-            }
-            _ => UiAction::Ignore,
-        };
-    }
-
-    // Alt+<char> (without Ctrl) -> ESC + UTF-8 bytes
-    if alt && !ctrl {
-        return match key {
-            Key::Character(ch) if !ch.is_empty() => {
-                let mut bytes = Vec::with_capacity(1 + ch.len());
-                bytes.push(0x1b);
-                bytes.extend_from_slice(ch.as_bytes());
-                UiAction::SendBytes(bytes)
-            }
-            Key::Named(NamedKey::Space) => UiAction::SendBytes(b"\x1b ".to_vec()),
-            Key::Named(NamedKey::Enter) => UiAction::SendBytes(b"\x1b\r".to_vec()),
-            Key::Named(NamedKey::Backspace) => UiAction::SendBytes(b"\x1b\x7f".to_vec()),
-            _ => UiAction::Ignore,
-        };
-    }
-
-    // Any other Ctrl+Alt combination is ignored rather than leaking raw text.
-    if ctrl {
-        return UiAction::Ignore;
-    }
-
-    // Standard XTerm VT named keys
-    if let Key::Named(named) = key {
-        let seq: Option<&'static [u8]> = match named {
-            NamedKey::Enter => Some(b"\r"),
-            NamedKey::Backspace => Some(b"\x7f"),
-            NamedKey::Tab => Some(if shift { b"\x1b[Z" } else { b"\t" }),
-            NamedKey::Escape => Some(b"\x1b"),
-            NamedKey::Space => Some(b" "),
-            NamedKey::ArrowUp => Some(if shift { b"\x1b[1;2A" } else { b"\x1b[A" }),
-            NamedKey::ArrowDown => Some(if shift { b"\x1b[1;2B" } else { b"\x1b[B" }),
-            NamedKey::ArrowRight => Some(if shift { b"\x1b[1;2C" } else { b"\x1b[C" }),
-            NamedKey::ArrowLeft => Some(if shift { b"\x1b[1;2D" } else { b"\x1b[D" }),
-            NamedKey::Home => Some(b"\x1b[H"),
-            NamedKey::End => Some(b"\x1b[F"),
-            NamedKey::Insert => Some(b"\x1b[2~"),
-            NamedKey::Delete => Some(b"\x1b[3~"),
-            NamedKey::PageUp => Some(b"\x1b[5~"),
-            NamedKey::PageDown => Some(b"\x1b[6~"),
+            Key::Named(NamedKey::Tab) => Some(UiAction::SwitchWorkspaceNext),
+            Key::Character(ch) if !is_macos => match ch.as_str() {
+                "=" | "+" => Some(UiAction::FontZoomIn),
+                "-" => Some(UiAction::FontZoomOut),
+                "0" => Some(UiAction::FontZoomReset),
+                _ => None,
+            },
             _ => None,
         };
-        return match seq {
-            Some(bytes) => UiAction::SendBytes(bytes.to_vec()),
-            None => UiAction::Ignore,
-        };
     }
-
-    // Printable UTF-8 text (prefer winit's composed `text` when non-control)
-    if let Some(t) = text
-        && !t.is_empty()
-        && !t.chars().all(char::is_control)
-    {
-        return UiAction::SendBytes(t.as_bytes().to_vec());
-    }
-
-    if let Key::Character(ch) = key
-        && !ch.is_empty()
-    {
-        return UiAction::SendBytes(ch.as_bytes().to_vec());
-    }
-
-    UiAction::Ignore
+    None
 }
 
 /// Windows clipboard shortcuts in the terminal viewport.
@@ -420,237 +369,10 @@ pub fn is_primary_shift_char(
         && matches!(key, Key::Character(ch) if ch.eq_ignore_ascii_case(target))
 }
 
-fn is_search_toggle_chord(key: &Key, mods: ModifiersState, is_macos: bool) -> bool {
-    let Key::Character(ch) = key else {
-        return false;
-    };
-    if !ch.eq_ignore_ascii_case("f") || mods.alt_key() {
-        return false;
-    }
-    if is_macos {
-        mods.super_key() && !mods.control_key()
-    } else {
-        mods.control_key() && mods.shift_key() && !mods.super_key()
-    }
-}
-
-fn translate_palette_key(key: &Key, mods: ModifiersState, is_macos: bool) -> UiAction {
-    if is_primary_shift_char(key, mods, "a", is_macos) {
-        return UiAction::ToggleActionPalette;
-    }
-    match key {
-        Key::Named(NamedKey::ArrowUp) => UiAction::ActionPaletteUp,
-        Key::Named(NamedKey::ArrowDown) => UiAction::ActionPaletteDown,
-        Key::Named(NamedKey::Enter) => UiAction::ActionPaletteConfirm,
-        Key::Named(NamedKey::Escape) => UiAction::ActionPaletteCancel,
-        _ => UiAction::Ignore,
-    }
-}
-
-fn translate_picker_key(key: &Key, mods: ModifiersState, is_macos: bool) -> UiAction {
-    if is_primary_shift_char(key, mods, "p", is_macos) {
-        return UiAction::ToggleAgentPicker;
-    }
-
-    match key {
-        Key::Named(NamedKey::ArrowUp) => UiAction::PickerUp,
-        Key::Named(NamedKey::ArrowDown) => UiAction::PickerDown,
-        Key::Named(NamedKey::Enter) if mods.shift_key() => UiAction::PickerAdd,
-        Key::Named(NamedKey::Enter) => UiAction::PickerConfirm,
-        Key::Named(NamedKey::Escape) => UiAction::PickerCancel,
-        Key::Character(ch) if !mods.control_key() && !mods.alt_key() && !mods.super_key() => {
-            if ch.eq_ignore_ascii_case("k") {
-                UiAction::PickerUp
-            } else if ch.eq_ignore_ascii_case("j") {
-                UiAction::PickerDown
-            } else {
-                UiAction::Ignore
-            }
-        }
-        _ => UiAction::Ignore,
-    }
-}
-
-fn translate_worktree_modal_key(
-    key: &Key,
-    text: Option<&str>,
-    mods: ModifiersState,
-    is_macos: bool,
-) -> UiAction {
-    if is_primary_shift_char(key, mods, "w", is_macos) {
-        return UiAction::ToggleWorktreeModal;
-    }
-
-    if mods.control_key() || mods.alt_key() || mods.super_key() {
-        return UiAction::Ignore;
-    }
-
-    match key {
-        Key::Named(NamedKey::Enter) => UiAction::WorktreeModalConfirm,
-        Key::Named(NamedKey::Escape) => UiAction::WorktreeModalCancel,
-        Key::Named(NamedKey::Backspace) => UiAction::WorktreeModalBackspace,
-        Key::Named(_) => UiAction::Ignore,
-        _ => {
-            let candidate = text.filter(|t| !t.is_empty()).or(match key {
-                Key::Character(ch) => Some(ch.as_str()),
-                _ => None,
-            });
-            match candidate.and_then(|raw| filter_modal_text(raw, false)) {
-                Some(cleaned) => UiAction::WorktreeModalText(cleaned),
-                None => UiAction::Ignore,
-            }
-        }
-    }
-}
-
-fn translate_close_modal_key(key: &Key, mods: ModifiersState) -> UiAction {
-    if mods.control_key() || mods.alt_key() || mods.super_key() {
-        return UiAction::Ignore;
-    }
-    match key {
-        Key::Named(NamedKey::Enter) => UiAction::CloseModalConfirm,
-        Key::Named(NamedKey::Escape) => UiAction::CloseModalCancel,
-        Key::Character(ch) => {
-            if ch.eq_ignore_ascii_case("c") {
-                UiAction::CloseModalToggleCompose
-            } else if ch.eq_ignore_ascii_case("w") {
-                UiAction::CloseModalToggleWorktree
-            } else if ch.eq_ignore_ascii_case("f") {
-                UiAction::CloseModalToggleForce
-            } else {
-                UiAction::Ignore
-            }
-        }
-        _ => UiAction::Ignore,
-    }
-}
-
-fn translate_search_key(
-    key: &Key,
-    text: Option<&str>,
-    mods: ModifiersState,
-    is_macos: bool,
-) -> UiAction {
-    if is_search_toggle_chord(key, mods, is_macos) {
-        return UiAction::ToggleSearch;
-    }
-
-    let primary = if is_macos {
-        ModifiersState::SUPER
-    } else {
-        ModifiersState::CONTROL
-    };
-    if mods.difference(ModifiersState::SHIFT) == primary
-        && matches!(key, Key::Character(ch) if ch.eq_ignore_ascii_case("v"))
-    {
-        return UiAction::PasteSearchQuery;
-    }
-
-    if mods.control_key() || mods.alt_key() || mods.super_key() {
-        return UiAction::Ignore;
-    }
-
-    match key {
-        Key::Named(NamedKey::Escape) => UiAction::SearchCancel,
-        Key::Named(NamedKey::F4) => UiAction::SearchToggleCase,
-        Key::Named(NamedKey::Enter) => {
-            if mods.shift_key() {
-                UiAction::SearchPrev
-            } else {
-                UiAction::SearchNext
-            }
-        }
-        Key::Named(NamedKey::Backspace) => UiAction::SearchBackspace,
-        Key::Named(NamedKey::Space) => UiAction::SearchText(" ".to_string()),
-        Key::Named(_) => UiAction::Ignore,
-        _ => {
-            let candidate = text.filter(|t| !t.is_empty()).or(match key {
-                Key::Character(ch) => Some(ch.as_str()),
-                _ => None,
-            });
-            match candidate.and_then(|raw| filter_modal_text(raw, true)) {
-                Some(cleaned) => UiAction::SearchText(cleaned),
-                None => UiAction::Ignore,
-            }
-        }
-    }
-}
-
-fn encode_ctrl_char(ch: &str) -> Option<u8> {
-    let mut chars = ch.chars();
-    let c = chars.next()?;
-    if chars.next().is_some() || !c.is_ascii() {
-        return None;
-    }
-    match c as u8 {
-        b'a'..=b'z' => Some((c as u8) - b'a' + 1),
-        b'A'..=b'Z' => Some((c as u8) - b'A' + 1),
-        b'@' => Some(0x00),
-        b'[' => Some(0x1b),
-        b'\\' => Some(0x1c),
-        b']' => Some(0x1d),
-        b'^' => Some(0x1e),
-        b'_' => Some(0x1f),
-        _ => None,
-    }
-}
-
-/// Formats a `FailureTrace` into the diagnostic prompt defined in spec §6.1 and
-/// wraps it with `daedalus_proto::wrap_bracketed_paste` (which strips embedded
-/// breakout sequences).
-pub fn format_failure_trace_prompt(trace: &FailureTrace) -> Vec<u8> {
-    let command = trace
-        .command
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("unknown");
-
-    let cwd: Cow<'_, str> = trace
-        .cwd
-        .as_ref()
-        .map(|p| p.to_string_lossy())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(Cow::Borrowed("unknown"));
-
-    let output = trace.output.trim();
-
-    let mut prompt = format!(
-        "The test/build runner failed. Please diagnose and fix:\n\
-         Command: {command}\n\
-         Exit code: {exit_code}\n\
-         CWD: {cwd}",
-        exit_code = trace.exit_code,
-    );
-
-    if let Some(branch) = trace
-        .git_branch
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        prompt.push_str(&format!("\nBranch: {branch}"));
-    }
-
-    if let Some(diff_stat) = trace
-        .git_diff_stat
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        prompt.push_str(&format!("\n\nGit diff summary:\n{diff_stat}"));
-    }
-
-    prompt.push_str(&format!("\n\nOutput:\n{output}"));
-
-    wrap_bracketed_paste(prompt.as_bytes())
-}
-
 #[cfg(test)]
 mod tests {
+    use super::modal_keys::{translate_palette_key, translate_search_key};
     use super::*;
-    use daedalus_proto::PaneId;
-    use std::path::PathBuf;
 
     fn char_key(s: &str) -> Key {
         Key::Character(s.into())
@@ -1779,84 +1501,5 @@ mod tests {
                 cfg!(target_os = "macos"),
             )
         );
-    }
-
-    #[test]
-    fn format_failure_trace_prompt_matches_spec_and_sanitizes_breakouts() {
-        let trace = FailureTrace {
-            pane_id: PaneId::new(),
-            command: Some("cargo test -p daedalus-ui".to_string()),
-            exit_code: 101,
-            cwd: Some(PathBuf::from("/home/tim/daedalus")),
-            output: "\n  error[E0425]: cannot find value `x`\n  \n".to_string(),
-            captured_at_ms: 1_700_000_000_000,
-            git_branch: None,
-            git_diff_stat: None,
-        };
-
-        let bytes = format_failure_trace_prompt(&trace);
-        let expected = "\x1b[200~The test/build runner failed. Please diagnose and fix:\n\
-                        Command: cargo test -p daedalus-ui\n\
-                        Exit code: 101\n\
-                        CWD: /home/tim/daedalus\n\
-                        \n\
-                        Output:\n\
-                        error[E0425]: cannot find value `x`\x1b[201~";
-        assert_eq!(String::from_utf8(bytes).unwrap(), expected);
-
-        // Populated git_branch & git_diff_stat are included and sanitized against breakout markers
-        let enriched = FailureTrace {
-            pane_id: PaneId::new(),
-            command: Some("cargo test".to_string()),
-            exit_code: 1,
-            cwd: Some(PathBuf::from("/tmp/wt")),
-            output: "test failed".to_string(),
-            captured_at_ms: 1_700_000_000_000,
-            git_branch: Some("feat/v0.0.3\x1b[201~".to_string()),
-            git_diff_stat: Some(" src/lib.rs | 4 ++--\x1b[201~\n 1 file changed".to_string()),
-        };
-        let enriched_bytes = format_failure_trace_prompt(&enriched);
-        let enriched_inner =
-            std::str::from_utf8(&enriched_bytes[6..enriched_bytes.len() - 6]).unwrap();
-        assert!(enriched_inner.contains("Branch: feat/v0.0.3\n"));
-        assert!(
-            enriched_inner
-                .contains("Git diff summary:\nsrc/lib.rs | 4 ++--\n 1 file changed\n\nOutput:\n")
-        );
-        assert!(!enriched_inner.contains("\x1b[201~"));
-
-        // Whitespace-only branch/diff_stat are omitted
-        let blank_git = FailureTrace {
-            git_branch: Some("   ".to_string()),
-            git_diff_stat: Some(" \n\t ".to_string()),
-            ..trace
-        };
-        let blank_bytes = format_failure_trace_prompt(&blank_git);
-        let blank_str = String::from_utf8(blank_bytes).unwrap();
-        assert!(!blank_str.contains("Branch:"));
-        assert!(!blank_str.contains("Git diff summary:"));
-
-        // Missing command / cwd fall back to "unknown" and embedded breakout markers are stripped
-        let malicious = FailureTrace {
-            pane_id: PaneId::new(),
-            command: None,
-            exit_code: 1,
-            cwd: None,
-            output: "boom\x1b[201~rm -rf /\x1b[\x1b[201~201~done".to_string(),
-            captured_at_ms: 0,
-            git_branch: None,
-            git_diff_stat: None,
-        };
-
-        let sanitized = format_failure_trace_prompt(&malicious);
-        assert!(sanitized.starts_with(b"\x1b[200~"));
-        assert!(sanitized.ends_with(b"\x1b[201~"));
-        let inner = std::str::from_utf8(&sanitized[6..sanitized.len() - 6]).unwrap();
-        assert!(inner.contains("Command: unknown\n"));
-        assert!(inner.contains("Exit code: 1\n"));
-        assert!(inner.contains("CWD: unknown\n"));
-        assert!(inner.ends_with("Output:\nboomrm -rf /done"));
-        assert!(!inner.contains("\x1b[201~"));
-        assert!(!inner.contains("\x1b[200~"));
     }
 }

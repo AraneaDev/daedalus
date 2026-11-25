@@ -1,0 +1,61 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Daedalus · Workbench concept</title><style>
+*{box-sizing:border-box}body{margin:0;background:#11161b;color:#e7eee9;font:15px/1.55 'Segoe UI',system-ui,sans-serif}button{font:inherit;color:inherit;cursor:pointer}header,footer,nav,.row{display:flex;align-items:center;gap:12px}header{height:64px;padding:0 24px;background:linear-gradient(105deg,#20332e,#182024 55%);border-bottom:1px solid #34403d}header b{letter-spacing:.04em}.muted,small{color:#a6b4af}main{display:grid;grid-template-columns:200px 1fr;min-height:calc(100vh - 130px)}aside{padding:24px 14px;border-right:1px solid #303a38}aside strong{display:block;margin:16px 0;background:#24352f;border-left:3px solid #89d9ae;border-radius:6px;padding:10px 12px}aside small{display:block;font-weight:400}.desk{padding:18px;display:grid;grid-template-rows:1fr auto;gap:12px}.agent,article{background:#10171a;border:1px solid #33423f;border-radius:12px;overflow:hidden}nav{padding:8px 10px 0;background:#182124;gap:4px;border-bottom:1px solid #36433f}nav button{background:transparent;border:0;border-radius:8px 8px 0 0;padding:10px 16px;display:flex;align-items:center;gap:9px;color:#aab8b3}nav button[aria-pressed=true]{color:white;background:#293933;box-shadow:inset 0 -2px #99d9b1}.icon{font: bold 16px monospace;color:#ade3c3}.claude{color:#e6a183;font-size:21px;line-height:16px}.session{padding:24px clamp(16px,4vw,58px);max-width:900px}.session h2{font-size:21px;font-weight:600}.prompt{border-left:2px solid #7bb895;padding-left:14px;color:#cad5d0}pre,code,.status{font:13px/1.65 ui-monospace,Consolas,monospace}pre{white-space:pre-wrap;color:#bfd1c8;background:#182121;padding:12px 16px;border-radius:6px}.widgets{display:grid;grid-template-columns:1fr 1.3fr;gap:10px}article{padding:11px 14px}.row{gap:8px;flex-wrap:wrap}.row b{font-size:14px}.status{margin-left:auto;color:#9cd5b0}.failure{color:#ffb2a2}.link{border:0;background:transparent;color:#ffbeaf;text-decoration:underline}footer{padding:10px 22px;justify-content:flex-end;color:#aebbb5;font-size:13px}footer button{background:#1c2527;border:1px solid #384440;border-radius:6px;padding:5px 12px}footer button[aria-pressed=true]{background:#33443c;color:white}button:focus-visible{outline:2px solid #b2deff;outline-offset:-2px}[hidden]{display:none}@media(max-width:760px){main{grid-template-columns:1fr}aside{display:none}.widgets{grid-template-columns:1fr}.desk{padding:10px}.session{padding:12px}.status{margin-left:0}}
+main{min-height:min(64vh,620px)}footer{justify-content:flex-start;flex-wrap:wrap;border-top:1px solid #34403d}
+.editor{margin:0 22px 18px;display:grid;gap:5px;max-width:650px}.editor label{font-size:13px;color:#bacbc1}
+textarea,select{background:#192223;color:#dbebe1;border:1px solid #485c51;border-radius:6px;padding:7px}textarea{font:13px/1.5 Consolas,monospace;width:100%}footer strong{color:#ddebe2}#error{color:#ffbeaf}
+</style><header><b>Daedalus</b><span class="muted">/</span> Workbench</header><main><aside><small>Workspaces</small><strong>daedalus<small>main</small></strong></aside><div class="desk"><section class="agent"><nav aria-label="Agent sessions"><button id="codex" aria-pressed="true"><span class="icon" aria-hidden="true">›_</span>Codex</button><button id="claude" aria-pressed="false"><span class="claude" aria-hidden="true">✳</span>Claude</button></nav><div class="session"><small id="identity">Codex · Implementer</small><h2 id="title">Resize the workbench panes</h2><p class="prompt" id="prompt">Keep the terminal usable while dragging a divider.</p><p id="reply">The split layout now follows the divider. I’m checking the terminal dimensions in both wide and stacked views.</p><pre id="snippet">$ cargo test --workspace<br><span class="muted">Running workspace tests in the runner pane.</span></pre></div></section><section class="widgets" aria-label="Workspace insights"><article><div class="row"><b>Workbench daemon</b><span class="status">● Connected</span></div></article><article><div class="row"><b id="label">Workspace tests</b><span id="status" class="status" aria-live="polite">Running · 82 passed</span><small id="time">8s</small><button class="link" id="jump" hidden>View failure ↗</button></div><pre hidden id="detail">layout::tests::stacked_panes FAILED<br>Expected three visible panes, found two.</pre></article></section></div></main><footer><strong>Simulated run</strong><select id="preset" aria-label="Cargo preset"><option value="test">Cargo Test</option><option value="check">Cargo Check</option></select>
+<select id="outcome" aria-label="Run outcome"><option>Success</option><option>Failure</option></select><button id="play">↻ Replay</button></footer>
+<section class="editor"><label for="config">Widget config · edits apply live</label><textarea id="config" rows="5" spellcheck="false"></textarea><small role="status" id="error"></small></section>
+<script>
+const el=id=>document.getElementById(id);
+const settings={
+ test:{label:'Workspace tests',show_duration:true,show_warnings:false},
+ check:{label:'Compiler',show_duration:true,show_warnings:true}
+};
+let step=0, timer;
+function draw(){
+ const check=el('preset').value==='check';
+ const config=settings[el('preset').value];
+ const failed=step===3 && el('outcome').value==='Failure';
+ const warnings=check && config.show_warnings && step>=2?' · 2 warnings':'';
+ const stages=check?['Starting','Checking dependencies','Checking daedalus-ui','Check passed']:['Compiling','Running · 24 passed','Running · 82 passed','96 passed'];
+ el('label').textContent=config.label;
+ el('status').textContent=(failed?(check?'Compile error':'1 failed'):stages[step])+warnings;
+ el('status').classList.toggle('failure',failed);
+ el('time').hidden=!config.show_duration;
+ el('time').textContent=[0,2,4,6][step]+'s';
+ el('jump').hidden=!failed;
+ el('detail').textContent=check?'error[E0308]: mismatched types in layout.rs':'layout::tests::stacked_panes FAILED — expected three visible panes, found two.';
+ el('snippet').textContent=check?'$ cargo check --workspace':'$ cargo test --workspace';
+}
+function replay(){
+ clearInterval(timer); step=0;
+ el('detail').hidden=true;el('jump').setAttribute('aria-expanded','false');draw();
+ timer=setInterval(()=>{step++;draw();if(step===3)clearInterval(timer)},2000);
+}
+function loadPreset(){
+ const config=settings[el('preset').value];
+ el('config').value=Object.entries(config).map(([k,v])=>k+' = '+JSON.stringify(v)).join('\n');
+ el('error').textContent='';replay();
+}
+el('config').oninput=()=>{
+ const values={};
+ try{
+ for(const line of el('config').value.split('\n').filter(l=>l.trim())){
+ const match=line.match(/^\s*(label|show_duration|show_warnings)\s*=\s*(.+?)\s*$/);
+ if(!match)throw Error('Use label, show_duration, or show_warnings.');
+ const [,key,raw]=match;
+ const value=JSON.parse(raw);
+ if(key==='label'?typeof value!=='string'||!value.trim():typeof value!=='boolean')throw Error('Use a quoted label and true or false for switches.');
+ values[key]=value;
+ }
+ if(Object.keys(values).length!==3)throw Error('Include all three settings.');
+ Object.assign(settings[el('preset').value],values);draw();el('error').textContent='';
+ }catch(e){el('error').textContent='Keeping the last valid config. '+e.message}
+};
+el('preset').onchange=loadPreset;el('outcome').onchange=replay;el('play').onclick=replay;
+el('jump').onclick=()=>{el('detail').hidden=!el('detail').hidden;el('jump').setAttribute('aria-expanded',!el('detail').hidden)};
+function agent(review){el('identity').textContent=review?'Claude · Reviewer':'Codex · Implementer';el('title').textContent=review?'Review the divider behavior':'Resize the workbench panes';el('prompt').textContent=review?'Check focus and minimum pane sizes.':'Keep the terminal usable while dragging a divider.';el('reply').textContent=review?'I’m checking that releasing a divider leaves keyboard focus in the active terminal.':'The split layout now follows the divider. I’m checking the terminal dimensions in both wide and stacked views.';el('snippet').hidden=review;el('claude').setAttribute('aria-pressed',review);el('codex').setAttribute('aria-pressed',!review)}
+el('codex').onclick=()=>agent(false);el('claude').onclick=()=>agent(true);
+loadPreset();
+</script></html>

@@ -1,12 +1,13 @@
 mod docker;
 mod local_ports;
 
+pub use crate::process::inventory::{
+    descendant_pids_including_roots as collect_descendant_pids, parse_ps_pid_comm_table,
+};
 pub use docker::{connect_docker_client, discover_docker_socket_candidates, poll_workspace_docker};
-#[cfg(target_os = "linux")]
-pub(crate) use local_ports::parse_proc_stat_pid_ppid;
 pub use local_ports::{
-    collect_descendant_pids, discover_local_ports_for_roots, parse_lsof_listen_output,
-    parse_proc_net_tcp, parse_ps_pid_comm_table, parse_windows_netstat_output,
+    discover_local_ports_for_roots, parse_lsof_listen_output, parse_proc_net_tcp,
+    parse_windows_netstat_output,
 };
 
 use crate::registry::Registry;

@@ -8,12 +8,12 @@ license.workspace = true
 clap.workspace = true
 daedalus-proto = { path = "../daedalus-proto" }
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 daedalusd = { path = "../daedalusd" }
-tempfile.workspace = true
 
 [lints]
 workspace = true

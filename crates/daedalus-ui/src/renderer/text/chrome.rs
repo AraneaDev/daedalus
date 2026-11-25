@@ -5,11 +5,10 @@ use super::{
     CHROME_SUB_FONT_SIZE_LOGICAL, CHROME_SUB_LINE_HEIGHT_LOGICAL, ChromeLineSpec, Rect, Theme,
     WorkspaceLayout, truncate_right_with_ellipsis,
 };
-use crate::layout::{PaneRect, sidebar_workspace_close_rect, tab_label_padding};
+use crate::layout::{PaneRect, sidebar_workspace_close_rect};
 use crate::renderer::sidebar::{Badge, BadgeKind, Card};
 use crate::renderer::{
-    SidebarCards, active_external_detail_preview, agent_state_badge, banner_appearance,
-    format_ports_summary, pane_agent_state_pill_rect,
+    SidebarCards, active_external_detail_preview, banner_appearance, format_ports_summary,
 };
 use crate::state::WorkspaceView;
 use daedalus_proto::{PaneRole, PaneStatus};
@@ -179,6 +178,48 @@ impl TextRenderer {
                 line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
                 color: theme.border_focused,
                 bold: true,
+            });
+        }
+        for (index, bounds) in &layout.widget_buttons {
+            let widget =
+                index.and_then(|index| state.workbench.as_ref()?.1.document.widgets.get(index));
+            let result = widget.and_then(|widget| {
+                state
+                    .widget_results
+                    .iter()
+                    .find(|snapshot| snapshot.id == widget.id)
+            });
+            let definition = widget.and_then(|widget| {
+                state
+                    .workbench
+                    .as_ref()?
+                    .1
+                    .document
+                    .widget_definition(widget)
+            });
+            let label = result
+                .map(|snapshot| snapshot.result.label.as_str())
+                .or_else(|| widget.map(|widget| widget.name.as_str()))
+                .unwrap_or("More widgets");
+            let title = definition
+                .and_then(|definition| definition.display.icon.as_deref())
+                .map_or_else(|| label.to_owned(), |icon| format!("{icon} {label}"));
+            let color = match result.map(|snapshot| snapshot.result.level) {
+                Some(daedalus_proto::StatusLevel::Ok) => theme.status_ok,
+                Some(daedalus_proto::StatusLevel::Warn) => theme.status_busy,
+                Some(daedalus_proto::StatusLevel::Error) => theme.status_err,
+                _ => theme.text_primary,
+            };
+            self.push_chrome_button(ChromeLineSpec {
+                text: &title,
+                bounds: *bounds,
+                left: bounds.x + 6. * s,
+                top: bounds.y + (bounds.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                max_w: (bounds.width - 12. * s).max(1.),
+                font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                color,
+                bold: false,
             });
         }
         for &(role, rect) in &layout.insight_rows {
@@ -735,229 +776,6 @@ impl TextRenderer {
             });
         }
     }
-
-    fn build_pane_header_text(
-        &mut self,
-        pane_rect: &PaneRect,
-        state: &AppState,
-        theme: &Theme,
-        layout: &WorkspaceLayout,
-    ) {
-        let s = self.scale_factor;
-        let header = pane_rect.header;
-        let is_focused = pane_rect.role == state.focused_role;
-        let pane_state = state.pane_for_role(pane_rect.role);
-
-        let role_label = match pane_rect.role {
-            PaneRole::Agent => "Agent".to_owned(),
-            PaneRole::Service => "Service".to_owned(),
-            PaneRole::Runner => "Runner".to_owned(),
-        };
-
-        let cwd_suffix = pane_state
-            .and_then(|p| p.summary.cwd.as_ref())
-            .and_then(|cwd| cwd.file_name())
-            .and_then(|n| n.to_str())
-            .map(|name| format!("  {name}"))
-            .unwrap_or_default();
-
-        let scroll_suffix = pane_state
-            .filter(|p| p.scroll_offset > 0)
-            .map(|p| format!("  [SCROLL -{}]", p.scroll_offset))
-            .unwrap_or_default();
-
-        let agent_badge = if pane_rect.role == PaneRole::Agent && !state.zoomed {
-            pane_state
-                .and_then(|p| p.summary.agent_state)
-                .and_then(|ast| {
-                    let (label, color) = agent_state_badge(ast, theme);
-                    pane_agent_state_pill_rect(pane_rect, label, s).map(|rect| (rect, label, color))
-                })
-        } else {
-            None
-        };
-
-        let label = pane_state
-            .and_then(|pane| state.session_names.get(&pane.summary.id))
-            .unwrap_or(&role_label);
-        let title = if state.zoomed {
-            format!("{cwd_suffix}{scroll_suffix}")
-                .trim_start()
-                .to_owned()
-        } else {
-            state
-                .widget_label(pane_rect.role)
-                .unwrap_or_else(|| format!("{label}{cwd_suffix}{scroll_suffix}"))
-        };
-        let title = match pane_state {
-            Some(pane) if !state.zoomed => crate::state::terminal_title(title, pane.summary.status),
-            _ => title,
-        };
-        let text_left = if let Some((_, _, last)) = layout.named_tabs.last() {
-            for (id, label, rect) in &layout.named_tabs {
-                let active = Some(*id) == state.focused_pane_id();
-                let close = layout.close_tab.filter(|(pane, _)| pane == id);
-                if let Some((_, button)) = close {
-                    self.push_chrome_button(ChromeLineSpec {
-                        text: "×",
-                        left: button.x,
-                        top: button.y + (button.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                        max_w: button.width,
-                        bounds: button,
-                        font_size_logical: CHROME_FONT_SIZE_LOGICAL,
-                        line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
-                        color: theme.text_muted,
-                        bold: false,
-                    });
-                }
-                let mark = super::super::agent_tab_mark(state, *id, label, *rect, s);
-                let padding = tab_label_padding(*rect, s);
-                let mut inset = if mark.is_some() { 22. * s } else { 0. };
-                if mark.is_some()
-                    || (!matches!(label.as_str(), "‹" | "›" | "‹ Prev" | "Next ›")
-                        && state.panes.get(id).is_some_and(|p| p.unread_attention))
-                {
-                    if let Some(indicator) = state
-                        .panes
-                        .get(id)
-                        .and_then(|p| p.tab_indicator(state.reduced_motion))
-                    {
-                        self.push_chrome_line(ChromeLineSpec {
-                            text: &indicator.to_string(),
-                            left: rect.x + padding + inset,
-                            top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                            max_w: 14. * s,
-                            bounds: *rect,
-                            font_size_logical: CHROME_FONT_SIZE_LOGICAL,
-                            line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
-                            color: theme.border_focused,
-                            bold: true,
-                        });
-                    }
-                    inset += 14. * s;
-                }
-                let max_w =
-                    (rect.width - inset - close.map_or(0., |(_, b)| b.width) - 2. * padding)
-                        .max(1.);
-                self.push_chrome_line(ChromeLineSpec {
-                    text: label,
-                    left: rect.x + inset + padding,
-                    top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                    max_w,
-                    bounds: *rect,
-                    font_size_logical: CHROME_FONT_SIZE_LOGICAL,
-                    line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
-                    color: if state.panes.get(id).is_some_and(|pane| matches!(pane.summary.status, PaneStatus::Exited { code: Some(code) } if code != 0)) { theme.status_err } else if active {
-                        theme.border_focused
-                    } else {
-                        theme.text_muted
-                    },
-                    bold: active,
-                });
-            }
-            last.right() + 4. * s
-        } else if state.zoomed {
-            let tabs = crate::layout::session_tabs(pane_rect, s);
-            for (role, rect) in tabs {
-                let padding = tab_label_padding(rect, s);
-                let label = match role {
-                    PaneRole::Agent => "Agent",
-                    PaneRole::Service => "Service",
-                    PaneRole::Runner => "Runner",
-                };
-                self.push_chrome_line(ChromeLineSpec {
-                    text: label,
-                    left: rect.x + padding,
-                    top: rect.y + (rect.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                    max_w: (rect.width - 2. * padding).max(1.),
-                    bounds: rect,
-                    font_size_logical: CHROME_FONT_SIZE_LOGICAL,
-                    line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
-                    color: if role == state.focused_role {
-                        theme.border_focused
-                    } else {
-                        theme.text_muted
-                    },
-                    bold: role == state.focused_role,
-                });
-            }
-            tabs[2].1.right() + 4. * s
-        } else {
-            header.x + 22.0 * s
-        };
-        let default_right = pane_rect
-            .action_pill
-            .map_or(header.right() - 8.0 * s, |pill| pill.x - 8.0 * s);
-        let text_right = agent_badge.map_or(default_right, |(rect, _, _)| rect.x - 8.0 * s);
-        let text_w = (text_right - text_left).max(1.0);
-        let title_bounds = Rect::new(text_left, header.y, text_w, header.height);
-
-        self.push_chrome_line(ChromeLineSpec {
-            text: &title,
-            left: text_left,
-            top: header.y + (header.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-            max_w: text_w,
-            bounds: title_bounds,
-            font_size_logical: CHROME_FONT_SIZE_LOGICAL,
-            line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
-            color: if is_focused {
-                theme.text_primary
-            } else {
-                theme.text_muted
-            },
-            bold: is_focused,
-        });
-
-        if let Some((pill, label, color)) = agent_badge {
-            self.push_chrome_button(ChromeLineSpec {
-                text: label,
-                left: pill.x + 6.0 * s,
-                top: pill.y + (pill.height - CHROME_BADGE_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                max_w: (pill.width - 10.0 * s).max(1.0),
-                bounds: pill,
-                font_size_logical: CHROME_BADGE_FONT_SIZE_LOGICAL,
-                line_height_logical: CHROME_BADGE_LINE_HEIGHT_LOGICAL,
-                color,
-                bold: true,
-            });
-        }
-
-        if let Some(pill) = pane_rect.action_pill {
-            let (pill_label, pill_color) = match pane_rect.role {
-                PaneRole::Agent if pill.width < 105. * s => ("Preset".into(), theme.border_focused),
-                PaneRole::Runner if pill.width < 150. * s => ("Forward".into(), theme.status_err),
-                PaneRole::Agent => {
-                    let preset_label = pane_state.and_then(|p| p.agent_preset).map_or_else(
-                        || "Choose preset".into(),
-                        |p| format!("Preset: {}", p.short_name()),
-                    );
-                    (preset_label, theme.border_focused)
-                }
-                PaneRole::Runner => (
-                    if cfg!(target_os = "macos") {
-                        "Send Error → Agent ⌘⇧E".to_string()
-                    } else {
-                        "Send Error → Agent ^⇧E".to_string()
-                    },
-                    theme.status_err,
-                ),
-                PaneRole::Service => (String::new(), theme.text_primary),
-            };
-            if !pill_label.is_empty() {
-                self.push_chrome_button(ChromeLineSpec {
-                    text: &pill_label,
-                    left: pill.x + 8.0 * s,
-                    top: pill.y + (pill.height - CHROME_SUB_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                    max_w: (pill.width - 12.0 * s).max(1.0),
-                    bounds: pill,
-                    font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
-                    line_height_logical: CHROME_SUB_LINE_HEIGHT_LOGICAL,
-                    color: pill_color,
-                    bold: true,
-                });
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1313,10 +1131,10 @@ mod tests {
         runner.id = PaneId::new();
         runner.role = PaneRole::Runner;
         runner.last_exit_code = Some(12);
-        state.register_pane(runner.clone(), None);
+        state.register_pane(runner.clone(), false);
         runner.id = PaneId::new();
         runner.last_exit_code = Some(0);
-        state.register_pane(runner, None);
+        state.register_pane(runner, false);
 
         for scale in [1.0, 1.5, 2.0] {
             let theme = Theme::dark();
@@ -1365,7 +1183,7 @@ mod tests {
         runner.id = PaneId::new();
         runner.role = PaneRole::Runner;
         runner.last_exit_code = Some(0);
-        state.register_pane(runner, None);
+        state.register_pane(runner, false);
         let ws = state.active_workspace_mut().unwrap();
         for label in ["old", "second", "last"] {
             ws.external_statuses.push(ExternalStatus {

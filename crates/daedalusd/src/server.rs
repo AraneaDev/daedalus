@@ -1,3 +1,5 @@
+mod workbench;
+
 use crate::external_hook::ExternalHookServer;
 use crate::persistence::StateStore;
 use crate::registry::Registry;
@@ -125,6 +127,8 @@ impl DaemonServer {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let monitor_handle =
             runtime_monitor::spawn_runtime_monitor(Arc::clone(&self.registry), shutdown_rx.clone());
+        let widgets =
+            crate::workbench::scheduler::spawn(Arc::clone(&self.registry), shutdown_rx.clone());
         let hook_handle = self.external_hook.map(|hook| {
             let mut hook_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
@@ -171,6 +175,7 @@ impl DaemonServer {
         client_tasks.abort_all();
         while client_tasks.join_next().await.is_some() {}
         let _ = monitor_handle.await;
+        let _ = widgets.await;
         if let Some(handle) = hook_handle {
             let _ = handle.await;
         }
@@ -187,10 +192,18 @@ struct SubscriptionFilter {
     /// Older UIs drop the connection on an event variant they do not know, so
     /// `ProjectSetupChanged` is sent only to connections that asked for it.
     project_setup_events: bool,
+    workspace_membership_events: bool,
+    workbench: Option<daedalus_proto::WorkspaceId>,
 }
 
 impl SubscriptionFilter {
     fn matches(&self, event: &ServerEvent) -> bool {
+        if let ServerEvent::WorkbenchChanged { workspace_id, .. } = event {
+            return self.workbench == Some(*workspace_id);
+        }
+        if matches!(event, ServerEvent::WorkspaceMembershipChanged) {
+            return self.workspace_membership_events;
+        }
         if !self.active {
             return false;
         }
@@ -209,7 +222,9 @@ impl SubscriptionFilter {
             | ServerEvent::ResyncRequired { pane_id } => allowed.contains(pane_id),
             ServerEvent::WorkspaceRuntimeUpdated { .. }
             | ServerEvent::ExternalStatusUpdated { .. }
-            | ServerEvent::ProjectSetupChanged { .. } => false,
+            | ServerEvent::ProjectSetupChanged { .. }
+            | ServerEvent::WorkspaceMembershipChanged
+            | ServerEvent::WorkbenchChanged { .. } => false,
         }
     }
 }
@@ -341,6 +356,11 @@ async fn dispatch_request(
                 project_setup_supported: true,
                 image_preview_supported: cfg!(unix),
                 paste_supported: true,
+                workbench_supported: true,
+                workspace_membership_supported: true,
+                runner_assignment_supported: true,
+                resolved_import_preview_supported: true,
+                agent_launch_metadata_supported: true,
                 home_dir: std::env::home_dir(),
             })
         }
@@ -380,6 +400,10 @@ async fn dispatch_request(
         } => Ok(ResponsePayload::Activity(
             registry.read_activity(workspace_id, cursor).await?,
         )),
+        ClientMessage::WatchWorkspaceMembership => {
+            filter.write().await.workspace_membership_events = true;
+            Ok(ResponsePayload::Ok)
+        }
         ClientMessage::ListWorkspaces => Ok(ResponsePayload::Workspaces(
             registry.list_workspaces().await,
         )),
@@ -476,6 +500,16 @@ async fn dispatch_request(
                 .replace_agent_pane(workspace_id, old_pane_id, command, cols, rows)
                 .await?,
         )),
+        ClientMessage::LaunchRunnerAssignment {
+            workspace_id,
+            assignment_id,
+            cols,
+            rows,
+        } => Ok(ResponsePayload::PaneSpawned(
+            registry
+                .launch_runner_assignment(workspace_id, &assignment_id, cols, rows)
+                .await?,
+        )),
         ClientMessage::ClosePane { pane_id } => {
             registry.close_pane(pane_id).await?;
             Ok(ResponsePayload::Ok)
@@ -564,6 +598,8 @@ async fn dispatch_request(
             f.active = false;
             f.pane_ids = None;
             f.project_setup_events = false;
+            f.workspace_membership_events = false;
+            f.workbench = None;
             Ok(ResponsePayload::Ok)
         }
         ClientMessage::RunWorkspaceAction {
@@ -574,6 +610,26 @@ async fn dispatch_request(
                 .run_workspace_action(workspace_id, &action_id)
                 .await?;
             Ok(ResponsePayload::Ok)
+        }
+        request @ (ClientMessage::GetWorkbench { .. }
+        | ClientMessage::WatchWorkbench { .. }
+        | ClientMessage::UpdateWorkbench { .. }
+        | ClientMessage::SeedLegacyWorkbench { .. }
+        | ClientMessage::ListWidgetTemplates
+        | ClientMessage::UpdateWidgetTemplates { .. }
+        | ClientMessage::PreviewWorkspaceImport { .. }
+        | ClientMessage::ResolveWorkspaceImport { .. }
+        | ClientMessage::ApplyWorkspaceImport { .. }
+        | ClientMessage::ExportWorkspace { .. }
+        | ClientMessage::PreviewWorkspaceCreation { .. }
+        | ClientMessage::ApplyWorkspaceCreation { .. }
+        | ClientMessage::CheckWorkspaceRepo { .. }
+        | ClientMessage::DecodeWidgetTemplate { .. }
+        | ClientMessage::EncodeWidgetTemplate { .. }
+        | ClientMessage::PreviewWidget { .. }
+        | ClientMessage::GetWidgetResults { .. }
+        | ClientMessage::InvokeWidgetAction { .. }) => {
+            workbench::dispatch(registry, filter, request).await
         }
     }
 }
@@ -685,7 +741,13 @@ async fn forward_subscriber_events(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                if sub_filter.read().await.active {
+                let has_subscription = {
+                    let filter = sub_filter.read().await;
+                    filter.active
+                        || filter.workspace_membership_events
+                        || filter.workbench.is_some()
+                };
+                if has_subscription {
                     // Missing updates may affect any pane or workspace.
                     warn!(
                         skipped,
@@ -737,6 +799,7 @@ mod tests {
                 active: true,
                 pane_ids,
                 project_setup_events: false,
+                ..Default::default()
             };
             assert!(!filter.matches(&event));
             filter.project_setup_events = true;

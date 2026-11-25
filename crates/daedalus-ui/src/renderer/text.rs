@@ -2,6 +2,7 @@ mod chrome;
 #[cfg(test)]
 mod frame_tests;
 mod modal;
+mod pane_header;
 mod settings;
 mod setup_review;
 mod workspace_form;

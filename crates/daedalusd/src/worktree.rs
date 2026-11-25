@@ -1,16 +1,16 @@
-use daedalus_proto::{GitWorkspaceStatus, GitWorktreeInfo};
-use std::ffi::OsStr;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::process::Command;
-use std::process::{ExitStatus, Stdio};
-use std::time::{Duration, Instant};
-use thiserror::Error;
+mod failure_context;
+mod git_command;
+mod observation;
 
-const GIT_TIMEOUT: Duration = Duration::from_secs(5);
-const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_FAILURE_CONTEXT_BYTES: usize = 4096;
+pub use failure_context::git_failure_context;
+use git_command::run_git_with_timeout;
+pub(crate) use observation::{GitObservation, git_observation};
+pub use observation::{current_branch, git_workspace_status, git_workspace_status_and_branch};
+
+use daedalus_proto::GitWorktreeInfo;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum WorktreeError {
@@ -24,12 +24,6 @@ pub enum WorktreeError {
     LockedWorktree(PathBuf),
     #[error("git command failed: {0}")]
     GitFailed(String),
-}
-
-struct GitOutput {
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
 }
 
 fn resolve_worktrees_dir(
@@ -104,89 +98,6 @@ pub fn sanitize_slug(branch: &str) -> Result<String, String> {
 fn canonicalize_path(path: &Path) -> PathBuf {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     daedalus_proto::strip_windows_verbatim_prefix(resolved)
-}
-
-fn spawn_reader<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        buf
-    })
-}
-
-fn run_git_with_timeout(repo_dir: &Path, args: &[&OsStr]) -> Result<GitOutput, String> {
-    run_git_with_timeout_for(repo_dir, args, GIT_TIMEOUT)
-}
-
-fn run_git_with_timeout_for(
-    repo_dir: &Path,
-    args: &[&OsStr],
-    timeout: Duration,
-) -> Result<GitOutput, String> {
-    let mut cmd = crate::background_command("git");
-    cmd.arg("-C").arg(repo_dir);
-    for arg in args {
-        cmd.arg(arg);
-    }
-    cmd.env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn git: {e}"))?;
-
-    let stdout_handle = child.stdout.take().map(spawn_reader);
-    let stderr_handle = child.stderr.take().map(spawn_reader);
-
-    let deadline = Instant::now() + timeout;
-    let mut poll_interval = Duration::from_millis(1);
-
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                let now = Instant::now();
-                if now >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    if let Some(h) = stdout_handle {
-                        let _ = h.join();
-                    }
-                    if let Some(h) = stderr_handle {
-                        let _ = h.join();
-                    }
-                    return Err(format!(
-                        "git command timed out after {}s",
-                        timeout.as_secs()
-                    ));
-                }
-                let remaining = deadline.saturating_duration_since(now);
-                std::thread::sleep(poll_interval.min(remaining));
-                poll_interval = (poll_interval * 2).min(Duration::from_millis(10));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("failed waiting for git: {e}"));
-            }
-        }
-    };
-
-    let stdout_bytes = stdout_handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
-    let stderr_bytes = stderr_handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
-
-    Ok(GitOutput {
-        status,
-        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
-    })
 }
 
 struct WorktreeEntry {
@@ -309,30 +220,6 @@ fn list_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeEntry>, String> {
     Ok(parse_worktree_porcelain(&out.stdout))
 }
 
-/// Returns the currently checked-out branch name in `dir`, or `None` for detached HEAD or non-git directories.
-pub fn current_branch(dir: &Path) -> Option<String> {
-    if !dir.is_dir() {
-        return None;
-    }
-
-    let args = [
-        OsStr::new("symbolic-ref"),
-        OsStr::new("--short"),
-        OsStr::new("HEAD"),
-    ];
-    let out = run_git_with_timeout(dir, &args).ok()?;
-    if !out.status.success() {
-        return None;
-    }
-
-    let branch = out.stdout.trim();
-    if branch.is_empty() {
-        None
-    } else {
-        Some(branch.to_string())
-    }
-}
-
 /// Creates a new Git worktree for `branch` under `<base_dir>/<repo_name>/<slug>` and returns its metadata.
 pub fn create_worktree(
     repo_dir: &Path,
@@ -340,6 +227,28 @@ pub fn create_worktree(
     create_branch: bool,
     base_dir: &Path,
 ) -> Result<GitWorktreeInfo, String> {
+    create_worktree_for_registration(repo_dir, branch, create_branch, base_dir)
+        .map(|created| created.info)
+}
+
+pub(crate) struct CreatedWorktree {
+    pub(crate) info: GitWorktreeInfo,
+    pub(crate) canonical_target: PathBuf,
+    primary_root: PathBuf,
+    new_branch: Option<CreatedBranch>,
+}
+
+struct CreatedBranch {
+    name: String,
+    start: Option<String>,
+}
+
+pub(crate) fn create_worktree_for_registration(
+    repo_dir: &Path,
+    branch: &str,
+    create_branch: bool,
+    base_dir: &Path,
+) -> Result<CreatedWorktree, String> {
     if !repo_dir.is_dir() {
         return Err(format!(
             "repository path is not a directory: {}",
@@ -390,6 +299,21 @@ pub fn create_worktree(
         ));
     }
 
+    // Record the original tip before hooks or another Git process can change the new branch.
+    let new_branch = create_branch.then(|| CreatedBranch {
+        name: branch.to_owned(),
+        start: run_git_with_timeout(
+            &repo_root,
+            &[
+                OsStr::new("rev-parse"),
+                OsStr::new("--verify"),
+                OsStr::new("HEAD"),
+            ],
+        )
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| out.stdout.trim().to_owned()),
+    });
     let add_out = if create_branch {
         let args = [
             OsStr::new("worktree"),
@@ -419,84 +343,97 @@ pub fn create_worktree(
     }
 
     let canonical_target = canonicalize_path(&target);
-    let worktrees = discover_worktrees(&repo_root)?;
-    worktrees
+    let recovery = || {
+        format!(
+            "git added the checkout at {}. Inspect it with git worktree list before retrying",
+            target.display()
+        )
+    };
+    let info = discover_worktrees(&repo_root)
+        .map_err(|error| format!("{error}. {}", recovery()))?
         .into_iter()
         .find(|wt| canonicalize_path(&wt.path) == canonical_target)
         .ok_or_else(|| {
             format!(
-                "created worktree at {} was not found in git worktree list",
-                target.display()
+                "created worktree was not found in git worktree list. {}",
+                recovery()
             )
-        })
+        })?;
+    Ok(CreatedWorktree {
+        info,
+        canonical_target,
+        primary_root,
+        new_branch,
+    })
 }
 
-fn parse_git_status_v2(output: &str, is_worktree: bool) -> (GitWorkspaceStatus, Option<String>) {
-    let mut dirty = false;
-    let mut ahead = 0u32;
-    let mut behind = 0u32;
-    let mut branch = None;
-
-    for raw_line in output.lines() {
-        let line = raw_line.trim_end_matches('\r');
-        if line.is_empty() {
-            continue;
+impl CreatedWorktree {
+    /// Compensates for failed registration, preserving changes made since Git added the checkout.
+    pub(crate) fn rollback(self) -> Result<(), String> {
+        let path = &self.info.path;
+        if canonicalize_path(path) != self.canonical_target
+            || canonicalize_path(
+                &validate_worktree_removal(path, false).map_err(|e| e.to_string())?,
+            ) != self.primary_root
+            || !discover_worktrees(&self.primary_root)?.contains(&self.info)
+            || self.new_branch.as_ref().is_some_and(|branch| {
+                branch.start.as_ref() != Some(&self.info.head)
+                    || Some(&branch.name) != self.info.branch.as_ref()
+            })
+        {
+            return Err("the checkout no longer matches the one created by this request".into());
         }
-        if let Some(rest) = line.strip_prefix("# ") {
-            if let Some(head) = rest.strip_prefix("branch.head ") {
-                if head != "(detached)" && !head.is_empty() {
-                    branch = Some(head.to_string());
-                }
-            } else if let Some(ab) = rest.strip_prefix("branch.ab ") {
-                for token in ab.split_whitespace() {
-                    if let Some(a) = token.strip_prefix('+') {
-                        ahead = a.parse::<u32>().unwrap_or(0);
-                    } else if let Some(b) = token.strip_prefix('-') {
-                        behind = b.parse::<u32>().unwrap_or(0);
-                    }
-                }
+
+        // Git's non-forced removal permits ignored files. Preserve those too.
+        let status = run_git_with_timeout(
+            path,
+            &[
+                OsStr::new("status"),
+                OsStr::new("--porcelain"),
+                OsStr::new("--untracked-files=all"),
+                OsStr::new("--ignored=matching"),
+                OsStr::new("--ignore-submodules=none"),
+            ],
+        )?;
+        if !status.status.success() {
+            return Err(format!(
+                "could not check checkout: {}",
+                status.stderr.trim()
+            ));
+        }
+        if !status.stdout.is_empty() {
+            return Err("the checkout contains local files or changes".into());
+        }
+
+        remove_worktree(path, false).map_err(|e| e.to_string())?;
+        if let Some(CreatedBranch { name: branch, .. }) = self.new_branch {
+            if discover_worktrees(&self.primary_root)?
+                .iter()
+                .any(|worktree| worktree.branch.as_deref() == Some(&branch))
+            {
+                return Err(format!("branch {branch} is now checked out elsewhere"));
             }
-        } else {
-            dirty = true;
+            let branch_ref = format!("refs/heads/{branch}");
+            // Compare the tip atomically so an updated branch is never discarded.
+            let removed = run_git_with_timeout(
+                &self.primary_root,
+                &[
+                    OsStr::new("update-ref"),
+                    OsStr::new("--no-deref"),
+                    OsStr::new("-d"),
+                    OsStr::new(&branch_ref),
+                    OsStr::new(&self.info.head),
+                ],
+            )?;
+            if !removed.status.success() {
+                return Err(format!(
+                    "could not roll back branch {branch}: {}",
+                    removed.stderr.trim()
+                ));
+            }
         }
+        Ok(())
     }
-
-    (
-        GitWorkspaceStatus {
-            is_worktree,
-            dirty,
-            ahead,
-            behind,
-        },
-        branch,
-    )
-}
-
-/// Queries `git status --porcelain=v2 --branch` (with a 2s timeout) and returns
-/// `(GitWorkspaceStatus, Option<branch_name>)`, or `None` if `path` is not a git repository.
-pub fn git_workspace_status_and_branch(
-    path: &Path,
-) -> Option<(GitWorkspaceStatus, Option<String>)> {
-    if !path.is_dir() {
-        return None;
-    }
-
-    let is_worktree = path.join(".git").is_file();
-    let args = [
-        OsStr::new("status"),
-        OsStr::new("--porcelain=v2"),
-        OsStr::new("--branch"),
-    ];
-    let out = run_git_with_timeout_for(path, &args, GIT_PROBE_TIMEOUT).ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(parse_git_status_v2(&out.stdout, is_worktree))
-}
-
-/// Queries [`GitWorkspaceStatus`] for `path` with a 2s timeout, returning `None` if not a git repo.
-pub fn git_workspace_status(path: &Path) -> Option<GitWorkspaceStatus> {
-    git_workspace_status_and_branch(path).map(|(status, _)| status)
 }
 
 /// Validates that `path` is a linked secondary worktree (never the primary checkout) and returns
@@ -573,82 +510,10 @@ pub fn remove_worktree(path: &Path, force: bool) -> Result<(), WorktreeError> {
     Ok(())
 }
 
-fn truncate_utf8_with_suffix(mut text: String, max_bytes: usize, suffix: &str) -> String {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let target = max_bytes.saturating_sub(suffix.len());
-    let mut cut = target.min(text.len());
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    text.truncate(cut);
-    text.push_str(suffix);
-    text
-}
-
-/// Captures `(branch, bounded_diff_stat)` (`git status --short` + `git diff --stat`, capped at
-/// 4 KiB with a 2s timeout) for enriching [`daedalus_proto::FailureTrace`].
-pub fn git_failure_context(path: &Path) -> (Option<String>, Option<String>) {
-    if !path.is_dir() {
-        return (None, None);
-    }
-
-    let branch = {
-        let args = [
-            OsStr::new("symbolic-ref"),
-            OsStr::new("--short"),
-            OsStr::new("HEAD"),
-        ];
-        run_git_with_timeout_for(path, &args, GIT_PROBE_TIMEOUT)
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| out.stdout.trim().to_string())
-            .filter(|b| !b.is_empty())
-    };
-
-    let status_args = [OsStr::new("status"), OsStr::new("--short")];
-    let Ok(status_out) = run_git_with_timeout_for(path, &status_args, GIT_PROBE_TIMEOUT) else {
-        return (branch, None);
-    };
-    if !status_out.status.success() {
-        return (branch, None);
-    }
-
-    let diff_args = [OsStr::new("diff"), OsStr::new("--stat")];
-    let diff_out = run_git_with_timeout_for(path, &diff_args, GIT_PROBE_TIMEOUT)
-        .ok()
-        .filter(|out| out.status.success());
-
-    let status_trimmed = status_out.stdout.trim_end();
-    let diff_trimmed = diff_out
-        .as_ref()
-        .map(|out| out.stdout.trim_end())
-        .unwrap_or("");
-
-    let mut combined = String::new();
-    if !status_trimmed.is_empty() {
-        combined.push_str(status_trimmed);
-    }
-    if !diff_trimmed.is_empty() {
-        if !combined.is_empty() {
-            combined.push_str("\n\n");
-        }
-        combined.push_str(diff_trimmed);
-    }
-
-    if combined.is_empty() {
-        return (branch, None);
-    }
-
-    let bounded =
-        truncate_utf8_with_suffix(combined, MAX_FAILURE_CONTEXT_BYTES, "\n...[truncated]");
-    (branch, Some(bounded))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
     use tempfile::TempDir;
 
     fn run_git_test(dir: &Path, args: &[&str]) {
@@ -668,7 +533,7 @@ mod tests {
         );
     }
 
-    fn init_temp_repo(parent: &Path, name: &str) -> PathBuf {
+    pub(super) fn init_temp_repo(parent: &Path, name: &str) -> PathBuf {
         let repo = parent.join(name);
         std::fs::create_dir_all(&repo).unwrap();
         run_git_test(&repo, &["init", "-b", "main"]);
@@ -914,6 +779,71 @@ detached\r\n";
     }
 
     #[test]
+    fn worktree_rollback_preserves_ignored_files_and_new_commits() {
+        let root = TempDir::new().unwrap();
+        let base = root.path().join("worktrees");
+        let repo = init_temp_repo(root.path(), "repo");
+        std::fs::write(repo.join(".git/info/exclude"), "local-cache\n").unwrap();
+
+        let ignored = create_worktree_for_registration(&repo, "ignored", true, &base).unwrap();
+        let file = ignored.info.path.join("local-cache");
+        std::fs::write(&file, "keep this").unwrap();
+        assert!(ignored.rollback().unwrap_err().contains("local files"));
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "keep this");
+
+        let advanced = create_worktree_for_registration(&repo, "advanced", true, &base).unwrap();
+        let path = advanced.info.path.clone();
+        run_git_test(
+            &path,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "new work",
+            ],
+        );
+        assert!(
+            advanced
+                .rollback()
+                .unwrap_err()
+                .contains("no longer matches")
+        );
+        assert_eq!(current_branch(&path).as_deref(), Some("advanced"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_rollback_preserves_commits_made_by_checkout_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        let repo = init_temp_repo(root.path(), "repo");
+        let hook = repo.join(".git/hooks/post-checkout");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\ngit -c user.name=Fixture -c user.email=fixture@example.com commit --allow-empty -m hook\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let created =
+            create_worktree_for_registration(&repo, "hook", true, &root.path().join("worktrees"))
+                .unwrap();
+        let path = created.info.path.clone();
+        assert!(
+            created
+                .rollback()
+                .unwrap_err()
+                .contains("no longer matches")
+        );
+        assert_eq!(current_branch(&path).as_deref(), Some("hook"));
+    }
+
+    #[test]
     fn creates_chained_worktree_under_primary_repo_name() {
         let root = TempDir::new().unwrap();
         let base_dir = TempDir::new().unwrap();
@@ -931,45 +861,6 @@ detached\r\n";
             std::fs::canonicalize(base_dir.path().join("primary-repo").join("feat-two")).unwrap()
         );
         assert!(!base_dir.path().join("feat-one").join("feat-two").exists());
-    }
-
-    #[test]
-    fn parses_git_status_v2_ahead_behind_and_dirty_lines() {
-        let clean = "\
-# branch.oid 1111111111111111111111111111111111111111\n\
-# branch.head feat/v0.0.3\n\
-# branch.upstream origin/feat/v0.0.3\n\
-# branch.ab +3 -2\n";
-        assert_eq!(
-            parse_git_status_v2(clean, true),
-            (
-                GitWorkspaceStatus {
-                    is_worktree: true,
-                    dirty: false,
-                    ahead: 3,
-                    behind: 2,
-                },
-                Some("feat/v0.0.3".to_string()),
-            )
-        );
-
-        let dirty = "\
-# branch.oid 1111111111111111111111111111111111111111\n\
-# branch.head (detached)\n\
-1 .M N... 100644 100644 100644 abc def src/lib.rs\n\
-? untracked.txt\n";
-        assert_eq!(
-            parse_git_status_v2(dirty, false),
-            (
-                GitWorkspaceStatus {
-                    is_worktree: false,
-                    dirty: true,
-                    ahead: 0,
-                    behind: 0,
-                },
-                None,
-            )
-        );
     }
 
     #[test]
@@ -1024,31 +915,5 @@ detached\r\n";
 
         remove_worktree(&wt_dirty.path, true).unwrap();
         assert!(!wt_dirty.path.exists());
-    }
-
-    #[test]
-    fn git_failure_context_captures_branch_and_bounded_diff_stat() {
-        let non_git = TempDir::new().unwrap();
-        assert_eq!(git_failure_context(non_git.path()), (None, None));
-
-        let root = TempDir::new().unwrap();
-        let repo = init_temp_repo(root.path(), "ctx-app");
-        assert_eq!(git_failure_context(&repo), (Some("main".to_string()), None));
-
-        std::fs::write(repo.join("README.md"), "# modified\nsecond line\n").unwrap();
-        std::fs::write(repo.join("extra.txt"), "new file\n").unwrap();
-        let (branch, diff_stat) = git_failure_context(&repo);
-        assert_eq!(branch.as_deref(), Some("main"));
-        let stat = diff_stat.expect("dirty repo should have failure context");
-        assert!(stat.contains("README.md"));
-        assert!(stat.contains("extra.txt"));
-        assert!(stat.len() <= MAX_FAILURE_CONTEXT_BYTES);
-
-        // Verify truncation helper respects byte limit and UTF-8 boundaries
-        let long = "é".repeat(3000); // 6000 bytes
-        let truncated =
-            truncate_utf8_with_suffix(long, MAX_FAILURE_CONTEXT_BYTES, "\n...[truncated]");
-        assert!(truncated.len() <= MAX_FAILURE_CONTEXT_BYTES);
-        assert!(truncated.ends_with("\n...[truncated]"));
     }
 }

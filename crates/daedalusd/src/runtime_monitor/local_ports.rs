@@ -1,7 +1,12 @@
+#[cfg(any(target_os = "linux", all(test, unix)))]
+use crate::process::inventory::descendant_pids_including_roots;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+use crate::process::inventory::descendant_pids_with_comms;
 use daedalus_proto::{PortMapping, PortSource};
 #[cfg(all(unix, not(target_os = "macos")))]
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(target_os = "linux")]
 use std::path::Path;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 use std::time::Duration;
@@ -46,59 +51,6 @@ pub fn parse_proc_net_tcp(content: &str) -> Vec<(u64, u16)> {
         out.push((inode, port));
     }
     out
-}
-
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn parse_proc_stat_pid_ppid(stat: &str) -> Option<(u32, u32)> {
-    let first_paren = stat.find('(')?;
-    let last_paren = stat.rfind(')')?;
-    if last_paren <= first_paren {
-        return None;
-    }
-    let pid: u32 = stat[..first_paren].trim().parse().ok()?;
-    let mut parts = stat[last_paren + 1..].split_whitespace();
-    let _state = parts.next()?;
-    let ppid: u32 = parts.next()?.parse().ok()?;
-    Some((pid, ppid))
-}
-
-/// Parses `ps -axo pid=,ppid=,comm=` output into `(pid, ppid, comm_basename)` tuples.
-pub fn parse_ps_pid_comm_table(output: &str) -> Vec<(u32, u32, String)> {
-    let mut rows = Vec::new();
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Some(idx1) = trimmed.find(char::is_whitespace) else {
-            continue;
-        };
-        let Ok(pid) = trimmed[..idx1].parse::<u32>() else {
-            continue;
-        };
-        if pid == 0 {
-            continue;
-        }
-        let rest = trimmed[idx1..].trim_start();
-        let Some(idx2) = rest.find(char::is_whitespace) else {
-            continue;
-        };
-        let Ok(ppid) = rest[..idx2].parse::<u32>() else {
-            continue;
-        };
-        let raw_comm = rest[idx2..].trim();
-        if raw_comm.is_empty() {
-            continue;
-        }
-        let comm = Path::new(raw_comm)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(raw_comm)
-            .to_string();
-        rows.push((pid, ppid, comm));
-    }
-    rows
 }
 
 /// Parses `lsof -nP -a -p <pids> -iTCP -sTCP:LISTEN -F pcn` output into deduplicated
@@ -213,101 +165,6 @@ pub fn parse_windows_netstat_output(output: &str, pid_filter: &HashSet<u32>) -> 
         .collect()
 }
 
-/// Walks `/proc/<pid>/stat` to collect `roots` and all live descendant PIDs.
-#[cfg(target_os = "linux")]
-pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
-    if roots.is_empty() {
-        return HashSet::new();
-    }
-
-    let mut children_by_ppid: HashMap<u32, Vec<u32>> = HashMap::new();
-    if let Ok(entries) = std::fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name_str) = name.to_str() else {
-                continue;
-            };
-            if !name_str.bytes().all(|b| b.is_ascii_digit()) {
-                continue;
-            }
-            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-                continue;
-            };
-            if let Some((pid, ppid)) = parse_proc_stat_pid_ppid(&stat) {
-                children_by_ppid.entry(ppid).or_default().push(pid);
-            }
-        }
-    }
-
-    let mut collected = HashSet::new();
-    let mut queue = VecDeque::new();
-    for &root in roots {
-        if root > 0 && collected.insert(root) {
-            queue.push_back(root);
-        }
-    }
-
-    while let Some(pid) = queue.pop_front() {
-        if let Some(children) = children_by_ppid.get(&pid) {
-            for &child in children {
-                if collected.insert(child) {
-                    queue.push_back(child);
-                }
-            }
-        }
-    }
-
-    collected
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn descendant_pids_with_comms(roots: &[u32]) -> (HashSet<u32>, HashMap<u32, String>) {
-    if roots.is_empty() {
-        return (HashSet::new(), HashMap::new());
-    }
-
-    let mut cmd = std::process::Command::new("ps");
-    cmd.args(["-axo", "pid=,ppid=,comm="]);
-    let Some(output) =
-        crate::supervisor::run_command_stdout_with_timeout(&mut cmd, Duration::from_secs(2), false)
-    else {
-        return (HashSet::new(), HashMap::new());
-    };
-
-    let mut children_by_ppid: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut comm_by_pid: HashMap<u32, String> = HashMap::new();
-    for (pid, ppid, comm) in parse_ps_pid_comm_table(&output) {
-        children_by_ppid.entry(ppid).or_default().push(pid);
-        comm_by_pid.insert(pid, comm);
-    }
-
-    let mut collected = HashSet::new();
-    let mut queue = VecDeque::new();
-    for &root in roots {
-        if root > 0 && collected.insert(root) {
-            queue.push_back(root);
-        }
-    }
-
-    while let Some(pid) = queue.pop_front() {
-        if let Some(children) = children_by_ppid.get(&pid) {
-            for &child in children {
-                if collected.insert(child) {
-                    queue.push_back(child);
-                }
-            }
-        }
-    }
-
-    (collected, comm_by_pid)
-}
-
-/// Walks `ps` output to collect `roots` and all live descendant PIDs.
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
-    descendant_pids_with_comms(roots).0
-}
-
 #[cfg(target_os = "macos")]
 #[path = "macos_ports.rs"]
 mod native;
@@ -316,7 +173,7 @@ mod native;
 mod native;
 
 #[cfg(any(target_os = "macos", windows))]
-pub use native::{collect_descendant_pids, discover_local_ports_for_roots};
+pub use native::discover_local_ports_for_roots;
 
 #[cfg(target_os = "linux")]
 fn parse_socket_inode(link_target: &Path) -> Option<u64> {
@@ -355,7 +212,9 @@ pub fn discover_local_ports_for_roots(root_pids: &[u32]) -> Vec<PortMapping> {
         return Vec::new();
     }
 
-    let mut pids: Vec<u32> = collect_descendant_pids(root_pids).into_iter().collect();
+    let mut pids: Vec<u32> = descendant_pids_including_roots(root_pids)
+        .into_iter()
+        .collect();
     pids.sort_unstable();
 
     let mut by_port: BTreeMap<u16, Option<String>> = BTreeMap::new();
@@ -432,9 +291,11 @@ pub fn discover_local_ports_for_roots(root_pids: &[u32]) -> Vec<PortMapping> {
         "-F",
         "pcn",
     ]);
-    let Some(output) =
-        crate::supervisor::run_command_stdout_with_timeout(&mut cmd, Duration::from_secs(2), true)
-    else {
+    let Some(output) = crate::process::command::run_command_stdout_with_timeout(
+        &mut cmd,
+        Duration::from_secs(2),
+        true,
+    ) else {
         return Vec::new();
     };
 
@@ -466,6 +327,7 @@ pub fn discover_local_ports_for_roots(root_pids: &[u32]) -> Vec<PortMapping> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::inventory::parse_ps_pid_comm_table;
     use std::net::TcpListener;
     #[cfg(unix)]
     use std::process::{Command, Stdio};
@@ -492,13 +354,6 @@ mod tests {
    1: 00000000000000000000000001000000:AD39 00000000000000000000000000000000:0000 01 00000000:00000000 00:00000000 00000000  1000        0 66666 1 0000000000000000 100 0 0 10 0
 ";
         assert_eq!(parse_proc_net_tcp(ipv6_sample), vec![(55555, 5000)]);
-    }
-
-    #[test]
-    fn parse_proc_stat_handles_spaces_and_parens_in_comm() {
-        let stat = "4242 (my (weird) proc name) S 1001 4242 1001 0 -1 4194304 10 0 0 0";
-        assert_eq!(parse_proc_stat_pid_ppid(stat), Some((4242, 1001)));
-        assert_eq!(parse_proc_stat_pid_ppid("bad"), None);
     }
 
     #[test]
@@ -534,7 +389,7 @@ mod tests {
 
         let self_pid = std::process::id();
         let child_pid = child.id();
-        let pids = collect_descendant_pids(&[self_pid]);
+        let pids = descendant_pids_including_roots(&[self_pid]);
         assert!(pids.contains(&self_pid));
         assert!(pids.contains(&child_pid));
 

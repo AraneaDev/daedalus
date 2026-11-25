@@ -117,12 +117,58 @@ Direct Cargo test and check manifest commands select their preset automatically.
 summaries accumulate across crates. Final status follows command completion. The `service` preset
 includes an observed workspace port when available. Choose `command` for process status alone.
 
-Open **Settings → Widgets** to choose service and runner presets, set labels, and control runner
-duration and warnings. **Save widgets** applies the changes to this workspace on the current
-computer. Default values and blank labels inherit the project configuration.
+Open **Settings → Widgets** to add or remove a service or runner widget, choose presets, set labels,
+and control runner duration and warnings. **Save widgets** saves the overrides to the daemon for
+this workspace. Older daemons use local settings. Default values and blank labels inherit the
+project configuration.
+Removing a widget leaves its terminal running.
 When an agent asks for input, its workspace is highlighted in amber with a **Needs reply** badge.
 
 ![Workspace Widgets settings with service and runner presets and details](docs/images/workspace-widgets.png)
+
+### Custom widgets and shared workspaces
+
+Open **Settings → Custom widgets → New widget** to start from a blank widget or an
+editable template. The built-in templates include Git Worktree, Cargo Test, Cargo
+Check, Clippy, Dev Server, Docker Compose, and Custom Status. Use **Test preview**
+to check the result, then pin the widget to the bottom bar or leave it in Settings.
+The **Advanced** editor accepts the full widget definition, including multiple
+sources, highlight rules, icons, and actions. Select a widget in the bottom bar
+to see its details and actions.
+
+![Daedalus workbench with the Git Worktree template open in the widget editor](docs/images/widget-editor.png)
+
+Commands run from the workspace directory on the daemon host. Configure a refresh
+interval or use manual refresh. Advanced definitions also support refreshing when a
+runner finishes. Available command outputs include exit status, matching text, JSON
+fields, and a full widget result. Use `DAEDALUS_WORKSPACE_DIR` and
+`DAEDALUS_GIT_BRANCH` in scripts to access workspace context.
+
+Use **Import / export** in the custom widget settings to share one template or the
+full workspace. A workspace file includes its layout, launch assignments, and the
+widget definitions it uses. Commit it as `.daedalus-workspace.toml` to offer the
+setup and future updates to teammates. Preview an import before applying it. Repo
+updates retain local changes and offer a choice when the same field changed on
+both sides. Live terminals stay open.
+
+![Daedalus workbench previewing a shared workspace before import](docs/images/workspace-import.png)
+
+The CLI uses the same configuration as the desktop. These commands use the
+workspace for the current directory unless supplied a workspace ID or directory.
+
+```sh
+daedalus-ctl widget template list
+daedalus-ctl widget create branch --template git-worktree
+daedalus-ctl widget edit branch
+daedalus-ctl widget template export git-worktree --file worktree-widget.toml
+daedalus-ctl workspace export --file .daedalus-workspace.toml
+daedalus-ctl workspace import --repo --dry-run --json
+daedalus-ctl workspace import --repo --new /path/to/checkout
+daedalus-ctl workspace update --dry-run --json
+```
+
+Use `widget preview --file worktree-widget.toml` to test a definition, and
+`workspace configure --edit` to edit the complete setup in your terminal editor.
 
 ## Terminal links, activity and image previews
 

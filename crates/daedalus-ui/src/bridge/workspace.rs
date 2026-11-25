@@ -87,7 +87,7 @@ pub(super) async fn add_agent(
         })
         .await?;
     if let ResponsePayload::PaneSpawned(summary) = response {
-        publish_pane(conn, sink, summary, Some(preset)).await?;
+        publish_pane(conn, sink, summary, Some(preset), true).await?;
     }
     Ok(())
 }
@@ -119,10 +119,7 @@ pub(super) async fn replace_agent_preset(
     };
 
     let pane_id = summary.id;
-    sink.emit(UiEvent::PaneSpawned {
-        summary,
-        agent_preset: Some(preset),
-    });
+    emit_spawned_pane(conn, sink, summary, Some(preset), true);
 
     if let Some(pane_id) = old_pane_id {
         sink.emit(UiEvent::PaneClosed { pane_id });
@@ -262,17 +259,33 @@ pub(super) async fn ensure_workspace_panes(
     result
 }
 
-pub(super) async fn publish_pane(
+pub(super) fn emit_spawned_pane(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+    mut summary: daedalus_proto::PaneSummary,
+    legacy_preset: Option<AgentPreset>,
+    select_tab: bool,
+) {
+    // A new daemon's missing preset represents an unrecognized executable. Older
+    // daemons can omit the tag even when the launch command has a known preset.
+    if !conn.agent_launch_metadata_supported && summary.launch_preset.is_none() {
+        summary.launch_preset = legacy_preset.map(|preset| preset.short_name().to_owned());
+    }
+    sink.emit(UiEvent::PaneSpawned {
+        summary,
+        select_tab,
+    });
+}
+
+async fn publish_pane(
     conn: &RpcConnection,
     sink: &Arc<dyn UiEventSink>,
     summary: daedalus_proto::PaneSummary,
-    agent_preset: Option<AgentPreset>,
+    legacy_preset: Option<AgentPreset>,
+    select_tab: bool,
 ) -> Result<(), RpcError> {
     let pane_id = summary.id;
-    sink.emit(UiEvent::PaneSpawned {
-        summary,
-        agent_preset,
-    });
+    emit_spawned_pane(conn, sink, summary, legacy_preset, select_tab);
     if let ResponsePayload::Snapshot(snapshot) =
         conn.call(ClientMessage::GetSnapshot { pane_id }).await?
     {
@@ -292,7 +305,7 @@ async fn spawn_workspace_panes(
     // Older daemons expose only the empty/nonempty distinction and the SpawnPane RPC.
     if !ws.needs_default_panes() {
         for pane in &ws.panes {
-            publish_pane(conn, sink, pane.clone(), None).await?;
+            publish_pane(conn, sink, pane.clone(), None, false).await?;
         }
         return Ok(());
     }
@@ -335,12 +348,12 @@ async fn spawn_workspace_panes(
             }
             other => other?,
         };
-        let summary = match response {
-            ResponsePayload::PaneSpawned(summary) => summary,
+        let (summary, select_tab) = match response {
+            ResponsePayload::PaneSpawned(summary) => (summary, role == PaneRole::Agent),
             ResponsePayload::DefaultPaneExisting(Some(summary)) => {
                 // Another client may have chosen a different preset.
                 agent_preset = None;
-                summary
+                (summary, false)
             }
             ResponsePayload::DefaultPaneExisting(None) => continue,
             _ => {
@@ -349,7 +362,7 @@ async fn spawn_workspace_panes(
                 )));
             }
         };
-        publish_pane(conn, sink, summary, agent_preset).await?;
+        publish_pane(conn, sink, summary, agent_preset, select_tab).await?;
     }
 
     Ok(())
@@ -370,14 +383,10 @@ fn resolve_pane_launch_specs(
         .and_then(|m| m.agent_command.as_ref())
         .filter(|cmd| !cmd.is_empty())
     {
-        Some(cmd) => {
-            let executable = cmd[0].rsplit(['/', '\\']).next().unwrap_or("");
-            let inferred_preset = AgentPreset::from_cli_name(
-                executable.trim_end_matches(".exe").trim_end_matches(".cmd"),
-            )
-            .or(manifest_preset);
-            (Some(cmd.clone()), inferred_preset)
-        }
+        Some(cmd) => (
+            Some(cmd.clone()),
+            AgentPreset::from_executable(&cmd[0]).or(manifest_preset),
+        ),
         None => (base_preset.command(), Some(base_preset)),
     };
 

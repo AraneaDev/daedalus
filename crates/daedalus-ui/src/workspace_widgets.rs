@@ -8,6 +8,10 @@ use tracing::warn;
 pub struct WorkspaceWidgets {
     pub service: WidgetConfig,
     pub runner: WidgetConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner_enabled: Option<bool>,
 }
 
 impl WorkspaceWidgets {
@@ -16,6 +20,36 @@ impl WorkspaceWidgets {
             PaneRole::Service => Some(&self.service),
             PaneRole::Runner => Some(&self.runner),
             _ => None,
+        }
+    }
+
+    pub(crate) fn includes(&self, role: PaneRole, automatic: bool) -> bool {
+        match role {
+            PaneRole::Service => self.service_enabled.unwrap_or(automatic),
+            PaneRole::Runner => self.runner_enabled.unwrap_or(automatic),
+            PaneRole::Agent => false,
+        }
+    }
+}
+
+impl From<WorkspaceWidgets> for daedalus_proto::workbench::PaneWidgets {
+    fn from(widgets: WorkspaceWidgets) -> Self {
+        Self {
+            service: widgets.service,
+            runner: widgets.runner,
+            service_enabled: widgets.service_enabled,
+            runner_enabled: widgets.runner_enabled,
+        }
+    }
+}
+
+impl From<daedalus_proto::workbench::PaneWidgets> for WorkspaceWidgets {
+    fn from(widgets: daedalus_proto::workbench::PaneWidgets) -> Self {
+        Self {
+            service: widgets.service,
+            runner: widgets.runner,
+            service_enabled: widgets.service_enabled,
+            runner_enabled: widgets.runner_enabled,
         }
     }
 }
@@ -37,11 +71,9 @@ pub fn load_all(directory: &Path) -> HashMap<WorkspaceId, WorkspaceWidgets> {
                 return None;
             }
             let id = WorkspaceId(uuid::Uuid::parse_str(path.file_stem()?.to_str()?).ok()?);
-            let result = fs::read_to_string(&path)
-                .map_err(|err| err.to_string())
-                .and_then(|contents| toml::from_str(&contents).map_err(|err| err.to_string()));
-            match result {
-                Ok(widgets) => Some((id, widgets)),
+            match load_from(&path) {
+                Ok(Some(widgets)) => Some((id, widgets)),
+                Ok(None) => None,
                 Err(err) => {
                     warn!(%err, path = %path.display(), "could not load workspace widgets");
                     None
@@ -49,6 +81,20 @@ pub fn load_all(directory: &Path) -> HashMap<WorkspaceId, WorkspaceWidgets> {
             }
         })
         .collect()
+}
+
+pub fn load(directory: &Path, id: WorkspaceId) -> Result<Option<WorkspaceWidgets>, String> {
+    load_from(&directory.join(format!("{id}.toml")))
+}
+
+fn load_from(path: &Path) -> Result<Option<WorkspaceWidgets>, String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => toml::from_str(&contents)
+            .map(Some)
+            .map_err(|err| err.to_string()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 pub fn save(

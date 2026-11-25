@@ -1,2 +1,9 @@
 pub(super) mod action;
+pub(crate) mod diagnostics;
 pub(super) mod pane;
+pub(crate) mod service;
+pub(crate) mod status;
+pub(super) mod widget;
+pub(crate) mod workspace;
+pub(super) mod workspace_config;
+pub(crate) mod worktree;

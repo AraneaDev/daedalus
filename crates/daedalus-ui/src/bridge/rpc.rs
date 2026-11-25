@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tracing::{debug, warn};
 
@@ -30,6 +30,11 @@ pub(super) struct RpcConnection {
     pub(super) image_preview_supported: bool,
     pub(super) project_setup_supported: bool,
     pub(super) paste_supported: bool,
+    pub(super) workbench_supported: bool,
+    pub(super) runner_assignment_supported: bool,
+    pub(super) resolved_import_preview_supported: bool,
+    pub(super) agent_launch_metadata_supported: bool,
+    membership: Arc<Notify>,
     write_tx: mpsc::UnboundedSender<Request>,
     pending: PendingMap,
     next_id: AtomicU64,
@@ -62,6 +67,8 @@ impl RpcConnection {
             let _ = writer_disconnect.send(true);
         });
 
+        let membership = Arc::new(Notify::new());
+        let membership_events = Arc::clone(&membership);
         let reader_pending = Arc::clone(&pending);
         let reader_disconnect = disconnect_tx.clone();
         let reader_task = tokio::spawn(async move {
@@ -103,6 +110,9 @@ impl RpcConnection {
                                 assignments,
                             });
                         }
+                        ServerEvent::WorkspaceMembershipChanged => {
+                            membership_events.notify_one();
+                        }
                         other => {
                             sink.emit(UiEvent::ServerEvent(other));
                         }
@@ -140,6 +150,11 @@ impl RpcConnection {
             project_setup_supported: false,
             image_preview_supported: false,
             paste_supported: false,
+            workbench_supported: false,
+            runner_assignment_supported: false,
+            resolved_import_preview_supported: false,
+            agent_launch_metadata_supported: false,
+            membership,
             write_tx,
             pending,
             next_id: AtomicU64::new(1),
@@ -148,6 +163,10 @@ impl RpcConnection {
             reader_task,
             writer_task,
         }
+    }
+
+    pub(super) fn membership_notifications(&self) -> Arc<Notify> {
+        Arc::clone(&self.membership)
     }
 
     pub(super) async fn call(&self, payload: ClientMessage) -> Result<ResponsePayload, RpcError> {

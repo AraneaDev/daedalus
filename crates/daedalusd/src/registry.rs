@@ -1,6 +1,9 @@
 mod persistence;
 mod projects;
 mod status;
+mod widget_runtime;
+mod workbench_config;
+mod workbench_import;
 
 use crate::isolation;
 use crate::journal::Journal;
@@ -10,6 +13,8 @@ use crate::persistence::{PersistedRecentProject, PersistedWorkspace, StateStore}
 use crate::runtime_monitor::WorkspaceMonitorTarget;
 use crate::shell_integration::ShellIntegration;
 use crate::supervisor::{IsolationMode, Supervisor};
+use crate::workbench::scheduler::WidgetCommands;
+use crate::workbench::store::WorkbenchStore;
 use crate::worktree::{self, WorktreeError};
 use daedalus_proto::{
     AgentState, Assignment, ContainerHealth, ExternalStatus, FailureTrace, GitWorkspaceStatus,
@@ -60,6 +65,7 @@ struct WorkspaceRecord {
     pane_ids: Vec<PaneId>,
     default_panes: DefaultPanes,
     lifecycle: std::sync::Arc<Mutex<()>>,
+    widget_commands: Arc<WidgetCommands>,
     journal: Journal,
     bound_ports: Vec<PortMapping>,
     containers: Vec<ContainerHealth>,
@@ -198,6 +204,7 @@ fn build_workspace_record(
             DefaultPanes::Pending(HashSet::new())
         },
         lifecycle: Default::default(),
+        widget_commands: Default::default(),
         journal: Journal::default(),
         bound_ports: Vec::new(),
         containers: Vec::new(),
@@ -213,6 +220,7 @@ pub struct Registry {
     shell_integration: ShellIntegration,
     event_tx: broadcast::Sender<ServerEvent>,
     state_store: Option<StateStore>,
+    pub(crate) workbench_store: WorkbenchStore,
     persist_lock: Arc<Mutex<persistence::PersistenceWriteState>>,
     unresolved_legacy_roots: RwLock<Vec<PersistedWorkspace>>,
     create_lock: Mutex<()>,
@@ -238,12 +246,17 @@ impl Registry {
         event_tx: broadcast::Sender<ServerEvent>,
         state_store: Option<StateStore>,
     ) -> Self {
+        let workbench_directory = state_store
+            .as_ref()
+            .and_then(|store| store.path().parent())
+            .map(|parent| parent.join("workbench"));
         Self {
             journal_epoch: WorkspaceId::new(),
             supervisor,
             shell_integration,
             event_tx,
             state_store,
+            workbench_store: WorkbenchStore::new(workbench_directory),
             persist_lock: Arc::new(Mutex::new(persistence::PersistenceWriteState::Unchecked)),
             unresolved_legacy_roots: RwLock::new(Vec::new()),
             create_lock: Mutex::new(()),
@@ -307,6 +320,37 @@ impl Registry {
         env: HashMap<String, String>,
         manual_launch: bool,
     ) -> Result<WorkspaceInfo, ProtoError> {
+        let create_guard = self.create_lock.lock().await;
+        let info = self
+            .register_workspace(name, root_dir, env, manual_launch)
+            .await?;
+        drop(create_guard);
+        Ok(self.finish_workspace_creation(info).await)
+    }
+
+    /// Registers the workspace while the caller holds `create_lock`.
+    async fn register_workspace(
+        &self,
+        name: String,
+        root_dir: PathBuf,
+        env: HashMap<String, String>,
+        manual_launch: bool,
+    ) -> Result<WorkspaceInfo, ProtoError> {
+        let record = self
+            .prepare_workspace_record(name, root_dir, env, manual_launch)
+            .await?;
+        Ok(self.publish_workspace(record).await)
+    }
+
+    /// Allocates an ID and a slot without exposing the workspace to clients.
+    /// The caller holds `create_lock` until it publishes or drops the record.
+    async fn prepare_workspace_record(
+        &self,
+        name: String,
+        root_dir: PathBuf,
+        env: HashMap<String, String>,
+        manual_launch: bool,
+    ) -> Result<WorkspaceRecord, ProtoError> {
         let root_dir =
             std::path::absolute(root_dir).map_err(|err| ProtoError::IoError(err.to_string()))?;
         if !root_dir.is_dir() {
@@ -316,7 +360,6 @@ impl Registry {
             )));
         }
 
-        let _create_guard = self.create_lock.lock().await;
         let (slot_index, reserved_ports) = {
             let ws_map = self.workspaces.read().await;
             let used_slots: HashSet<u16> = ws_map.values().map(|ws| ws.slot_index).collect();
@@ -340,14 +383,27 @@ impl Registry {
         .map_err(|e| ProtoError::IoError(e.to_string()))?;
 
         let id = WorkspaceId::new();
-        let record = build_workspace_record(id, name, root_dir, prepared, manual_launch);
-        let mut info = record.to_info(Vec::new());
+        Ok(build_workspace_record(
+            id,
+            name,
+            root_dir,
+            prepared,
+            manual_launch,
+        ))
+    }
+
+    async fn publish_workspace(&self, record: WorkspaceRecord) -> WorkspaceInfo {
+        let info = record.to_info(Vec::new());
         self.record_recent_project(&info.name, &info.root_dir).await;
-        self.workspaces.write().await.insert(id, record);
-        drop(_create_guard);
+        self.workspaces.write().await.insert(info.id, record);
+        self.notify_membership();
+        info
+    }
+
+    async fn finish_workspace_creation(&self, mut info: WorkspaceInfo) -> WorkspaceInfo {
         self.persist_state().await;
         self.attach_project_setup(&mut info).await;
-        Ok(info)
+        info
     }
 
     pub async fn discover_worktrees(
@@ -384,22 +440,58 @@ impl Registry {
         let base_dir = self.worktrees_base_dir();
         let branch_clone = branch.clone();
         let wt = tokio::task::spawn_blocking(move || {
-            worktree::create_worktree(&repo_dir, &branch_clone, create_branch, &base_dir)
+            worktree::create_worktree_for_registration(
+                &repo_dir,
+                &branch_clone,
+                create_branch,
+                &base_dir,
+            )
         })
         .await
         .map_err(|e| ProtoError::Internal(format!("worktree creation task failed: {e}")))?
         .map_err(ProtoError::InvalidRequest)?;
 
-        let name = wt
-            .path
+        let path = wt.info.path.clone();
+        let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .or_else(|| wt.branch.clone())
+            .or_else(|| wt.info.branch.clone())
             .unwrap_or(branch);
 
-        self.create_workspace(name, wt.path, env).await
+        // Git hooks can run while other workspace requests proceed. Serialize registration
+        // and rollback from here, and check whether a request already claimed this checkout.
+        let create_guard = self.create_lock.lock().await;
+        let info = match self
+            .register_workspace(name, path.clone(), env, false)
+            .await
+        {
+            Ok(info) => info,
+            Err(error) => {
+                let already_registered = self
+                    .workspaces
+                    .read()
+                    .await
+                    .values()
+                    .any(|record| record.canonical_root_dir == wt.canonical_target);
+                let cleanup_error = if already_registered {
+                    "another workspace is using the checkout".into()
+                } else {
+                    match tokio::task::spawn_blocking(move || wt.rollback()).await {
+                        Ok(Ok(())) => return Err(error),
+                        Ok(Err(reason)) => reason,
+                        Err(task_error) => task_error.to_string(),
+                    }
+                };
+                return Err(ProtoError::IoError(format!(
+                    "{error}. Worktree cleanup at {} failed: {cleanup_error}. Inspect the checkout and branch with git worktree list before retrying.",
+                    path.display()
+                )));
+            }
+        };
+        drop(create_guard);
+        Ok(self.finish_workspace_creation(info).await)
     }
 
     pub async fn list_workspaces(&self) -> Vec<WorkspaceInfo> {
@@ -494,6 +586,40 @@ impl Registry {
             pane_env,
             None,
             false,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn launch_runner_assignment(
+        &self,
+        workspace_id: WorkspaceId,
+        assignment_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<PaneSummary, ProtoError> {
+        let _lifecycle = self.lock_workspace_lifecycle(workspace_id).await?;
+        let assignment = self
+            .workbench(workspace_id)
+            .await?
+            .document
+            .assignments
+            .into_iter()
+            .find(|entry| entry.id == assignment_id && entry.role == PaneRole::Runner)
+            .ok_or_else(|| {
+                ProtoError::InvalidRequest(format!("No saved runner assignment '{assignment_id}'"))
+            })?;
+        self.install_pane(
+            workspace_id,
+            PaneRole::Runner,
+            Some(assignment.argv),
+            None,
+            cols,
+            rows,
+            HashMap::new(),
+            None,
+            false,
+            Some(assignment.id),
         )
         .await
     }
@@ -514,6 +640,29 @@ impl Registry {
             .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
         if matches!(&ws.default_panes, DefaultPanes::Pending(done) if !done.contains(&role)) {
             drop(workspaces);
+            let workbench = self.workbench(workspace_id).await?;
+            let saved = (workbench.revision > 0)
+                .then(|| {
+                    workbench
+                        .document
+                        .assignments
+                        .into_iter()
+                        .find(|entry| entry.role == role)
+                })
+                .flatten();
+            let assignment_id = saved
+                .as_ref()
+                .filter(|_| role == PaneRole::Runner)
+                .map(|entry| entry.id.clone());
+            let command = if let Some(saved) = saved {
+                if role == PaneRole::Agent && saved.argv == ["shell"] {
+                    None
+                } else {
+                    Some(saved.argv)
+                }
+            } else {
+                command
+            };
             return self
                 .install_pane(
                     workspace_id,
@@ -525,6 +674,7 @@ impl Registry {
                     HashMap::new(),
                     None,
                     true,
+                    assignment_id,
                 )
                 .await
                 .map(ResponsePayload::PaneSpawned);
@@ -588,6 +738,7 @@ impl Registry {
             HashMap::new(),
             old_pane_id,
             false,
+            None,
         )
         .await
     }
@@ -605,8 +756,9 @@ impl Registry {
         pane_env: HashMap<String, String>,
         old_pane_id: Option<PaneId>,
         is_default: bool,
+        assignment_id: Option<String>,
     ) -> Result<PaneSummary, ProtoError> {
-        let (root_dir, mut merged_env, journal) = {
+        let (root_dir, mut merged_env, journal, manifest_preset) = {
             let ws_map = self.workspaces.read().await;
             let ws = ws_map
                 .get(&workspace_id)
@@ -615,6 +767,16 @@ impl Registry {
                 ws.root_dir.clone(),
                 ws.injected_env.clone(),
                 ws.journal.clone(),
+                ws.manifest
+                    .as_ref()
+                    .filter(|_| role == PaneRole::Agent)
+                    .filter(|manifest| {
+                        command.as_ref().is_some_and(|argv| {
+                            !argv.is_empty() && manifest.agent_command.as_ref() == Some(argv)
+                        })
+                    })
+                    .and_then(|manifest| manifest.agent_preset.as_deref())
+                    .and_then(daedalus_proto::canonical_agent_preset),
             )
         };
         merged_env.extend(pane_env);
@@ -624,7 +786,7 @@ impl Registry {
             .shell_integration
             .build_launch_spec(command.as_deref(), shell.as_deref());
 
-        let spawned = self
+        let mut spawned = self
             .supervisor
             .spawn_pty(
                 workspace_id,
@@ -637,6 +799,9 @@ impl Registry {
                 &merged_env,
             )
             .map_err(ProtoError::SpawnFailed)?;
+        if spawned.launch_preset.is_none() {
+            spawned.launch_preset = manifest_preset.map(str::to_owned);
+        }
 
         let handle = PaneHandle::spawn_journaled(
             workspace_id,
@@ -647,7 +812,8 @@ impl Registry {
             spawned,
             self.event_tx.clone(),
             journal,
-        );
+        )
+        .with_assignment_id(assignment_id);
 
         let summary = match handle.summary().await {
             Ok(s) => s,
@@ -672,6 +838,7 @@ impl Registry {
             panes.insert(pane_id, handle);
             previous
         };
+        self.notify_membership();
         if let Some(previous) = previous {
             previous.close().await;
         }
@@ -705,8 +872,13 @@ impl Registry {
         {
             ws.pane_ids.retain(|id| *id != pane_id);
         }
+        self.notify_membership();
         handle.close().await;
         Ok(())
+    }
+
+    fn notify_membership(&self) {
+        let _ = self.event_tx.send(ServerEvent::WorkspaceMembershipChanged);
     }
 
     pub async fn close_workspace(
@@ -795,37 +967,68 @@ impl Registry {
             }
             handles
         };
+        let had_panes = !handles.is_empty();
         for handle in handles {
             handle.close().await;
         }
 
-        if compose_down && let Some(project) = project {
+        let project = project.filter(|_| compose_down);
+        if let Err(error) = Self::remove_workspace_resources(
+            root_dir,
+            project,
+            remove_worktree,
+            force_remove_worktree,
+        )
+        .await
+        {
+            if had_panes {
+                self.notify_membership();
+            }
+            return Err(error);
+        }
+
+        if let Some(workspace) = self.workspaces.write().await.remove(&workspace_id) {
+            workspace.widget_commands.close();
+        }
+        self.notify_membership();
+        if persist {
+            self.persist_state().await;
+        }
+        Ok(())
+    }
+
+    async fn remove_workspace_resources(
+        root_dir: PathBuf,
+        compose_project: Option<String>,
+        remove_worktree: bool,
+        force_remove_worktree: bool,
+    ) -> Result<(), ProtoError> {
+        if let Some(project) = compose_project {
             let root_dir = root_dir.clone();
-            tokio::task::spawn_blocking(move || isolation::run_compose_down(&root_dir, &project))
-                .await
-                .map_err(|err| ProtoError::Internal(format!(
-                    "panes stopped; workspace retained for retry after Compose teardown task failed: {err}"
-                )))?
-                .map_err(|err| ProtoError::IoError(format!(
-                    "panes stopped; workspace retained for retry after Compose teardown failed: {err}"
-                )))?;
+            let cleanup =
+                tokio::task::spawn_blocking(move || isolation::run_compose_down(&root_dir, &project))
+                    .await
+                    .map_err(|error| {
+                        ProtoError::Internal(format!(
+                            "panes stopped; workspace retained for retry after Compose teardown task failed: {error}"
+                        ))
+                    })?;
+            cleanup.map_err(|error| {
+                ProtoError::IoError(format!(
+                    "panes stopped; workspace retained for retry after Compose teardown failed: {error}"
+                ))
+            })?;
         }
 
         if remove_worktree {
-            let removal = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 worktree::remove_worktree(&root_dir, force_remove_worktree)
             })
             .await
-            .map_err(|e| ProtoError::Internal(format!("worktree removal task failed: {e}")))?;
-
-            if let Err(err) = removal {
-                return Err(map_worktree_error(err));
-            }
-        }
-
-        self.workspaces.write().await.remove(&workspace_id);
-        if persist {
-            self.persist_state().await;
+            .map_err(|error| {
+                ProtoError::Internal(format!("worktree removal task failed: {error}"))
+            })?
+            .map_err(map_worktree_error)?;
         }
         Ok(())
     }
@@ -1281,6 +1484,78 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ProtoError::WorkspaceNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn failed_worktree_registration_preserves_existing_branch_and_allows_retry() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let worktrees = dir.path().join("worktrees");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let commit = |message| {
+            git(&["add", ".env"]);
+            git(&[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "-m",
+                message,
+            ]);
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(repo.join(".env"), "PORT=65500\n").unwrap();
+        commit("overflowing port");
+        git(&["branch", "existing"]);
+
+        let registry = test_registry(dir.path());
+        registry.set_worktrees_dir(worktrees.clone());
+        registry
+            .create_workspace("slot zero".into(), dir.path().to_path_buf(), HashMap::new())
+            .await
+            .unwrap();
+
+        for (branch, create_branch) in [("new", true), ("existing", false)] {
+            let error = registry
+                .create_worktree_workspace(
+                    repo.clone(),
+                    branch.into(),
+                    create_branch,
+                    HashMap::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ProtoError::IoError(message) if message.contains("port block"))
+            );
+            assert!(!worktrees.join("repo").join(branch).exists());
+        }
+        git(&["show-ref", "--verify", "refs/heads/existing"]);
+        assert_eq!(worktree::discover_worktrees(&repo).unwrap().len(), 1);
+        assert_eq!(registry.list_workspaces().await.len(), 1);
+
+        std::fs::write(repo.join(".env"), "# no port reservation\n").unwrap();
+        commit("remove invalid port");
+        let workspace = registry
+            .create_worktree_workspace(repo, "new".into(), true, HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(workspace.git_branch.as_deref(), Some("new"));
+        assert!(workspace.root_dir.is_dir());
     }
 
     #[tokio::test]

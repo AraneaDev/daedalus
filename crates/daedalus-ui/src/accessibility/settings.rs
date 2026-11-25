@@ -13,7 +13,7 @@ fn control_id(settings: &SettingsDialog, control: Control) -> NodeId {
     let offset = settings
         .control_order()
         .position(|c| c == control)
-        .expect("visible control");
+        .unwrap_or_default();
     id(settings, offset as u64)
 }
 
@@ -33,7 +33,9 @@ pub(super) fn fields(
     }
     for (index, (control, rect)) in settings.controls(modal).enumerate() {
         let enabled = settings.enabled(control);
+        let review_text = settings.is_import_review_text(control);
         let mut node = match control {
+            _ if review_text => named(Role::Label, settings.label(control)),
             field if field.field_label().is_some() => {
                 let label = field.field_label().unwrap();
                 let mut field = if enabled {
@@ -77,7 +79,7 @@ pub(super) fn fields(
         };
         if enabled {
             node.add_action(Action::Focus);
-        } else {
+        } else if !review_text {
             node.set_disabled();
         }
         node.set_bounds(bounds(rect));

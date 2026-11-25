@@ -83,6 +83,21 @@ impl Registry {
         assignments: Vec<Assignment>,
     ) -> Result<(), ProtoError> {
         daedalus_proto::validate_assignments(&assignments).map_err(ProtoError::InvalidRequest)?;
+        let state = self.workbench(workspace_id).await?;
+        if state.revision > 0 {
+            let mut document = state.document;
+            document.assignments = assignments;
+            return match self
+                .update_workbench(workspace_id, Some(state.revision), document)
+                .await?
+            {
+                crate::workbench::store::Change::Applied(_) => Ok(()),
+                crate::workbench::store::Change::Conflict(_) => Err(ProtoError::InvalidRequest(
+                    "The workspace changed. Reopen settings and review the latest assignments."
+                        .into(),
+                )),
+            };
+        }
         let root_dir = {
             let ws_map = self.workspaces.read().await;
             ws_map
@@ -95,6 +110,13 @@ impl Registry {
     }
 
     pub(crate) async fn attach_project_setup(&self, info: &mut WorkspaceInfo) {
+        if let Ok(state) = self.workbench(info.id).await
+            && state.revision > 0
+        {
+            info.name = state.document.name;
+            info.setup = Some(state.document.assignments);
+            return;
+        }
         info.setup = self
             .project_setups
             .read()

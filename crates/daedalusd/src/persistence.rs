@@ -100,63 +100,66 @@ impl StateStore {
     }
 
     pub fn save(&self, state: &PersistedState) -> io::Result<()> {
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            #[cfg_attr(not(unix), allow(unused_variables))]
-            let created = !parent.exists();
-            fs::create_dir_all(parent)?;
-            #[cfg(unix)]
-            if created {
-                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-            }
-        }
-
-        let mut bytes = serde_json::to_vec_pretty(state)
-            .map_err(|e| io::Error::other(format!("failed to serialize state.json: {e}")))?;
-        bytes.push(b'\n');
-
-        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp_name = format!(
-            "{}.{}.{}.tmp",
-            self.path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("state.json"),
-            std::process::id(),
-            seq
-        );
-        let tmp_path = match self.path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
-            _ => PathBuf::from(tmp_name),
-        };
-
-        let mut open_opts = OpenOptions::new();
-        open_opts.write(true).create_new(true);
-        #[cfg(unix)]
-        open_opts.mode(0o600);
-        let mut file = open_opts.open(&tmp_path)?;
-
-        let write_res = (|| -> io::Result<()> {
-            #[cfg(unix)]
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            Ok(())
-        })();
-
-        if let Err(err) = write_res {
-            drop(file);
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-        drop(file);
-
-        if let Err(err) = fs::rename(&tmp_path, &self.path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-
-        Ok(())
+        write_json_atomic(&self.path, state)
     }
+}
+
+pub(crate) fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        #[cfg_attr(not(unix), allow(unused_variables))]
+        let created = !parent.exists();
+        fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        if created {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|e| io::Error::other(format!("failed to serialize {}: {e}", path.display())))?;
+    bytes.push(b'\n');
+
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(
+        "{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("state.json"),
+        std::process::id(),
+        seq
+    );
+    let tmp_path = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+        _ => PathBuf::from(tmp_name),
+    };
+
+    let mut open_opts = OpenOptions::new();
+    open_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    open_opts.mode(0o600);
+    let mut file = open_opts.open(&tmp_path)?;
+
+    let write_res = (|| -> io::Result<()> {
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    drop(file);
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

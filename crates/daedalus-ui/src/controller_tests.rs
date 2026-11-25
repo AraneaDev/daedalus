@@ -1,5 +1,6 @@
 use super::*;
 use daedalus_proto::{PaneStatus, PaneSummary, SetupInspection, WorkspaceInfo};
+use daedalus_ui::bridge::WorkbenchOperation;
 use daedalus_ui::setup_review::SetupAction;
 use daedalus_ui::workspace_form::WorkspaceFormAction;
 use std::sync::mpsc::{Receiver, channel};
@@ -10,6 +11,137 @@ struct Workbench {
     app: DaedalusApp,
     commands: Receiver<UiCommand>,
     root: TempDir,
+}
+
+mod membership;
+mod settings_workflows;
+mod widget_library;
+mod widget_viewport;
+
+#[test]
+fn widget_editor_builds_previews_and_saves_a_daemon_definition() {
+    use daedalus_proto::workbench::{WidgetSource, WorkbenchState, WorkspaceDocument};
+    use daedalus_proto::{ClientMessage, ResponsePayload};
+    use daedalus_ui::settings::Control;
+
+    let mut workbench = Workbench::new();
+    let workspace = workspace("Widget editor");
+    let id = workspace.id;
+    let agent = workspace.panes[0].id;
+    workbench.app.state.set_workspaces(vec![workspace]);
+    workbench.app.workbench_capable = true;
+    workbench.app.open_workspace_settings();
+    let state = WorkbenchState {
+        revision: 2,
+        document: WorkspaceDocument::new("Widget editor".into()),
+        repo_baseline: None,
+    };
+    workbench.app.workbench_response(
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(state)),
+    );
+    while workbench.commands.try_recv().is_ok() {}
+    let settings = &mut workbench.app.state.settings;
+    settings.activate(Control::CustomWidgetsPage);
+    settings.activate(Control::CustomNew);
+    settings.set_value(Control::CustomName, "API health");
+    settings.set_value(Control::CustomExecutable, "printf");
+    settings.set_value(Control::CustomArguments, r#"["ready"]"#);
+    settings.set_value(Control::CustomInterval, "5");
+    settings.activate(Control::CustomOutput);
+    settings.set_value(Control::CustomSummary, "main:text");
+    let preview = settings.activate(Control::CustomPreview);
+    workbench.app.handle_settings_action(preview);
+    let UiCommand::Workbench { request, .. } = workbench.commands.try_recv().unwrap() else {
+        panic!("expected a daemon preview")
+    };
+    assert!(
+        matches!(*request, ClientMessage::PreviewWidget { definition, .. }
+        if matches!(&definition.sources[0].source, WidgetSource::Command { command, refresh, .. }
+            if command.argv == ["printf", "ready"] && refresh.interval_seconds == Some(5)))
+    );
+    let save = workbench.app.state.settings.activate(Control::CustomSave);
+    workbench.app.handle_settings_action(save);
+    let UiCommand::Workbench { request, .. } = workbench.commands.try_recv().unwrap() else {
+        panic!("expected a daemon save")
+    };
+    assert!(
+        matches!(*request, ClientMessage::UpdateWorkbench { revision: 2, document, .. }
+        if document.widgets.len() == 1 && document.widgets[0].name == "API health")
+    );
+    assert_eq!(
+        workbench.app.state.pane_id_for_role(PaneRole::Agent),
+        Some(agent)
+    );
+}
+
+#[test]
+fn widget_lifecycle_creates_a_slot_and_removal_keeps_its_terminal() {
+    use daedalus_ui::settings::Control;
+
+    let mut workbench = Workbench::new();
+    let mut workspace = workspace("Widget lifecycle");
+    let service = workspace.panes.remove(1);
+    let id = workspace.id;
+    workbench.app.state.set_workspaces(vec![workspace]);
+    workbench.app.open_workspace_settings();
+    let settings = &mut workbench.app.state.settings;
+    settings.activate(Control::WidgetsPage);
+    let add = settings
+        .control_order()
+        .find(|&control| settings.label(control) == "+ Add service widget")
+        .expect("missing service widget offers creation");
+    settings.activate(add);
+    settings.set_value(Control::ServiceLabel, "Health API");
+    let action = settings.activate(Control::Save);
+    workbench.app.handle_settings_action(action);
+    assert_eq!(
+        workbench
+            .app
+            .state
+            .widget_label(PaneRole::Service)
+            .as_deref(),
+        Some("Health API · No terminal")
+    );
+
+    workbench.app.state.register_pane(service.clone(), false);
+    let settings = &mut workbench.app.state.settings;
+    let remove = settings
+        .control_order()
+        .find(|&control| settings.label(control) == "Remove service widget")
+        .expect("configured widget offers removal");
+    settings.activate(remove);
+    let action = settings.activate(Control::Save);
+    workbench.app.handle_settings_action(action);
+    assert!(
+        workbench
+            .app
+            .state
+            .widget_label(PaneRole::Service)
+            .is_none()
+    );
+    assert_eq!(
+        workbench.app.state.pane_id_for_role(PaneRole::Service),
+        Some(service.id)
+    );
+
+    workbench.app.state.workspace_widgets =
+        daedalus_ui::workspace_widgets::load_all(&workbench.app.widget_directory);
+    assert!(
+        workbench
+            .app
+            .state
+            .widget_label(PaneRole::Service)
+            .is_none()
+    );
+    assert!(
+        workbench.app.state.workspace_widgets[&id]
+            .service
+            .label
+            .is_none()
+    );
+    assert!(workbench.idle());
 }
 
 #[test]
@@ -580,9 +712,10 @@ fn dormant_workspaces_spawn_once_and_failure_forwarding_revalidates_agent_choice
     assert_eq!(w.app.state.focused_pane_id(), Some(agent));
     let mut second = failed.panes[0].clone();
     second.id = PaneId::new();
+    second.launch_preset = Some("claude".into());
     w.app.handle_daemon_event(UiEvent::PaneSpawned {
         summary: second,
-        agent_preset: Some(AgentPreset::Claude),
+        select_tab: true,
     });
     w.app.handle_ui_action(UiAction::ForwardFailureToAgent);
     let choices = w.app.state.failure_recipients.take().unwrap();
@@ -651,7 +784,7 @@ fn settings_persist_bindings_restore_names_and_launch_saved_tests_in_an_isolated
     ));
     assert!(!w.app.state.settings.open);
     assert!(
-        matches!(w.command(), UiCommand::LaunchAssignment { workspace_id, assignment, cols, rows}
+        matches!(w.command(), UiCommand::LaunchAssignment { workspace_id, assignment, cols, rows, ..}
             if workspace_id == id && assignment == entry && (cols, rows) == (FALLBACK_PANE_COLS, FALLBACK_PANE_ROWS))
     );
     w.app.handle_daemon_event(UiEvent::AssignmentStarted {
@@ -901,9 +1034,9 @@ fn pointer_routes_header_sidebar_and_overlay_clicks_using_the_rendered_layout() 
     let tab = zoom
         .named_tabs
         .iter()
-        .find(|(id, _, _)| *id == runner)
+        .find(|tab| tab.kind.session() == Some(runner))
         .unwrap();
-    click(&mut w.app, tab.2);
+    click(&mut w.app, tab.rect);
     assert_eq!(w.app.state.focused_pane_id(), Some(runner));
     let (_, close) = w.app.layout_for(metrics).close_tab.unwrap();
     click(&mut w.app, close);
@@ -2233,6 +2366,101 @@ fn draggable_gutters_resize_terminal_cells_without_changing_focus() {
 }
 
 #[test]
+fn native_workspace_selection_disambiguates_names_restores_focus_and_rejects_stale_controls() {
+    use accesskit::{Action, ActionRequest, TreeId};
+
+    let mut w = Workbench::new();
+    let mut first = workspace("Same name");
+    first.root_dir = "/first".into();
+    let selected_pane = first.panes[1].id;
+    let mut second = workspace("Same name");
+    second.root_dir = "/second".into();
+    w.app.handle_daemon_event(UiEvent::WorkspacesLoaded(vec![
+        first.clone(),
+        second.clone(),
+    ]));
+    w.app.state.select_workspace(first.id);
+    w.app
+        .state
+        .select_session(first.id, PaneRole::Service, selected_pane);
+    let tree =
+        accessibility::workbench_tree(&w.app.state, 1200., 700., 1., &mut w.app.terminal_controls);
+    let node = |path| {
+        tree.nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(path))
+            .unwrap()
+            .0
+    };
+    let first_node = node("Same name · /first");
+    let second_node = node("Same name · /second");
+    let click = |target_node| ActionRequest {
+        target_tree: TreeId::ROOT,
+        target_node,
+        action: Action::Click,
+        data: None,
+    };
+    for (node, workspace) in [(second_node, second.id), (first_node, first.id)] {
+        let action = accessibility::action(&w.app.state, &click(node), &w.app.terminal_controls)
+            .expect("workspace action missing");
+        w.app.handle_ui_action(action);
+        assert_eq!(w.app.state.active_workspace_id, Some(workspace));
+    }
+    assert_eq!(w.app.state.focused_pane_id(), Some(selected_pane));
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![first]));
+    assert!(
+        accessibility::action(&w.app.state, &click(second_node), &w.app.terminal_controls)
+            .is_none()
+    );
+}
+
+#[test]
+fn image_preview_button_does_not_report_terminal_motion() {
+    use daedalus_proto::{Cell, GridRow, MouseTracking};
+    use daedalus_ui::selection::{CellPos, Selection};
+
+    let mut w = Workbench::new();
+    let ws = workspace("Preview");
+    let pane = ws.panes[0].id;
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+    let view = w.app.state.panes.get_mut(&pane).unwrap();
+    view.terminal_modes.mouse = MouseTracking::Any;
+    view.terminal_modes.sgr_mouse = true;
+    view.selection = Some(Selection::new(CellPos::new(0, 0), CellPos::new(8, 0)));
+    view.viewport_rows = vec![GridRow {
+        row_index: 0,
+        abs_row: 0,
+        wraps: false,
+        links: vec![],
+        cells: "image.png"
+            .chars()
+            .map(|c| Cell {
+                text: c.to_string(),
+                ..Default::default()
+            })
+            .collect(),
+    }];
+    let metrics = ViewportMetrics {
+        size: (1200, 700).into(),
+        scale_factor: 1.,
+        cell: (8., 16.),
+    };
+    let button = w
+        .app
+        .layout_for(metrics)
+        .preview_button(&w.app.state, 1.)
+        .unwrap();
+    w.app
+        .move_pointer(button.x + 2., button.y + 2., Some(metrics));
+    assert!(w.idle(), "the image button sent terminal input");
+    w.app
+        .move_pointer(button.x - 10., button.y + 2., Some(metrics));
+    assert!(matches!(w.command(), UiCommand::SendInput { pane_id, .. } if pane_id == pane));
+}
+
+#[test]
 fn selected_png_preview_preserves_terminal_focus_selection_and_scroll() {
     use daedalus_proto::{Cell, GridRow, rpc::ImagePreview};
     use daedalus_ui::selection::{CellPos, Selection};
@@ -2453,7 +2681,7 @@ fn cargo_bar_runs_on_the_selected_workspace_without_taking_agent_focus() {
         let pane = runner.id;
         w.app.handle_daemon_event(UiEvent::PaneSpawned {
             summary: runner,
-            agent_preset: None,
+            select_tab: false,
         });
         w.app.handle_daemon_event(UiEvent::AssignmentStarted {
             workspace_id: id,
@@ -2502,4 +2730,43 @@ fn windows_copy_with_no_selection_never_sends_terminal_input() {
         workbench.command(),
         UiCommand::SendInput { pane_id: target, data } if target == pane_id && data == b"\x03"
     ));
+}
+
+#[test]
+fn ime_commit_reaches_form_opened_by_native_action_with_recap_selected() {
+    use accesskit::{Action, ActionRequest, TreeId};
+    use daedalus_ui::{recap::RecapEntry, workspace_form::Control};
+
+    let mut w = Workbench::new();
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![workspace("Recap")]));
+    w.app.state.recap.keyboard_row = Some(RecapEntry::from("Runner completed"));
+    let tree =
+        accessibility::workbench_tree(&w.app.state, 900., 600., 1., &mut w.app.terminal_controls);
+    let node = tree
+        .nodes
+        .iter()
+        .find(|(_, node)| node.label() == Some("New workspace"))
+        .unwrap()
+        .0;
+    let request = ActionRequest {
+        target_tree: TreeId::ROOT,
+        target_node: node,
+        action: Action::Click,
+        data: None,
+    };
+    let action = accessibility::action(&w.app.state, &request, &w.app.terminal_controls).unwrap();
+    w.app.handle_ui_action(action);
+    assert!(w.app.state.workspace_form.open);
+    assert!(w.app.state.recap.keyboard_row.is_some());
+    w.app.commit_text("日本語".into());
+    assert!(
+        w.app
+            .state
+            .workspace_form
+            .value(Control::Folder)
+            .unwrap()
+            .contains("日本語"),
+        "the active form lost committed Japanese text"
+    );
 }

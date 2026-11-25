@@ -23,6 +23,292 @@ fn test_supervisor() -> Supervisor {
 }
 
 #[tokio::test]
+async fn cli_widget_crud_and_workspace_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let checkout = dir.path().join("checkout");
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let sock = dir.path().join("test.sock");
+    let server = DaemonServer::bind_with_supervisor(
+        sock.clone(),
+        dir.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let (shutdown, done) = oneshot::channel();
+    let server = tokio::spawn(server.serve(async {
+        let _ = done.await;
+    }));
+    async fn cli(socket: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_daedalus-ctl"))
+            .arg("--socket")
+            .arg(socket)
+            .args(args)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+    let base = cli(
+        &sock,
+        &[
+            "workspace",
+            "create",
+            "API",
+            "--dir",
+            checkout.to_str().unwrap(),
+        ],
+    )
+    .await;
+    let target = cli(
+        &sock,
+        &[
+            "workspace",
+            "create",
+            "Backup",
+            "--dir",
+            other.to_str().unwrap(),
+        ],
+    )
+    .await;
+    let base = base.trim();
+    let target = target.trim();
+    let template = dir.path().join("git-widget.toml");
+    cli(
+        &sock,
+        &[
+            "widget",
+            "template",
+            "export",
+            "git-worktree",
+            "--file",
+            template.to_str().unwrap(),
+        ],
+    )
+    .await;
+    cli(
+        &sock,
+        &[
+            "widget",
+            "template",
+            "validate",
+            "--file",
+            template.to_str().unwrap(),
+        ],
+    )
+    .await;
+    cli(
+        &sock,
+        &[
+            "widget",
+            "create",
+            "branch",
+            "--template",
+            "git-worktree",
+            "--workspace",
+            base,
+        ],
+    )
+    .await;
+    cli(
+        &sock,
+        &[
+            "widget",
+            "duplicate",
+            "branch",
+            "review",
+            "--workspace",
+            base,
+        ],
+    )
+    .await;
+    cli(
+        &sock,
+        &["widget", "move", "review", "1", "--workspace", base],
+    )
+    .await;
+    cli(
+        &sock,
+        &["widget", "pin", "review", "--unpin", "--workspace", base],
+    )
+    .await;
+    let portable = checkout.join(".daedalus-workspace.toml");
+    cli(
+        &sock,
+        &[
+            "workspace",
+            "export",
+            "--workspace",
+            base,
+            "--file",
+            portable.to_str().unwrap(),
+        ],
+    )
+    .await;
+    cli(
+        &sock,
+        &["workspace", "import", "--repo", "--workspace", base],
+    )
+    .await;
+    cli(
+        &sock,
+        &[
+            "workspace",
+            "import",
+            "--file",
+            portable.to_str().unwrap(),
+            "--workspace",
+            target,
+            "--dry-run",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(
+        cli(&sock, &["widget", "list", "--workspace", target, "--json"])
+            .await
+            .trim(),
+        "[]"
+    );
+    cli(
+        &sock,
+        &[
+            "workspace",
+            "import",
+            "--file",
+            portable.to_str().unwrap(),
+            "--workspace",
+            target,
+        ],
+    )
+    .await;
+    let original = cli(&sock, &["workspace", "export", "--workspace", base]).await;
+    assert_eq!(
+        cli(&sock, &["workspace", "export", "--workspace", target]).await,
+        original
+    );
+    cli(
+        &sock,
+        &[
+            "widget",
+            "edit",
+            "branch",
+            "--name",
+            "Local branch",
+            "--workspace",
+            base,
+        ],
+    )
+    .await;
+    std::fs::write(
+        &portable,
+        original.replace("name = \"API\"", "name = \"Shared API\""),
+    )
+    .unwrap();
+    let applied = cli(
+        &sock,
+        &["workspace", "update", "--workspace", base, "--json"],
+    )
+    .await;
+    assert!(applied.contains("Shared API"));
+    assert!(applied.contains("Local branch"));
+    let fresh = dir.path().join("fresh");
+    std::fs::create_dir(&fresh).unwrap();
+    let imported = cli(
+        &sock,
+        &[
+            "workspace",
+            "import",
+            "--new",
+            fresh.to_str().unwrap(),
+            "--file",
+            portable.to_str().unwrap(),
+        ],
+    )
+    .await;
+    let imported_widgets = cli(&sock, &["widget", "list", "--workspace", imported.trim()]).await;
+    assert!(imported_widgets.contains("Git Worktree"));
+
+    #[cfg(unix)]
+    {
+        let command = dir.path().join("command-widget.toml");
+        std::fs::write(
+            &command,
+            r#"
+version = 1
+[template]
+id = "cwd"
+name = "Checkout location"
+[[template.definition.sources]]
+id = "main"
+kind = "command"
+[template.definition.sources.command]
+argv = ["sh", "-c", "pwd"]
+[template.definition.sources.refresh]
+interval_seconds = 1
+[template.definition.sources.output]
+kind = "text"
+[[template.definition.display.summary]]
+source = "main"
+field = "text"
+"#,
+        )
+        .unwrap();
+        let path = command.to_str().unwrap();
+        let preview = cli(
+            &sock,
+            &[
+                "widget",
+                "preview",
+                "--file",
+                path,
+                "--workspace",
+                imported.trim(),
+            ],
+        )
+        .await;
+        assert!(preview.contains(fresh.to_str().unwrap()));
+        cli(
+            &sock,
+            &[
+                "widget",
+                "create",
+                "cwd",
+                "--file",
+                path,
+                "--workspace",
+                imported.trim(),
+            ],
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                let results = cli(
+                    &sock,
+                    &["widget", "results", "--workspace", imported.trim()],
+                )
+                .await;
+                if results.contains(fresh.to_str().unwrap()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("timer refreshes the command in the imported workspace");
+    }
+    shutdown.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn cli_smoke_ping_workspace_and_pane_lifecycle() {
     let dir = TempDir::new().unwrap();
     let sock = dir.path().join("daedalusd.sock");
@@ -1245,6 +1531,11 @@ async fn workspace_recent_reports_unsupported_daemon() {
                     project_setup_supported: false,
                     image_preview_supported: false,
                     paste_supported: false,
+                    workbench_supported: false,
+                    workspace_membership_supported: false,
+                    runner_assignment_supported: false,
+                    resolved_import_preview_supported: false,
+                    agent_launch_metadata_supported: false,
                     home_dir: None,
                     recent_projects_supported: false,
                 }),

@@ -6,12 +6,14 @@ pub mod manifest;
 pub mod pane_actor;
 pub mod persistence;
 mod preview;
+mod process;
 pub mod registry;
 pub mod runtime_monitor;
 pub mod server;
 mod setup;
 pub mod shell_integration;
 pub mod supervisor;
+pub mod workbench;
 pub mod worktree;
 
 /// Background probes run from a detached daemon, which has no console to inherit.

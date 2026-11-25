@@ -9,5 +9,5 @@ if [[ $(uname -s) == Linux ]]; then
 fi
 cargo llvm-cov report --fail-under-lines 92.9 --fail-under-functions 92.5 --fail-under-regions 92.4
 mkdir -p target/quality
-cargo mutants --file crates/daedalus-proto/src/codec.rs --output target/quality/frames -- --locked frame_
-cargo mutants -p daedalus-vt --re 'Grid::erase_in_line' --output target/quality/erase -- --locked
+cargo mutants --file crates/daedalus-proto/src/codec.rs --output target/quality/frames --cargo-arg=--locked -- frame_
+cargo mutants -p daedalus-vt --re 'Grid::erase_in_line' --output target/quality/erase --cargo-arg=--locked

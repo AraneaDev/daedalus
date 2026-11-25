@@ -39,8 +39,11 @@ impl TextRenderer {
         };
         let heading = row(0.0, 48.0 * unit);
         let count_width = (105.0 * scale).min(heading.width * 0.30);
+        let custom_heading = dialog.is_custom_page().then(|| dialog.heading());
         line(
-            if dialog.widgets_page {
+            if let Some(title) = &custom_heading {
+                title
+            } else if dialog.is_pane_widgets_page() {
                 "Workspace widgets"
             } else {
                 "Workspace assignments"
@@ -76,7 +79,11 @@ impl TextRenderer {
                 .field_label()
                 .or_else(|| (c == crate::settings::Control::Role).then(|| "Pane".to_owned()))
             {
-                let caption_width = (100.0 * scale).min(r.width * 0.38);
+                let caption_width = if dialog.is_custom_page() {
+                    ((caption.chars().count() as f32 * 8.0 + 24.0) * scale).min(r.width * 0.70)
+                } else {
+                    (100.0 * scale).min(r.width * 0.38)
+                };
                 let value = Rect::new(r.x + caption_width, r.y, r.width - caption_width, r.height);
                 let columns = ((value.width - 22.0 * scale) / glyph_width).max(1.0) as usize;
                 let display = dialog.visible_label(c, columns + caption.len() + 3);
@@ -97,14 +104,21 @@ impl TextRenderer {
             let label = dialog.label(c);
             let color = if !dialog.enabled(c) {
                 theme.text_muted
-            } else if c == crate::settings::Control::Save {
+            } else if c.primary() {
                 theme.bg_window
             } else if active {
                 theme.border_focused
             } else {
                 theme.text_primary
             };
-            line(&label, r, 14.0, color, active, true);
+            line(
+                &label,
+                r,
+                14.0,
+                color,
+                active,
+                !dialog.is_import_review_text(c),
+            );
         }
         line(
             dialog.hint(),

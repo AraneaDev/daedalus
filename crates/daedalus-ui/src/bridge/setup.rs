@@ -1,4 +1,5 @@
 use super::rpc::{RpcConnection, RpcError};
+use super::workspace::emit_spawned_pane;
 use super::{DEFAULT_PANE_COLS, DEFAULT_PANE_ROWS, UiEvent, UiEventSink};
 use crate::assignments::{self, Assignment};
 use crate::state::AgentPreset;
@@ -81,6 +82,7 @@ pub(super) async fn launch_assignment(
     sink: &Arc<dyn UiEventSink>,
     workspace_id: WorkspaceId,
     assignment: Assignment,
+    saved_runner: bool,
     cols: u16,
     rows: u16,
 ) -> Result<(), RpcError> {
@@ -88,17 +90,33 @@ pub(super) async fn launch_assignment(
         assignment
             .argv
             .first()
-            .and_then(|program| AgentPreset::from_cli_name(program))
+            .and_then(|program| AgentPreset::from_executable(program))
     } else {
         None
     };
-    let command = (!assignment.argv.is_empty()).then(|| assignment.argv.clone());
-    let summary = spawn(conn, workspace_id, assignment.role, command, cols, rows).await?;
+    let summary = if saved_runner && conn.runner_assignment_supported {
+        match conn
+            .call(ClientMessage::LaunchRunnerAssignment {
+                workspace_id,
+                assignment_id: assignment.id.clone(),
+                cols,
+                rows,
+            })
+            .await?
+        {
+            ResponsePayload::PaneSpawned(summary) => summary,
+            _ => {
+                return Err(RpcError::Proto(ProtoError::Internal(
+                    "Unexpected runner launch response.".into(),
+                )));
+            }
+        }
+    } else {
+        let command = (!assignment.argv.is_empty()).then(|| assignment.argv.clone());
+        spawn(conn, workspace_id, assignment.role, command, cols, rows).await?
+    };
     let pane_id = summary.id;
-    sink.emit(UiEvent::PaneSpawned {
-        summary,
-        agent_preset,
-    });
+    emit_spawned_pane(conn, sink, summary, agent_preset, false);
     sink.emit(UiEvent::AssignmentStarted {
         workspace_id,
         pane_id,
@@ -212,11 +230,13 @@ pub(super) async fn apply(
         .filter(|entry| launch.contains(&entry.id))
     {
         let name = entry.name.clone();
+        let saved_runner = conn.project_setup_supported && entry.role == PaneRole::Runner;
         match launch_assignment(
             conn,
             sink,
             workspace_id,
             entry,
+            saved_runner,
             DEFAULT_PANE_COLS,
             DEFAULT_PANE_ROWS,
         )
@@ -270,10 +290,7 @@ pub(super) async fn install(
     {
         Ok(summary) => {
             let pane_id = summary.id;
-            sink.emit(UiEvent::PaneSpawned {
-                summary,
-                agent_preset: None,
-            });
+            emit_spawned_pane(conn, sink, summary, None, false);
             sink.emit(UiEvent::SetupInstallerStarted {
                 workspace_id,
                 pane_id,

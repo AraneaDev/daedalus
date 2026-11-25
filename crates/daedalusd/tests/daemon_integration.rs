@@ -24,6 +24,80 @@ fn test_supervisor() -> Supervisor {
     }
 }
 
+#[tokio::test]
+async fn workbench_configuration_survives_reconnect_and_rejects_a_stale_write() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daedalusd.sock");
+    let runtime = dir.path().join("runtime");
+    let state_path = dir.path().join("state.json");
+    let mut workspace_id = None;
+    for restart in [false, true] {
+        let server = DaemonServer::bind_with_options(
+            sock.clone(),
+            runtime.clone(),
+            None,
+            Some(state_path.clone()),
+            test_supervisor(),
+        )
+        .await
+        .unwrap();
+        let (shutdown, done) = oneshot::channel();
+        let task = tokio::spawn(server.serve(async {
+            let _ = done.await;
+        }));
+        let mut client = IpcStream::connect(&sock).await.unwrap();
+        let id = match workspace_id {
+            Some(id) => id,
+            None => match send_rpc(
+                &mut client,
+                1,
+                ClientMessage::CreateManualWorkspace {
+                    name: "Workbench".into(),
+                    root_dir: dir.path().to_path_buf(),
+                },
+            )
+            .await
+            {
+                ResponsePayload::WorkspaceCreated(workspace) => workspace.id,
+                response => panic!("unexpected response: {response:?}"),
+            },
+        };
+        workspace_id = Some(id);
+        let state = match send_rpc(
+            &mut client,
+            2,
+            ClientMessage::GetWorkbench { workspace_id: id },
+        )
+        .await
+        {
+            ResponsePayload::Workbench(state) => state,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        if restart {
+            assert_eq!(state.revision, 1);
+            assert_eq!(state.document.name, "Shared workbench");
+        } else {
+            let mut stale_client = IpcStream::connect(&sock).await.unwrap();
+            let mut document = state.document;
+            document.name = "Shared workbench".into();
+            let update = ClientMessage::UpdateWorkbench {
+                workspace_id: id,
+                revision: state.revision,
+                document,
+            };
+            assert!(
+                matches!(send_rpc(&mut client, 3, update.clone()).await, ResponsePayload::Workbench(state) if state.revision == 1)
+            );
+            assert!(
+                matches!(send_rpc(&mut stale_client, 1, update).await, ResponsePayload::WorkbenchConflict(state) if state.revision == 1)
+            );
+        }
+        drop(client);
+        shutdown.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+}
+
 fn sleep_command() -> Vec<String> {
     #[cfg(unix)]
     {
@@ -3515,6 +3589,114 @@ async fn next_event_until(
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn manifest_wrapped_agents_keep_identity_across_clients() {
+    let dir = TempDir::new().unwrap();
+    let wrapper = dir.path().join("agent-wrapper");
+    let codex = dir.path().join("codex");
+    for executable in [&wrapper, &codex] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(executable, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(
+        dir.path().join(".daedalus.toml"),
+        "[agent]\npreset = 'Claude'\ncommand = ['./agent-wrapper', 'project agent']\n",
+    )
+    .unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let server = DaemonServer::bind_with_supervisor(
+        socket.clone(),
+        dir.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let (shutdown, rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(async {
+        let _ = rx.await;
+    }));
+    let mut client = IpcStream::connect(&socket).await.unwrap();
+    let ResponsePayload::WorkspaceCreated(workspace) = send_rpc(
+        &mut client,
+        1,
+        ClientMessage::CreateWorkspace {
+            name: "Agent test".into(),
+            root_dir: dir.path().into(),
+            env: HashMap::new(),
+        },
+    )
+    .await
+    else {
+        panic!("expected a workspace");
+    };
+    let ResponsePayload::PaneSpawned(manifest_agent) = send_rpc(
+        &mut client,
+        2,
+        ClientMessage::EnsureDefaultPane {
+            workspace_id: workspace.id,
+            role: PaneRole::Agent,
+            command: workspace.manifest.unwrap().agent_command,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    else {
+        panic!("expected the manifest agent");
+    };
+    assert_eq!(manifest_agent.launch_preset.as_deref(), Some("claude"));
+
+    let mut fresh_client = IpcStream::connect(&socket).await.unwrap();
+    let ResponsePayload::Workspaces(workspaces) =
+        send_rpc(&mut fresh_client, 1, ClientMessage::ListWorkspaces).await
+    else {
+        panic!("expected a fresh workspace list");
+    };
+    let existing = workspaces[0]
+        .panes
+        .iter()
+        .find(|pane| pane.id == manifest_agent.id)
+        .unwrap();
+    assert_eq!(existing.launch_preset.as_deref(), Some("claude"));
+
+    for (index, (command, expected)) in [
+        (Some(vec!["./codex".into()]), Some("codex")),
+        (
+            Some(vec!["./agent-wrapper".into(), "different argv".into()]),
+            None,
+        ),
+        (None, Some("shell")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ResponsePayload::PaneSpawned(pane) = send_rpc(
+            &mut client,
+            (index + 3) as u64,
+            ClientMessage::SpawnPane {
+                workspace_id: workspace.id,
+                role: PaneRole::Agent,
+                command,
+                cols: 80,
+                rows: 24,
+                shell: None,
+                env: HashMap::new(),
+            },
+        )
+        .await
+        else {
+            panic!("expected agent pane");
+        };
+        assert_eq!(pane.launch_preset.as_deref(), expected);
+    }
+    drop(client);
+    drop(fresh_client);
+    let _ = shutdown.send(());
+    task.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn cargo_widget_snapshots_survive_reconnect_and_process_exit() {
     let dir = TempDir::new().unwrap();
@@ -3672,4 +3854,324 @@ async fn workspace_png_preview_round_trip() {
     );
     let _ = shutdown.send(());
     handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn opted_in_client_reconciles_workspace_and_pane_membership() {
+    async fn expect_membership(stream: &mut IpcStream) {
+        let event = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_frame::<_, ServerMessage>(stream),
+        )
+        .await
+        .expect("membership event did not arrive")
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            event,
+            ServerMessage::Event(ServerEvent::WorkspaceMembershipChanged)
+        );
+    }
+
+    async fn legacy_request(
+        stream: &mut IpcStream,
+        id: u64,
+        payload: ClientMessage,
+    ) -> ResponsePayload {
+        write_frame(stream, &Request { id, payload }).await.unwrap();
+        let Some(ServerMessage::Response {
+            id: reply_id,
+            result,
+        }) = read_frame(stream).await.unwrap()
+        else {
+            panic!("legacy connection received an event it did not opt into");
+        };
+        assert_eq!(reply_id, id);
+        result.unwrap()
+    }
+
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daemon.sock");
+    let daemon = DaemonServer::bind_with_supervisor(
+        sock.clone(),
+        dir.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let (stop, done) = oneshot::channel();
+    let daemon = tokio::spawn(daemon.serve(async {
+        let _ = done.await;
+    }));
+    let mut watcher = IpcStream::connect(&sock).await.unwrap();
+    let mut legacy = IpcStream::connect(&sock).await.unwrap();
+
+    assert!(matches!(
+        send_rpc(&mut watcher, 1, ClientMessage::Ping).await,
+        ResponsePayload::Pong {
+            workspace_membership_supported: true,
+            ..
+        }
+    ));
+    assert_eq!(
+        send_rpc(&mut watcher, 2, ClientMessage::WatchWorkspaceMembership).await,
+        ResponsePayload::Ok
+    );
+    assert_eq!(
+        legacy_request(
+            &mut legacy,
+            1,
+            ClientMessage::Subscribe {
+                pane_ids: Some(vec![]),
+                project_setup_events: false,
+            }
+        )
+        .await,
+        ResponsePayload::Ok
+    );
+    let ResponsePayload::WorkspaceCreated(workspace) = legacy_request(
+        &mut legacy,
+        2,
+        ClientMessage::CreateManualWorkspace {
+            name: "Membership".into(),
+            root_dir: dir.path().to_path_buf(),
+        },
+    )
+    .await
+    else {
+        panic!("expected workspace");
+    };
+    expect_membership(&mut watcher).await;
+    let ResponsePayload::PaneSpawned(first) = legacy_request(
+        &mut legacy,
+        3,
+        ClientMessage::SpawnPane {
+            workspace_id: workspace.id,
+            role: PaneRole::Agent,
+            command: Some(sleep_command()),
+            shell: None,
+            cols: 80,
+            rows: 24,
+            env: Default::default(),
+        },
+    )
+    .await
+    else {
+        panic!("expected pane");
+    };
+    expect_membership(&mut watcher).await;
+    assert!(
+        matches!(send_rpc(&mut watcher, 3, ClientMessage::ListWorkspaces).await,
+        ResponsePayload::Workspaces(list) if list[0].panes[0].id == first.id)
+    );
+    let ResponsePayload::PaneSpawned(second) = legacy_request(
+        &mut legacy,
+        4,
+        ClientMessage::ReplaceAgentPane {
+            workspace_id: workspace.id,
+            old_pane_id: Some(first.id),
+            command: Some(sleep_command()),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    else {
+        panic!("expected replacement");
+    };
+    expect_membership(&mut watcher).await;
+    assert!(
+        matches!(send_rpc(&mut watcher, 4, ClientMessage::ListWorkspaces).await,
+        ResponsePayload::Workspaces(list) if list[0].panes.len() == 1 && list[0].panes[0].id == second.id)
+    );
+    assert_eq!(
+        legacy_request(
+            &mut legacy,
+            5,
+            ClientMessage::ClosePane { pane_id: second.id }
+        )
+        .await,
+        ResponsePayload::Ok
+    );
+    expect_membership(&mut watcher).await;
+    assert!(
+        matches!(send_rpc(&mut watcher, 5, ClientMessage::ListWorkspaces).await,
+        ResponsePayload::Workspaces(list) if list[0].panes.is_empty())
+    );
+    assert_eq!(
+        legacy_request(
+            &mut legacy,
+            6,
+            ClientMessage::CloseWorkspace {
+                id: workspace.id,
+                compose_down: false,
+                remove_worktree: false,
+                force_remove_worktree: false,
+            }
+        )
+        .await,
+        ResponsePayload::Ok
+    );
+    expect_membership(&mut watcher).await;
+    assert!(
+        matches!(send_rpc(&mut watcher, 6, ClientMessage::ListWorkspaces).await,
+        ResponsePayload::Workspaces(list) if list.is_empty())
+    );
+
+    write_frame(
+        &mut legacy,
+        &Request {
+            id: 7,
+            payload: ClientMessage::Ping,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, ServerMessage>(&mut legacy).await.unwrap(),
+        Some(ServerMessage::Response {
+            id: 7,
+            result: Ok(ResponsePayload::Pong { .. })
+        })
+    ));
+    drop(watcher);
+    drop(legacy);
+    stop.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn workbench_watch_tracks_only_the_selected_workspace_and_rejects_invalid_widget_requests() {
+    use daedalus_proto::WorkspaceId;
+    use daedalus_proto::workbench::{
+        WidgetDefinition, WidgetDisplay, WidgetField, WorkspaceDocument,
+    };
+
+    let root = TempDir::new().unwrap();
+    let socket = root.path().join("daemon.sock");
+    let daemon = DaemonServer::bind_with_supervisor(
+        socket.clone(),
+        root.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let (stop, stopped) = oneshot::channel();
+    let daemon = tokio::spawn(daemon.serve(async {
+        let _ = stopped.await;
+    }));
+
+    let exercise = async {
+        let mut watcher = IpcStream::connect(&socket).await.unwrap();
+        let mut writer = IpcStream::connect(&socket).await.unwrap();
+        let missing = WorkspaceId::new();
+        assert_eq!(
+            send_rpc_result(
+                &mut watcher,
+                1,
+                ClientMessage::WatchWorkbench {
+                    workspace_id: missing
+                }
+            )
+            .await,
+            Err(ProtoError::WorkspaceNotFound(missing)),
+        );
+
+        let mut workspaces = Vec::new();
+        for (request_id, name) in [(2, "First"), (3, "Second")] {
+            let ResponsePayload::WorkspaceCreated(info) = send_rpc(
+                &mut writer,
+                request_id,
+                ClientMessage::CreateManualWorkspace {
+                    root_dir: root.path().to_path_buf(),
+                    name: name.into(),
+                },
+            )
+            .await
+            else {
+                panic!("expected a workspace")
+            };
+            workspaces.push((info.id, name));
+        }
+
+        for (revision, watched_idx) in [(0, 0), (1, 1)] {
+            let (watched, _) = workspaces[watched_idx];
+            assert!(matches!(
+                send_rpc(&mut watcher, 2, ClientMessage::WatchWorkbench { workspace_id: watched }).await,
+                ResponsePayload::Workbench(state) if state.revision == revision
+            ));
+            for (workspace_id, name) in [workspaces[1 - watched_idx], workspaces[watched_idx]] {
+                assert!(matches!(
+                    send_rpc(&mut writer, 4, ClientMessage::UpdateWorkbench {
+                        workspace_id, revision, document: WorkspaceDocument::new(name.into())
+                    }).await,
+                    ResponsePayload::Workbench(state) if state.revision == revision + 1
+                ));
+            }
+            // The two committed events share one broadcast stream. The watched event
+            // confirms the forwarder has already processed the other workspace's event.
+            assert_eq!(
+                next_event_until(&mut watcher, "workbench invalidation", |event| {
+                    matches!(event, ServerEvent::WorkbenchChanged { .. })
+                })
+                .await,
+                ServerEvent::WorkbenchChanged {
+                    workspace_id: watched,
+                    revision: revision + 1
+                },
+            );
+        }
+
+        let workspace_id = workspaces[0].0;
+        let invalid = [
+            ClientMessage::PreviewWidget {
+                workspace_id,
+                name: "Invalid preview".into(),
+                definition: WidgetDefinition {
+                    display: WidgetDisplay {
+                        summary: vec![WidgetField {
+                            source: "missing".into(),
+                            field: "label".into(),
+                            label: None,
+                        }],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            },
+            ClientMessage::GetWidgetResults {
+                workspace_id,
+                refresh: Some("missing".into()),
+            },
+            ClientMessage::InvokeWidgetAction {
+                workspace_id,
+                widget: "missing".into(),
+                action: "logs".into(),
+            },
+        ];
+        for request in invalid {
+            assert!(matches!(
+                send_rpc_result(&mut watcher, 3, request).await,
+                Err(ProtoError::InvalidRequest(message)) if message.contains("missing")
+            ));
+        }
+        assert_eq!(
+            send_rpc(
+                &mut watcher,
+                4,
+                ClientMessage::GetWidgetResults {
+                    workspace_id,
+                    refresh: None
+                }
+            )
+            .await,
+            ResponsePayload::WidgetResults(vec![]),
+        );
+    };
+    tokio::time::timeout(Duration::from_secs(10), exercise)
+        .await
+        .expect("workbench IPC stalled");
+
+    stop.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
 }
