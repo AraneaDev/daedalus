@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.18](https://github.com/AraneaDev/daedalus/compare/v0.0.17...v0.0.18) (2026-11-25)
+
+
+### Bug Fixes
+
+* restore terminal interaction and daemon recovery ([#50](https://github.com/AraneaDev/daedalus/issues/50)) ([12096ba](https://github.com/AraneaDev/daedalus/commit/12096baae808c1773b3dea434d06234d15ce0c48))
+
 ## [0.0.17](https://github.com/AraneaDev/daedalus/compare/v0.0.16...v0.0.17) (2026-11-25)
 
 
