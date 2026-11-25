@@ -29,6 +29,7 @@ pub struct PaneViewState {
     pub activity: Option<daedalus_proto::types::TerminalActivity>,
     pub unread_attention: bool,
     pub insight: Option<daedalus_proto::RunnerInsight>,
+    pub terminal_modes: daedalus_proto::TerminalModes,
     pub last_seq: u64,
 }
 
@@ -38,6 +39,14 @@ impl PaneViewState {
             .launch_preset
             .as_deref()
             .and_then(AgentPreset::from_cli_name);
+        let cargo_preset = (summary.role == daedalus_proto::PaneRole::Runner)
+            .then(|| {
+                summary
+                    .launch_preset
+                    .as_deref()
+                    .and_then(crate::assignments::CargoPreset::from_launch_tag)
+            })
+            .flatten();
         Self {
             summary,
             grid_received: false,
@@ -52,12 +61,13 @@ impl PaneViewState {
             dirty_row_indices: Vec::new(),
             selection: None,
             agent_preset: preset,
-            cargo_preset: None,
+            cargo_preset,
             last_failure_trace: None,
             show_diagnostic: false,
             unread_attention: false,
             activity: None,
             insight: None,
+            terminal_modes: Default::default(),
             last_seq: 0,
         }
     }
@@ -116,6 +126,7 @@ impl PaneViewState {
         self.grid_received = true;
         self.activity = snapshot.activity;
         self.insight = snapshot.insight;
+        self.terminal_modes = snapshot.terminal_modes;
         self.summary.cols = snapshot.cols;
         self.summary.rows = snapshot.rows;
         self.cursor = snapshot.cursor;
@@ -149,6 +160,7 @@ impl PaneViewState {
         }
         self.activity = delta.activity;
         self.insight = delta.insight;
+        self.terminal_modes = delta.terminal_modes;
         let erased = self.update_history_generation(delta.history_generation);
         if let Some(len) = delta.scrollback_len {
             self.scrollback_len = len;
@@ -289,6 +301,7 @@ mod tests {
 
         // Initial delta when last_seq == 0 should still apply
         pane.apply_delta(GridDelta {
+            terminal_modes: Default::default(),
             activity: None,
             insight: None,
             pane_id: pane.summary.id,
@@ -305,6 +318,7 @@ mod tests {
 
         // Newer snapshot advances last_seq to 5
         pane.apply_snapshot(GridSnapshot {
+            terminal_modes: Default::default(),
             activity: None,
             insight: None,
             pane_id: pane.summary.id,
@@ -325,6 +339,7 @@ mod tests {
         // Older (seq < last_seq) and duplicate (seq == last_seq) deltas must be ignored
         for stale_seq in [4, 5] {
             pane.apply_delta(GridDelta {
+                terminal_modes: Default::default(),
                 activity: None,
                 insight: None,
                 pane_id: pane.summary.id,
@@ -348,6 +363,7 @@ mod tests {
 
         // Newer delta (seq > last_seq) applies normally
         pane.apply_delta(GridDelta {
+            terminal_modes: Default::default(),
             activity: None,
             insight: None,
             pane_id: pane.summary.id,
@@ -375,6 +391,7 @@ mod tests {
         let summary = make_pane_summary(ws_id, PaneRole::Runner);
         let mut pane = PaneViewState::from_summary(summary);
         pane.apply_snapshot(GridSnapshot {
+            terminal_modes: Default::default(),
             activity: None,
             insight: None,
             pane_id: pane.summary.id,
@@ -445,6 +462,7 @@ mod tests {
         pane.set_scroll_offset(5);
         let original = pane.begin_scrollback_request().unwrap();
         pane.apply_delta(GridDelta {
+            terminal_modes: Default::default(),
             activity: None,
             insight: None,
             pane_id: pane.summary.id,

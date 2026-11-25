@@ -9,7 +9,8 @@ esac
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 app="$stage/Applications/Daedalus.app"
-mkdir -p "$app/Contents/MacOS" "$stage/usr/local/bin" dist
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$stage/usr/local/bin" dist
+install -m644 packaging/daedalus.icns "$app/Contents/Resources/daedalus.icns"
 for program in daedalus-ui daedalusd daedalus-ctl; do
     lipo "target/release/$program" -verify_arch "$arch"
     install -m755 "target/release/$program" "$app/Contents/MacOS/$program"
@@ -20,6 +21,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <plist version="1.0"><dict>
 <key>CFBundleIdentifier</key><string>dev.aranea.daedalus</string>
 <key>CFBundleName</key><string>Daedalus</string>
+<key>CFBundleIconFile</key><string>daedalus.icns</string>
 <key>CFBundleExecutable</key><string>daedalus-ui</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleVersion</key><string>$version</string>

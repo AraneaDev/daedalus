@@ -5,7 +5,7 @@ version=${1:?supply the package version}
 binaries=${2:-target/release}
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-cp "$binaries"/{daedalus-ui,daedalus-ctl,daedalusd} LICENSE packaging/daedalus.desktop "$stage/"
+cp "$binaries"/{daedalus-ui,daedalus-ctl,daedalusd} LICENSE packaging/daedalus.desktop packaging/daedalus.png "$stage/"
 sed "s/@VERSION@/$version/" packaging/arch/PKGBUILD.in > "$stage/PKGBUILD"
 mkdir -p dist
 docker run --rm --platform linux/amd64 -v "$stage:/input:ro" -v "$PWD/dist:/output" archlinux:base bash -euc '

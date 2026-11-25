@@ -48,3 +48,4 @@ jobs:
           echo "LD_LIBRARY_PATH=$RUNNER_TEMP/libghostty/lib" >> "$GITHUB_ENV"
       - run: cargo test --locked -p daedalus-vt --features ghostty-vt
       - run: cargo test --locked -p daedalusd --features ghostty-vt --test daemon_integration bash_osc133_captures_failure_trace_and_survives_client_reconnect
+      - run: cargo test --locked -p daedalusd --features ghostty-vt --test daemon_integration terminal_paste_uses_the_current_pty_mode

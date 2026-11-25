@@ -9,6 +9,7 @@ for program in daedalus-ui daedalus-ctl daedalusd; do
 done
 install -m644 LICENSE "$stage/usr/share/doc/daedalus/copyright"
 install -m644 packaging/daedalus.desktop "$stage/usr/share/applications/daedalus.desktop"
+install -Dm644 packaging/daedalus.png "$stage/usr/share/icons/hicolor/256x256/apps/daedalus.png"
 # Resolve the actual linked library versions from the release binaries.
 mkdir -p "$stage/build/debian"
 touch "$stage/build/debian/control"

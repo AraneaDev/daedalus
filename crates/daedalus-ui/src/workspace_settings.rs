@@ -69,6 +69,9 @@ impl DaedalusApp {
         self.request_redraw();
     }
     pub(super) fn open_workspace_settings(&mut self) {
+        if self.state.settings.is_saving() {
+            return;
+        }
         let Some(ws) = self.state.active_workspace() else {
             self.show_toast("Create a workspace to configure its terminals", false);
             return;
@@ -89,6 +92,9 @@ impl DaedalusApp {
     }
 
     pub(super) fn handle_settings_action(&mut self, action: SettingsAction) {
+        if self.state.settings.is_saving() {
+            return;
+        }
         let (entries, launch_id) = match action {
             SettingsAction::None => {
                 self.request_redraw();
@@ -102,38 +108,66 @@ impl DaedalusApp {
             SettingsAction::Save(entries) => (entries, None),
             SettingsAction::Launch(entries, id) => (entries, Some(id)),
         };
-        let Some(workspace) = self.state.active_workspace().cloned() else {
+        let Some(workspace) = self.state.active_workspace_id else {
             self.state.settings.open = false;
             return;
         };
-        match self.project_setups.save(workspace.id, entries.clone()) {
-            Ok(Some(command)) => {
-                if !self.send_command(command) {
-                    self.project_setups.rejected(workspace.id);
-                    self.state.settings.error = Some("Reconnect to save these settings.".into());
-                    self.request_redraw();
-                    return;
+        let launch = launch_id.and_then(|id| entries.iter().find(|entry| entry.id == id).cloned());
+        match self.project_setups.save(workspace, entries) {
+            Ok(Some(assignments)) => {
+                let request_id = self.state.settings.start_save(workspace, launch);
+                if !self.send_command(UiCommand::SaveWorkspaceSettings {
+                    workspace_id: workspace,
+                    assignments,
+                    request_id,
+                }) {
+                    self.state
+                        .settings
+                        .fail_pending_save("Reconnect to save these settings.".into());
                 }
             }
-            Ok(None) => {}
-            Err(error) => {
-                self.state.settings.error = Some(error);
-                self.request_redraw();
-                return;
-            }
+            Ok(None) => self.complete_workspace_settings_save(workspace, launch),
+            Err(error) => self.state.settings.error = Some(error),
         }
-        self.restore_workspace_names(workspace.id, workspace.panes.iter().copied());
-        if let Some(assignment) =
-            launch_id.and_then(|id| entries.into_iter().find(|entry| entry.id == id))
-            && !self.launch_saved_assignment(workspace.id, assignment)
+        self.request_redraw();
+    }
+
+    pub(super) fn workspace_settings_saved(
+        &mut self,
+        workspace: WorkspaceId,
+        request_id: u64,
+        result: Result<(), String>,
+    ) {
+        let Some(launch) = self.state.settings.finish_save(workspace, request_id) else {
+            return;
+        };
+        match result {
+            Ok(()) => self.complete_workspace_settings_save(workspace, launch),
+            Err(message) => self.state.settings.error = Some(message),
+        }
+        self.request_redraw();
+    }
+
+    pub(super) fn workspace_settings_disconnected(&mut self) {
+        self.state.settings.fail_pending_save(
+            "Connection lost before the daemon confirmed the save. Reconnect and check the saved settings before retrying.".into(),
+        );
+    }
+
+    fn complete_workspace_settings_save(
+        &mut self,
+        workspace: WorkspaceId,
+        launch: Option<Assignment>,
+    ) {
+        self.refresh_workspace_setup(workspace);
+        if let Some(assignment) = launch
+            && !self.launch_saved_assignment(workspace, assignment)
         {
             self.state.settings.error =
                 Some("Settings saved. Reconnect to launch this terminal.".into());
-            self.request_redraw();
             return;
         }
         self.state.settings.open = false;
-        self.request_redraw();
     }
 
     pub(super) fn refresh_test_runner(&mut self, workspace: WorkspaceId) {

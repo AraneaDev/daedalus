@@ -1,8 +1,6 @@
 use super::Registry;
 use crate::persistence::{PersistedProjectSetup, PersistedRecentProject, PersistedState};
-use daedalus_proto::{
-    Assignment, ProtoError, RecentProject, ServerEvent, WorkspaceId, WorkspaceInfo,
-};
+use daedalus_proto::{Assignment, ProtoError, RecentProject, WorkspaceId, WorkspaceInfo};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -93,17 +91,7 @@ impl Registry {
                 .root_dir
                 .clone()
         };
-        self.project_setups
-            .write()
-            .await
-            .insert(root_dir.clone(), assignments.clone());
-        self.persist_state().await;
-        // No subscribers is fine; the setup is stored either way.
-        let _ = self.event_tx.send(ServerEvent::ProjectSetupChanged {
-            root_dir,
-            assignments,
-        });
-        Ok(())
+        self.persist_project_setup(root_dir, assignments).await
     }
 
     pub(crate) async fn attach_project_setup(&self, info: &mut WorkspaceInfo) {
@@ -163,7 +151,7 @@ mod tests {
     use crate::persistence::StateStore;
     use crate::shell_integration::ShellIntegration;
     use crate::supervisor::{IsolationMode, Supervisor};
-    use daedalus_proto::PaneRole;
+    use daedalus_proto::{PaneRole, ServerEvent};
     use std::collections::HashMap;
     use tempfile::TempDir;
     use tokio::sync::broadcast;
@@ -339,6 +327,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_setup_persistence_keeps_the_confirmed_setup() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        let reg = registry_at(tmp.path(), path.clone());
+        let ws = open(&reg, "a", &folder(tmp.path(), "a")).await;
+        let confirmed = vec![assignment("confirmed")];
+        reg.set_project_setup(ws.id, confirmed.clone())
+            .await
+            .unwrap();
+
+        let backup = tmp.path().join("state.backup");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let mut events = reg.subscribe_events();
+        assert!(matches!(
+            reg.set_project_setup(ws.id, vec![assignment("never-written")])
+                .await,
+            Err(ProtoError::IoError(_))
+        ));
+        assert!(events.try_recv().is_err());
+        assert_eq!(
+            reg.list_workspaces().await[0].setup.as_ref(),
+            Some(&confirmed)
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(backup, &path).unwrap();
+
+        let restarted = registry_at(tmp.path(), path);
+        assert_eq!(restarted.restore_persisted_workspaces().await.unwrap(), 1);
+        assert_eq!(
+            restarted.list_workspaces().await[0].setup.as_ref(),
+            Some(&confirmed)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_setups_broadcast_in_persisted_order() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        let reg = registry_at(tmp.path(), path.clone());
+        let ws = open(&reg, "a", &folder(tmp.path(), "a")).await;
+        let mut events = reg.subscribe_events();
+        let (first, second) = tokio::join!(
+            reg.set_project_setup(ws.id, vec![assignment("first")]),
+            reg.set_project_setup(ws.id, vec![assignment("second")])
+        );
+        first.unwrap();
+        second.unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            ServerEvent::ProjectSetupChanged { .. }
+        ));
+        let ServerEvent::ProjectSetupChanged { assignments, .. } = events.recv().await.unwrap()
+        else {
+            panic!("expected the last committed setup");
+        };
+        let persisted = StateStore::new(path).load().unwrap();
+        assert_eq!(persisted.project_setups.len(), 1);
+        assert_eq!(persisted.project_setups[0].assignments, assignments);
+        assert_eq!(reg.list_workspaces().await[0].setup, Some(assignments));
+    }
+
+    #[tokio::test]
     async fn restart_restores_lists() {
         let tmp = TempDir::new().unwrap();
         let state_path = tmp.path().join("state.json");
@@ -354,7 +405,7 @@ mod tests {
 
         // No workspaces are left open, so restore must still load the lists.
         let reg2 = registry_at(tmp.path(), state_path);
-        assert_eq!(reg2.restore_persisted_workspaces().await, 0);
+        assert_eq!(reg2.restore_persisted_workspaces().await.unwrap(), 0);
         assert_eq!(reg2.recent_projects().await, before);
         let reopened = open(&reg2, "a", &ws.root_dir).await;
         assert_eq!(reopened.setup.as_ref(), Some(&setup));

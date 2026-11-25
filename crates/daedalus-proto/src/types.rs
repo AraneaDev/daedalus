@@ -428,8 +428,34 @@ pub struct TerminalActivity {
     pub attention_seq: u64,
 }
 
+/// DEC terminal modes that change how the client delivers input.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalModes {
+    pub mouse: MouseTracking,
+    pub sgr_mouse: bool,
+    pub bracketed_paste: bool,
+}
+
+impl TerminalModes {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MouseTracking {
+    #[default]
+    Off,
+    Press,
+    Button,
+    Drag,
+    Any,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GridSnapshot {
+    #[serde(default, skip_serializing_if = "TerminalModes::is_default")]
+    pub terminal_modes: TerminalModes,
     pub pane_id: PaneId,
     pub seq: u64,
     pub cols: u16,
@@ -449,6 +475,8 @@ pub struct GridSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GridDelta {
+    #[serde(default, skip_serializing_if = "TerminalModes::is_default")]
+    pub terminal_modes: TerminalModes,
     pub pane_id: PaneId,
     pub seq: u64,
     pub cols: u16,
@@ -499,6 +527,21 @@ fn strip_bracketed_paste_markers(data: &[u8]) -> Vec<u8> {
         }
         current = next;
     }
+}
+
+/// Paste safely when the terminal does not support bracketed input. Line
+/// breaks and tabs become spaces so an untrusted clipboard cannot submit input.
+pub fn single_line_paste(data: &[u8]) -> Vec<u8> {
+    let data = strip_bracketed_paste_markers(data);
+    let text = String::from_utf8_lossy(&data).replace("\r\n", "\n");
+    text.chars()
+        .filter_map(|ch| match ch {
+            '\r' | '\n' | '\t' => Some(' '),
+            ch if ch.is_control() => None,
+            ch => Some(ch),
+        })
+        .collect::<String>()
+        .into_bytes()
 }
 
 /// Wraps input bytes in XTerm bracketed paste markers (`ESC [ 200 ~` ... `ESC [ 201 ~`)

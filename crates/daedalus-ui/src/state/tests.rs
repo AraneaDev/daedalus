@@ -179,6 +179,7 @@ fn workspace_refresh_keeps_live_grid_and_selected_pane_metadata() {
     state.set_workspaces(vec![ws.clone()]);
     state.select_session(ws.id, PaneRole::Agent, id);
     state.apply_grid_snapshot(GridSnapshot {
+        terminal_modes: Default::default(),
         activity: None,
         insight: None,
         pane_id: id,
@@ -194,6 +195,7 @@ fn workspace_refresh_keeps_live_grid_and_selected_pane_metadata() {
     assert_eq!(state.panes[&id].summary.cols, 99);
 
     state.apply_server_event(ServerEvent::GridDelta(GridDelta {
+        terminal_modes: Default::default(),
         activity: None,
         insight: None,
         pane_id: id,
@@ -235,6 +237,7 @@ fn snapshot_and_delta_patching_tracks_dirty_rows() {
     state.set_workspaces(vec![ws]);
 
     let snapshot = GridSnapshot {
+        terminal_modes: Default::default(),
         activity: None,
         insight: None,
         pane_id: agent_id,
@@ -263,6 +266,7 @@ fn snapshot_and_delta_patching_tracks_dirty_rows() {
     assert!(pane.dirty_row_indices.is_empty());
 
     let delta = GridDelta {
+        terminal_modes: Default::default(),
         activity: None,
         insight: None,
         pane_id: agent_id,
@@ -324,6 +328,7 @@ fn history_reset_discards_displayed_rows_inflight_reads_and_search_results() {
     pane.set_scroll_offset(5);
     let late = pane.begin_scrollback_request().unwrap();
     let reset = GridDelta {
+        terminal_modes: Default::default(),
         activity: None,
         insight: None,
         pane_id,
@@ -359,6 +364,7 @@ fn resync_snapshot_invalidates_erased_history_even_if_new_lines_already_accumula
     pane.set_scroll_offset(2);
     let pending = pane.begin_scrollback_request().unwrap();
     let reset = GridSnapshot {
+        terminal_modes: Default::default(),
         activity: None,
         insight: None,
         pane_id: id,
@@ -1241,8 +1247,11 @@ fn bottom_bar_cargo_runs_use_the_launched_presets_warning_defaults() {
     let mut state = AppState::new();
     state.set_workspaces(vec![ws]);
     for (preset, expected) in [
-        (CargoPreset::Test, "Workspace tests · Compiling · 4s"),
-        (CargoPreset::Check, "Compiler · Compiling · 2 warnings · 4s"),
+        (CargoPreset::Test, "Cargo Test · Compiling · 4s"),
+        (
+            CargoPreset::Check,
+            "Cargo Check · Compiling · 2 warnings · 4s",
+        ),
     ] {
         let pane = state.panes.get_mut(&runner).unwrap();
         pane.cargo_preset = Some(preset);
@@ -1258,4 +1267,48 @@ fn bottom_bar_cargo_runs_use_the_launched_presets_warning_defaults() {
             Some(expected)
         );
     }
+}
+
+#[test]
+fn cargo_runner_launch_identity_survives_refresh_and_new_clients() {
+    use crate::assignments::CargoPreset;
+
+    for preset in CargoPreset::ALL {
+        let (mut ws, _, _, runner) = make_workspace_with_three_panes();
+        ws.panes
+            .iter_mut()
+            .find(|pane| pane.id == runner)
+            .unwrap()
+            .launch_preset = Some(preset.launch_tag().into());
+        let mut first_client = AppState::new();
+        let mut second_client = AppState::new();
+        first_client.set_workspaces(vec![ws.clone()]);
+        first_client.set_workspaces(vec![ws.clone()]);
+        second_client.set_workspaces(vec![ws]);
+        for client in [&first_client, &second_client] {
+            let active = client.active_workspace().unwrap();
+            assert!(
+                client
+                    .terminal_tabs(active)
+                    .iter()
+                    .any(|(id, name)| *id == runner && name == preset.label())
+            );
+            assert_eq!(client.panes[&runner].cargo_preset, Some(preset));
+        }
+    }
+}
+
+#[test]
+fn active_overlay_matches_visible_dialog_precedence_and_keeps_search_last() {
+    let mut state = AppState::new();
+    state.search = Some(SearchState::new(PaneId::new()));
+    assert_eq!(state.active_overlay(), Some(ActiveOverlay::Search));
+    state.picker.open = true;
+    state.action_palette.open = true;
+    assert_eq!(state.active_overlay(), Some(ActiveOverlay::ActionPalette));
+    state.settings.open = true;
+    state.workspace_form.open = true;
+    assert_eq!(state.active_overlay(), Some(ActiveOverlay::WorkspaceForm));
+    state.setup_review.open = true;
+    assert_eq!(state.active_overlay(), Some(ActiveOverlay::SetupReview));
 }

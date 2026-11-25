@@ -2,7 +2,7 @@ use super::{bounds, editable_field, named};
 use accesskit::{Action, ActionData, ActionRequest, Invalid, Live, Node, NodeId, Role, TreeId};
 use daedalus_ui::layout::Rect;
 use daedalus_ui::settings::{Control, SettingsAction, SettingsDialog};
-use daedalus_ui::state::AppState;
+use daedalus_ui::state::{ActiveOverlay, AppState};
 
 fn id(dialog: &SettingsDialog, offset: u64) -> NodeId {
     // A distinct namespace keeps callbacks from earlier forms and assignments isolated.
@@ -93,9 +93,7 @@ pub(crate) fn settings_action(
     request: &ActionRequest,
 ) -> Option<SettingsAction> {
     if request.target_tree != TreeId::ROOT
-        || state.setup_review.open
-        || !state.settings.open
-        || state.failure_recipients.is_some()
+        || state.active_overlay() != Some(ActiveOverlay::Settings)
     {
         return None;
     }

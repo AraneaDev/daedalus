@@ -10,6 +10,88 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::warn;
 
+pub(super) async fn create_manual_workspace(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+    session: u64,
+    name: String,
+    root_dir: PathBuf,
+) -> Result<(), RpcError> {
+    let event = match conn
+        .call(ClientMessage::CreateManualWorkspace { name, root_dir })
+        .await
+    {
+        Ok(ResponsePayload::WorkspaceCreated(workspace)) => {
+            UiEvent::ManualWorkspaceCreated { session, workspace }
+        }
+        Ok(_) => UiEvent::ManualWorkspaceFailed {
+            session,
+            message: "Unexpected reply to workspace creation.".into(),
+        },
+        Err(RpcError::Proto(error)) => UiEvent::ManualWorkspaceFailed {
+            session,
+            message: error.to_string(),
+        },
+        Err(err @ (RpcError::Disconnected | RpcError::TimedOut)) => return Err(err),
+    };
+    sink.emit(event);
+    Ok(())
+}
+
+pub(super) async fn close_workspace(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+    id: WorkspaceId,
+    compose_down: bool,
+    remove_worktree: bool,
+    force_remove_worktree: bool,
+) -> Result<(), RpcError> {
+    let close = conn
+        .call(ClientMessage::CloseWorkspace {
+            id,
+            compose_down,
+            remove_worktree,
+            force_remove_worktree,
+        })
+        .await;
+    if matches!(close, Err(RpcError::Disconnected | RpcError::TimedOut)) {
+        return close.map(|_| ());
+    }
+    if let ResponsePayload::Workspaces(ws) = conn.call(ClientMessage::ListWorkspaces).await? {
+        if close.is_ok() {
+            sink.emit(UiEvent::WorkspacesLoaded(ws));
+        } else {
+            sink.emit(UiEvent::WorkspaceCloseFailed(ws));
+        }
+    }
+    close.map(|_| ())
+}
+
+pub(super) async fn add_agent(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+    workspace_id: WorkspaceId,
+    preset: AgentPreset,
+    cols: u16,
+    rows: u16,
+) -> Result<(), RpcError> {
+    let response = conn
+        .call(ClientMessage::SpawnPane {
+            workspace_id,
+            role: PaneRole::Agent,
+            command: preset.command(),
+            shell: None,
+            env: Default::default(),
+            cols,
+            rows,
+        })
+        .await?;
+    if let ResponsePayload::PaneSpawned(summary) = response {
+        publish_pane(conn, sink, summary, Some(preset)).await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn replace_agent_preset(
     conn: &RpcConnection,
     sink: &Arc<dyn UiEventSink>,

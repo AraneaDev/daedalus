@@ -12,6 +12,7 @@ pub(super) struct Info {
     pub y: u16,
     pub visible: bool,
     pub alternate: bool,
+    pub bracketed_paste: bool,
     pub history: usize,
 }
 

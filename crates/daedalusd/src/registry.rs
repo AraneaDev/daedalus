@@ -13,11 +13,12 @@ use crate::supervisor::{IsolationMode, Supervisor};
 use crate::worktree::{self, WorktreeError};
 use daedalus_proto::{
     AgentState, Assignment, ContainerHealth, ExternalStatus, FailureTrace, GitWorkspaceStatus,
-    GitWorktreeInfo, PaneId, PaneRole, PaneSummary, PortMapping, ProtoError, ServerEvent,
-    WorkspaceId, WorkspaceInfo, WorkspaceManifest,
+    GitWorktreeInfo, PaneId, PaneRole, PaneStatus, PaneSummary, PortMapping, ProtoError,
+    ServerEvent, WorkspaceId, WorkspaceInfo, WorkspaceManifest,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 const DEFAULT_ROLES: [PaneRole; 3] = [PaneRole::Agent, PaneRole::Service, PaneRole::Runner];
@@ -212,11 +213,11 @@ pub struct Registry {
     shell_integration: ShellIntegration,
     event_tx: broadcast::Sender<ServerEvent>,
     state_store: Option<StateStore>,
-    persist_lock: Mutex<()>,
+    persist_lock: Arc<Mutex<persistence::PersistenceWriteState>>,
     unresolved_legacy_roots: RwLock<Vec<PersistedWorkspace>>,
     create_lock: Mutex<()>,
     recent_projects: RwLock<Vec<PersistedRecentProject>>,
-    project_setups: RwLock<HashMap<PathBuf, Vec<Assignment>>>,
+    project_setups: Arc<RwLock<HashMap<PathBuf, Vec<Assignment>>>>,
     worktrees_dir: std::sync::RwLock<Option<PathBuf>>,
     workspaces: RwLock<HashMap<WorkspaceId, WorkspaceRecord>>,
     panes: RwLock<HashMap<PaneId, PaneHandle>>,
@@ -243,11 +244,11 @@ impl Registry {
             shell_integration,
             event_tx,
             state_store,
-            persist_lock: Mutex::new(()),
+            persist_lock: Arc::new(Mutex::new(persistence::PersistenceWriteState::Unchecked)),
             unresolved_legacy_roots: RwLock::new(Vec::new()),
             create_lock: Mutex::new(()),
             recent_projects: RwLock::new(Vec::new()),
-            project_setups: RwLock::new(HashMap::new()),
+            project_setups: Arc::new(RwLock::new(HashMap::new())),
             worktrees_dir: std::sync::RwLock::new(None),
             workspaces: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
@@ -931,8 +932,6 @@ impl Registry {
         handle.set_agent_state(state).await
     }
 
-    /// Executes a custom action from the workspace's `.daedalus.toml` `[[actions]]` manifest
-    /// by sending its command to the first pane matching `action.target`.
     pub async fn preview_image(
         &self,
         id: WorkspaceId,
@@ -951,12 +950,13 @@ impl Registry {
             .map_err(|e| ProtoError::Internal(e.to_string()))?
     }
 
+    /// Sends a manifest action to the first live pane with its target role.
     pub async fn run_workspace_action(
         &self,
         workspace_id: WorkspaceId,
         action_id: &str,
     ) -> Result<(), ProtoError> {
-        let (action, pane_handle) = {
+        let (action, candidates) = {
             let ws_map = self.workspaces.read().await;
             let pane_map = self.panes.read().await;
             let ws = ws_map
@@ -970,17 +970,26 @@ impl Registry {
                 .ok_or_else(|| {
                     ProtoError::InvalidRequest(format!("unknown action '{action_id}'"))
                 })?;
-            let handle = ws
+            let candidates = ws
                 .pane_ids
                 .iter()
                 .filter_map(|pid| pane_map.get(pid))
-                .find(|h| h.role() == action.target)
+                .filter(|handle| handle.role() == action.target)
                 .cloned()
-                .ok_or_else(|| {
-                    ProtoError::InvalidRequest(format!("no {} pane in workspace", action.target))
-                })?;
-            (action, handle)
+                .collect::<Vec<_>>();
+            (action, candidates)
         };
+        if candidates.is_empty() {
+            return Err(ProtoError::InvalidRequest(format!(
+                "no {} pane in workspace",
+                action.target
+            )));
+        }
+        let pane_handle = Self::first_live_action_pane(candidates)
+            .await
+            .ok_or_else(|| {
+                ProtoError::InvalidRequest(format!("no live {} pane in workspace", action.target))
+            })?;
 
         let data = match action.target {
             PaneRole::Agent => {
@@ -999,6 +1008,17 @@ impl Registry {
         };
 
         pane_handle.send_input(data).await
+    }
+
+    async fn first_live_action_pane(candidates: Vec<PaneHandle>) -> Option<PaneHandle> {
+        for handle in candidates {
+            if let Ok(summary) = handle.summary().await
+                && !matches!(summary.status, PaneStatus::Exited { .. })
+            {
+                return Some(handle);
+            }
+        }
+        None
     }
 
     pub async fn get_failure_trace(
@@ -1865,6 +1885,35 @@ SHARED_KEY = "from_manifest"
     }
 
     #[tokio::test]
+    async fn rejected_snapshots_survive_workspace_mutations() {
+        for original in [br#"{ "version": 99 }"#.as_slice(), b"{invalid json"] {
+            let dir = TempDir::new().unwrap();
+            let state_file = dir.path().join("state.json");
+            std::fs::write(&state_file, original).unwrap();
+            let registry = Registry::new_with_state_store(
+                test_supervisor(),
+                ShellIntegration::prepare(dir.path()).unwrap(),
+                broadcast::channel(8).0,
+                Some(StateStore::new(state_file.clone())),
+            );
+            assert!(registry.restore_persisted_workspaces().await.is_err());
+            let ws = registry
+                .create_workspace("temporary".into(), dir.path().into(), HashMap::new())
+                .await
+                .unwrap();
+            assert!(matches!(
+                registry.set_project_setup(ws.id, Vec::new()).await,
+                Err(ProtoError::IoError(_))
+            ));
+            registry
+                .close_workspace(ws.id, false, false, false)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(state_file).unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
     async fn ambiguous_legacy_roots_survive_new_state_writes_without_becoming_active() {
         let dir = TempDir::new().unwrap();
         let store = StateStore::new(dir.path().join("state.json"));
@@ -1885,7 +1934,7 @@ SHARED_KEY = "from_manifest"
             broadcast::channel(8).0,
             Some(store.clone()),
         );
-        assert_eq!(registry.restore_persisted_workspaces().await, 0);
+        assert_eq!(registry.restore_persisted_workspaces().await.unwrap(), 0);
         registry
             .create_workspace("new".into(), dir.path().into(), HashMap::new())
             .await
@@ -1946,7 +1995,7 @@ SHARED_KEY = "from_manifest"
             broadcast::channel(64).0,
             Some(StateStore::new(state_path.clone())),
         );
-        let restored = reg2.restore_persisted_workspaces().await;
+        let restored = reg2.restore_persisted_workspaces().await.unwrap();
         assert_eq!(restored, 1);
 
         let listed = reg2.list_workspaces().await;

@@ -2,7 +2,7 @@ use super::{SETUP_REVIEW, bounds, editable_field, named};
 use accesskit::{Action, ActionData, ActionRequest, Live, Node, NodeId, Role, TreeId};
 use daedalus_ui::layout::Rect;
 use daedalus_ui::setup_review::{Control, SetupAction, SetupReview, role_label};
-use daedalus_ui::state::AppState;
+use daedalus_ui::state::{ActiveOverlay, AppState};
 
 fn id(review: &SetupReview, c: Control) -> NodeId {
     let offset = match c {
@@ -86,8 +86,7 @@ pub(super) fn fields(
 
 pub(crate) fn setup_action(state: &mut AppState, request: &ActionRequest) -> Option<SetupAction> {
     if request.target_tree != TreeId::ROOT
-        || !state.setup_review.open
-        || state.failure_recipients.is_some()
+        || state.active_overlay() != Some(ActiveOverlay::SetupReview)
     {
         return None;
     }

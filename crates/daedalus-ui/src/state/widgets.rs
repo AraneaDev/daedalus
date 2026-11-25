@@ -25,25 +25,19 @@ impl AppState {
         };
         let preset = config.and_then(|c| c.preset.as_deref()).or_else(|| {
             if let Some(preset) = pane.cargo_preset {
-                return Some(match preset {
-                    crate::assignments::CargoPreset::Test => "cargo-test",
-                    crate::assignments::CargoPreset::Check => "cargo-check",
-                });
+                return Some(preset.launch_tag());
             }
             let args = command?;
-            if args.first()?.rsplit(['/', '\\']).next()? != "cargo" {
-                return None;
-            }
-            match args.get(1)?.as_str() {
-                "test" => Some("cargo-test"),
-                "check" => Some("cargo-check"),
-                _ => None,
-            }
+            daedalus_proto::cargo_launch_preset(args.first()?, args.get(1).map(String::as_str))
         });
         let name = config
             .and_then(|c| c.label.as_deref())
             .filter(|s| !s.trim().is_empty())
             .or_else(|| self.session_names.get(&pane.summary.id).map(String::as_str))
+            .or_else(|| {
+                pane.cargo_preset
+                    .map(crate::assignments::CargoPreset::label)
+            })
             .unwrap_or(match (role, preset) {
                 (_, Some("cargo-test")) => "Workspace tests",
                 (_, Some("cargo-check")) => "Compiler",
