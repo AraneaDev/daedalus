@@ -110,18 +110,17 @@ impl DaedalusApp {
         response: Result<ResponsePayload, String>,
     ) {
         let settings = self.state.settings.open && self.state.settings.widget_workspace == Some(id);
-        match operation {
+        let applies = match operation {
             WorkbenchOperation::WidgetPreview(token) => {
-                if !settings || !self.state.settings.custom.finish_widget_test(token) {
-                    return;
-                }
+                settings && self.state.settings.custom.finish_widget_test(token)
             }
             WorkbenchOperation::ImportPreview(token) => {
-                if !settings || !self.state.settings.custom.finish_import_review(token) {
-                    return;
-                }
+                settings && self.state.settings.custom.finish_import_review(token)
             }
-            _ => {}
+            _ => true,
+        };
+        if !applies {
+            return;
         }
         let previous: Vec<_> = if settings {
             self.state.settings.control_order().collect()

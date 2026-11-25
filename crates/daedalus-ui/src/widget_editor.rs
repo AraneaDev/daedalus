@@ -93,8 +93,16 @@ impl WidgetEditor {
     pub fn show_import_review(&mut self, result: WidgetResult) {
         self.import_lines.clear();
         for (label, value) in &result.details {
-            let row = format!("{label} · {value}");
-            self.import_lines.extend(wrap_review_row(&row));
+            let rows = wrap_review_row(&format!("{label} · {value}"));
+            if rows.len() > 1 {
+                let value_rows = wrap_review_row(value);
+                if value_rows.len() == 1 {
+                    self.import_lines.extend(wrap_review_row(label));
+                    self.import_lines.extend(value_rows);
+                    continue;
+                }
+            }
+            self.import_lines.extend(rows);
         }
         self.preview = Some(result);
         self.detail_page = 0;

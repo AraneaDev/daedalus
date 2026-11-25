@@ -337,7 +337,8 @@ def exercise(binaries, scratch, screen):
                 ui.click(875, 400)  # Import / export
                 ui.wait_dialog((395, 254))
                 ui.click(720, 482)  # Preview the shared repo file
-                ui.wait_dialog((395, 174))
+                # Review rows can wrap, which changes the final dialog height.
+                ui.wait_dialog((395, 254), visible=False)
                 capture(ui, "workspace-import.png")
             ui.key("Escape")
             ui.close(client)
