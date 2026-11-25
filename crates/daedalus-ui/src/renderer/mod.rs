@@ -16,7 +16,7 @@ use daedalus_proto::{
 };
 use winit::window::Window;
 
-use crate::layout::{PaneRect, Rect, WorkspaceLayout, sidebar_workspace_close_rect};
+use crate::layout::{NamedTab, PaneRect, Rect, WorkspaceLayout, sidebar_workspace_close_rect};
 use crate::state::ConnectionState;
 use crate::state::{AppState, WorkspaceView};
 use crate::theme::{Rgba, Theme};
@@ -479,10 +479,13 @@ fn collect_prepared_quads(
                 .into_iter()
                 .find_map(|(role, rect)| (role == state.focused_role).then_some(rect))
         } else {
-            layout
-                .named_tabs
-                .iter()
-                .find_map(|(id, _, rect)| (Some(*id) == state.focused_pane_id()).then_some(*rect))
+            state.focused_pane_id().and_then(|id| {
+                layout
+                    .named_tabs
+                    .iter()
+                    .find(|tab| tab.kind.session() == Some(id))
+                    .map(|tab| tab.rect)
+            })
         };
         if let Some(tab) = selected {
             let surface = Rect::new(
@@ -550,8 +553,8 @@ fn collect_prepared_quads(
         }
     }
 
-    for (id, label, rect) in &layout.named_tabs {
-        if let Some((preset, bounds)) = agent_tab_mark(state, *id, label, *rect, s) {
+    for tab in &layout.named_tabs {
+        if let Some((preset, bounds)) = agent_tab_mark(state, tab, s) {
             quads.push(QuadInstance::agent_mark(bounds, preset, theme));
         }
     }
@@ -580,16 +583,12 @@ fn collect_prepared_quads(
 
 fn agent_tab_mark(
     state: &AppState,
-    id: daedalus_proto::PaneId,
-    label: &str,
-    rect: Rect,
+    tab: &NamedTab,
     scale: f32,
 ) -> Option<(crate::state::AgentPreset, Rect)> {
-    let pane = state.panes.get(&id)?;
-    if pane.summary.role != PaneRole::Agent
-        || rect.width <= 60. * scale
-        || matches!(label, "‹" | "›" | "‹ Prev" | "Next ›")
-    {
+    let pane = state.panes.get(&tab.kind.session()?)?;
+    let rect = tab.rect;
+    if pane.summary.role != PaneRole::Agent || rect.width <= 60. * scale {
         return None;
     }
     let size = 15. * scale;
@@ -1690,7 +1689,19 @@ pub(crate) mod tests {
         let id = state.focused_pane_id().unwrap();
         let theme = Theme::dark();
         let rect = Rect::new(12., 0., 132., 26.);
-        layout.named_tabs = vec![(id, "Agent".into(), rect)];
+        use crate::layout::TabKind;
+        layout.named_tabs = vec![
+            NamedTab {
+                kind: TabKind::Session(id),
+                label: "Next ›".into(),
+                rect,
+            },
+            NamedTab {
+                kind: TabKind::NextPage(id),
+                label: "Next ›".into(),
+                rect: Rect::new(144., 0., 132., 26.),
+            },
+        ];
         for (preset, expected) in [
             (Some(AgentPreset::Claude), -1.),
             (Some(AgentPreset::Codex), -2.),
@@ -1699,13 +1710,12 @@ pub(crate) mod tests {
         ] {
             state.panes.get_mut(&id).unwrap().agent_preset = preset;
             let (quads, _) = collect_quads(&state, &layout, &theme, 1200., 800., 1., (8., 19.));
-            assert!(
-                quads
-                    .iter()
-                    .any(|quad| quad.style[0] == expected && quad.rect == [22., 5.5, 15., 15.])
-            );
+            let marks: Vec<_> = quads.iter().filter(|quad| quad.style[0] < 0.).collect();
+            assert_eq!(marks.len(), 1);
+            assert_eq!(marks[0].style[0], expected);
+            assert_eq!(marks[0].rect, [22., 5.5, 15., 15.]);
         }
-        layout.named_tabs[0].2.width = 60.;
+        layout.named_tabs[0].rect.width = 60.;
         let (quads, _) = collect_quads(&state, &layout, &theme, 1200., 800., 1., (8., 19.));
         assert!(quads.iter().all(|quad| quad.style[0] >= 0.));
     }

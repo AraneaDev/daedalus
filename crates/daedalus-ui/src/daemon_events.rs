@@ -87,10 +87,14 @@ impl DaedalusApp {
             }
             UiEvent::ActivityReadFailed(token) => self.history.failed(token),
             UiEvent::Connected => {
+                if self.state.connection == ConnectionState::Reconnecting {
+                    self.state.workbench = None;
+                }
                 self.state.connection = ConnectionState::Connected;
                 self.schedule_resize_flush();
             }
             UiEvent::Disconnected => {
+                self.pause_layout_saves();
                 self.watched_workbench = None;
                 self.widget_refresh_at = None;
                 self.setup_disconnected();
@@ -120,6 +124,7 @@ impl DaedalusApp {
             }
             UiEvent::WorkspaceCloseFailed(workspaces) => {
                 self.state.set_workspaces(workspaces);
+                self.prune_layout_saves();
                 self.schedule_resize_flush();
             }
             UiEvent::WorkspacesLoaded(workspaces) => self.apply_workspace_list(workspaces, true),
@@ -283,8 +288,10 @@ impl DaedalusApp {
         }
         self.restore_session_names(&workspaces);
         self.state.set_workspaces(workspaces);
+        self.prune_layout_saves();
         self.reconcile_setup_installer();
         if initialize {
+            self.refresh_inactive_layout_saves();
             self.offer_first_workspace();
             self.ensure_active_workspace_panes();
         }

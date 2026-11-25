@@ -33,11 +33,20 @@ impl WidgetEditor {
         &mut self,
         name: &str,
         definition: &WidgetDefinition,
-    ) -> uuid::Uuid {
+    ) -> Option<uuid::Uuid> {
+        if self
+            .widget_test
+            .as_ref()
+            .is_some_and(|(_, pending_name, pending_definition)| {
+                pending_name == name && pending_definition == definition
+            })
+        {
+            return None;
+        }
         let token = uuid::Uuid::new_v4();
         self.preview = None;
         self.widget_test = Some((token, name.into(), definition.clone()));
-        token
+        Some(token)
     }
 
     pub fn finish_widget_test(&mut self, token: uuid::Uuid) -> bool {

@@ -1,61 +1,15 @@
+use crate::process::inventory::descendant_pids_including_roots;
 use daedalus_proto::{PortMapping, PortSource};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::mem::{offset_of, size_of};
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, INVALID_HANDLE_VALUE,
-};
+use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID,
     MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
-
-pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
-    let mut seen: HashSet<_> = roots.iter().copied().filter(|&pid| pid != 0).collect();
-    if seen.is_empty() {
-        return seen;
-    }
-    // SAFETY: TH32CS_SNAPPROCESS requests a snapshot of the process list; the PID is ignored.
-    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if raw == INVALID_HANDLE_VALUE {
-        return seen;
-    }
-    // SAFETY: the successful call transferred ownership of one snapshot handle.
-    let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
-    let mut entry = PROCESSENTRY32W {
-        dwSize: size_of::<PROCESSENTRY32W>() as u32,
-        ..Default::default()
-    };
-    let mut children = HashMap::<u32, Vec<u32>>::new();
-    // SAFETY: entry has the required size and the snapshot stays open for the enumeration.
-    let mut found = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) };
-    while found != 0 {
-        if entry.th32ProcessID != 0 {
-            children
-                .entry(entry.th32ParentProcessID)
-                .or_default()
-                .push(entry.th32ProcessID);
-        }
-        // SAFETY: same snapshot and initialized destination as Process32FirstW.
-        found = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) };
-    }
-    let mut pending: Vec<_> = seen.iter().copied().collect();
-    while let Some(pid) = pending.pop() {
-        for child in children.remove(&pid).unwrap_or_default() {
-            if seen.insert(child) {
-                pending.push(child);
-            }
-        }
-    }
-    seen
-}
-
 pub fn discover_local_ports_for_roots(roots: &[u32]) -> Vec<PortMapping> {
-    let pids = collect_descendant_pids(roots);
+    let pids = descendant_pids_including_roots(roots);
     let mut ports = BTreeSet::new();
     if !pids.is_empty() {
         for family in [AF_INET, AF_INET6] {

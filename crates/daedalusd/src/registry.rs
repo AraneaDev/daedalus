@@ -336,6 +336,21 @@ impl Registry {
         env: HashMap<String, String>,
         manual_launch: bool,
     ) -> Result<WorkspaceInfo, ProtoError> {
+        let record = self
+            .prepare_workspace_record(name, root_dir, env, manual_launch)
+            .await?;
+        Ok(self.publish_workspace(record).await)
+    }
+
+    /// Allocates an ID and a slot without exposing the workspace to clients.
+    /// The caller holds `create_lock` until it publishes or drops the record.
+    async fn prepare_workspace_record(
+        &self,
+        name: String,
+        root_dir: PathBuf,
+        env: HashMap<String, String>,
+        manual_launch: bool,
+    ) -> Result<WorkspaceRecord, ProtoError> {
         let root_dir =
             std::path::absolute(root_dir).map_err(|err| ProtoError::IoError(err.to_string()))?;
         if !root_dir.is_dir() {
@@ -368,12 +383,21 @@ impl Registry {
         .map_err(|e| ProtoError::IoError(e.to_string()))?;
 
         let id = WorkspaceId::new();
-        let record = build_workspace_record(id, name, root_dir, prepared, manual_launch);
+        Ok(build_workspace_record(
+            id,
+            name,
+            root_dir,
+            prepared,
+            manual_launch,
+        ))
+    }
+
+    async fn publish_workspace(&self, record: WorkspaceRecord) -> WorkspaceInfo {
         let info = record.to_info(Vec::new());
         self.record_recent_project(&info.name, &info.root_dir).await;
-        self.workspaces.write().await.insert(id, record);
+        self.workspaces.write().await.insert(info.id, record);
         self.notify_membership();
-        Ok(info)
+        info
     }
 
     async fn finish_workspace_creation(&self, mut info: WorkspaceInfo) -> WorkspaceInfo {

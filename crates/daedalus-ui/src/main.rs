@@ -2,9 +2,11 @@
 
 mod accessibility;
 mod daemon_events;
+mod dialog_actions;
 mod pointer;
 mod setup;
 mod terminal_commands;
+mod terminal_search;
 mod viewport;
 mod workspace_settings;
 mod workspace_sharing;
@@ -18,7 +20,7 @@ use daedalus_proto::{PaneId, PaneRole, WorkspaceId, default_socket_path};
 use daedalus_ui::bridge::{BridgeConfig, DaemonBridge, UiCommand, UiEvent, UiEventSink};
 use daedalus_ui::config::UiConfig;
 use daedalus_ui::input::{
-    KeyRepeatGuard, UiAction, filter_modal_text, translate_key, windows_terminal_shortcut,
+    KeyRepeatGuard, UiAction, filter_modal_text, translate_overlay_key, windows_terminal_shortcut,
 };
 use daedalus_ui::layout::overlays::picker_row_stride;
 use daedalus_ui::layout::{HitTarget, hit_test};
@@ -137,6 +139,7 @@ struct DaedalusApp {
     widget_directory: PathBuf,
     workbench_capable: bool,
     watched_workbench: Option<WorkspaceId>,
+    layout_saves: std::collections::HashMap<WorkspaceId, workspace_sharing::LayoutSave>,
     seeded_workbench: std::collections::HashSet<WorkspaceId>,
     widget_refresh_at: Option<Instant>,
     daemon_home: Option<PathBuf>,
@@ -205,6 +208,7 @@ impl DaedalusApp {
             widget_directory,
             workbench_capable: false,
             watched_workbench: None,
+            layout_saves: Default::default(),
             seeded_workbench: Default::default(),
             widget_refresh_at: None,
             daemon_home: None,
@@ -523,41 +527,6 @@ impl DaedalusApp {
         self.request_redraw();
     }
 
-    fn request_scrollback_if_needed(&mut self, pane_id: PaneId) {
-        let Some(pane) = self.state.panes.get_mut(&pane_id) else {
-            return;
-        };
-        if let Some(generation) = pane.begin_scrollback_request() {
-            let command = UiCommand::RequestScrollback {
-                pane_id,
-                generation,
-                offset_from_bottom: pane.requested_scroll_offset,
-                count: usize::from(pane.summary.rows).max(1),
-            };
-            self.send_command(command);
-        }
-    }
-
-    fn scroll_pane(&mut self, role: PaneRole, delta: isize) {
-        if delta == 0 {
-            return;
-        }
-        let Some(pane_id) = self.state.pane_id_for_role(role) else {
-            return;
-        };
-        let Some(pane) = self.state.panes.get_mut(&pane_id) else {
-            return;
-        };
-        if delta > 0 {
-            // Older daemons omit history length from deltas. Let the daemon clamp the request.
-            pane.set_scroll_offset(pane.requested_scroll_offset.saturating_add(delta as usize));
-        } else {
-            pane.adjust_scroll_offset(delta);
-        }
-        self.request_scrollback_if_needed(pane_id);
-        self.request_redraw();
-    }
-
     fn ensure_active_workspace_panes(&mut self) {
         let Some(ws) = self.state.active_dormant_workspace() else {
             return;
@@ -573,56 +542,6 @@ impl DaedalusApp {
         {
             self.state.mark_workspace_spawning(workspace_id);
         }
-    }
-
-    fn run_pane_search(&self) {
-        let Some(ref search) = self.state.search else {
-            return;
-        };
-        if search.query.is_empty() {
-            return;
-        }
-        self.send_command(UiCommand::SearchPane {
-            pane_id: search.pane_id,
-            query: search.query.clone(),
-            case_sensitive: search.case_sensitive,
-            generation: search.generation,
-        });
-    }
-
-    fn scroll_to_active_search_match(&mut self) {
-        let Some(ref search) = self.state.search else {
-            return;
-        };
-        let Some(active) = search.active_match() else {
-            return;
-        };
-        let pane_id = search.pane_id;
-        {
-            let Some(pane) = self.state.panes.get_mut(&pane_id) else {
-                return;
-            };
-            pane.scrollback_len = search.total_scrollback;
-            if pane
-                .visible_rows()
-                .iter()
-                .any(|r| r.abs_row == active.abs_row)
-            {
-                pane.set_scroll_offset(pane.scroll_offset);
-            } else {
-                let viewport_rows = (pane.summary.rows as usize).max(1);
-                let live_start = pane
-                    .viewport_rows
-                    .last()
-                    .and_then(|r| (r.abs_row + 1).checked_sub(viewport_rows as u64))
-                    .max(Some(search.total_scrollback as u64));
-                let target_offset = search
-                    .target_scroll_offset_with_live_start(viewport_rows, live_start)
-                    .unwrap_or(0);
-                pane.set_scroll_offset(target_offset);
-            }
-        }
-        self.request_scrollback_if_needed(pane_id);
     }
 
     fn apply_font_size_delta(&mut self, delta: f32) {
@@ -649,21 +568,6 @@ impl DaedalusApp {
             }
             self.request_redraw();
         }
-    }
-
-    fn confirm_workspace_action(&mut self) {
-        let selected = self.state.action_palette.selected_index;
-        if let (Some(workspace_id), Some(action)) = (
-            self.state.active_workspace_id,
-            self.state.active_actions().get(selected),
-        ) {
-            self.send_command(UiCommand::RunWorkspaceAction {
-                workspace_id,
-                action_id: action.id.clone(),
-            });
-        }
-        self.state.action_palette.close();
-        self.request_redraw();
     }
 
     fn handle_ui_action(&mut self, action: UiAction) {
@@ -699,59 +603,6 @@ impl DaedalusApp {
                 self.schedule_resize_flush();
                 self.request_redraw();
             }
-            UiAction::ToggleActionPalette => {
-                if self.state.action_palette.open {
-                    self.state.action_palette.close();
-                } else {
-                    self.pointer.end_drag();
-                    self.state.open_action_palette();
-                }
-                self.request_redraw();
-            }
-            UiAction::ActionPaletteUp | UiAction::ActionPaletteDown => {
-                let count = self.state.active_actions().len();
-                if action == UiAction::ActionPaletteUp {
-                    self.state.action_palette.move_up(count);
-                } else {
-                    self.state.action_palette.move_down(count);
-                }
-                self.request_redraw();
-            }
-            UiAction::ActionPaletteConfirm => self.confirm_workspace_action(),
-            UiAction::ActionPaletteCancel => {
-                self.state.action_palette.close();
-                self.request_redraw();
-            }
-            UiAction::ToggleAgentPicker => {
-                if self.state.picker.open {
-                    self.state.picker.close();
-                    self.request_redraw();
-                } else {
-                    self.open_agent_picker();
-                }
-            }
-            UiAction::ToggleWorktreeModal => {
-                self.state.toggle_worktree_modal();
-                self.request_redraw();
-            }
-            UiAction::CloseTerminal => {
-                if let Some(id) = self.state.focused_pane_id() {
-                    self.send_command(UiCommand::ClosePane(id));
-                }
-            }
-            UiAction::OpenCloseWorkspaceModal => {
-                if let Some(ws_id) = self.state.active_workspace_id {
-                    self.open_close_modal_for_workspace(ws_id);
-                } else {
-                    self.show_toast("No active workspace to close", true);
-                }
-            }
-            UiAction::ToggleSearch => {
-                if let Some(pane_id) = self.state.focused_pane_id() {
-                    self.state.toggle_search(pane_id);
-                    self.request_redraw();
-                }
-            }
             UiAction::RunTests => self.run_saved_tests(),
             UiAction::RunCargo(preset) => self.run_cargo_preset(preset),
             UiAction::WorkspaceSettings => self.open_workspace_settings(),
@@ -774,137 +625,42 @@ impl DaedalusApp {
             UiAction::FontZoomIn => self.apply_font_size_delta(1.0),
             UiAction::FontZoomOut => self.apply_font_size_delta(-1.0),
             UiAction::FontZoomReset => self.set_font_size(self.ui_config.font_size),
-            UiAction::ScrollPageUp => {
-                let page = self
-                    .state
-                    .pane_for_role(self.state.focused_role)
-                    .map_or(20, |p| (p.summary.rows as isize).saturating_sub(1).max(1));
-                self.scroll_pane(self.state.focused_role, page);
-            }
-            UiAction::ScrollPageDown => {
-                let page = self
-                    .state
-                    .pane_for_role(self.state.focused_role)
-                    .map_or(20, |p| (p.summary.rows as isize).saturating_sub(1).max(1));
-                self.scroll_pane(self.state.focused_role, -page);
-            }
-            UiAction::ScrollToBottom => {
-                if let Some(pane) = self.state.pane_for_role_mut(self.state.focused_role) {
-                    pane.reset_scroll();
-                }
-                self.request_redraw();
-            }
-            UiAction::SendBytes(data) => {
-                if let Some(pane_id) = self.state.focused_pane_id() {
-                    if let Some(pane) = self.state.panes.get_mut(&pane_id) {
-                        pane.reset_scroll();
-                        pane.selection = None;
-                    }
-                    self.send_command(UiCommand::SendInput { pane_id, data });
-                    self.request_redraw();
-                }
-            }
-            UiAction::PickerUp => {
-                self.state.picker.move_up();
-                self.request_redraw();
-            }
-            UiAction::PickerDown => {
-                self.state.picker.move_down();
-                self.request_redraw();
-            }
-            UiAction::PickerConfirm | UiAction::PickerAdd => {
-                let preset = self.state.picker.selected_preset();
-                self.apply_agent_preset(preset, action == UiAction::PickerAdd);
-            }
-            UiAction::PickerCancel => {
-                self.state.picker.close();
-                self.request_redraw();
-            }
-            UiAction::WorktreeModalText(text) => {
-                self.state.worktree_modal.push_text(&text);
-                self.request_redraw();
-            }
-            UiAction::WorktreeModalSetText(text) => {
-                self.state.worktree_modal.set_text(text);
-                self.request_redraw();
-            }
-            UiAction::WorktreeModalBackspace => {
-                self.state.worktree_modal.pop_char();
-                self.request_redraw();
-            }
-            UiAction::WorktreeModalConfirm => self.submit_worktree_modal(),
-            UiAction::WorktreeModalCancel => {
-                self.state.worktree_modal.close();
-                self.request_redraw();
-            }
-            UiAction::CloseModalToggleCompose => {
-                self.state.close_modal.toggle_compose();
-                self.request_redraw();
-            }
-            UiAction::CloseModalToggleWorktree => {
-                self.state.close_modal.toggle_worktree();
-                self.request_redraw();
-            }
-            UiAction::CloseModalToggleForce => {
-                self.state.close_modal.toggle_force();
-                self.request_redraw();
-            }
-            UiAction::CloseModalConfirm => self.confirm_close_workspace(),
-            UiAction::CloseModalCancel => {
-                if self.state.close_modal.submitting {
-                    return;
-                }
-                self.state.close_modal.close();
-                self.request_redraw();
-            }
-            UiAction::PasteSearchQuery => {
-                if let Some(text) = self
-                    .clipboard_text()
-                    .and_then(|text| filter_modal_text(&text, true))
-                {
-                    self.handle_ui_action(UiAction::SearchText(text));
-                }
-            }
-            UiAction::SearchText(text) => {
-                if let Some(ref mut search) = self.state.search {
-                    search.push_text(&text);
-                    self.run_pane_search();
-                    self.request_redraw();
-                }
-            }
-            UiAction::SearchBackspace => {
-                if let Some(ref mut search) = self.state.search
-                    && search.pop_char()
-                {
-                    self.run_pane_search();
-                    self.request_redraw();
-                }
-            }
-            UiAction::SearchToggleCase => {
-                if let Some(ref mut search) = self.state.search {
-                    search.toggle_case();
-                    self.run_pane_search();
-                    self.request_redraw();
-                }
-            }
-            UiAction::SearchNext => {
-                if let Some(ref mut search) = self.state.search {
-                    search.step_next();
-                }
-                self.scroll_to_active_search_match();
-                self.request_redraw();
-            }
-            UiAction::SearchPrev => {
-                if let Some(ref mut search) = self.state.search {
-                    search.step_prev();
-                }
-                self.scroll_to_active_search_match();
-                self.request_redraw();
-            }
-            UiAction::SearchCancel => {
-                self.state.close_search();
-                self.request_redraw();
-            }
+            UiAction::ToggleActionPalette
+            | UiAction::ActionPaletteUp
+            | UiAction::ActionPaletteDown
+            | UiAction::ActionPaletteConfirm
+            | UiAction::ActionPaletteCancel
+            | UiAction::ToggleAgentPicker
+            | UiAction::ToggleWorktreeModal
+            | UiAction::OpenCloseWorkspaceModal
+            | UiAction::PickerUp
+            | UiAction::PickerDown
+            | UiAction::PickerConfirm
+            | UiAction::PickerAdd
+            | UiAction::PickerCancel
+            | UiAction::WorktreeModalText(_)
+            | UiAction::WorktreeModalSetText(_)
+            | UiAction::WorktreeModalBackspace
+            | UiAction::WorktreeModalConfirm
+            | UiAction::WorktreeModalCancel
+            | UiAction::CloseModalToggleCompose
+            | UiAction::CloseModalToggleWorktree
+            | UiAction::CloseModalToggleForce
+            | UiAction::CloseModalConfirm
+            | UiAction::CloseModalCancel => self.handle_dialog_action(action),
+            UiAction::ToggleSearch
+            | UiAction::PasteSearchQuery
+            | UiAction::SearchText(_)
+            | UiAction::SearchBackspace
+            | UiAction::SearchToggleCase
+            | UiAction::SearchNext
+            | UiAction::SearchPrev
+            | UiAction::SearchCancel => self.handle_search_action(action),
+            UiAction::CloseTerminal
+            | UiAction::ScrollPageUp
+            | UiAction::ScrollPageDown
+            | UiAction::ScrollToBottom
+            | UiAction::SendBytes(_) => self.handle_terminal_action(action),
             UiAction::Ignore => {}
         }
     }
@@ -956,7 +712,7 @@ impl DaedalusApp {
             }
             return;
         }
-        if self.handle_recap_key(logical_key, repeat) {
+        if overlay.is_none() && self.handle_recap_key(logical_key, repeat) {
             self.key_repeats.suppress(physical_key);
             return;
         }
@@ -966,15 +722,12 @@ impl DaedalusApp {
             None
         };
         let action = terminal_shortcut.unwrap_or_else(|| {
-            translate_key(
+            translate_overlay_key(
                 logical_key,
                 text,
                 self.modifiers,
-                overlay == Some(ActiveOverlay::AgentPicker),
-                overlay == Some(ActiveOverlay::Worktree),
-                overlay == Some(ActiveOverlay::CloseWorkspace),
-                overlay == Some(ActiveOverlay::Search),
-                overlay == Some(ActiveOverlay::ActionPalette),
+                overlay,
+                cfg!(target_os = "macos"),
             )
         });
         let action = self.key_repeats.press(physical_key, repeat, action);
@@ -982,9 +735,6 @@ impl DaedalusApp {
     }
 
     fn commit_text(&mut self, text: String) {
-        if self.state.recap.keyboard_row.is_some() {
-            return;
-        }
         match self.state.active_overlay() {
             Some(ActiveOverlay::SetupReview) => {
                 self.state.setup_review.insert_text(&text);
@@ -1014,7 +764,10 @@ impl DaedalusApp {
                 | ActiveOverlay::ActionPalette
                 | ActiveOverlay::CloseWorkspace,
             ) => {}
-            None if !text.is_empty() && !text.chars().all(char::is_control) => {
+            None if self.state.recap.keyboard_row.is_none()
+                && !text.is_empty()
+                && !text.chars().all(char::is_control) =>
+            {
                 self.handle_ui_action(UiAction::SendBytes(text.into_bytes()));
             }
             None => {}
@@ -1023,14 +776,6 @@ impl DaedalusApp {
 
     fn handle_recap_key(&mut self, key: &winit::keyboard::Key, repeat: bool) -> bool {
         use winit::keyboard::{Key, NamedKey};
-        if self.state.picker.open
-            || self.state.worktree_modal.open
-            || self.state.close_modal.open
-            || self.state.search.is_some()
-            || self.state.action_palette.open
-        {
-            return false;
-        }
         let open = daedalus_ui::input::is_primary_shift_char(
             key,
             self.modifiers,

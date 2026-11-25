@@ -177,6 +177,10 @@ fn live_terminal_modes(pane: &PaneViewState) -> Option<TerminalModes> {
 }
 
 impl PointerState {
+    pub(super) fn dragging_divider(&self) -> bool {
+        self.divider_drag.is_some()
+    }
+
     pub(super) fn end_drag(&mut self) {
         self.divider_drag = None;
         self.drag_anchor = None;

@@ -277,23 +277,31 @@ fn zoomed_headers_switch_from_default_role_tabs_to_named_sessions_with_a_close_t
         );
     }
     let active = frame.state.focused_pane_id().unwrap();
+    frame.state.panes.get_mut(&active).unwrap().unread_attention = true;
     let entries = [
-        (active, "Builder".into()),
+        (active, "Next ›".into()),
         (PaneId::new(), "Test suite".into()),
     ];
     frame.layout.set_named_tabs(&entries, Some(active), 1.);
     frame.labels(1200., 800.);
-    for (id, label, rect) in &frame.layout.named_tabs {
+    assert!(
+        frame.renderer.chrome_items.iter().any(|item| {
+            item.buffer.lines[0].text() == "●"
+                && item.bounds.left == frame.layout.named_tabs[0].rect.x.floor() as i32
+        }),
+        "a session matching the pager caption still draws its unread marker"
+    );
+    for tab in &frame.layout.named_tabs {
         let item = frame
             .renderer
             .chrome_items
             .iter()
-            .find(|i| i.buffer.lines[0].text() == label)
+            .find(|i| i.buffer.lines[0].text() == tab.label)
             .unwrap();
-        assert_eq!(item.bounds.left, rect.x.floor() as i32);
+        assert_eq!(item.bounds.left, tab.rect.x.floor() as i32);
         assert_eq!(
             item.default_color,
-            if *id == active {
+            if tab.kind.session() == Some(active) {
                 theme.border_focused
             } else {
                 theme.text_muted

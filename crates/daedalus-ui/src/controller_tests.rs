@@ -1034,9 +1034,9 @@ fn pointer_routes_header_sidebar_and_overlay_clicks_using_the_rendered_layout() 
     let tab = zoom
         .named_tabs
         .iter()
-        .find(|(id, _, _)| *id == runner)
+        .find(|tab| tab.kind.session() == Some(runner))
         .unwrap();
-    click(&mut w.app, tab.2);
+    click(&mut w.app, tab.rect);
     assert_eq!(w.app.state.focused_pane_id(), Some(runner));
     let (_, close) = w.app.layout_for(metrics).close_tab.unwrap();
     click(&mut w.app, close);
@@ -2730,4 +2730,43 @@ fn windows_copy_with_no_selection_never_sends_terminal_input() {
         workbench.command(),
         UiCommand::SendInput { pane_id: target, data } if target == pane_id && data == b"\x03"
     ));
+}
+
+#[test]
+fn ime_commit_reaches_form_opened_by_native_action_with_recap_selected() {
+    use accesskit::{Action, ActionRequest, TreeId};
+    use daedalus_ui::{recap::RecapEntry, workspace_form::Control};
+
+    let mut w = Workbench::new();
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![workspace("Recap")]));
+    w.app.state.recap.keyboard_row = Some(RecapEntry::from("Runner completed"));
+    let tree =
+        accessibility::workbench_tree(&w.app.state, 900., 600., 1., &mut w.app.terminal_controls);
+    let node = tree
+        .nodes
+        .iter()
+        .find(|(_, node)| node.label() == Some("New workspace"))
+        .unwrap()
+        .0;
+    let request = ActionRequest {
+        target_tree: TreeId::ROOT,
+        target_node: node,
+        action: Action::Click,
+        data: None,
+    };
+    let action = accessibility::action(&w.app.state, &request, &w.app.terminal_controls).unwrap();
+    w.app.handle_ui_action(action);
+    assert!(w.app.state.workspace_form.open);
+    assert!(w.app.state.recap.keyboard_row.is_some());
+    w.app.commit_text("日本語".into());
+    assert!(
+        w.app
+            .state
+            .workspace_form
+            .value(Control::Folder)
+            .unwrap()
+            .contains("日本語"),
+        "the active form lost committed Japanese text"
+    );
 }

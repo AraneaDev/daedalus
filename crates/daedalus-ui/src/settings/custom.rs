@@ -174,9 +174,12 @@ impl SettingsDialog {
                 let operation = match &request {
                     ClientMessage::PreviewWidget {
                         name, definition, ..
-                    } => WorkbenchOperation::WidgetPreview(
-                        self.custom.start_widget_test(name, definition),
-                    ),
+                    } => {
+                        let Some(token) = self.custom.start_widget_test(name, definition) else {
+                            return SettingsAction::None;
+                        };
+                        WorkbenchOperation::WidgetPreview(token)
+                    }
                     ClientMessage::PreviewWorkspaceImport { .. }
                     | ClientMessage::PreviewWorkspaceCreation { .. }
                     | ClientMessage::ResolveWorkspaceImport { .. } => {

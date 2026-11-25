@@ -66,9 +66,10 @@ impl<'a> WidgetLane<'a> {
                     self.jobs = JoinSet::new();
                 }
                 Some(_) => {
-                    self.sink.emit(UiEvent::Toast {
-                        message: "A widget operation is already running.".into(),
-                        is_error: false,
+                    self.sink.emit(UiEvent::Workbench {
+                        workspace_id: *workspace_id,
+                        operation: operation.clone(),
+                        response: Box::new(Err("A widget operation is already running.".into())),
                     });
                     return true;
                 }

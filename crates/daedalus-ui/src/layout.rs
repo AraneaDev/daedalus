@@ -1,5 +1,6 @@
 pub mod overlays;
 
+use crate::sidebar_content::{SidebarContent, SidebarRow};
 use daedalus_proto::{PaneId, PaneRole, WorkspaceId};
 
 pub const SIDEBAR_LOGICAL_WIDTH: f32 = 240.0;
@@ -168,13 +169,42 @@ pub struct LayoutInput {
     pub runner_has_failure: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabKind {
+    Session(PaneId),
+    PreviousPage(PaneId),
+    NextPage(PaneId),
+}
+
+impl TabKind {
+    pub fn target(self) -> PaneId {
+        match self {
+            Self::Session(id) | Self::PreviousPage(id) | Self::NextPage(id) => id,
+        }
+    }
+
+    pub fn session(self) -> Option<PaneId> {
+        match self {
+            Self::Session(id) => Some(id),
+            Self::PreviousPage(_) | Self::NextPage(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedTab {
+    pub kind: TabKind,
+    pub label: String,
+    pub rect: Rect,
+}
+
 /// Computed rectangles for the sidebar, optional top banner, and visible semantic panes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceLayout {
     pub insight_rows: Vec<(PaneRole, Rect)>,
     pub compact_recap: Option<Rect>,
     pub close_tab: Option<(PaneId, Rect)>,
-    pub named_tabs: Vec<(PaneId, String, Rect)>,
+    pub named_tabs: Vec<NamedTab>,
     pub stacked: bool,
     pub run_tests_button: Option<Rect>,
     pub layout_button: Option<Rect>,
@@ -371,14 +401,17 @@ impl WorkspaceLayout {
         };
         spare -= selected_extra;
         let mut x = left;
-        let mut push = |id, label: String, w| {
-            self.named_tabs
-                .push((id, label, Rect::new(x, strip.y, w, strip.height)));
+        let mut push = |kind, label: String, w| {
+            self.named_tabs.push(NamedTab {
+                kind,
+                label,
+                rect: Rect::new(x, strip.y, w, strip.height),
+            });
             x += w;
         };
         if overflow {
             push(
-                entries[(start + entries.len() - 1) % entries.len()].0,
+                TabKind::PreviousPage(entries[(start + entries.len() - 1) % entries.len()].0),
                 if compact { "‹" } else { "‹ Prev" }.into(),
                 if compact { arrow_width } else { width },
             );
@@ -393,19 +426,24 @@ impl WorkspaceLayout {
                 spare -= extra;
                 extra
             };
-            push(*id, label.clone(), width + extra);
+            push(TabKind::Session(*id), label.clone(), width + extra);
         }
         if overflow {
             push(
-                entries[(start + visible) % entries.len()].0,
+                TabKind::NextPage(entries[(start + visible) % entries.len()].0),
                 if compact { "›" } else { "Next ›" }.into(),
                 if compact { arrow_width } else { width },
             );
         }
         if let Some(id) = focused
-            && let Some((_, _, rect)) = self.named_tabs.iter().rev().find(|(tab, _, _)| *tab == id)
-            && rect.width >= 52. * scale
+            && let Some(tab) = self
+                .named_tabs
+                .iter()
+                .rev()
+                .find(|tab| tab.kind == TabKind::Session(id))
+            && tab.rect.width >= 52. * scale
         {
+            let rect = tab.rect;
             let width = (TAB_CLOSE_LOGICAL_WIDTH * scale).min(rect.width - 30. * scale);
             self.close_tab = Some((
                 id,
@@ -951,22 +989,9 @@ pub fn hit_test(
     x: f32,
     y: f32,
 ) -> HitTarget {
-    use crate::sidebar_content::{SidebarContent, SidebarRow};
-    if let Some((index, _)) = layout
-        .widget_buttons
-        .iter()
-        .find(|(_, rect)| rect.contains(x, y))
-    {
-        return HitTarget::CustomWidget(*index);
-    }
-    if let Some((preset, _)) = layout
-        .cargo_buttons(scale_factor)
-        .find(|(_, rect)| rect.contains(x, y))
-    {
-        return HitTarget::RunCargo(preset);
-    }
-    if let Some((role, _)) = layout.insight_rows.iter().find(|(_, r)| r.contains(x, y)) {
-        return HitTarget::Widget(*role);
+    let point = (x, y);
+    if let Some(target) = footer_target(layout, scale_factor, point) {
+        return target;
     }
     let fallback = layout
         .sidebar
@@ -975,123 +1000,185 @@ pub fn hit_test(
             SidebarContent::plain(workspace_count, rect, layout.sidebar_first, scale_factor)
         });
     let list = layout.sidebar_content.as_deref().or(fallback.as_ref());
-    if let Some((up, down)) = list.as_ref().and_then(|list| list.arrows) {
+    if let Some(target) =
+        workbench_controls_target(layout, list, workspace_count, scale_factor, point)
+    {
+        return target;
+    }
+    if layout.sidebar.is_some_and(|sidebar| sidebar.contains(x, y)) {
+        return sidebar_target(
+            layout,
+            list.expect("visible sidebar has content"),
+            scale_factor,
+            point,
+        );
+    }
+
+    layout
+        .panes
+        .iter()
+        .find_map(|pane| {
+            pane_target(
+                layout,
+                pane,
+                workspace_count > 0,
+                scale_factor,
+                (cell_w, cell_h),
+                point,
+            )
+        })
+        .unwrap_or(HitTarget::None)
+}
+
+fn footer_target(
+    layout: &WorkspaceLayout,
+    scale_factor: f32,
+    (x, y): (f32, f32),
+) -> Option<HitTarget> {
+    if let Some((index, _)) = layout
+        .widget_buttons
+        .iter()
+        .find(|(_, rect)| rect.contains(x, y))
+    {
+        return Some(HitTarget::CustomWidget(*index));
+    }
+    if let Some((preset, _)) = layout
+        .cargo_buttons(scale_factor)
+        .find(|(_, rect)| rect.contains(x, y))
+    {
+        return Some(HitTarget::RunCargo(preset));
+    }
+    if let Some((role, _)) = layout.insight_rows.iter().find(|(_, r)| r.contains(x, y)) {
+        return Some(HitTarget::Widget(*role));
+    }
+    None
+}
+
+fn workbench_controls_target(
+    layout: &WorkspaceLayout,
+    list: Option<&SidebarContent>,
+    workspace_count: usize,
+    scale_factor: f32,
+    (x, y): (f32, f32),
+) -> Option<HitTarget> {
+    if let Some((up, down)) = list.and_then(|list| list.arrows) {
         if up.contains(x, y) {
-            return HitTarget::SidebarPageUp;
+            return Some(HitTarget::SidebarPageUp);
         }
         if down.contains(x, y) {
-            return HitTarget::SidebarPageDown;
+            return Some(HitTarget::SidebarPageDown);
         }
     }
     if layout
         .layout_button
         .is_some_and(|button| button.contains(x, y))
     {
-        return HitTarget::ToggleLayout;
+        return Some(HitTarget::ToggleLayout);
     }
     if layout
         .run_tests_button
         .is_some_and(|button| button.contains(x, y))
     {
-        return HitTarget::RunTests;
+        return Some(HitTarget::RunTests);
     }
     if workspace_count > 0
         && layout.sidebar_toggle.is_some_and(|rect| {
-            settings_button(rect, list.as_ref().and_then(|l| l.arrows), scale_factor).contains(x, y)
+            settings_button(rect, list.and_then(|l| l.arrows), scale_factor).contains(x, y)
         })
     {
-        return HitTarget::WorkspaceSettings;
+        return Some(HitTarget::WorkspaceSettings);
     }
     if layout
         .sidebar_toggle
         .is_some_and(|rect| rect.contains(x, y))
     {
-        return HitTarget::ToggleSidebar;
+        return Some(HitTarget::ToggleSidebar);
     }
-    if let Some(sidebar) = layout.sidebar
-        && sidebar.contains(x, y)
-    {
-        if let Some(&(workspace, _)) = layout
-            .failed_run_buttons
-            .iter()
-            .find(|(_, rect)| rect.contains(x, y))
-        {
-            return HitTarget::SidebarFailedRun(workspace);
-        }
-        let list = list.expect("visible sidebar has content");
-        for (row, rect) in list.rows[list.visible.clone()].iter().zip(&list.rects) {
-            if let SidebarRow::Workspace(i) = row
-                && rect.contains(x, y)
-            {
-                if sidebar_workspace_close_rect(*rect, scale_factor).contains(x, y) {
-                    return HitTarget::SidebarWorkspaceClose(*i);
-                }
-                return HitTarget::SidebarWorkspace(*i);
-            }
-        }
-        if list.new_workspace.contains(x, y) {
-            return HitTarget::SidebarNewWorkspace;
-        }
-        if list.new_worktree.contains(x, y) {
-            return HitTarget::SidebarNewWorktree;
-        }
-        return HitTarget::None;
-    }
+    None
+}
 
-    for pane in &layout.panes {
-        if workspace_count == 0 && pane.header.contains(x, y) {
-            return HitTarget::None;
-        }
-        if let Some(pill) = pane.action_pill
-            && pill.contains(x, y)
-        {
-            return HitTarget::PaneHeaderAction(pane.role);
-        }
-        if let Some((id, rect)) = layout.close_tab
+fn sidebar_target(
+    layout: &WorkspaceLayout,
+    list: &SidebarContent,
+    scale_factor: f32,
+    (x, y): (f32, f32),
+) -> HitTarget {
+    if let Some(&(workspace, _)) = layout
+        .failed_run_buttons
+        .iter()
+        .find(|(_, rect)| rect.contains(x, y))
+    {
+        return HitTarget::SidebarFailedRun(workspace);
+    }
+    for (row, rect) in list.rows[list.visible.clone()].iter().zip(&list.rects) {
+        if let SidebarRow::Workspace(i) = row
             && rect.contains(x, y)
         {
-            return HitTarget::CloseSession(id);
-        }
-        if let Some((id, _, _)) = layout
-            .named_tabs
-            .iter()
-            .find(|(_, _, rect)| rect.contains(x, y))
-        {
-            return HitTarget::SelectSession(*id);
-        }
-        if layout.named_tabs.is_empty()
-            && layout.panes.len() == 1
-            && let Some((role, _)) = session_tabs(pane, scale_factor)
-                .into_iter()
-                .find(|(_, rect)| rect.contains(x, y))
-        {
-            return HitTarget::SessionTab(role);
-        }
-        if pane.header.contains(x, y) {
-            return HitTarget::PaneHeader(pane.role);
-        }
-        if pane.viewport.contains(x, y) {
-            let col = if cell_w > 0.0 {
-                (((x - pane.viewport.x) / cell_w).floor().max(0.0) as u16)
-                    .min(pane.cols.saturating_sub(1))
-            } else {
-                0
-            };
-            let row = if cell_h > 0.0 {
-                (((y - pane.viewport.y) / cell_h).floor().max(0.0) as u16)
-                    .min(pane.rows.saturating_sub(1))
-            } else {
-                0
-            };
-            return HitTarget::PaneViewport {
-                role: pane.role,
-                col,
-                row,
-            };
+            if sidebar_workspace_close_rect(*rect, scale_factor).contains(x, y) {
+                return HitTarget::SidebarWorkspaceClose(*i);
+            }
+            return HitTarget::SidebarWorkspace(*i);
         }
     }
-
+    if list.new_workspace.contains(x, y) {
+        return HitTarget::SidebarNewWorkspace;
+    }
+    if list.new_worktree.contains(x, y) {
+        return HitTarget::SidebarNewWorktree;
+    }
     HitTarget::None
+}
+
+fn pane_target(
+    layout: &WorkspaceLayout,
+    pane: &PaneRect,
+    has_workspace: bool,
+    scale_factor: f32,
+    (cell_w, cell_h): (f32, f32),
+    (x, y): (f32, f32),
+) -> Option<HitTarget> {
+    if !has_workspace && pane.header.contains(x, y) {
+        return Some(HitTarget::None);
+    }
+    if let Some(pill) = pane.action_pill
+        && pill.contains(x, y)
+    {
+        return Some(HitTarget::PaneHeaderAction(pane.role));
+    }
+    if let Some((id, rect)) = layout.close_tab
+        && rect.contains(x, y)
+    {
+        return Some(HitTarget::CloseSession(id));
+    }
+    if let Some(tab) = layout.named_tabs.iter().find(|tab| tab.rect.contains(x, y)) {
+        return Some(HitTarget::SelectSession(tab.kind.target()));
+    }
+    if layout.named_tabs.is_empty()
+        && layout.panes.len() == 1
+        && let Some((role, _)) = session_tabs(pane, scale_factor)
+            .into_iter()
+            .find(|(_, rect)| rect.contains(x, y))
+    {
+        return Some(HitTarget::SessionTab(role));
+    }
+    if pane.header.contains(x, y) {
+        return Some(HitTarget::PaneHeader(pane.role));
+    }
+    pane.viewport
+        .contains(x, y)
+        .then(|| HitTarget::PaneViewport {
+            role: pane.role,
+            col: viewport_cell(x - pane.viewport.x, cell_w, pane.cols),
+            row: viewport_cell(y - pane.viewport.y, cell_h, pane.rows),
+        })
+}
+
+fn viewport_cell(offset: f32, size: f32, count: u16) -> u16 {
+    if size > 0.0 {
+        ((offset / size).floor().max(0.0) as u16).min(count.saturating_sub(1))
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]
@@ -1171,13 +1258,13 @@ mod tests {
                 ..default_input()
             });
             layout.set_named_tabs(&entries, Some(entries[1].0), scale);
-            let (_, _, active) = layout.named_tabs[1];
+            let active = layout.named_tabs[1].rect;
             let (_, close) = layout.close_tab.unwrap();
             assert_eq!(active.height, 34. * scale);
             assert_eq!(close.width, 28. * scale);
-            assert!(layout.named_tabs[2].2.width >= 180. * scale);
+            assert!(layout.named_tabs[2].rect.width >= 180. * scale);
             assert_eq!(close.right(), active.right());
-            assert!(layout.named_tabs[2].2.right() <= layout.panes[0].tab_strip(scale).right());
+            assert!(layout.named_tabs[2].rect.right() <= layout.panes[0].tab_strip(scale).right());
         }
     }
 
@@ -1194,7 +1281,7 @@ mod tests {
             ..default_input()
         });
         layout.set_named_tabs(&entries, Some(entries[2].0), 1.);
-        let tab = layout.named_tabs[2].2;
+        let tab = layout.named_tabs[2].rect;
         assert!(tab.width >= 160.);
         assert!(tab.right() <= layout.panes[0].tab_strip(1.).right());
         assert_eq!(layout.close_tab.unwrap().1.right(), tab.right());
@@ -1281,9 +1368,10 @@ mod tests {
             layout
                 .named_tabs
                 .iter()
-                .any(|(id, label, _)| *id == entries[6].0 && label == "Session 6")
+                .any(|tab| tab.kind == TabKind::Session(entries[6].0) && tab.label == "Session 6")
         );
-        for (id, _, rect) in &layout.named_tabs {
+        for tab in &layout.named_tabs {
+            let rect = tab.rect;
             assert_eq!(
                 hit_test(
                     &layout,
@@ -1294,7 +1382,7 @@ mod tests {
                     rect.x + rect.width * 0.5,
                     rect.y + rect.height * 0.5
                 ),
-                HitTarget::SelectSession(*id)
+                HitTarget::SelectSession(tab.kind.target())
             );
         }
         if let Some((id, button)) = layout.close_tab {
@@ -1304,9 +1392,11 @@ mod tests {
                 HitTarget::CloseSession(id)
             );
         }
+        let previous = layout.named_tabs.first().unwrap();
+        assert_eq!(previous.kind, TabKind::PreviousPage(entries[5].0));
         let next = layout.named_tabs.last().unwrap();
-        assert_eq!(next.1, "›"); // Compact paging reserves width for the selected terminal.
-        assert_eq!(next.0, entries[7].0);
+        assert_eq!(next.label, "›"); // Compact paging reserves width for the selected terminal.
+        assert_eq!(next.kind, TabKind::NextPage(entries[7].0));
     }
 
     #[test]
@@ -1364,12 +1454,12 @@ mod tests {
                 };
                 assert_eq!(hit(pill), HitTarget::PaneHeaderAction(role));
                 assert_eq!(layout.named_tabs.len(), 3);
-                for (i, (id, _, rect)) in layout.named_tabs.iter().enumerate() {
-                    assert_eq!(*id, entries[i + 1].0);
-                    assert!(rect.bottom() <= pill.y);
-                    assert_eq!(hit(*rect), HitTarget::SelectSession(*id));
+                for (i, tab) in layout.named_tabs.iter().enumerate() {
+                    assert_eq!(tab.kind.target(), entries[i + 1].0);
+                    assert!(tab.rect.bottom() <= pill.y);
+                    assert_eq!(hit(tab.rect), HitTarget::SelectSession(tab.kind.target()));
                 }
-                assert!(layout.named_tabs[1].2.width >= 36. * scale);
+                assert!(layout.named_tabs[1].rect.width >= 36. * scale);
                 assert!(layout.panes[0].viewport.y >= pill.bottom());
             }
         }

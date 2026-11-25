@@ -7,6 +7,8 @@ use daedalus_ui::workspace_widgets::{self, WorkspaceWidgets};
 use std::time::{Duration, Instant};
 
 mod import_review;
+mod layout_saves;
+pub(super) use layout_saves::LayoutSave;
 mod replies;
 
 impl DaedalusApp {
@@ -20,12 +22,19 @@ impl DaedalusApp {
         operation: WorkbenchOperation,
         request: ClientMessage,
     ) -> bool {
+        let widget_test = match operation {
+            WorkbenchOperation::WidgetPreview(token) => Some(token),
+            _ => None,
+        };
         let queued = self.send_command(UiCommand::Workbench {
             workspace_id: id,
             operation,
             request: Box::new(request),
         });
         if !queued && self.state.settings.widget_workspace == Some(id) {
+            if let Some(token) = widget_test {
+                self.state.settings.custom.finish_widget_test(token);
+            }
             self.state.settings.error =
                 Some("Reconnect to the daemon to configure widgets.".into());
         }
@@ -64,6 +73,12 @@ impl DaedalusApp {
             self.state.workbench = None;
             self.state.widget_results.clear();
             self.state.workbench_repo_update = false;
+            if !self.pointer.dragging_divider()
+                && let Some(layout) = self.layout_saves.get(&id).map(|save| save.desired.clone())
+            {
+                self.show_workbench_layout(&layout);
+                self.schedule_resize_flush();
+            }
             self.request_workbench(id, ClientMessage::WatchWorkbench { workspace_id: id });
         }
         if self.widget_refresh_at.is_none_or(|at| now >= at) {
@@ -113,7 +128,9 @@ impl DaedalusApp {
         } else {
             Vec::new()
         };
-        if let WorkbenchOperation::PaneWidgets(token) = operation {
+        if let WorkbenchOperation::Layout(token) = operation {
+            self.layout_save_response(id, token, response);
+        } else if let WorkbenchOperation::PaneWidgets(token) = operation {
             self.pane_widgets_response(id, token, response);
         } else {
             match response {
@@ -209,8 +226,22 @@ impl DaedalusApp {
                 .filter(|(workspace, _)| *workspace == id)
                 .map(|(_, state)| state)
         };
-        if current.is_some_and(|current| current.revision > state.revision) {
+        let pending_base = self
+            .layout_saves
+            .get(&id)
+            .and_then(|save| save.base.as_ref());
+        if current
+            .into_iter()
+            .chain(pending_base)
+            .any(|current| current.revision > state.revision)
+        {
+            self.flush_workbench_layout(id);
             return;
+        }
+        if state.revision == 0 {
+            self.layout_saves.remove(&id);
+        } else if let Some(save) = self.layout_saves.get_mut(&id) {
+            save.base = Some(state.clone());
         }
 
         if state.revision == 0 && self.seeded_workbench.insert(id) {
@@ -271,12 +302,14 @@ impl DaedalusApp {
                 .as_ref()
                 .filter(|(workspace, _)| *workspace == id)
                 .map(|(_, state)| state);
-            if state.revision > 0
-                && previous.is_none_or(|previous| previous.document.layout != state.document.layout)
-            {
-                self.state.zoomed = !state.document.layout.split_view;
-                self.pointer.splits =
-                    daedalus_ui::layout::PaneSplits::from_portable(&state.document.layout);
+            if !self.pointer.dragging_divider() && state.revision > 0 {
+                if let Some(layout) = self.layout_saves.get(&id).map(|save| save.desired.clone()) {
+                    self.show_workbench_layout(&layout);
+                } else if previous
+                    .is_none_or(|previous| previous.document.layout != state.document.layout)
+                {
+                    self.show_workbench_layout(&state.document.layout);
+                }
             }
             if state.revision > 0 {
                 self.request_workbench(
@@ -290,28 +323,7 @@ impl DaedalusApp {
             self.state.workbench = Some((id, state));
             self.schedule_resize_flush();
         }
-    }
-
-    pub(super) fn save_workbench_layout(&mut self) {
-        if let Some((id, state)) = self.state.workbench.as_ref()
-            && Some(*id) == self.state.active_workspace_id
-            && state.revision > 0
-        {
-            let mut document = state.document.clone();
-            let layout = self.pointer.splits.portable(!self.state.zoomed);
-            if document.layout != layout {
-                document.layout = layout;
-                self.request_workbench_as(
-                    *id,
-                    WorkbenchOperation::Layout,
-                    ClientMessage::UpdateWorkbench {
-                        workspace_id: *id,
-                        revision: state.revision,
-                        document,
-                    },
-                );
-            }
-        }
+        self.flush_workbench_layout(id);
     }
 
     pub(super) fn open_widget_details(&mut self, index: Option<usize>) {

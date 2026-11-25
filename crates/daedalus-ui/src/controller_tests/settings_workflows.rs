@@ -525,15 +525,17 @@ fn unrelated_workbench_save_preserves_the_widget_draft() {
     settings.set_value(Control::CustomName, "Uncommitted widget");
     settings.set_value(Control::CustomExecutable, "true");
     w.commands.try_iter().for_each(drop);
-    for (operation, revision) in [
-        (WorkbenchOperation::Layout, 2),
-        (WorkbenchOperation::Migration, 3),
+    w.app.handle_ui_action(UiAction::ToggleZoom);
+    let (layout_save, _, layout_ack) = next_layout_save(&w, id);
+    for (operation, snapshot) in [
+        (layout_save, layout_ack),
+        (WorkbenchOperation::Migration, workbench_snapshot(3)),
     ] {
         daemon_workbench_reply(
             &mut w,
             id,
             operation,
-            Ok(ResponsePayload::Workbench(workbench_snapshot(revision))),
+            Ok(ResponsePayload::Workbench(snapshot)),
         );
         assert_eq!(
             w.app.state.settings.value(Control::CustomName),
@@ -1202,6 +1204,326 @@ fn changing_the_edited_widget_does_not_rebase_its_draft() {
     assert_eq!(
         w.app.state.settings.value(Control::CustomName),
         Some("Keep local draft")
+    );
+    assert!(w.idle());
+}
+
+#[test]
+fn duplicate_widget_test_keeps_the_in_flight_preview() {
+    use daedalus_proto::{StatusLevel, workbench::WidgetResult};
+
+    let ws = workspace("Preview admission");
+    let id = ws.id;
+    let mut w = modern_client(ws);
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(workbench_snapshot(1))),
+    );
+    w.commands.try_iter().for_each(drop);
+    apply_control(&mut w, Control::CustomWidgetsPage);
+    apply_control(&mut w, Control::CustomNew);
+    w.app.state.settings.set_value(Control::CustomName, "Draft");
+    apply_control(&mut w, Control::CustomPreview);
+    let UiCommand::Workbench { operation, .. } = w.command() else {
+        panic!("preview");
+    };
+
+    apply_control(&mut w, Control::CustomPreview);
+    assert!(w.idle(), "the same draft already has a preview in flight");
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        operation,
+        Ok(ResponsePayload::WidgetResult(WidgetResult {
+            label: "Ready".into(),
+            level: StatusLevel::Ok,
+            details: Vec::new(),
+        })),
+    );
+    assert_eq!(
+        w.app
+            .state
+            .settings
+            .custom
+            .preview
+            .as_ref()
+            .map(|result| result.label.as_str()),
+        Some("Ready")
+    );
+}
+
+#[test]
+fn busy_widget_preview_rejection_settles_only_its_request() {
+    use daedalus_proto::{StatusLevel, workbench::WidgetResult};
+
+    let ws = workspace("Preview admission");
+    let id = ws.id;
+    let mut w = modern_client(ws);
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(workbench_snapshot(1))),
+    );
+    w.commands.try_iter().for_each(drop);
+    apply_control(&mut w, Control::CustomWidgetsPage);
+    apply_control(&mut w, Control::CustomNew);
+    w.app
+        .state
+        .settings
+        .set_value(Control::CustomName, "Original");
+    apply_control(&mut w, Control::CustomPreview);
+    let UiCommand::Workbench {
+        operation: original,
+        ..
+    } = w.command()
+    else {
+        panic!("preview");
+    };
+
+    w.app
+        .state
+        .settings
+        .set_value(Control::CustomName, "Edited");
+    apply_control(&mut w, Control::CustomPreview);
+    let UiCommand::Workbench {
+        operation: edited, ..
+    } = w.command()
+    else {
+        panic!("edited preview");
+    };
+    assert_ne!(edited, original);
+
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        edited,
+        Err("A widget operation is already running.".into()),
+    );
+    assert_eq!(
+        w.app.state.settings.error.as_deref(),
+        Some("A widget operation is already running.")
+    );
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        original,
+        Ok(ResponsePayload::WidgetResult(WidgetResult {
+            label: "Original".into(),
+            level: StatusLevel::Ok,
+            details: Vec::new(),
+        })),
+    );
+    assert!(w.app.state.settings.custom.preview.is_none());
+
+    apply_control(&mut w, Control::CustomPreview);
+    let UiCommand::Workbench { operation, .. } = w.command() else {
+        panic!("retry");
+    };
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        operation,
+        Ok(ResponsePayload::WidgetResult(WidgetResult {
+            label: "Edited".into(),
+            level: StatusLevel::Ok,
+            details: Vec::new(),
+        })),
+    );
+    assert_eq!(
+        w.app
+            .state
+            .settings
+            .custom
+            .preview
+            .as_ref()
+            .map(|result| result.label.as_str()),
+        Some("Edited")
+    );
+}
+
+fn layout_client(split_view: bool) -> (WorkspaceId, Workbench, WorkbenchState) {
+    let ws = workspace("Layout");
+    let id = ws.id;
+    let mut w = modern_client(ws);
+    w.app.state.settings.open = false;
+    let mut initial = workbench_snapshot(1);
+    initial.document.layout = daedalus_ui::layout::PaneSplits::default().portable(split_view);
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(initial.clone())),
+    );
+    w.commands.try_iter().for_each(drop);
+    (id, w, initial)
+}
+
+fn next_layout_save(w: &Workbench, id: WorkspaceId) -> (WorkbenchOperation, u64, WorkbenchState) {
+    w.commands
+        .try_iter()
+        .find_map(|command| {
+            let UiCommand::Workbench {
+                operation, request, ..
+            } = command
+            else {
+                return None;
+            };
+            let ClientMessage::UpdateWorkbench {
+                workspace_id,
+                revision,
+                document,
+            } = *request
+            else {
+                return None;
+            };
+            assert_eq!(workspace_id, id);
+            Some((
+                operation,
+                revision,
+                WorkbenchState {
+                    revision: revision + 1,
+                    document,
+                    repo_baseline: None,
+                },
+            ))
+        })
+        .expect("expected layout save")
+}
+
+#[test]
+fn reversing_a_layout_before_acknowledgment_preserves_the_latest_choice() {
+    let (id, mut w, original) = layout_client(false);
+    w.app.handle_ui_action(UiAction::ToggleZoom);
+    let (first, revision, split) = next_layout_save(&w, id);
+    assert_eq!(revision, 1);
+    assert!(split.document.layout.split_view);
+
+    w.app.handle_ui_action(UiAction::ToggleZoom);
+    assert!(w.app.state.zoomed);
+    assert!(w.idle(), "only one layout save should be in flight");
+    daemon_workbench_reply(&mut w, id, first, Ok(ResponsePayload::Workbench(split)));
+
+    assert!(
+        w.app.state.zoomed,
+        "the first reply undid the latest choice"
+    );
+    let (second, revision, focused) = next_layout_save(&w, id);
+    assert_eq!(revision, 2);
+    assert_eq!(focused.document.layout, original.document.layout);
+    daemon_workbench_reply(&mut w, id, second, Ok(ResponsePayload::Workbench(focused)));
+    assert!(w.app.state.zoomed);
+    assert!(w.commands.try_iter().all(|command| {
+        !matches!(command, UiCommand::Workbench { request, .. } if matches!(*request, ClientMessage::UpdateWorkbench { .. }))
+    }));
+}
+
+#[test]
+fn layout_conflict_rebases_the_latest_divider_without_overwriting_widget_changes() {
+    use daedalus_ui::layout::Divider;
+
+    let (id, mut w, _) = layout_client(true);
+    w.app.pointer.splits.move_divider(Divider::Column, 0.64);
+    w.app.save_workbench_layout();
+    let (first, revision, first_ack) = next_layout_save(&w, id);
+    assert_eq!(revision, 1);
+    assert_eq!(first_ack.document.layout.splits["column"], 640);
+
+    w.app.pointer.splits.move_divider(Divider::Column, 0.71);
+    w.app.save_workbench_layout();
+    assert!(w.idle());
+
+    let mut other_client = snapshot_with_runner_label(3, "Updated runner");
+    other_client
+        .document
+        .layout
+        .splits
+        .insert("future_split".into(), 475);
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(other_client.clone())),
+    );
+    let outdated_conflict = snapshot_with_runner_label(2, "Earlier runner");
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        first.clone(),
+        Ok(ResponsePayload::WorkbenchConflict(outdated_conflict)),
+    );
+
+    let (second, revision, rebased) = next_layout_save(&w, id);
+    assert_ne!(first, second);
+    assert_eq!(revision, 3);
+    assert_eq!(
+        rebased.document.pane_widgets,
+        other_client.document.pane_widgets
+    );
+    assert_eq!(rebased.document.layout.splits["column"], 710);
+    assert_eq!(rebased.document.layout.splits["future_split"], 475);
+    assert!(!w.app.state.zoomed);
+
+    let mut stale_ack = first_ack;
+    stale_ack.revision = 99;
+    daemon_workbench_reply(&mut w, id, first, Ok(ResponsePayload::Workbench(stale_ack)));
+    assert!(
+        w.idle(),
+        "the stale first token must not retire the second save"
+    );
+    assert_eq!(w.app.state.workbench.as_ref().unwrap().1.revision, 3);
+
+    daemon_workbench_reply(&mut w, id, second, Ok(ResponsePayload::Workbench(rebased)));
+    assert_eq!(w.app.state.workbench.as_ref().unwrap().1.revision, 4);
+}
+
+#[test]
+fn reconnect_reloads_a_layout_base_and_workspace_removal_discards_the_pending_save() {
+    let (id, mut w, initial) = layout_client(false);
+    w.app.handle_ui_action(UiAction::ToggleZoom);
+    let (before_disconnect, _, old_ack) = next_layout_save(&w, id);
+    w.app.handle_daemon_event(UiEvent::Disconnected);
+    w.app.handle_ui_action(UiAction::ToggleZoom);
+    assert!(w.app.state.zoomed);
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        before_disconnect,
+        Ok(ResponsePayload::Workbench(old_ack)),
+    );
+    assert!(w.app.state.zoomed);
+    assert!(w.idle());
+
+    w.app.handle_daemon_event(UiEvent::Connected);
+    w.app.poll_workbench();
+    assert!(w.commands.try_iter().any(|command| matches!(
+        command, UiCommand::Workbench { request, .. } if matches!(*request, ClientMessage::WatchWorkbench { workspace_id } if workspace_id == id)
+    )));
+    let mut fresh = initial;
+    fresh.revision = 6;
+    fresh.document.layout.split_view = true;
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(fresh)),
+    );
+    assert!(w.app.state.zoomed);
+    let (after_reconnect, revision, ack) = next_layout_save(&w, id);
+    assert_eq!(revision, 6);
+    assert!(!ack.document.layout.split_view);
+
+    w.app
+        .handle_daemon_event(UiEvent::WorkspaceMembershipLoaded(Vec::new()));
+    w.commands.try_iter().for_each(drop);
+    assert!(!w.app.layout_saves.contains_key(&id));
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        after_reconnect,
+        Ok(ResponsePayload::Workbench(ack)),
     );
     assert!(w.idle());
 }

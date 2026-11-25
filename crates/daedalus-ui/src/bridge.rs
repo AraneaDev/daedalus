@@ -3,7 +3,7 @@ mod launch;
 mod negotiation_tests;
 mod rpc;
 mod setup;
-mod terminal;
+pub(crate) mod terminal;
 mod widget_lane;
 mod workspace;
 
@@ -71,7 +71,7 @@ impl std::fmt::Debug for BridgeConfig {
 pub enum WorkbenchOperation {
     #[default]
     Read,
-    Layout,
+    Layout(uuid::Uuid),
     Migration,
     PaneWidgets(u64),
     WidgetEdit,

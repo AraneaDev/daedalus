@@ -1,7 +1,8 @@
 use super::DaedalusApp;
-use daedalus_proto::PaneRole;
+use daedalus_proto::{PaneId, PaneRole};
 use daedalus_ui::{
     bridge::UiCommand,
+    input::UiAction,
     links::{browser_link_at, detect_link_in_row, open_link},
     selection::extract_selected_text,
 };
@@ -131,6 +132,82 @@ impl DaedalusApp {
         if let Err(err) = open_link(&link, self.ui_config.editor.as_deref()) {
             warn!(error = %err, link = ?link, "failed to open clicked link");
             self.show_toast(format!("Failed to open link: {err}"), true);
+        }
+    }
+
+    pub(super) fn request_scrollback_if_needed(&mut self, pane_id: PaneId) {
+        let Some(pane) = self.state.panes.get_mut(&pane_id) else {
+            return;
+        };
+        if let Some(generation) = pane.begin_scrollback_request() {
+            let command = UiCommand::RequestScrollback {
+                pane_id,
+                generation,
+                offset_from_bottom: pane.requested_scroll_offset,
+                count: usize::from(pane.summary.rows).max(1),
+            };
+            self.send_command(command);
+        }
+    }
+
+    pub(super) fn scroll_pane(&mut self, role: PaneRole, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let Some(pane_id) = self.state.pane_id_for_role(role) else {
+            return;
+        };
+        let Some(pane) = self.state.panes.get_mut(&pane_id) else {
+            return;
+        };
+        if delta > 0 {
+            // Older daemons omit history length from deltas. Let the daemon clamp the request.
+            pane.set_scroll_offset(pane.requested_scroll_offset.saturating_add(delta as usize));
+        } else {
+            pane.adjust_scroll_offset(delta);
+        }
+        self.request_scrollback_if_needed(pane_id);
+        self.request_redraw();
+    }
+
+    pub(super) fn handle_terminal_action(&mut self, action: UiAction) {
+        match action {
+            UiAction::CloseTerminal => {
+                if let Some(id) = self.state.focused_pane_id() {
+                    self.send_command(UiCommand::ClosePane(id));
+                }
+            }
+            UiAction::ScrollPageUp => {
+                let page = self
+                    .state
+                    .pane_for_role(self.state.focused_role)
+                    .map_or(20, |p| (p.summary.rows as isize).saturating_sub(1).max(1));
+                self.scroll_pane(self.state.focused_role, page);
+            }
+            UiAction::ScrollPageDown => {
+                let page = self
+                    .state
+                    .pane_for_role(self.state.focused_role)
+                    .map_or(20, |p| (p.summary.rows as isize).saturating_sub(1).max(1));
+                self.scroll_pane(self.state.focused_role, -page);
+            }
+            UiAction::ScrollToBottom => {
+                if let Some(pane) = self.state.pane_for_role_mut(self.state.focused_role) {
+                    pane.reset_scroll();
+                }
+                self.request_redraw();
+            }
+            UiAction::SendBytes(data) => {
+                if let Some(pane_id) = self.state.focused_pane_id() {
+                    if let Some(pane) = self.state.panes.get_mut(&pane_id) {
+                        pane.reset_scroll();
+                        pane.selection = None;
+                    }
+                    self.send_command(UiCommand::SendInput { pane_id, data });
+                    self.request_redraw();
+                }
+            }
+            _ => unreachable!("action routed to the wrong handler"),
         }
     }
 }

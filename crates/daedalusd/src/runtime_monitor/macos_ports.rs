@@ -1,28 +1,14 @@
+use crate::process::inventory::descendant_pids_including_roots;
 use daedalus_proto::{PortMapping, PortSource};
 use libproc::libproc::bsd_info::BSDInfo;
 use libproc::libproc::file_info::{ListFDs, ProcFDType, pidfdinfo};
 use libproc::libproc::net_info::{SocketFDInfo, SocketInfoKind, TcpSIState};
 use libproc::libproc::proc_pid::{listpidinfo, name, pidinfo};
-use libproc::processes::{ProcFilter, pids_by_type};
-use std::collections::{BTreeMap, HashSet};
-
-pub fn collect_descendant_pids(roots: &[u32]) -> HashSet<u32> {
-    let mut pending = roots.to_vec();
-    let mut seen = HashSet::new();
-    while let Some(pid) = pending.pop() {
-        if pid != 0
-            && seen.insert(pid)
-            && let Ok(children) = pids_by_type(ProcFilter::ByParentProcess { ppid: pid })
-        {
-            pending.extend(children);
-        }
-    }
-    seen
-}
+use std::collections::BTreeMap;
 
 pub fn discover_local_ports_for_roots(roots: &[u32]) -> Vec<PortMapping> {
     let mut by_port = BTreeMap::new();
-    let mut pids: Vec<_> = collect_descendant_pids(roots).into_iter().collect();
+    let mut pids: Vec<_> = descendant_pids_including_roots(roots).into_iter().collect();
     pids.sort_unstable();
     for pid in pids {
         let Ok(pid) = i32::try_from(pid) else {

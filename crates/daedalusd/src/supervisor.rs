@@ -1,3 +1,12 @@
+#[cfg(unix)]
+use crate::process::command::run_command_until;
+#[cfg(any(target_os = "linux", windows))]
+use crate::process::command::run_command_with_timeout;
+#[cfg(target_os = "linux")]
+use crate::process::inventory::pgid_has_non_zombie_proc;
+pub use crate::process::inventory::{
+    collect_descendant_pids, descendants_from_ppid_edges, parse_ps_ppid_table,
+};
 use crate::shell_integration::ShellLaunchSpec;
 use daedalus_proto::{PaneId, PaneRole, WorkspaceId};
 #[cfg(unix)]
@@ -5,11 +14,19 @@ use nix::sys::signal::{Signal, killpg};
 #[cfg(unix)]
 use nix::unistd::Pid;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::process::Command;
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
+
+#[cfg(unix)]
+const PANE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(unix)]
+const SYSTEMD_CALL_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationMode {
@@ -250,30 +267,46 @@ impl ProcessHandle {
 
     #[cfg(unix)]
     pub fn teardown(&mut self) {
+        self.teardown_with_systemctl(Path::new("systemctl"), PANE_TEARDOWN_TIMEOUT);
+    }
+
+    #[cfg(unix)]
+    fn teardown_with_systemctl(&mut self, systemctl: &Path, timeout: Duration) {
         if self.torn_down {
             return;
         }
         self.torn_down = true;
 
-        if self.try_wait_exit().is_some() && !self.has_live_processes() {
-            self.reset_failed_unit();
+        let deadline = Instant::now() + timeout;
+        // Keep time for a final KILL and reset even if the liveness probe stalls.
+        let grace_deadline = if self.systemd_unit.is_some() {
+            deadline - (SYSTEMD_CALL_TIMEOUT * 2).min(timeout / 2)
+        } else {
+            deadline
+        };
+        if self.try_wait_exit().is_some() && !self.has_live_processes(systemctl, grace_deadline) {
+            self.reset_failed_unit(systemctl, deadline);
             return;
         }
 
-        self.send_signal(Signal::SIGTERM);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if self.try_wait_exit().is_some() && !self.has_live_processes() {
-                self.reset_failed_unit();
+        self.send_signal(Signal::SIGTERM, systemctl, grace_deadline);
+        while Instant::now() < grace_deadline {
+            if self.try_wait_exit().is_some() && !self.has_live_processes(systemctl, grace_deadline)
+            {
+                self.reset_failed_unit(systemctl, deadline);
                 return;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(
+                grace_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(50)),
+            );
         }
 
-        self.send_signal(Signal::SIGKILL);
+        self.send_signal(Signal::SIGKILL, systemctl, deadline);
         let _ = self.child.kill();
         let _ = self.child.wait();
-        self.reset_failed_unit();
+        self.reset_failed_unit(systemctl, deadline);
     }
 
     #[cfg(windows)]
@@ -297,15 +330,14 @@ impl ProcessHandle {
     }
 
     #[cfg(unix)]
-    fn has_live_processes(&self) -> bool {
-        self.has_live_pgid_processes() || self.has_active_systemd_unit()
-    }
-
-    #[cfg(unix)]
-    fn has_active_systemd_unit(&self) -> bool {
-        self.systemd_unit
-            .as_deref()
-            .is_some_and(|unit| run_systemctl_quiet(&["is-active", "--quiet", unit]))
+    fn has_live_processes(&self, systemctl: &Path, deadline: Instant) -> bool {
+        self.has_live_pgid_processes()
+            || self.systemd_unit.as_deref().is_some_and(|unit| {
+                // An unavailable status leaves the scope's liveness unknown.
+                // Try the final signal before treating it as closed.
+                run_systemctl_quiet(systemctl, &["is-active", "--quiet", unit], deadline)
+                    .is_none_or(|status| status.success())
+            })
     }
 
     #[cfg(unix)]
@@ -330,300 +362,49 @@ impl ProcessHandle {
     }
 
     #[cfg(unix)]
-    fn send_signal(&self, sig: Signal) {
+    fn send_signal(&self, sig: Signal, systemctl: &Path, deadline: Instant) {
+        if let Some(pid) = self.pid {
+            let _ = killpg(Pid::from_raw(pid as i32), sig);
+        }
         let sig_name = match sig {
             Signal::SIGTERM => "SIGTERM",
             Signal::SIGKILL => "SIGKILL",
             _ => "SIGTERM",
         };
         if let Some(unit) = &self.systemd_unit {
-            let _ = run_systemctl_quiet(&["kill", "-s", sig_name, unit]);
-        }
-        if let Some(pid) = self.pid {
-            let _ = killpg(Pid::from_raw(pid as i32), sig);
+            let _ = run_systemctl_quiet(systemctl, &["kill", "-s", sig_name, unit], deadline);
         }
     }
 
     #[cfg(unix)]
-    fn reset_failed_unit(&self) {
+    fn reset_failed_unit(&self, systemctl: &Path, deadline: Instant) {
         if let Some(unit) = &self.systemd_unit {
-            let _ = run_systemctl_quiet(&["reset-failed", unit]);
+            let _ = run_systemctl_quiet(systemctl, &["reset-failed", unit], deadline);
         }
     }
-}
-
-#[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
-fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> bool {
-    let Ok(mut child) = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-        }
-    }
-}
-
-#[cfg(all(unix, any(test, not(any(target_os = "macos", target_os = "linux")))))]
-pub(crate) fn run_command_stdout_with_timeout(
-    cmd: &mut Command,
-    timeout: Duration,
-    allow_nonzero_exit: bool,
-) -> Option<String> {
-    use std::os::unix::process::CommandExt;
-
-    let mut child = cmd
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let pgid = Pid::from_raw(child.id() as i32);
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        std::io::Read::read_to_end(&mut stdout, &mut buf).ok()?;
-        Some(String::from_utf8_lossy(&buf).into_owned())
-    });
-
-    let deadline = Instant::now() + timeout;
-    let completed = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break allow_nonzero_exit || status.success(),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = killpg(pgid, Signal::SIGKILL);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break false;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => {
-                let _ = killpg(pgid, Signal::SIGKILL);
-                let _ = child.kill();
-                let _ = child.wait();
-                break false;
-            }
-        }
-    };
-
-    if !completed {
-        return None;
-    }
-
-    reader.join().ok().flatten()
 }
 
 #[cfg(unix)]
-fn run_systemctl_quiet(args: &[&str]) -> bool {
-    Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Parses `ps -axo pid=,ppid=` output into `(pid, ppid)` pairs, ignoring headers and malformed lines.
-pub fn parse_ps_ppid_table(output: &str) -> Vec<(u32, u32)> {
-    let mut edges = Vec::new();
-    for line in output.lines() {
-        let mut cols = line.split_whitespace();
-        let (Some(pid_str), Some(ppid_str), None) = (cols.next(), cols.next(), cols.next()) else {
-            continue;
-        };
-        let (Ok(pid), Ok(ppid)) = (pid_str.parse::<u32>(), ppid_str.parse::<u32>()) else {
-            continue;
-        };
-        if pid == 0 {
-            continue;
-        }
-        edges.push((pid, ppid));
-    }
-    edges
-}
-
-/// Computes all descendant PIDs of `root` from `(pid, ppid)` edges.
-pub fn descendants_from_ppid_edges(root: u32, edges: &[(u32, u32)]) -> Vec<u32> {
-    if root == 0 {
-        return Vec::new();
-    }
-
-    let mut children_by_ppid: HashMap<u32, Vec<u32>> = HashMap::new();
-    for &(pid, ppid) in edges {
-        if pid > 0 {
-            children_by_ppid.entry(ppid).or_default().push(pid);
-        }
-    }
-    for children in children_by_ppid.values_mut() {
-        children.sort_unstable();
-        children.dedup();
-    }
-
-    let mut visited = HashSet::from([root]);
-    let mut queue = VecDeque::from([root]);
-    let mut descendants = Vec::new();
-
-    while let Some(pid) = queue.pop_front() {
-        if let Some(children) = children_by_ppid.get(&pid) {
-            for &child in children {
-                if visited.insert(child) {
-                    descendants.push(child);
-                    queue.push_back(child);
-                }
-            }
-        }
-    }
-
-    descendants
-}
-
-/// Collects all live descendant PIDs of `root_pid`.
-#[cfg(target_os = "linux")]
-pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
-    if root_pid == 0 {
-        return Vec::new();
-    }
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    let mut edges = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        if !name_str.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        if let Some(edge) = crate::runtime_monitor::parse_proc_stat_pid_ppid(&stat) {
-            edges.push(edge);
-        }
-    }
-    descendants_from_ppid_edges(root_pid, &edges)
-}
-
-/// Collects descendants on Unix systems without a native port discovery backend.
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
-    if root_pid == 0 {
-        return Vec::new();
-    }
-    let mut cmd = Command::new("ps");
-    cmd.args(["-axo", "pid=,ppid="]);
-    let Some(output) = run_command_stdout_with_timeout(&mut cmd, Duration::from_secs(2), false)
-    else {
-        return Vec::new();
-    };
-    let edges = parse_ps_ppid_table(&output);
-    descendants_from_ppid_edges(root_pid, &edges)
-}
-
-/// Uses the same native process inventory as workspace port discovery.
-#[cfg(any(windows, target_os = "macos"))]
-pub fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
-    let mut pids = crate::runtime_monitor::collect_descendant_pids(&[root_pid]);
-    pids.remove(&root_pid);
-    let mut pids: Vec<_> = pids.into_iter().collect();
-    pids.sort_unstable();
-    pids
-}
-
-#[cfg(target_os = "linux")]
-fn parse_proc_stat(stat: &str) -> Option<(char, i32)> {
-    let after_comm = stat.rfind(')')?;
-    let mut parts = stat[after_comm + 1..].split_whitespace();
-    let state = parts.next()?.chars().next()?;
-    let _ppid = parts.next()?;
-    let pgrp: i32 = parts.next()?.parse().ok()?;
-    Some((state, pgrp))
-}
-
-#[cfg(target_os = "linux")]
-fn pgid_has_non_zombie_proc(pgid: i32) -> bool {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return true;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        if !name_str.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        if let Some((state, pgrp)) = parse_proc_stat(&stat)
-            && pgrp == pgid
-            && !matches!(state, 'Z' | 'X')
-        {
-            return true;
-        }
-    }
-    false
+fn run_systemctl_quiet(
+    systemctl: &Path,
+    args: &[&str],
+    deadline: Instant,
+) -> Option<std::process::ExitStatus> {
+    let deadline = deadline.min(Instant::now() + SYSTEMD_CALL_TIMEOUT);
+    run_command_until(Command::new(systemctl).arg("--user").args(args), deadline)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::process::inventory::parse_proc_stat;
     #[cfg(unix)]
     use nix::sys::signal::kill;
     #[cfg(unix)]
     use std::io::BufRead;
     #[cfg(unix)]
     use tempfile::TempDir;
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn parse_proc_stat_reads_state_and_group_after_the_last_paren() {
-        assert_eq!(
-            parse_proc_stat("4242 (odd) name (x)) S 1 777 777 0 -1"),
-            Some(('S', 777))
-        );
-        assert_eq!(parse_proc_stat("4242 (agent) Z 1 9 9"), Some(('Z', 9)));
-        assert_eq!(parse_proc_stat("4242 (agent) S 1 group"), None);
-        assert_eq!(parse_proc_stat("4242 (agent) S"), None);
-        assert_eq!(parse_proc_stat("no paren"), None);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn pgid_scan_finds_this_test_group_and_not_an_unused_one() {
-        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
-        let (_, own_group) = parse_proc_stat(&stat).unwrap();
-        assert!(pgid_has_non_zombie_proc(own_group));
-        // Linux caps PIDs at 2^22, so no process group can have this id.
-        assert!(!pgid_has_non_zombie_proc(i32::MAX));
-    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -791,132 +572,95 @@ exit 17
         assert_orphan_killed("(trap '' HUP; exec sleep 60) & echo CHILD_PID=$!; wait");
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn command_probe_respects_timeout_and_kills_hanging_process() {
-        let mut ok_cmd = Command::new("/bin/sh");
-        ok_cmd.args(["-c", "true"]);
-        assert!(run_command_with_timeout(
-            &mut ok_cmd,
-            Duration::from_secs(2)
-        ));
+    #[cfg(target_os = "linux")]
+    const SLOW_SYSTEMCTL_SIGNAL: &str =
+        "[ \"$2\" != kill ] || exec /bin/sleep 4\n[ \"$2\" != is-active ]\n";
 
-        let mut fail_cmd = Command::new("/bin/sh");
-        fail_cmd.args(["-c", "false"]);
-        assert!(!run_command_with_timeout(
-            &mut fail_cmd,
-            Duration::from_secs(2)
-        ));
+    #[cfg(target_os = "linux")]
+    fn teardown_against_fake_systemctl(script: &str, systemctl_script: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
 
+        let dir = TempDir::new().unwrap();
+        let systemctl = dir.path().join("systemctl");
+        std::fs::write(
+            &systemctl,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${{0%/*}}/trace\"\n{systemctl_script}"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut pane = Supervisor::with_mode(IsolationMode::PgidFallback)
+            .spawn_pty(
+                WorkspaceId::new(),
+                PaneId::new(),
+                PaneRole::Service,
+                dir.path(),
+                80,
+                24,
+                &ShellLaunchSpec {
+                    direct: true,
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), script.into()],
+                    extra_env: HashMap::new(),
+                },
+                &HashMap::new(),
+            )
+            .unwrap();
+        const UNIT: &str = "daedalus-test.scope";
+        pane.handle.systemd_unit = Some(UNIT.into());
+        let mut ready = String::new();
+        std::io::BufReader::new(pane.reader)
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let pid = pane.handle.root_pid().unwrap() as i32;
         let start = Instant::now();
-        let mut hang_cmd = Command::new("/bin/sh");
-        hang_cmd.args(["-c", "sleep 10"]);
-        assert!(!run_command_with_timeout(
-            &mut hang_cmd,
-            Duration::from_millis(150)
-        ));
+        pane.handle
+            .teardown_with_systemctl(&systemctl, Duration::from_secs(1));
         assert!(
             start.elapsed() < Duration::from_secs(2),
-            "timeout helper took too long: {:?}",
+            "systemctl exceeded the shared teardown budget: {:?}",
             start.elapsed()
         );
+        assert!(!is_process_alive(pid));
+        std::fs::read_to_string(dir.path().join("trace")).unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn parse_ps_ppid_table_ignores_headers_and_malformed_lines() {
-        let sample = "\
-  PID  PPID
-    0     0
-    1     0
-  100     1
-  205   100
-bad line
-  300   abc
-  400
-  500   205   extra
-  600   205
-";
-        assert_eq!(
-            parse_ps_ppid_table(sample),
-            vec![(1, 0), (100, 1), (205, 100), (600, 205)]
+    fn systemd_teardown_bounds_slow_helpers_on_normal_exit() {
+        let trace = teardown_against_fake_systemctl(
+            "echo ready; exec /bin/sleep 30",
+            SLOW_SYSTEMCTL_SIGNAL,
         );
+        assert!(trace.contains("--user kill -s SIGTERM"));
+        assert!(trace.contains("--user is-active --quiet"));
+        assert!(trace.contains("--user reset-failed"));
+        assert!(!trace.contains("SIGKILL"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn descendants_from_ppid_edges_collects_subtree_and_handles_cycles() {
-        let edges = vec![
-            (10, 1),
-            (20, 10),
-            (30, 10),
-            (40, 20),
-            (50, 40),
-            (60, 1),
-            // Self-loop and cycle should not loop infinitely or re-include root
-            (10, 20),
-            (70, 70),
-        ];
-        assert_eq!(
-            descendants_from_ppid_edges(10, &edges),
-            vec![20, 30, 40, 50]
+    fn systemd_teardown_reserves_time_to_escalate_a_term_resistant_pane() {
+        let trace = teardown_against_fake_systemctl(
+            "trap '' TERM; echo ready; exec /bin/sleep 30",
+            SLOW_SYSTEMCTL_SIGNAL,
         );
-        assert!(descendants_from_ppid_edges(999, &edges).is_empty());
-        assert!(descendants_from_ppid_edges(0, &edges).is_empty());
+        assert!(trace.contains("--user kill -s SIGTERM"));
+        assert!(trace.contains("--user kill -s SIGKILL"));
+        assert!(trace.contains("--user reset-failed"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn collect_descendant_pids_finds_live_child_process() {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "sleep 5"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn child");
-
-        let child_pid = child.id();
-        let descendants = collect_descendant_pids(std::process::id());
-        assert!(
-            descendants.contains(&child_pid),
-            "expected {child_pid} in {descendants:?}"
+    fn systemd_teardown_escalates_when_scope_status_is_unavailable() {
+        let trace = teardown_against_fake_systemctl(
+            "echo ready; exec /bin/sleep 30",
+            "[ \"$2\" = kill ] || exec /bin/sleep 4\n",
         );
-
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn command_stdout_with_timeout_captures_output_and_kills_hanging_process() {
-        let mut ok_cmd = Command::new("/bin/sh");
-        ok_cmd.args(["-c", "printf 'hello\\n'"]);
-        assert_eq!(
-            run_command_stdout_with_timeout(&mut ok_cmd, Duration::from_secs(2), false),
-            Some("hello\n".to_string())
-        );
-
-        let mut nonzero_cmd = Command::new("/bin/sh");
-        nonzero_cmd.args(["-c", "printf 'partial'; exit 1"]);
-        assert_eq!(
-            run_command_stdout_with_timeout(&mut nonzero_cmd, Duration::from_secs(2), false),
-            None
-        );
-
-        let mut allowed_nonzero_cmd = Command::new("/bin/sh");
-        allowed_nonzero_cmd.args(["-c", "printf 'partial'; exit 1"]);
-        assert_eq!(
-            run_command_stdout_with_timeout(&mut allowed_nonzero_cmd, Duration::from_secs(2), true),
-            Some("partial".to_string())
-        );
-
-        let start = Instant::now();
-        let mut hang_cmd = Command::new("/bin/sh");
-        hang_cmd.args(["-c", "sleep 10"]);
-        assert_eq!(
-            run_command_stdout_with_timeout(&mut hang_cmd, Duration::from_millis(150), true),
-            None
-        );
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(trace.contains("--user kill -s SIGTERM"));
+        assert!(trace.contains("--user is-active --quiet"));
+        assert!(trace.contains("--user kill -s SIGKILL"));
+        assert!(trace.contains("--user reset-failed"));
     }
 
     #[test]

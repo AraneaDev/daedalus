@@ -104,8 +104,23 @@ async fn manual_refresh_supersedes_polling_and_rejects_another_manual_job() {
 
     assert!(lane.dispatch(&command(poll.clone(), id)));
     assert!(events.try_recv().is_err());
-    assert!(lane.dispatch(&command(action(id), id)));
-    expect_toast(&mut events, "A widget operation is already running.");
+    let token = uuid::Uuid::new_v4();
+    let rejected = UiCommand::Workbench {
+        workspace_id: id,
+        operation: WorkbenchOperation::WidgetPreview(token),
+        request: Box::new(ClientMessage::PreviewWidget {
+            workspace_id: id,
+            name: "Preview".into(),
+            definition: Default::default(),
+        }),
+    };
+    assert!(lane.dispatch(&rejected));
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        UiEvent::Workbench { workspace_id, operation: WorkbenchOperation::WidgetPreview(request), response }
+            if workspace_id == id && request == token
+                && *response == Err("A widget operation is already running.".into())
+    ));
 
     let payload = ResponsePayload::WidgetResults(vec![]);
     reply(&mut refresh_peer, request.id, Ok(payload.clone())).await;

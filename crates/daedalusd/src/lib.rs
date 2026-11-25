@@ -6,6 +6,7 @@ pub mod manifest;
 pub mod pane_actor;
 pub mod persistence;
 mod preview;
+mod process;
 pub mod registry;
 pub mod runtime_monitor;
 pub mod server;

@@ -6,7 +6,7 @@ use daedalus_proto::workbench::{
     ConflictChoice, SHARED_WORKSPACE_FILE, WorkbenchState, WorkspaceCreationPreview,
     WorkspaceDocument, WorkspaceImportPreview, WorkspaceImportSource,
 };
-use daedalus_proto::{ProtoError, WorkspaceId, WorkspaceInfo};
+use daedalus_proto::{ProtoError, ServerEvent, WorkspaceId, WorkspaceInfo};
 use std::collections::BTreeMap;
 
 impl Registry {
@@ -57,11 +57,13 @@ impl Registry {
                 "The repo workspace file changed. Preview the import again.".into(),
             ));
         }
-        let mut workspace = self
-            .create_workspace(
+        let create_guard = self.create_lock.lock().await;
+        let record = self
+            .prepare_workspace_record(
                 preview.incoming.name.clone(),
                 preview.root_dir,
                 Default::default(),
+                false,
             )
             .await?;
         let link = if preview.linked {
@@ -69,24 +71,28 @@ impl Registry {
         } else {
             RepoLink::Clear
         };
-        match self
-            .commit_workbench(workspace.id, Some(0), preview.incoming, link)
-            .await
-        {
-            Ok(Change::Applied(state)) => {
-                workspace.setup = Some(state.document.assignments);
-                Ok(workspace)
-            }
-            Err(error) => {
-                let _ = self
-                    .close_workspace(workspace.id, false, false, false)
-                    .await;
-                Err(error)
-            }
-            Ok(Change::Conflict(_)) => Err(ProtoError::InvalidRequest(
-                "The new workspace changed before import completed.".into(),
-            )),
-        }
+        // Write the first revision by its private ID. A failed write drops the
+        // prepared record without adding membership, reserving a slot, or
+        // recording a recent project.
+        let Change::Applied(state) = self
+            .workbench_store
+            .update_workspace(record.id, Some(0), preview.incoming, link)
+            .await?
+        else {
+            return Err(ProtoError::Internal(
+                "New workspace ID already has a workbench revision".into(),
+            ));
+        };
+        record.widget_commands.reconcile(&state);
+        let mut workspace = self.publish_workspace(record).await;
+        let _ = self.event_tx.send(ServerEvent::WorkbenchChanged {
+            workspace_id: workspace.id,
+            revision: state.revision,
+        });
+        drop(create_guard);
+        self.persist_state().await;
+        workspace.setup = Some(state.document.assignments);
+        Ok(workspace)
     }
     pub(crate) async fn workspace_repo_status(
         &self,
@@ -270,4 +276,141 @@ fn reconcile(
 
 pub(crate) fn document_error(error: crate::workbench::documents::DocumentError) -> ProtoError {
     ProtoError::InvalidRequest(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::StateStore;
+    use crate::shell_integration::ShellIntegration;
+    use crate::supervisor::{IsolationMode, Supervisor};
+    use std::path::Path;
+    use tempfile::TempDir;
+    use tokio::sync::broadcast;
+
+    fn registry(root: &Path) -> Registry {
+        #[cfg(unix)]
+        let isolation = IsolationMode::PgidFallback;
+        #[cfg(windows)]
+        let isolation = IsolationMode::WindowsProcessTree;
+        Registry::new_with_state_store(
+            Supervisor::with_mode(isolation),
+            ShellIntegration::prepare(root).unwrap(),
+            broadcast::channel(16).0,
+            Some(StateStore::new(root.join("state.json"))),
+        )
+    }
+
+    fn preview(root: &Path) -> WorkspaceCreationPreview {
+        WorkspaceCreationPreview {
+            root_dir: root.to_owned(),
+            incoming: WorkspaceDocument::new("Reviewed import".into()),
+            linked: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn imported_assignment_is_ready_when_membership_is_published() {
+        use daedalus_proto::{Assignment, PaneRole, ResponsePayload};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let registry = Arc::new(registry(dir.path()));
+        let mut preview = preview(dir.path());
+        preview.incoming.assignments.push(Assignment {
+            id: "reviewed".into(),
+            name: "Reviewed runner".into(),
+            role: PaneRole::Runner,
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf reviewed > marker".into(),
+            ],
+        });
+        let assignments = preview.incoming.assignments.clone();
+        let mut events = registry.subscribe_events();
+
+        // Hold registry persistence after membership so the second client observes
+        // precisely the state published before Apply returns.
+        let hold = registry.persist_lock.clone().lock_owned().await;
+        let apply = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.apply_workspace_creation(preview).await }
+        });
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event, ServerEvent::WorkspaceMembershipChanged);
+        let listed = registry.list_workspaces().await;
+        assert_eq!(listed.len(), 1);
+        let id = listed[0].id;
+        assert_eq!(registry.workbench(id).await.unwrap().revision, 1);
+        assert_eq!(listed[0].setup.as_deref(), Some(assignments.as_slice()));
+        let pane = registry
+            .ensure_default_pane(
+                id,
+                PaneRole::Runner,
+                Some(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf fallback > marker".into(),
+                ]),
+                80,
+                24,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(pane, ResponsePayload::PaneSpawned(_)));
+        let marker = dir.path().join("marker");
+        let data = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(data) = std::fs::read_to_string(&marker)
+                    && !data.is_empty()
+                {
+                    break data;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(hold);
+        let imported = apply.await.unwrap().unwrap();
+        assert_eq!(imported.id, id);
+        assert_eq!(imported.setup, Some(assignments));
+        registry.close_all().await;
+        assert_eq!(data, "reviewed");
+    }
+
+    #[tokio::test]
+    async fn failed_import_write_leaves_no_workspace_or_recent_project() {
+        let dir = TempDir::new().unwrap();
+        let registry = registry(dir.path());
+        let mut events = registry.subscribe_events();
+        let blocking_file = dir.path().join("workbench");
+        std::fs::write(&blocking_file, b"workbench directory blocked").unwrap();
+
+        let error = registry
+            .apply_workspace_creation(preview(dir.path()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProtoError::IoError(_)), "{error:?}");
+        assert!(registry.list_workspaces().await.is_empty());
+        assert!(registry.recent_projects().await.is_empty());
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        std::fs::remove_file(blocking_file).unwrap();
+        let workspace = registry
+            .apply_workspace_creation(preview(dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(workspace.slot_index, 0);
+        assert_eq!(registry.workbench(workspace.id).await.unwrap().revision, 1);
+    }
 }
