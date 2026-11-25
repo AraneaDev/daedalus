@@ -473,6 +473,7 @@ pub(super) fn workbench_tree(
     let current_overlay = overlay(state);
     if state.workspace_list_loaded && current_overlay.is_none() {
         controls.append_run_tests(state, &mut root, &mut nodes);
+        controls.append_widgets(state, &mut root, &mut nodes);
         controls.append_failed_runs(state, &mut root, &mut nodes);
         let mut button = named(Role::Button, "New workspace");
         button.add_action(Action::Click);

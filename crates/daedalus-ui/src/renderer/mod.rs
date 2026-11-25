@@ -441,10 +441,13 @@ fn collect_prepared_quads(
         }
     }
 
-    if let Some(bar) = layout.cargo_bar {
+    if let Some(bar) = layout.cargo_bar.or(layout.widget_bar) {
         quads.push(QuadInstance::new(bar, theme.bg_header));
         for (_, button) in layout.cargo_buttons(s) {
             quads.push(QuadInstance::new(button, theme.bg_sidebar).rounded(5. * s, 0., 0.));
+        }
+        for (_, button) in &layout.widget_buttons {
+            quads.push(QuadInstance::new(*button, theme.bg_sidebar).rounded(5. * s, 0., 0.));
         }
     }
 
@@ -895,18 +898,17 @@ fn collect_overlay_quads(
             } else {
                 theme.border_unfocused
             };
-            let fill =
-                if control == crate::settings::Control::Save && state.settings.enabled(control) {
-                    theme.border_focused
-                } else if state.settings.page_selected(control) {
-                    theme.border_focused.with_alpha(0.12)
-                } else if control.field_label().is_some() {
-                    theme.bg_pane
-                } else {
-                    theme.bg_header
-                };
+            let fill = if control.primary() && state.settings.enabled(control) {
+                theme.border_focused
+            } else if state.settings.page_selected(control) {
+                theme.border_focused.with_alpha(0.12)
+            } else if control.field_label().is_some() {
+                theme.bg_pane
+            } else {
+                theme.bg_header
+            };
             push_control(quads, field, fill, border, border_w, 6.0 * s);
-            if control == crate::settings::Control::Save && state.settings.focus == control {
+            if control.primary() && state.settings.focus == control {
                 push_inner_focus(quads, field, border_w, theme.bg_window);
             }
         }

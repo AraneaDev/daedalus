@@ -24,6 +24,80 @@ fn test_supervisor() -> Supervisor {
     }
 }
 
+#[tokio::test]
+async fn workbench_configuration_survives_reconnect_and_rejects_a_stale_write() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("daedalusd.sock");
+    let runtime = dir.path().join("runtime");
+    let state_path = dir.path().join("state.json");
+    let mut workspace_id = None;
+    for restart in [false, true] {
+        let server = DaemonServer::bind_with_options(
+            sock.clone(),
+            runtime.clone(),
+            None,
+            Some(state_path.clone()),
+            test_supervisor(),
+        )
+        .await
+        .unwrap();
+        let (shutdown, done) = oneshot::channel();
+        let task = tokio::spawn(server.serve(async {
+            let _ = done.await;
+        }));
+        let mut client = IpcStream::connect(&sock).await.unwrap();
+        let id = match workspace_id {
+            Some(id) => id,
+            None => match send_rpc(
+                &mut client,
+                1,
+                ClientMessage::CreateManualWorkspace {
+                    name: "Workbench".into(),
+                    root_dir: dir.path().to_path_buf(),
+                },
+            )
+            .await
+            {
+                ResponsePayload::WorkspaceCreated(workspace) => workspace.id,
+                response => panic!("unexpected response: {response:?}"),
+            },
+        };
+        workspace_id = Some(id);
+        let state = match send_rpc(
+            &mut client,
+            2,
+            ClientMessage::GetWorkbench { workspace_id: id },
+        )
+        .await
+        {
+            ResponsePayload::Workbench(state) => state,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        if restart {
+            assert_eq!(state.revision, 1);
+            assert_eq!(state.document.name, "Shared workbench");
+        } else {
+            let mut stale_client = IpcStream::connect(&sock).await.unwrap();
+            let mut document = state.document;
+            document.name = "Shared workbench".into();
+            let update = ClientMessage::UpdateWorkbench {
+                workspace_id: id,
+                revision: state.revision,
+                document,
+            };
+            assert!(
+                matches!(send_rpc(&mut client, 3, update.clone()).await, ResponsePayload::Workbench(state) if state.revision == 1)
+            );
+            assert!(
+                matches!(send_rpc(&mut stale_client, 1, update).await, ResponsePayload::WorkbenchConflict(state) if state.revision == 1)
+            );
+        }
+        drop(client);
+        shutdown.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+}
+
 fn sleep_command() -> Vec<String> {
     #[cfg(unix)]
     {

@@ -445,6 +445,7 @@ impl DaedalusApp {
             HitTarget::SessionTab(role) => self.handle_ui_action(UiAction::FocusRole(role)),
             HitTarget::RunCargo(preset) => self.handle_ui_action(UiAction::RunCargo(preset)),
             HitTarget::RunTests => self.handle_ui_action(UiAction::RunTests),
+            HitTarget::CustomWidget(index) => self.open_widget_details(index),
             HitTarget::WorkspaceSettings => self.open_workspace_settings(),
             HitTarget::SidebarNewWorkspace => self.create_new_workspace(),
             HitTarget::SidebarNewWorktree => self.open_worktree_modal(),
@@ -499,7 +500,11 @@ impl DaedalusApp {
     }
 
     pub(super) fn handle_left_mouse_up(&mut self) {
+        let resized = self.pointer.divider_drag.is_some();
         self.pointer.end_drag();
+        if resized {
+            self.save_workbench_layout();
+        }
         if let Some(press) = self.pointer.terminal_press.take()
             && let Some(pane) = self.state.panes.get(&press.pane_id)
             && !matches!(pane.summary.status, PaneStatus::Exited { .. })

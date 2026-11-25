@@ -181,6 +181,48 @@ impl TextRenderer {
                 bold: true,
             });
         }
+        for (index, bounds) in &layout.widget_buttons {
+            let widget =
+                index.and_then(|index| state.workbench.as_ref()?.1.document.widgets.get(index));
+            let result = widget.and_then(|widget| {
+                state
+                    .widget_results
+                    .iter()
+                    .find(|snapshot| snapshot.id == widget.id)
+            });
+            let definition = widget.and_then(|widget| {
+                state
+                    .workbench
+                    .as_ref()?
+                    .1
+                    .document
+                    .widget_definition(widget)
+            });
+            let label = result
+                .map(|snapshot| snapshot.result.label.as_str())
+                .or_else(|| widget.map(|widget| widget.name.as_str()))
+                .unwrap_or("More widgets");
+            let title = definition
+                .and_then(|definition| definition.display.icon.as_deref())
+                .map_or_else(|| label.to_owned(), |icon| format!("{icon} {label}"));
+            let color = match result.map(|snapshot| snapshot.result.level) {
+                Some(daedalus_proto::StatusLevel::Ok) => theme.status_ok,
+                Some(daedalus_proto::StatusLevel::Warn) => theme.status_busy,
+                Some(daedalus_proto::StatusLevel::Error) => theme.status_err,
+                _ => theme.text_primary,
+            };
+            self.push_chrome_button(ChromeLineSpec {
+                text: &title,
+                bounds: *bounds,
+                left: bounds.x + 6. * s,
+                top: bounds.y + (bounds.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                max_w: (bounds.width - 12. * s).max(1.),
+                font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                color,
+                bold: false,
+            });
+        }
         for &(role, rect) in &layout.insight_rows {
             if let Some(text) = state.focused_widget_label(role) {
                 self.push_chrome_line(ChromeLineSpec {

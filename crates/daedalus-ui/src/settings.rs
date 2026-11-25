@@ -1,11 +1,13 @@
 use crate::{
     assignments::{Assignment, CargoPreset},
     layout::Rect,
+    widget_editor::WidgetEditor,
     workspace_widgets::WorkspaceWidgets,
 };
 use daedalus_proto::{PaneRole, WorkspaceId};
 use std::sync::atomic::{AtomicU64, Ordering};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+mod custom;
 
 #[derive(Debug)]
 pub enum SettingsAction {
@@ -14,6 +16,7 @@ pub enum SettingsAction {
     Save(Vec<Assignment>),
     Launch(Vec<Assignment>, String),
     SaveWidgets(WorkspaceWidgets),
+    Workbench(Box<daedalus_proto::ClientMessage>),
 }
 
 #[derive(Clone, Debug)]
@@ -42,6 +45,50 @@ impl From<Assignment> for Draft {
 pub enum Control {
     AssignmentsPage,
     WidgetsPage,
+    CustomWidgetsPage,
+    CustomNew,
+    CustomEdit,
+    CustomPrev,
+    CustomNext,
+    CustomDuplicate,
+    CustomRemove,
+    CustomPin,
+    CustomMove,
+    CustomSharing,
+    CustomBack,
+    CustomTemplate,
+    CustomName,
+    CustomExecutable,
+    CustomArguments,
+    CustomInterval,
+    CustomOutput,
+    CustomPublish,
+    CustomSummary,
+    CustomDetails,
+    CustomUrl,
+    CustomPreview,
+    CustomDetail(usize),
+    CustomDetailPrev,
+    CustomDetailNext,
+    CustomViewAction(usize),
+    CustomRefresh,
+    CustomAdvanced,
+    CustomDefinition,
+    CustomApplyDefinition,
+    CustomSave,
+    CustomSaveTemplate,
+    CustomPath,
+    CustomRoot,
+    CustomImport,
+    CustomExport,
+    CustomImportTemplate,
+    CustomExportTemplate,
+    CustomRepo,
+    CustomApplyImport,
+    CustomResolve,
+    CustomResolveIncoming,
+    ServiceWidget,
+    RunnerWidget,
     ServicePreset,
     ServiceLabel,
     RunnerPreset,
@@ -75,6 +122,12 @@ use Control::*;
 const PAGE_SIZE: usize = 3;
 
 impl Control {
+    pub(crate) fn primary(self) -> bool {
+        matches!(
+            self,
+            Save | CustomSave | CustomApplyImport | CustomApplyDefinition
+        )
+    }
     pub fn field_label(self) -> Option<String> {
         Some(match self {
             Name => "Name".into(),
@@ -82,6 +135,17 @@ impl Control {
             Argument(i) => format!("Argument {}", i + 1),
             ServiceLabel => "Service label".into(),
             RunnerLabel => "Runner label".into(),
+            CustomName => "Widget name".into(),
+            CustomExecutable => "Executable".into(),
+            CustomArguments => "Arguments (JSON)".into(),
+            CustomInterval => "Refresh seconds".into(),
+            CustomPublish => "Published status key".into(),
+            CustomSummary => "Bar fields".into(),
+            CustomDetails => "Detail fields".into(),
+            CustomUrl => "Open URL".into(),
+            CustomPath => "TOML file path".into(),
+            CustomRoot => "New workspace folder (optional, on daemon host)".into(),
+            CustomDefinition => "Widget definition (JSON)".into(),
             _ => return None,
         })
     }
@@ -102,9 +166,14 @@ pub struct SettingsDialog {
     pub error: Option<String>,
     pending_save: Option<PendingSave>,
     pub(crate) widgets_page: bool,
+    pub custom_supported: bool,
+    pub custom_page: bool,
+    pub custom: WidgetEditor,
     pub widgets: WorkspaceWidgets,
     pub widget_workspace: Option<WorkspaceId>,
     pub widgets_saved: bool,
+    automatic_service_widget: bool,
+    automatic_runner_widget: bool,
     drafts: Vec<Draft>,
     selected: usize,
     argument_page: usize,
@@ -165,17 +234,31 @@ impl SettingsDialog {
     }
 
     fn rows(&self) -> Vec<Vec<Control>> {
-        let pages = vec![AssignmentsPage, WidgetsPage];
+        let mut pages = vec![AssignmentsPage, WidgetsPage];
+        if self.custom_supported {
+            pages.push(CustomWidgetsPage);
+        }
+        if self.custom_page {
+            return self.custom_rows(pages);
+        }
         if self.widgets_page {
-            return vec![
-                pages,
-                vec![ServicePreset],
-                vec![ServiceLabel],
-                vec![RunnerPreset],
-                vec![RunnerLabel],
-                vec![RunnerDuration, RunnerWarnings],
-                vec![Cancel, Save],
-            ];
+            let mut rows = vec![pages];
+            if self.widget_present(PaneRole::Service) {
+                rows.extend([vec![ServicePreset, ServiceWidget], vec![ServiceLabel]]);
+            } else {
+                rows.push(vec![ServiceWidget]);
+            }
+            if self.widget_present(PaneRole::Runner) {
+                rows.extend([
+                    vec![RunnerPreset, RunnerWidget],
+                    vec![RunnerLabel],
+                    vec![RunnerDuration, RunnerWarnings],
+                ]);
+            } else {
+                rows.push(vec![RunnerWidget]);
+            }
+            rows.push(vec![Cancel, Save]);
+            return rows;
         }
         let mut rows = vec![
             pages,
@@ -208,6 +291,7 @@ impl SettingsDialog {
         let rows = self.rows();
         let unit = self.content_scale(modal);
         let last = rows.len() - 1;
+        let custom_page = self.custom_page;
         rows.into_iter().enumerate().flat_map(move |(index, row)| {
             let pad = modal.width * 0.025;
             let width = modal.width - 2.0 * pad;
@@ -222,16 +306,24 @@ impl SettingsDialog {
                 // The equal-width fallback leaves room for labels on narrow screens.
                 let roomy = width >= 500.0 * unit;
                 let (offset, fraction) = match control {
+                    AssignmentsPage if count == 3.0 => (0., 0.34),
+                    WidgetsPage if count == 3.0 => (0.34, 0.41),
+                    CustomWidgetsPage => (0.75, 0.25),
                     Prev if roomy => (0., 0.17),
                     Next if roomy => (0.17, 0.15),
                     Remove if roomy => (0.84, 0.16),
+                    Cancel if custom_page && roomy && count == 2.0 => (0.83, 0.17),
                     Cancel if roomy => (0., 0.17),
+                    CustomBack if roomy => (0., 0.17),
+                    CustomSave if roomy => (0.75, 0.25),
                     Save if roomy && count == 2.0 => (0.75, 0.25),
                     Save if roomy => (0.58, 0.17),
                     Launch if roomy => (0.75, 0.25),
                     AddArgument if roomy && count == 1.0 => (0., 0.24),
                     Argument(_) => (0., 0.80),
                     DropArgument(_) => (0.80, 0.20),
+                    ServicePreset | RunnerPreset if roomy => (0., 0.70),
+                    ServiceWidget | RunnerWidget if roomy && count == 2.0 => (0.70, 0.30),
                     _ => (i as f32 / count, 1. / count),
                 };
                 (
@@ -259,11 +351,41 @@ impl SettingsDialog {
         }
     }
 
+    pub fn set_automatic_widgets(&mut self, service: bool, runner: bool) {
+        self.automatic_service_widget = service;
+        self.automatic_runner_widget = runner;
+    }
+
+    fn widget_present(&self, role: PaneRole) -> bool {
+        let automatic = match role {
+            PaneRole::Service => self.automatic_service_widget,
+            PaneRole::Runner => self.automatic_runner_widget,
+            PaneRole::Agent => false,
+        };
+        self.widgets.includes(role, automatic)
+    }
+
     pub fn label(&self, c: Control) -> String {
+        if let Some(label) = self.custom_label(c) {
+            return label;
+        }
         let draft = self.drafts.get(self.selected);
         match c {
             AssignmentsPage => "Assignments".into(),
             WidgetsPage => "Widgets".into(),
+            ServiceWidget | RunnerWidget => {
+                let (role, name) = if c == ServiceWidget {
+                    (PaneRole::Service, "service")
+                } else {
+                    (PaneRole::Runner, "runner")
+                };
+                let action = if self.widget_present(role) {
+                    "Remove"
+                } else {
+                    "+ Add"
+                };
+                format!("{action} {name} widget")
+            }
             ServicePreset => format!(
                 "Service preset   {}   ↻",
                 preset_label(self.widgets.service.preset.as_deref())
@@ -313,6 +435,7 @@ impl SettingsDialog {
             Save if self.widgets_page => "Save widgets".into(),
             Save => "Save".into(),
             Launch => "Save & launch".into(),
+            _ => String::new(),
         }
     }
 
@@ -349,6 +472,14 @@ impl SettingsDialog {
             "Saving workspace settings…"
         } else if let Some(error) = &self.error {
             error
+        } else if self.custom_page
+            && let Some(path) = self.next_import_conflict()
+        {
+            path
+        } else if self.custom_page
+            && let Some(preview) = &self.custom.preview
+        {
+            &preview.label
         } else if self.select_all && self.field_has_text() {
             "All text selected · Type to replace"
         } else if self.widgets_page && self.widgets_saved {
@@ -366,7 +497,7 @@ impl SettingsDialog {
     }
 
     pub(crate) fn position_label(&self) -> String {
-        if self.widgets_page {
+        if self.widgets_page || self.custom_page {
             String::new()
         } else if self.drafts.is_empty() {
             "No assignments".into()
@@ -376,7 +507,19 @@ impl SettingsDialog {
     }
 
     pub fn heading(&self) -> String {
-        if self.widgets_page {
+        if self.custom_page {
+            if self.custom.sharing {
+                "Workspace sharing".into()
+            } else if self.custom.showing_details {
+                self.custom
+                    .selected()
+                    .map_or_else(|| "Widget details".into(), |widget| widget.name.clone())
+            } else if self.custom.draft.is_some() {
+                "Widget editor".into()
+            } else {
+                "Custom widgets".into()
+            }
+        } else if self.widgets_page {
             "Workspace widgets".into()
         } else {
             format!("Workspace assignments · {}", self.position_label())
@@ -387,7 +530,17 @@ impl SettingsDialog {
         if self.is_saving() {
             return false;
         }
+        if self.custom_page {
+            return self.custom_enabled(c);
+        }
         match c {
+            ServiceWidget | RunnerWidget => self.widgets_page,
+            ServicePreset | ServiceLabel => {
+                self.widgets_page && self.widget_present(PaneRole::Service)
+            }
+            RunnerPreset | RunnerLabel | RunnerDuration | RunnerWarnings => {
+                self.widgets_page && self.widget_present(PaneRole::Runner)
+            }
             Prev | Next => self.drafts.len() > 1,
             PreviousArguments => self.argument_page > 0,
             NextArguments => self
@@ -406,6 +559,9 @@ impl SettingsDialog {
     fn field(&mut self) -> Option<&mut String> {
         if self.is_saving() {
             return None;
+        }
+        if self.custom_page {
+            return self.custom_field();
         }
         if self.widgets_page {
             self.widgets_saved = false;
@@ -442,7 +598,26 @@ impl SettingsDialog {
         self.revision
     }
 
+    pub fn reconcile_controls(&mut self, previous: &[Control]) {
+        let current: Vec<_> = self.control_order().collect();
+        if previous != current {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        if !current.contains(&self.focus) {
+            self.focus = current
+                .iter()
+                .copied()
+                .find(|&control| self.enabled(control))
+                .unwrap_or_default();
+            self.from_end = 0;
+            self.select_all = false;
+        }
+    }
+
     pub fn value(&self, control: Control) -> Option<&str> {
+        if self.custom_page {
+            return self.custom_value(control);
+        }
         if self.widgets_page {
             return match control {
                 ServiceLabel => Some(self.widgets.service.label.as_deref().unwrap_or_default()),
@@ -480,7 +655,10 @@ impl SettingsDialog {
     }
 
     pub fn set_value(&mut self, control: Control, value: &str) {
-        if self.value(control).is_some() && !value.chars().any(char::is_control) {
+        if self.enabled(control)
+            && self.value(control).is_some()
+            && !value.chars().any(char::is_control)
+        {
             self.set_focus(control);
             self.select_all = true;
             self.from_end = 0;
@@ -495,6 +673,7 @@ impl SettingsDialog {
         let previous = (self.selected, self.drafts.len());
         let previous_page = self.argument_page;
         let was_widgets_page = self.widgets_page;
+        let was_custom_page = self.custom_page;
         let action = self.apply_control(control);
         if previous != (self.selected, self.drafts.len()) {
             self.argument_page = match self.focus {
@@ -505,7 +684,12 @@ impl SettingsDialog {
         if previous != (self.selected, self.drafts.len())
             || previous_page != self.argument_page
             || was_widgets_page != self.widgets_page
-            || matches!(control, AddArgument | DropArgument(_))
+            || was_custom_page != self.custom_page
+            || self.custom_page
+            || matches!(
+                control,
+                AddArgument | DropArgument(_) | ServiceWidget | RunnerWidget
+            )
         {
             // Ignore queued platform actions addressed to a previous set of rows.
             self.revision = self.revision.wrapping_add(1);
@@ -519,15 +703,52 @@ impl SettingsDialog {
         self.select_all = false;
         self.error = None;
         self.invalid_field = None;
+        if self.custom_page
+            && !matches!(
+                c,
+                AssignmentsPage | WidgetsPage | CustomWidgetsPage | Cancel
+            )
+        {
+            return self.apply_custom_control(c);
+        }
         if matches!(
             c,
-            ServicePreset | RunnerPreset | RunnerDuration | RunnerWarnings
+            ServiceWidget
+                | RunnerWidget
+                | ServicePreset
+                | RunnerPreset
+                | RunnerDuration
+                | RunnerWarnings
         ) {
             self.widgets_saved = false;
         }
         match c {
-            AssignmentsPage => self.widgets_page = false,
-            WidgetsPage => self.widgets_page = true,
+            AssignmentsPage => {
+                self.widgets_page = false;
+                self.custom_page = false;
+            }
+            WidgetsPage => {
+                self.widgets_page = true;
+                self.custom_page = false;
+            }
+            CustomWidgetsPage => {
+                self.custom_page = true;
+                self.widgets_page = false;
+            }
+            ServiceWidget => {
+                let add = !self.widget_present(PaneRole::Service);
+                self.widgets.service_enabled = Some(add);
+                if !add {
+                    self.widgets.service = Default::default();
+                }
+            }
+            RunnerWidget => {
+                let add = !self.widget_present(PaneRole::Runner);
+                self.widgets.runner_enabled = Some(add);
+                if !add {
+                    self.widgets.runner = Default::default();
+                }
+            }
             ServicePreset => {
                 cycle_preset(&mut self.widgets.service.preset, &["service", "command"])
             }
@@ -663,12 +884,13 @@ impl SettingsDialog {
                     SettingsAction::Save(values)
                 };
             }
+            _ => {}
         }
         SettingsAction::None
     }
 
     pub fn scroll(&mut self, delta_y: f32) {
-        if self.widgets_page {
+        if self.widgets_page || self.custom_page {
             return;
         }
         if delta_y > 0.0 {
@@ -680,6 +902,9 @@ impl SettingsDialog {
     }
 
     pub(crate) fn page_selected(&self, control: Control) -> bool {
+        if self.custom_page {
+            return control == CustomWidgetsPage;
+        }
         matches!(
             (self.widgets_page, control),
             (true, WidgetsPage) | (false, AssignmentsPage)

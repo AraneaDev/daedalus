@@ -17,6 +17,12 @@ impl DaedalusApp {
         }
         self.sync_history_visit();
         match event {
+            UiEvent::WorkbenchCapability(supported) => self.workbench_capable = supported,
+            UiEvent::Workbench {
+                workspace_id,
+                saved,
+                response,
+            } => self.workbench_response(workspace_id, saved, *response),
             UiEvent::ImagePreview { pane_id, image } => {
                 if self.state.focused_pane_id() == Some(pane_id) && image.valid() {
                     self.state.image_preview = Some((pane_id, image));
@@ -79,6 +85,9 @@ impl DaedalusApp {
                 self.schedule_resize_flush();
             }
             UiEvent::Disconnected => {
+                self.workbench_capable = false;
+                self.watched_workbench = None;
+                self.widget_refresh_at = None;
                 self.setup_disconnected();
                 self.workspace_settings_disconnected();
                 self.history.connection(false);
@@ -208,6 +217,12 @@ impl DaedalusApp {
                     containers,
                     git_status,
                     git_branch,
+                );
+            }
+            UiEvent::ServerEvent(ServerEvent::WorkbenchChanged { workspace_id, .. }) => {
+                self.request_workbench(
+                    workspace_id,
+                    daedalus_proto::ClientMessage::GetWorkbench { workspace_id },
                 );
             }
             UiEvent::ServerEvent(server_event) => self.apply_terminal_event(server_event),

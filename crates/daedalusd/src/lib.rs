@@ -12,6 +12,7 @@ pub mod server;
 mod setup;
 pub mod shell_integration;
 pub mod supervisor;
+pub mod workbench;
 pub mod worktree;
 
 /// Background probes run from a detached daemon, which has no console to inherit.

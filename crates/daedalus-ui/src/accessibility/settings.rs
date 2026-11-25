@@ -13,7 +13,7 @@ fn control_id(settings: &SettingsDialog, control: Control) -> NodeId {
     let offset = settings
         .control_order()
         .position(|c| c == control)
-        .expect("visible control");
+        .unwrap_or_default();
     id(settings, offset as u64)
 }
 

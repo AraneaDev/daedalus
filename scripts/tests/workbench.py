@@ -160,6 +160,16 @@ esac
 
 def exercise(binaries, scratch, screen):
     project, env = fixture(scratch)
+    screenshots = os.environ.get("DAEDALUS_WIDGET_SCREENSHOTS")
+
+    def capture(ui, name):
+        if screenshots:
+            time.sleep(0.15)
+            subprocess.run(
+                ["import", "-window", hex(ui.window.id), Path(screenshots) / name],
+                check=True,
+                timeout=5,
+            )
 
     def cli(*args):
         return subprocess.run(
@@ -228,6 +238,8 @@ def exercise(binaries, scratch, screen):
             ui.shortcut("s")
             ui.wait_dialog((395, 214))
             ui.click(850, 284)  # Widgets page
+            ui.wait_dialog((395, 274))
+            ui.click(720, 385)  # Add service widget
             ui.wait_dialog((395, 254))
             ui.click(720, 365)  # Service preset
             ui.click(630, 404)  # Service label
@@ -246,14 +258,56 @@ def exercise(binaries, scratch, screen):
                 return tomllib.loads(files[0].read_text()) if files else None
 
             saved = until("saved widget settings", widget_settings)
+            assert saved["service_enabled"] is True
             assert saved["service"] == {"preset": "service", "label": "api"}
             assert saved["runner"] == {
                 "preset": "cargo-check",
                 "show_duration": False,
                 "show_warnings": True,
             }
+            ui.click(910, 365)  # Remove service widget
+            ui.wait_dialog((395, 274))
+            ui.key("Control_L", "s")
+            until(
+                "removed service widget",
+                lambda: widget_settings().get("service_enabled") is False,
+            )
+            assert widget_settings()["service"] == {}
+            assert widget_settings()["runner"] == saved["runner"]
             ui.key("Escape")
-            ui.wait_dialog((395, 254), visible=False)
+            ui.wait_dialog((395, 274), visible=False)
+            ui.shortcut("s")
+            ui.wait_dialog((395, 214))
+            ui.click(975, 284)  # Custom widgets
+            ui.wait_dialog((395, 334))
+            ui.click(558, 440)  # New widget
+            ui.wait_dialog((395, 174))
+            ui.click(550, 282)  # Git Worktree template
+            capture(ui, "widget-editor.png")
+            ui.click(942, 690)  # Add widget
+            until(
+                "custom widget stored on the daemon",
+                lambda: (
+                    "Git Worktree" in cli("widget", "list", "--dir", project).stdout
+                ),
+            )
+            if screenshots:
+                export = cli(
+                    "workspace",
+                    "export",
+                    "--dir",
+                    project,
+                    "--file",
+                    project / ".daedalus-workspace.toml",
+                )
+                assert export.returncode == 0, export.stderr
+                ui.wait_dialog((395, 294))
+                ui.click(875, 400)  # Import / export
+                ui.wait_dialog((395, 254))
+                ui.click(720, 482)  # Preview the shared repo file
+                ui.wait_dialog((395, 174))
+                capture(ui, "workspace-import.png")
+            ui.key("Escape")
             ui.close(client)
 
         # Reconnect to the daemon and run the saved assignment again.

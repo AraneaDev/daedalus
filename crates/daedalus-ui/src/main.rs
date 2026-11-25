@@ -7,6 +7,7 @@ mod setup;
 mod terminal_commands;
 mod viewport;
 mod workspace_settings;
+mod workspace_sharing;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -134,6 +135,10 @@ struct DaedalusApp {
     ui_config: UiConfig,
     project_setups: daedalus_ui::project_setups::ProjectSetups,
     widget_directory: PathBuf,
+    workbench_capable: bool,
+    watched_workbench: Option<WorkspaceId>,
+    seeded_workbench: std::collections::HashSet<WorkspaceId>,
+    widget_refresh_at: Option<Instant>,
     daemon_home: Option<PathBuf>,
     setup: setup::SetupFlow,
     history: daedalus_ui::activity_history::ActivityHistory,
@@ -198,6 +203,10 @@ impl DaedalusApp {
         Self {
             project_setups: Default::default(),
             widget_directory,
+            workbench_capable: false,
+            watched_workbench: None,
+            seeded_workbench: Default::default(),
+            widget_refresh_at: None,
             daemon_home: None,
             setup: Default::default(),
             history: daedalus_ui::activity_history::ActivityHistory::new(
@@ -661,6 +670,7 @@ impl DaedalusApp {
             }
             UiAction::ToggleZoom => {
                 self.state.zoomed = !self.state.zoomed;
+                self.save_workbench_layout();
                 self.schedule_resize_flush();
                 self.request_redraw();
             }
@@ -1071,6 +1081,7 @@ impl DaedalusApp {
 
     fn activate_session(&mut self, target: HitTarget) {
         match target {
+            HitTarget::CustomWidget(index) => self.open_widget_details(index),
             HitTarget::Widget(role) => {
                 if let Some(id) = self.state.pane_id_for_role(role) {
                     if role == PaneRole::Runner && self.state.widget_diagnostic().is_some() {
@@ -1504,6 +1515,7 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_workbench();
         self.sync_history_visit();
         if let Some(cmd) = self.history.request(Instant::now())
             && let UiCommand::ReadActivity { token, .. } = cmd
@@ -1551,6 +1563,7 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
         if let Some(deadline) = next_deadline
             .into_iter()
             .chain(self.history.deadline())
+            .chain(self.widget_refresh_at)
             .min()
         {
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));

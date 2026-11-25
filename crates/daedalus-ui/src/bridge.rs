@@ -69,6 +69,10 @@ impl std::fmt::Debug for BridgeConfig {
 /// Commands sent from the UI thread to `DaemonBridge`.
 #[derive(Debug, Clone)]
 pub enum UiCommand {
+    Workbench {
+        workspace_id: WorkspaceId,
+        request: Box<ClientMessage>,
+    },
     PreviewImage {
         workspace_id: WorkspaceId,
         pane_id: PaneId,
@@ -193,6 +197,12 @@ pub enum UiCommand {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum UiEvent {
+    WorkbenchCapability(bool),
+    Workbench {
+        workspace_id: WorkspaceId,
+        saved: bool,
+        response: Box<Result<ResponsePayload, String>>,
+    },
     ImagePreview {
         pane_id: PaneId,
         image: daedalus_proto::rpc::ImagePreview,
@@ -498,6 +508,7 @@ async fn initialize_session(
         project_setup_supported,
         image_preview_supported,
         paste_supported,
+        workbench_supported,
         home_dir,
         ..
     } = conn.call(ClientMessage::Ping).await?
@@ -511,6 +522,7 @@ async fn initialize_session(
     conn.image_preview_supported = image_preview_supported;
     conn.project_setup_supported = project_setup_supported;
     conn.paste_supported = paste_supported;
+    conn.workbench_supported = workbench_supported;
     let _ = conn
         .call(ClientMessage::Subscribe {
             pane_ids: None,
@@ -519,6 +531,7 @@ async fn initialize_session(
         .await?;
     session.send_replace(Some(cmd_tx));
     sink.emit(UiEvent::Connected);
+    sink.emit(UiEvent::WorkbenchCapability(workbench_supported));
     sink.emit(UiEvent::JournalCapability(journal_supported));
     sink.emit(UiEvent::DaemonCapabilities {
         home_dir,
@@ -677,6 +690,29 @@ async fn handle_command(
                 }
                 Err(err @ (RpcError::Disconnected | RpcError::TimedOut)) => return Err(err),
                 _ => sink.emit(UiEvent::ActivityReadFailed(token)),
+            }
+        }
+        UiCommand::Workbench {
+            workspace_id,
+            request,
+        } => {
+            if conn.workbench_supported {
+                let saved = matches!(
+                    *request,
+                    ClientMessage::UpdateWorkbench { .. }
+                        | ClientMessage::ApplyWorkspaceImport { .. }
+                        | ClientMessage::SeedLegacyWorkbench { .. }
+                );
+                let response = match conn.call(*request).await {
+                    Ok(response) => Ok(response),
+                    Err(RpcError::Proto(error)) => Err(error.to_string()),
+                    Err(error) => return Err(error),
+                };
+                sink.emit(UiEvent::Workbench {
+                    workspace_id,
+                    saved,
+                    response: Box::new(response),
+                });
             }
         }
         UiCommand::CreateManualWorkspace {

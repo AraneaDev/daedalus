@@ -431,11 +431,12 @@ pub fn create_worktree(
         })
 }
 
-fn parse_git_status_v2(output: &str, is_worktree: bool) -> (GitWorkspaceStatus, Option<String>) {
-    let mut dirty = false;
+fn parse_git_status_v2(output: &str, is_worktree: bool) -> GitObservation {
+    let mut changes = 0;
     let mut ahead = 0u32;
     let mut behind = 0u32;
     let mut branch = None;
+    let mut upstream = false;
 
     for raw_line in output.lines() {
         let line = raw_line.trim_end_matches('\r');
@@ -448,6 +449,7 @@ fn parse_git_status_v2(output: &str, is_worktree: bool) -> (GitWorkspaceStatus, 
                     branch = Some(head.to_string());
                 }
             } else if let Some(ab) = rest.strip_prefix("branch.ab ") {
+                upstream = true;
                 for token in ab.split_whitespace() {
                     if let Some(a) = token.strip_prefix('+') {
                         ahead = a.parse::<u32>().unwrap_or(0);
@@ -457,19 +459,28 @@ fn parse_git_status_v2(output: &str, is_worktree: bool) -> (GitWorkspaceStatus, 
                 }
             }
         } else {
-            dirty = true;
+            changes += 1;
         }
     }
 
-    (
-        GitWorkspaceStatus {
+    GitObservation {
+        status: GitWorkspaceStatus {
             is_worktree,
-            dirty,
+            dirty: changes != 0,
             ahead,
             behind,
         },
         branch,
-    )
+        changes,
+        upstream,
+    }
+}
+
+pub(crate) struct GitObservation {
+    pub status: GitWorkspaceStatus,
+    pub branch: Option<String>,
+    pub changes: usize,
+    pub upstream: bool,
 }
 
 /// Queries `git status --porcelain=v2 --branch` (with a 2s timeout) and returns
@@ -477,6 +488,10 @@ fn parse_git_status_v2(output: &str, is_worktree: bool) -> (GitWorkspaceStatus, 
 pub fn git_workspace_status_and_branch(
     path: &Path,
 ) -> Option<(GitWorkspaceStatus, Option<String>)> {
+    git_observation(path).map(|observation| (observation.status, observation.branch))
+}
+
+pub(crate) fn git_observation(path: &Path) -> Option<GitObservation> {
     if !path.is_dir() {
         return None;
     }
@@ -940,8 +955,11 @@ detached\r\n";
 # branch.head feat/v0.0.3\n\
 # branch.upstream origin/feat/v0.0.3\n\
 # branch.ab +3 -2\n";
+        let clean = parse_git_status_v2(clean, true);
+        assert!(clean.upstream);
+        assert_eq!(clean.changes, 0);
         assert_eq!(
-            parse_git_status_v2(clean, true),
+            (clean.status, clean.branch),
             (
                 GitWorkspaceStatus {
                     is_worktree: true,
@@ -958,8 +976,11 @@ detached\r\n";
 # branch.head (detached)\n\
 1 .M N... 100644 100644 100644 abc def src/lib.rs\n\
 ? untracked.txt\n";
+        let dirty = parse_git_status_v2(dirty, false);
+        assert!(!dirty.upstream);
+        assert_eq!(dirty.changes, 2);
         assert_eq!(
-            parse_git_status_v2(dirty, false),
+            (dirty.status, dirty.branch),
             (
                 GitWorkspaceStatus {
                     is_worktree: false,

@@ -87,6 +87,11 @@ impl DaedalusApp {
                 self.state.picker.close();
                 self.state.settings.begin(entries);
                 self.state.settings.widget_workspace = Some(id);
+                self.prepare_workbench_settings(id);
+                self.state.settings.set_automatic_widgets(
+                    self.state.has_widget_source(PaneRole::Service),
+                    self.state.has_widget_source(PaneRole::Runner),
+                );
                 self.state.settings.widgets = self
                     .state
                     .workspace_widgets
@@ -126,13 +131,22 @@ impl DaedalusApp {
                     {
                         Ok(()) => {
                             self.state.workspace_widgets.insert(id, widgets.clone());
-                            self.state.settings.widgets = widgets;
+                            self.state.settings.widgets = widgets.clone();
                             self.state.settings.widgets_saved = true;
+                            self.save_shared_pane_widgets(id, widgets);
+                            self.schedule_resize_flush();
                         }
                         Err(error) => self.state.settings.error = Some(error),
                     }
                 } else {
                     self.state.settings.error = Some("This workspace is no longer open.".into());
+                }
+                self.request_redraw();
+                return;
+            }
+            SettingsAction::Workbench(request) => {
+                if let Some(id) = self.state.settings.widget_workspace {
+                    self.request_workbench(id, *request);
                 }
                 self.request_redraw();
                 return;

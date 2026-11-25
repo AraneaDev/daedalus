@@ -179,6 +179,8 @@ pub struct WorkspaceLayout {
     pub run_tests_button: Option<Rect>,
     pub layout_button: Option<Rect>,
     pub cargo_bar: Option<Rect>,
+    pub widget_bar: Option<Rect>,
+    pub widget_buttons: Vec<(Option<usize>, Rect)>,
     pub failed_run_buttons: Vec<(WorkspaceId, Rect)>,
     pub sidebar_first: usize,
     pub sidebar_content: Option<std::sync::Arc<crate::sidebar_content::SidebarContent>>,
@@ -433,6 +435,7 @@ pub enum HitTarget {
     SidebarNewWorktree,
     RunTests,
     Widget(PaneRole),
+    CustomWidget(Option<usize>),
     SessionTab(PaneRole),
     SelectSession(PaneId),
     CloseSession(PaneId),
@@ -568,6 +571,41 @@ impl Default for PaneSplits {
 }
 
 impl PaneSplits {
+    pub fn portable(&self, split_view: bool) -> daedalus_proto::workbench::WorkbenchLayout {
+        daedalus_proto::workbench::WorkbenchLayout {
+            split_view,
+            splits: [
+                ("column", self.column),
+                ("right_row", self.right_row),
+                ("upper", self.upper),
+                ("lower", self.lower),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.into(), (value * 1000.).round() as u16))
+            .collect(),
+        }
+    }
+
+    pub fn from_portable(layout: &daedalus_proto::workbench::WorkbenchLayout) -> Self {
+        let mut splits = Self::default();
+        let get = |name| {
+            layout
+                .splits
+                .get(name)
+                .map(|value| f32::from(*value) / 1000.)
+        };
+        if let Some(value) = get("column") {
+            splits.move_divider(Divider::Column, value);
+        }
+        if let Some(value) = get("right_row") {
+            splits.move_divider(Divider::RightRow, value);
+        }
+        if let Some(value) = get("lower") {
+            splits.lower = value.clamp(0.2, 0.9);
+        }
+        splits.move_divider(Divider::UpperRow, get("upper").unwrap_or(splits.upper));
+        splits
+    }
     pub fn move_divider(&mut self, divider: Divider, fraction: f32) {
         match divider {
             Divider::Column => self.column = fraction.clamp(0.15, 0.85),
@@ -739,6 +777,8 @@ pub fn compute_split_layout(input: &LayoutInput, splits: &PaneSplits) -> Workspa
 
     WorkspaceLayout {
         insight_rows: Vec::new(),
+        widget_bar: None,
+        widget_buttons: Vec::new(),
         compact_recap,
         close_tab: None,
         named_tabs: Vec::new(),
@@ -912,6 +952,13 @@ pub fn hit_test(
     y: f32,
 ) -> HitTarget {
     use crate::sidebar_content::{SidebarContent, SidebarRow};
+    if let Some((index, _)) = layout
+        .widget_buttons
+        .iter()
+        .find(|(_, rect)| rect.contains(x, y))
+    {
+        return HitTarget::CustomWidget(*index);
+    }
     if let Some((preset, _)) = layout
         .cargo_buttons(scale_factor)
         .find(|(_, rect)| rect.contains(x, y))

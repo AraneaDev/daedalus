@@ -3,6 +3,11 @@ use crate::types::{
     GridDelta, GridRow, GridSnapshot, PaneId, PaneRole, PaneStatus, PaneSummary, PortMapping,
     SearchMatch, StatusLevel, WorkspaceId, WorkspaceInfo,
 };
+use crate::workbench::{
+    ConflictChoice, WidgetActionResult, WidgetDefinition, WidgetLibrary, WidgetResult,
+    WidgetSnapshot, WidgetTemplate, WorkbenchState, WorkspaceCreationPreview, WorkspaceDocument,
+    WorkspaceImportPreview, WorkspaceImportSource,
+};
 use crate::{ActivityCursor, ActivityPage, Assignment, RecentProject};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -183,6 +188,72 @@ pub enum ClientMessage {
         workspace_id: WorkspaceId,
         action_id: String,
     },
+    GetWorkbench {
+        workspace_id: WorkspaceId,
+    },
+    WatchWorkbench {
+        workspace_id: WorkspaceId,
+    },
+    UpdateWorkbench {
+        workspace_id: WorkspaceId,
+        revision: u64,
+        document: WorkspaceDocument,
+    },
+    SeedLegacyWorkbench {
+        workspace_id: WorkspaceId,
+        document: WorkspaceDocument,
+    },
+    ListWidgetTemplates,
+    UpdateWidgetTemplates {
+        revision: u64,
+        templates: Vec<WidgetTemplate>,
+    },
+    PreviewWorkspaceImport {
+        workspace_id: WorkspaceId,
+        source: WorkspaceImportSource,
+        linked: bool,
+    },
+    ApplyWorkspaceImport {
+        workspace_id: WorkspaceId,
+        revision: u64,
+        incoming: WorkspaceDocument,
+        linked: bool,
+        resolutions: std::collections::BTreeMap<String, ConflictChoice>,
+    },
+    ExportWorkspace {
+        workspace_id: WorkspaceId,
+    },
+    PreviewWorkspaceCreation {
+        root_dir: PathBuf,
+        source: WorkspaceImportSource,
+        linked: bool,
+    },
+    ApplyWorkspaceCreation {
+        preview: WorkspaceCreationPreview,
+    },
+    CheckWorkspaceRepo {
+        workspace_id: WorkspaceId,
+    },
+    DecodeWidgetTemplate {
+        text: String,
+    },
+    EncodeWidgetTemplate {
+        template: WidgetTemplate,
+    },
+    PreviewWidget {
+        workspace_id: WorkspaceId,
+        name: String,
+        definition: WidgetDefinition,
+    },
+    GetWidgetResults {
+        workspace_id: WorkspaceId,
+        refresh: Option<String>,
+    },
+    InvokeWidgetAction {
+        workspace_id: WorkspaceId,
+        widget: String,
+        action: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +286,8 @@ pub enum ResponsePayload {
         #[serde(default)]
         paste_supported: bool,
         #[serde(default)]
+        workbench_supported: bool,
+        #[serde(default)]
         home_dir: Option<PathBuf>,
     },
     ImagePreview(ImagePreview),
@@ -241,6 +314,19 @@ pub enum ResponsePayload {
     },
     FailureTrace(Option<FailureTrace>),
     Ok,
+    Workbench(WorkbenchState),
+    WorkbenchConflict(WorkbenchState),
+    WidgetLibrary(WidgetLibrary),
+    WidgetLibraryConflict(WidgetLibrary),
+    WorkspaceImportPreview(WorkspaceImportPreview),
+    WorkspaceCreationPreview(WorkspaceCreationPreview),
+    WorkbenchCreated(WorkspaceInfo),
+    WorkbenchToml(String),
+    WorkspaceRepoStatus(Option<bool>),
+    WidgetTemplate(WidgetTemplate),
+    WidgetResult(WidgetResult),
+    WidgetResults(Vec<WidgetSnapshot>),
+    WidgetAction(WidgetActionResult),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +371,10 @@ pub enum ServerEvent {
     ProjectSetupChanged {
         root_dir: PathBuf,
         assignments: Vec<Assignment>,
+    },
+    WorkbenchChanged {
+        workspace_id: WorkspaceId,
+        revision: u64,
     },
 }
 

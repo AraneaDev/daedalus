@@ -2,6 +2,23 @@ use super::AppState;
 use daedalus_proto::{PaneRole, PaneStatus, WidgetConfig};
 
 impl AppState {
+    pub fn has_widget_source(&self, role: PaneRole) -> bool {
+        matches!(role, PaneRole::Service | PaneRole::Runner)
+            && (self.pane_for_role(role).is_some()
+                || self
+                    .active_workspace_id
+                    .and_then(|id| self.workspace_widgets.get(&id))
+                    .and_then(|widgets| widgets.for_role(role))
+                    .is_some_and(|config| config != &WidgetConfig::default()))
+    }
+
+    pub fn widget_present(&self, role: PaneRole) -> bool {
+        let automatic = self.has_widget_source(role);
+        self.active_workspace_id
+            .and_then(|id| self.workspace_widgets.get(&id))
+            .map_or(automatic, |widgets| widgets.includes(role, automatic))
+    }
+
     fn widget_configs(&self, role: PaneRole) -> impl Iterator<Item = &WidgetConfig> + Clone {
         let workspace = self.active_workspace();
         let overrides = workspace
@@ -25,8 +42,11 @@ impl AppState {
 
     /// Single-line summary shared by terminal headers, the focused view and accessibility.
     pub fn widget_label(&self, role: PaneRole) -> Option<String> {
+        if !self.widget_present(role) {
+            return None;
+        }
         let ws = self.active_workspace()?;
-        let pane = self.pane_for_role(role)?;
+        let pane = self.pane_for_role(role);
         let manifest = ws.manifest.as_ref();
         let command = match role {
             PaneRole::Runner => manifest.and_then(|m| m.runner_command.as_ref()),
@@ -38,7 +58,7 @@ impl AppState {
             .clone()
             .find_map(|c| c.preset.as_deref())
             .or_else(|| {
-                if let Some(preset) = pane.cargo_preset {
+                if let Some(preset) = pane.and_then(|pane| pane.cargo_preset) {
                     return Some(preset.launch_tag());
                 }
                 let args = command?;
@@ -47,9 +67,12 @@ impl AppState {
         let name = configs
             .clone()
             .find_map(|c| c.label.as_deref().filter(|s| !s.trim().is_empty()))
-            .or_else(|| self.session_names.get(&pane.summary.id).map(String::as_str))
             .or_else(|| {
-                pane.cargo_preset
+                pane.and_then(|pane| self.session_names.get(&pane.summary.id))
+                    .map(String::as_str)
+            })
+            .or_else(|| {
+                pane.and_then(|pane| pane.cargo_preset)
                     .map(crate::assignments::CargoPreset::label)
             })
             .unwrap_or(match (role, preset) {
@@ -58,6 +81,9 @@ impl AppState {
                 (PaneRole::Service, _) => "Service",
                 _ => "Runner",
             });
+        let Some(pane) = pane else {
+            return Some(format!("{name} · No terminal"));
+        };
         let status = match pane.summary.status {
             PaneStatus::Exited { code: Some(0) } => "Completed",
             PaneStatus::Exited { code: Some(_) } => "Failed",
@@ -117,10 +143,11 @@ impl AppState {
     }
 
     pub fn widget_diagnostic(&self) -> Option<&str> {
-        if self
-            .widget_configs(PaneRole::Runner)
-            .find_map(|w| w.preset.as_deref())
-            == Some("command")
+        if !self.widget_present(PaneRole::Runner)
+            || self
+                .widget_configs(PaneRole::Runner)
+                .find_map(|w| w.preset.as_deref())
+                == Some("command")
         {
             return None;
         }

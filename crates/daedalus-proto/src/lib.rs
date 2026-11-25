@@ -5,6 +5,7 @@ pub mod remote;
 pub mod rpc;
 pub mod transport;
 pub mod types;
+pub mod workbench;
 
 pub use activity::{ActivityCursor, ActivityEntry, ActivityKind, ActivityPage};
 pub use codec::{CodecError, MAX_FRAME_SIZE, read_frame, write_frame};

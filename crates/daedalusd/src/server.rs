@@ -125,6 +125,8 @@ impl DaemonServer {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let monitor_handle =
             runtime_monitor::spawn_runtime_monitor(Arc::clone(&self.registry), shutdown_rx.clone());
+        let widgets =
+            crate::workbench::scheduler::spawn(Arc::clone(&self.registry), shutdown_rx.clone());
         let hook_handle = self.external_hook.map(|hook| {
             let mut hook_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
@@ -171,6 +173,7 @@ impl DaemonServer {
         client_tasks.abort_all();
         while client_tasks.join_next().await.is_some() {}
         let _ = monitor_handle.await;
+        let _ = widgets.await;
         if let Some(handle) = hook_handle {
             let _ = handle.await;
         }
@@ -187,10 +190,14 @@ struct SubscriptionFilter {
     /// Older UIs drop the connection on an event variant they do not know, so
     /// `ProjectSetupChanged` is sent only to connections that asked for it.
     project_setup_events: bool,
+    workbench: Option<daedalus_proto::WorkspaceId>,
 }
 
 impl SubscriptionFilter {
     fn matches(&self, event: &ServerEvent) -> bool {
+        if let ServerEvent::WorkbenchChanged { workspace_id, .. } = event {
+            return self.workbench == Some(*workspace_id);
+        }
         if !self.active {
             return false;
         }
@@ -209,7 +216,8 @@ impl SubscriptionFilter {
             | ServerEvent::ResyncRequired { pane_id } => allowed.contains(pane_id),
             ServerEvent::WorkspaceRuntimeUpdated { .. }
             | ServerEvent::ExternalStatusUpdated { .. }
-            | ServerEvent::ProjectSetupChanged { .. } => false,
+            | ServerEvent::ProjectSetupChanged { .. }
+            | ServerEvent::WorkbenchChanged { .. } => false,
         }
     }
 }
@@ -341,6 +349,7 @@ async fn dispatch_request(
                 project_setup_supported: true,
                 image_preview_supported: cfg!(unix),
                 paste_supported: true,
+                workbench_supported: true,
                 home_dir: std::env::home_dir(),
             })
         }
@@ -564,6 +573,7 @@ async fn dispatch_request(
             f.active = false;
             f.pane_ids = None;
             f.project_setup_events = false;
+            f.workbench = None;
             Ok(ResponsePayload::Ok)
         }
         ClientMessage::RunWorkspaceAction {
@@ -575,6 +585,141 @@ async fn dispatch_request(
                 .await?;
             Ok(ResponsePayload::Ok)
         }
+        ClientMessage::GetWorkbench { workspace_id } => Ok(ResponsePayload::Workbench(
+            registry.workbench(workspace_id).await?,
+        )),
+        ClientMessage::WatchWorkbench { workspace_id } => {
+            filter.write().await.workbench = Some(workspace_id);
+            Ok(ResponsePayload::Workbench(
+                registry.workbench(workspace_id).await?,
+            ))
+        }
+        ClientMessage::UpdateWorkbench {
+            workspace_id,
+            revision,
+            document,
+        } => {
+            let result = registry
+                .update_workbench(workspace_id, Some(revision), document)
+                .await?;
+            Ok(workbench_response(result))
+        }
+        ClientMessage::SeedLegacyWorkbench {
+            workspace_id,
+            document,
+        } => {
+            let result = registry
+                .update_workbench(workspace_id, None, document)
+                .await?;
+            Ok(workbench_response(result))
+        }
+        ClientMessage::ListWidgetTemplates => Ok(ResponsePayload::WidgetLibrary(
+            registry.workbench_store.library().await?,
+        )),
+        ClientMessage::UpdateWidgetTemplates {
+            revision,
+            templates,
+        } => {
+            use crate::workbench::store::Change;
+            Ok(
+                match registry
+                    .workbench_store
+                    .update_library(revision, templates)
+                    .await?
+                {
+                    Change::Applied(library) => ResponsePayload::WidgetLibrary(library),
+                    Change::Conflict(library) => ResponsePayload::WidgetLibraryConflict(library),
+                },
+            )
+        }
+        ClientMessage::PreviewWorkspaceImport {
+            workspace_id,
+            source,
+            linked,
+        } => Ok(ResponsePayload::WorkspaceImportPreview(
+            registry
+                .preview_workspace_import(workspace_id, source, linked)
+                .await?,
+        )),
+        ClientMessage::ApplyWorkspaceImport {
+            workspace_id,
+            revision,
+            incoming,
+            linked,
+            resolutions,
+        } => Ok(workbench_response(
+            registry
+                .apply_workspace_import(workspace_id, revision, incoming, linked, resolutions)
+                .await?,
+        )),
+        ClientMessage::ExportWorkspace { workspace_id } => Ok(ResponsePayload::WorkbenchToml(
+            registry.export_workbench(workspace_id).await?,
+        )),
+        ClientMessage::PreviewWorkspaceCreation {
+            root_dir,
+            source,
+            linked,
+        } => Ok(ResponsePayload::WorkspaceCreationPreview(
+            registry
+                .preview_workspace_creation(root_dir, source, linked)
+                .await?,
+        )),
+        ClientMessage::ApplyWorkspaceCreation { preview } => Ok(ResponsePayload::WorkbenchCreated(
+            registry.apply_workspace_creation(preview).await?,
+        )),
+        ClientMessage::CheckWorkspaceRepo { workspace_id } => {
+            Ok(ResponsePayload::WorkspaceRepoStatus(
+                registry.workspace_repo_status(workspace_id).await?,
+            ))
+        }
+        ClientMessage::DecodeWidgetTemplate { text } => {
+            let document = crate::workbench::documents::parse_template(&text)
+                .map_err(|error| ProtoError::InvalidRequest(error.to_string()))?;
+            Ok(ResponsePayload::WidgetTemplate(document.template))
+        }
+        ClientMessage::EncodeWidgetTemplate { template } => {
+            use daedalus_proto::workbench::{TemplateDocument, WORKSPACE_FORMAT_VERSION};
+            let text = crate::workbench::documents::serialize_template(&TemplateDocument {
+                version: WORKSPACE_FORMAT_VERSION,
+                template,
+            })
+            .map_err(|error| ProtoError::InvalidRequest(error.to_string()))?;
+            Ok(ResponsePayload::WorkbenchToml(text))
+        }
+        ClientMessage::PreviewWidget {
+            workspace_id,
+            name,
+            definition,
+        } => Ok(ResponsePayload::WidgetResult(
+            registry
+                .preview_widget(workspace_id, name, definition)
+                .await?,
+        )),
+        ClientMessage::GetWidgetResults {
+            workspace_id,
+            refresh,
+        } => Ok(ResponsePayload::WidgetResults(
+            registry.widget_results(workspace_id, refresh).await?,
+        )),
+        ClientMessage::InvokeWidgetAction {
+            workspace_id,
+            widget,
+            action,
+        } => Ok(ResponsePayload::WidgetAction(
+            registry
+                .invoke_widget_action(workspace_id, &widget, &action)
+                .await?,
+        )),
+    }
+}
+
+fn workbench_response(
+    result: crate::workbench::store::Change<daedalus_proto::workbench::WorkbenchState>,
+) -> ResponsePayload {
+    use crate::workbench::store::Change;
+    match result {
+        Change::Applied(state) => ResponsePayload::Workbench(state),
+        Change::Conflict(state) => ResponsePayload::WorkbenchConflict(state),
     }
 }
 
@@ -737,6 +882,7 @@ mod tests {
                 active: true,
                 pane_ids,
                 project_setup_events: false,
+                workbench: None,
             };
             assert!(!filter.matches(&event));
             filter.project_setup_events = true;

@@ -988,6 +988,7 @@ async fn queued_terminal_input_stays_with_its_connection() {
                     project_setup_supported: false,
                     image_preview_supported: false,
                     paste_supported: false,
+                    workbench_supported: false,
                     home_dir: None,
                 },
                 _ => ResponsePayload::Ok,

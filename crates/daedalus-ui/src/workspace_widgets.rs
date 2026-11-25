@@ -8,6 +8,10 @@ use tracing::warn;
 pub struct WorkspaceWidgets {
     pub service: WidgetConfig,
     pub runner: WidgetConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner_enabled: Option<bool>,
 }
 
 impl WorkspaceWidgets {
@@ -16,6 +20,36 @@ impl WorkspaceWidgets {
             PaneRole::Service => Some(&self.service),
             PaneRole::Runner => Some(&self.runner),
             _ => None,
+        }
+    }
+
+    pub(crate) fn includes(&self, role: PaneRole, automatic: bool) -> bool {
+        match role {
+            PaneRole::Service => self.service_enabled.unwrap_or(automatic),
+            PaneRole::Runner => self.runner_enabled.unwrap_or(automatic),
+            PaneRole::Agent => false,
+        }
+    }
+}
+
+impl From<WorkspaceWidgets> for daedalus_proto::workbench::PaneWidgets {
+    fn from(widgets: WorkspaceWidgets) -> Self {
+        Self {
+            service: widgets.service,
+            runner: widgets.runner,
+            service_enabled: widgets.service_enabled,
+            runner_enabled: widgets.runner_enabled,
+        }
+    }
+}
+
+impl From<daedalus_proto::workbench::PaneWidgets> for WorkspaceWidgets {
+    fn from(widgets: daedalus_proto::workbench::PaneWidgets) -> Self {
+        Self {
+            service: widgets.service,
+            runner: widgets.runner,
+            service_enabled: widgets.service_enabled,
+            runner_enabled: widgets.runner_enabled,
         }
     }
 }

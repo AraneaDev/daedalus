@@ -50,7 +50,25 @@ impl DaedalusApp {
             cell: (cell_w, cell_h),
         } = metrics;
         let footer_height = daedalus_ui::layout::CARGO_BAR_LOGICAL_HEIGHT * scale_factor;
-        let show_footer = self.state.show_cargo_bar() && size.height as f32 >= footer_height * 5.;
+        let widgets: Vec<_> = self
+            .state
+            .workbench
+            .as_ref()
+            .filter(|(id, state)| self.state.active_workspace_id == Some(*id) && state.revision > 0)
+            .map(|(_, state)| {
+                state
+                    .document
+                    .widgets
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, widget)| widget.pinned)
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cargo = self.state.show_cargo_bar();
+        let show_footer =
+            (cargo || !widgets.is_empty()) && size.height as f32 >= footer_height * 5.;
         let height = size.height as f32 - if show_footer { footer_height } else { 0. };
         let mut layout = compute_split_layout(
             &LayoutInput {
@@ -68,12 +86,48 @@ impl DaedalusApp {
             &self.pointer.splits,
         );
         if show_footer {
-            layout.cargo_bar = Some(daedalus_ui::layout::Rect::new(
-                0.,
-                height,
-                size.width as f32,
-                footer_height,
-            ));
+            let bar = daedalus_ui::layout::Rect::new(0., height, size.width as f32, footer_height);
+            if cargo {
+                layout.cargo_bar = Some(bar);
+            }
+            if !widgets.is_empty() {
+                layout.widget_bar = Some(bar);
+                let padding = 5. * scale_factor;
+                let start = layout
+                    .cargo_buttons(scale_factor)
+                    .last()
+                    .map_or(padding, |(_, rect)| rect.right() + padding);
+                let room = (bar.right() - start - padding).max(0.);
+                let minimum = 110. * scale_factor;
+                let max = ((room + padding) / (minimum + padding)) as usize;
+                if max > 0 {
+                    let visible = if widgets.len() > max {
+                        max.saturating_sub(1)
+                    } else {
+                        widgets.len()
+                    };
+                    let count = visible + usize::from(widgets.len() > visible);
+                    let width = ((room - (count as f32 - 1.) * padding) / count as f32)
+                        .min(190. * scale_factor);
+                    for (position, index) in widgets
+                        .into_iter()
+                        .take(visible)
+                        .map(Some)
+                        .chain((visible < count).then_some(None))
+                        .enumerate()
+                    {
+                        layout.widget_buttons.push((
+                            index,
+                            daedalus_ui::layout::Rect::new(
+                                start + position as f32 * (width + padding),
+                                bar.y + padding,
+                                width,
+                                bar.height - padding * 2.,
+                            ),
+                        ));
+                    }
+                }
+            }
         }
         layout
     }
@@ -84,7 +138,7 @@ impl DaedalusApp {
         if self.state.zoomed {
             let roles: Vec<_> = [PaneRole::Service, PaneRole::Runner]
                 .into_iter()
-                .filter(|&role| self.state.pane_for_role(role).is_some())
+                .filter(|&role| self.state.widget_present(role))
                 .collect();
             layout.reserve_insights(&roles, scale_factor, metrics.cell.1);
         }

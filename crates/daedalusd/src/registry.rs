@@ -1,6 +1,9 @@
 mod persistence;
 mod projects;
 mod status;
+mod widget_runtime;
+mod workbench_config;
+mod workbench_import;
 
 use crate::isolation;
 use crate::journal::Journal;
@@ -10,6 +13,7 @@ use crate::persistence::{PersistedRecentProject, PersistedWorkspace, StateStore}
 use crate::runtime_monitor::WorkspaceMonitorTarget;
 use crate::shell_integration::ShellIntegration;
 use crate::supervisor::{IsolationMode, Supervisor};
+use crate::workbench::store::WorkbenchStore;
 use crate::worktree::{self, WorktreeError};
 use daedalus_proto::{
     AgentState, Assignment, ContainerHealth, ExternalStatus, FailureTrace, GitWorkspaceStatus,
@@ -213,6 +217,8 @@ pub struct Registry {
     shell_integration: ShellIntegration,
     event_tx: broadcast::Sender<ServerEvent>,
     state_store: Option<StateStore>,
+    pub(crate) workbench_store: WorkbenchStore,
+    widget_commands: crate::workbench::scheduler::WidgetCommands,
     persist_lock: Arc<Mutex<persistence::PersistenceWriteState>>,
     unresolved_legacy_roots: RwLock<Vec<PersistedWorkspace>>,
     create_lock: Mutex<()>,
@@ -238,12 +244,18 @@ impl Registry {
         event_tx: broadcast::Sender<ServerEvent>,
         state_store: Option<StateStore>,
     ) -> Self {
+        let workbench_directory = state_store
+            .as_ref()
+            .and_then(|store| store.path().parent())
+            .map(|parent| parent.join("workbench"));
         Self {
             journal_epoch: WorkspaceId::new(),
             supervisor,
             shell_integration,
             event_tx,
             state_store,
+            workbench_store: WorkbenchStore::new(workbench_directory),
+            widget_commands: Default::default(),
             persist_lock: Arc::new(Mutex::new(persistence::PersistenceWriteState::Unchecked)),
             unresolved_legacy_roots: RwLock::new(Vec::new()),
             create_lock: Mutex::new(()),
@@ -514,6 +526,23 @@ impl Registry {
             .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
         if matches!(&ws.default_panes, DefaultPanes::Pending(done) if !done.contains(&role)) {
             drop(workspaces);
+            let workbench = self.workbench(workspace_id).await?;
+            let command = if workbench.revision > 0 {
+                let saved = workbench
+                    .document
+                    .assignments
+                    .into_iter()
+                    .find(|entry| entry.role == role)
+                    .map(|entry| entry.argv);
+                if role == PaneRole::Agent && saved.as_deref().is_some_and(|argv| argv == ["shell"])
+                {
+                    None
+                } else {
+                    saved.or(command)
+                }
+            } else {
+                command
+            };
             return self
                 .install_pane(
                     workspace_id,

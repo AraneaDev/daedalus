@@ -37,6 +37,7 @@ fn pong(supported: bool) -> ResponsePayload {
         project_setup_supported: supported,
         image_preview_supported: supported,
         paste_supported: supported,
+        workbench_supported: false,
         home_dir: supported.then(|| PathBuf::from("/home/test")),
     }
 }

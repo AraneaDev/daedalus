@@ -153,6 +153,9 @@ pub struct AppState {
     pub workspace_form: crate::workspace_form::WorkspaceForm,
     pub settings: crate::settings::SettingsDialog,
     pub workspace_widgets: HashMap<WorkspaceId, crate::workspace_widgets::WorkspaceWidgets>,
+    pub workbench: Option<(WorkspaceId, daedalus_proto::workbench::WorkbenchState)>,
+    pub widget_results: Vec<daedalus_proto::workbench::WidgetSnapshot>,
+    pub workbench_repo_update: bool,
     pub recap: crate::recap::Recap,
     pub test_workspaces: HashSet<WorkspaceId>,
     pub reduced_motion: bool,
@@ -239,6 +242,9 @@ impl AppState {
             workspace_form: Default::default(),
             settings: Default::default(),
             workspace_widgets: HashMap::new(),
+            workbench: None,
+            widget_results: Vec::new(),
+            workbench_repo_update: false,
             recap: Default::default(),
             test_workspaces: HashSet::new(),
             reduced_motion: false,
@@ -1034,7 +1040,7 @@ impl AppState {
                 }
                 None
             }
-            ServerEvent::ProjectSetupChanged { .. } => None,
+            ServerEvent::ProjectSetupChanged { .. } | ServerEvent::WorkbenchChanged { .. } => None,
         }
     }
 

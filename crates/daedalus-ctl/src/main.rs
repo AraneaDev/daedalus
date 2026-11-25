@@ -33,12 +33,32 @@ struct Cli {
     command: Commands,
 }
 
+#[cfg(test)]
+#[test]
+fn accepts_workspace_update_and_widget_creation() {
+    Cli::try_parse_from([
+        "daedalus-ctl",
+        "workspace",
+        "update",
+        "--dir",
+        ".",
+        "--dry-run",
+        "--json",
+    ])
+    .unwrap();
+    Cli::try_parse_from(["daedalus-ctl", "widget", "create", "branch", "--file", "-"]).unwrap();
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     Ping,
     Workspace {
         #[command(subcommand)]
         action: WorkspaceAction,
+    },
+    Widget {
+        #[command(subcommand)]
+        action: commands::widget::Action,
     },
     Worktree {
         #[command(subcommand)]
@@ -119,6 +139,14 @@ enum WorkspaceAction {
     List,
     /// List recently used projects, newest first
     Recent,
+    /// Inspect the current workbench configuration.
+    Configure(commands::workspace_config::Configure),
+    /// Preview or apply a portable workspace document.
+    Import(commands::workspace_config::Import),
+    /// Export the workspace and its embedded widget templates.
+    Export(commands::workspace_config::Export),
+    /// Preview or apply the shared configuration from the checkout.
+    Update(commands::workspace_config::Update),
     Close {
         id: Uuid,
         #[arg(long)]
@@ -497,6 +525,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => return Err(unexpected_response(other)),
         },
         Commands::Workspace { action } => match action {
+            WorkspaceAction::Configure(args) => args.run(&mut client).await?,
+            WorkspaceAction::Import(args) => args.run(&mut client).await?,
+            WorkspaceAction::Export(args) => args.run(&mut client).await?,
+            WorkspaceAction::Update(args) => args.run(&mut client).await?,
             WorkspaceAction::Create { name, dir, env } => {
                 let root_dir = resolve_dir(Some(dir))?;
                 let env_map = parse_env_pairs(&env)?;
@@ -585,6 +617,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("closed {id}");
             }
         },
+        Commands::Widget { action } => action.run(&mut client).await?,
         Commands::Worktree { action } => match action {
             WorktreeAction::List { dir } => {
                 let repo_dir = resolve_dir(dir)?;

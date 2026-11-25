@@ -13,6 +13,130 @@ struct Workbench {
 }
 
 #[test]
+fn widget_editor_builds_previews_and_saves_a_daemon_definition() {
+    use daedalus_proto::workbench::{WidgetSource, WorkbenchState, WorkspaceDocument};
+    use daedalus_proto::{ClientMessage, ResponsePayload};
+    use daedalus_ui::settings::Control;
+
+    let mut workbench = Workbench::new();
+    let workspace = workspace("Widget editor");
+    let id = workspace.id;
+    let agent = workspace.panes[0].id;
+    workbench.app.state.set_workspaces(vec![workspace]);
+    workbench.app.workbench_capable = true;
+    workbench.app.open_workspace_settings();
+    let state = WorkbenchState {
+        revision: 2,
+        document: WorkspaceDocument::new("Widget editor".into()),
+        repo_baseline: None,
+    };
+    workbench
+        .app
+        .workbench_response(id, false, Ok(ResponsePayload::Workbench(state)));
+    while workbench.commands.try_recv().is_ok() {}
+    let settings = &mut workbench.app.state.settings;
+    settings.activate(Control::CustomWidgetsPage);
+    settings.activate(Control::CustomNew);
+    settings.set_value(Control::CustomName, "API health");
+    settings.set_value(Control::CustomExecutable, "printf");
+    settings.set_value(Control::CustomArguments, r#"["ready"]"#);
+    settings.set_value(Control::CustomInterval, "5");
+    settings.activate(Control::CustomOutput);
+    settings.set_value(Control::CustomSummary, "main:text");
+    let preview = settings.activate(Control::CustomPreview);
+    workbench.app.handle_settings_action(preview);
+    let UiCommand::Workbench { request, .. } = workbench.commands.try_recv().unwrap() else {
+        panic!("expected a daemon preview")
+    };
+    assert!(
+        matches!(*request, ClientMessage::PreviewWidget { definition, .. }
+        if matches!(&definition.sources[0].source, WidgetSource::Command { command, refresh, .. }
+            if command.argv == ["printf", "ready"] && refresh.interval_seconds == Some(5)))
+    );
+    let save = workbench.app.state.settings.activate(Control::CustomSave);
+    workbench.app.handle_settings_action(save);
+    let UiCommand::Workbench { request, .. } = workbench.commands.try_recv().unwrap() else {
+        panic!("expected a daemon save")
+    };
+    assert!(
+        matches!(*request, ClientMessage::UpdateWorkbench { revision: 2, document, .. }
+        if document.widgets.len() == 1 && document.widgets[0].name == "API health")
+    );
+    assert_eq!(
+        workbench.app.state.pane_id_for_role(PaneRole::Agent),
+        Some(agent)
+    );
+}
+
+#[test]
+fn widget_lifecycle_creates_a_slot_and_removal_keeps_its_terminal() {
+    use daedalus_ui::settings::Control;
+
+    let mut workbench = Workbench::new();
+    let mut workspace = workspace("Widget lifecycle");
+    let service = workspace.panes.remove(1);
+    let id = workspace.id;
+    workbench.app.state.set_workspaces(vec![workspace]);
+    workbench.app.open_workspace_settings();
+    let settings = &mut workbench.app.state.settings;
+    settings.activate(Control::WidgetsPage);
+    let add = settings
+        .control_order()
+        .find(|&control| settings.label(control) == "+ Add service widget")
+        .expect("missing service widget offers creation");
+    settings.activate(add);
+    settings.set_value(Control::ServiceLabel, "Health API");
+    let action = settings.activate(Control::Save);
+    workbench.app.handle_settings_action(action);
+    assert_eq!(
+        workbench
+            .app
+            .state
+            .widget_label(PaneRole::Service)
+            .as_deref(),
+        Some("Health API · No terminal")
+    );
+
+    workbench.app.state.register_pane(service.clone(), None);
+    let settings = &mut workbench.app.state.settings;
+    let remove = settings
+        .control_order()
+        .find(|&control| settings.label(control) == "Remove service widget")
+        .expect("configured widget offers removal");
+    settings.activate(remove);
+    let action = settings.activate(Control::Save);
+    workbench.app.handle_settings_action(action);
+    assert!(
+        workbench
+            .app
+            .state
+            .widget_label(PaneRole::Service)
+            .is_none()
+    );
+    assert_eq!(
+        workbench.app.state.pane_id_for_role(PaneRole::Service),
+        Some(service.id)
+    );
+
+    workbench.app.state.workspace_widgets =
+        daedalus_ui::workspace_widgets::load_all(&workbench.app.widget_directory);
+    assert!(
+        workbench
+            .app
+            .state
+            .widget_label(PaneRole::Service)
+            .is_none()
+    );
+    assert!(
+        workbench.app.state.workspace_widgets[&id]
+            .service
+            .label
+            .is_none()
+    );
+    assert!(workbench.idle());
+}
+
+#[test]
 fn widget_page_updates_the_current_workspace_and_saves_per_profile() {
     use daedalus_ui::settings::Control;
 
