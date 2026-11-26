@@ -61,7 +61,8 @@ fn process_start_time(pid: u32) -> Option<u128> {
         System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
     };
 
-    // The handle is opened for metadata only and closed on every result path.
+    // SAFETY: A non-null handle from OpenProcess is owned here and closed after the query.
+    // GetProcessTimes receives four distinct, writable FILETIME values that live through the call.
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if process.is_null() {
