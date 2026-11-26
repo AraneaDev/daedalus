@@ -140,7 +140,8 @@ struct DaedalusApp {
     workbench_capable: bool,
     watched_workbench: Option<WorkspaceId>,
     layout_saves: std::collections::HashMap<WorkspaceId, workspace_sharing::LayoutSave>,
-    seeded_workbench: std::collections::HashSet<WorkspaceId>,
+    layout_workspace: Option<WorkspaceId>,
+    seeding_workbench: std::collections::HashSet<WorkspaceId>,
     widget_refresh_at: Option<Instant>,
     daemon_home: Option<PathBuf>,
     setup: setup::SetupFlow,
@@ -209,7 +210,8 @@ impl DaedalusApp {
             workbench_capable: false,
             watched_workbench: None,
             layout_saves: Default::default(),
-            seeded_workbench: Default::default(),
+            layout_workspace: None,
+            seeding_workbench: Default::default(),
             widget_refresh_at: None,
             daemon_home: None,
             setup: Default::default(),
@@ -434,6 +436,7 @@ impl DaedalusApp {
             return;
         }
         self.state.select_workspace(id);
+        self.prepare_active_workbench_layout();
         self.state.close_search();
         self.ensure_active_workspace_panes();
         self.reveal_active_workspace();
@@ -590,6 +593,7 @@ impl DaedalusApp {
                 self.request_redraw();
             }
             UiAction::ToggleZoom => {
+                self.prepare_active_workbench_layout();
                 self.state.zoomed = !self.state.zoomed;
                 self.save_workbench_layout();
                 self.schedule_resize_flush();

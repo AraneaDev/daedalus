@@ -301,10 +301,26 @@ async fn repo_updates_require_a_choice_before_replacing_concurrent_local_edits()
         .await;
 
     let imports = ["workspace", "import", "--repo"];
-    // Link a base that provides a named widget, then edit its name on both sides.
+    // Link a base with two widgets, then edit their names on both sides.
     app.run(
         &[
             &["widget", "create", "branch", "--template", "git-worktree"][..],
+            &suffix,
+        ]
+        .concat(),
+    )
+    .await;
+    app.run(
+        &[
+            &[
+                "widget",
+                "create",
+                "other",
+                "--template",
+                "git-worktree",
+                "--name",
+                "Base other",
+            ][..],
             &suffix,
         ]
         .concat(),
@@ -328,16 +344,57 @@ async fn repo_updates_require_a_choice_before_replacing_concurrent_local_edits()
         .concat(),
     )
     .await;
-    std::fs::write(
-        &config,
-        contents.replace("name = \"Git Worktree\"", "name = \"Incoming branch\""),
+    app.run(
+        &[
+            &["widget", "edit", "other", "--name", "Local other"][..],
+            &suffix,
+        ]
+        .concat(),
     )
-    .unwrap();
+    .await;
+    let remote = contents
+        .replace("name = \"Git Worktree\"", "name = \"Incoming branch\"")
+        .replace("name = \"Base other\"", "name = \"Incoming other\"");
+    std::fs::write(&config, &remote).unwrap();
     let update = ["workspace", "update"];
     let dry_run = app
         .run(&[&update[..], &suffix, &["--dry-run"]].concat())
         .await;
     assert!(dry_run.contains("Conflict at /widgets/branch/name"));
+    let configure = [&["workspace", "configure", "--json"][..], &suffix].concat();
+    let before = app.run(&configure).await;
+    let partial = [
+        &update[..],
+        &suffix,
+        &["--resolve", "/widgets/branch/name=incoming"],
+    ]
+    .concat();
+    let partial_preview: serde_json::Value = serde_json::from_str(
+        &app.run(&[partial.as_slice(), &["--dry-run", "--json"]].concat())
+            .await,
+    )
+    .unwrap();
+    assert_eq!(
+        partial_preview["proposed"]["widgets"][0]["name"],
+        "Incoming branch"
+    );
+    assert_eq!(partial_preview["conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        partial_preview["conflicts"][0]["path"],
+        "/widgets/other/name"
+    );
+    let resolved = [
+        partial.as_slice(),
+        &["--resolve", "/widgets/other/name=local"],
+    ]
+    .concat();
+    let resolved_preview: serde_json::Value = serde_json::from_str(
+        &app.run(&[resolved.as_slice(), &["--dry-run", "--json"]].concat())
+            .await,
+    )
+    .unwrap();
+    assert_eq!(resolved_preview["conflicts"], serde_json::json!([]));
+    assert_eq!(app.run(&configure).await, before);
     let blocked = app
         .reject(
             &[&update[..], &suffix, &["--json"]].concat(),
@@ -360,23 +417,12 @@ async fn repo_updates_require_a_choice_before_replacing_concurrent_local_edits()
         "Choose local or incoming",
     )
     .await;
-    app.run(
-        &[
-            &update[..],
-            &suffix,
-            &["--resolve", "/widgets/branch/name=local"],
-        ]
-        .concat(),
-    )
-    .await;
-    assert!(
-        app.run(&[&["workspace", "configure"][..], &suffix].concat())
-            .await
-            .contains("Local branch")
-    );
+    app.run(&resolved).await;
+    let applied: serde_json::Value = serde_json::from_str(&app.run(&configure).await).unwrap();
+    assert_eq!(applied["document"], resolved_preview["proposed"]);
     std::fs::write(
         &config,
-        contents.replace("name = \"Git Worktree\"", "name = \"Another incoming\""),
+        remote.replace("name = \"Incoming branch\"", "name = \"Another incoming\""),
     )
     .unwrap();
     app.run(

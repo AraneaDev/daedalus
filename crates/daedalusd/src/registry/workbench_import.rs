@@ -64,6 +64,7 @@ impl Registry {
                 preview.root_dir,
                 Default::default(),
                 false,
+                None,
             )
             .await?;
         let link = if preview.linked {

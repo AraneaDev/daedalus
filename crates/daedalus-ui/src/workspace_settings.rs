@@ -193,6 +193,7 @@ impl DaedalusApp {
                     workspace_id: id,
                     revision,
                     document,
+                    layout_only: false,
                 },
             ) {
                 self.state.settings.finish_pane_widget_save(id, token);
@@ -211,7 +212,6 @@ impl DaedalusApp {
     }
 
     pub(super) fn pane_widget_save_disconnected(&mut self) {
-        self.seeded_workbench.clear();
         self.state.settings.fail_pane_widget_save();
     }
 

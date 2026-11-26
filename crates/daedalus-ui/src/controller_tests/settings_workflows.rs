@@ -928,9 +928,16 @@ fn widget_detail_pages_hold_action_output_until_explicit_refresh() {
     );
 
     apply_control(&mut w, Control::CustomViewAction(0));
-    assert!(matches!(w.command(), UiCommand::Workbench { request, .. }
-        if matches!(request.as_ref(), ClientMessage::InvokeWidgetAction { widget, action, .. }
-            if widget == "runner" && action == "terminal")));
+    let UiCommand::Workbench {
+        operation, request, ..
+    } = w.command()
+    else {
+        panic!("expected a widget action")
+    };
+    assert!(
+        matches!(request.as_ref(), ClientMessage::InvokeWidgetAction { widget, action, .. }
+        if widget == "runner" && action == "terminal")
+    );
     let action_output = WidgetResult {
         label: "Detailed output".into(),
         level: StatusLevel::Info,
@@ -939,7 +946,7 @@ fn widget_detail_pages_hold_action_output_until_explicit_refresh() {
     daemon_workbench_reply(
         &mut w,
         id,
-        WorkbenchOperation::Read,
+        operation.clone(),
         Ok(ResponsePayload::WidgetAction(WidgetActionResult::Output(
             action_output.clone(),
         ))),
@@ -955,7 +962,7 @@ fn widget_detail_pages_hold_action_output_until_explicit_refresh() {
     daemon_workbench_reply(
         &mut w,
         id,
-        WorkbenchOperation::Read,
+        operation,
         Ok(ResponsePayload::WidgetAction(WidgetActionResult::Pane(
             agent,
         ))),
@@ -1375,6 +1382,7 @@ fn next_layout_save(w: &Workbench, id: WorkspaceId) -> (WorkbenchOperation, u64,
                 workspace_id,
                 revision,
                 document,
+                layout_only: true,
             } = *request
             else {
                 return None;
@@ -1391,6 +1399,153 @@ fn next_layout_save(w: &Workbench, id: WorkspaceId) -> (WorkbenchOperation, u64,
             ))
         })
         .expect("expected layout save")
+}
+
+#[test]
+fn first_split_waits_for_the_revision_zero_snapshot_and_survives_reconnect() {
+    let ws = workspace("Fresh layout");
+    let id = ws.id;
+    let mut w = modern_client(ws);
+    w.app.handle_ui_action(UiAction::ToggleZoom);
+    assert!(!w.app.state.zoomed);
+    assert!(w.commands.try_iter().any(|command| matches!(command,
+        UiCommand::Workbench { request, .. }
+            if matches!(*request, ClientMessage::GetWorkbench { workspace_id } if workspace_id == id)
+    )));
+
+    let mut initial = workbench_snapshot(0);
+    initial.document.pane_widgets = snapshot_with_runner_label(0, "Project default")
+        .document
+        .pane_widgets;
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(initial.clone())),
+    );
+    let (operation, revision, saved) = next_layout_save(&w, id);
+    assert_eq!(revision, 0);
+    assert!(saved.document.layout.split_view);
+    assert_eq!(saved.document.pane_widgets, initial.document.pane_widgets);
+    assert_eq!(saved.document.assignments, initial.document.assignments);
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        operation,
+        Ok(ResponsePayload::Workbench(saved.clone())),
+    );
+    w.app.handle_daemon_event(UiEvent::Disconnected);
+    w.app.handle_daemon_event(UiEvent::Connected);
+    w.app.state.zoomed = true;
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(saved)),
+    );
+    assert!(!w.app.state.zoomed);
+    assert!(!w.app.layout_saves.contains_key(&id));
+}
+
+#[test]
+fn first_layout_rebases_after_a_retried_legacy_widget_seed() {
+    let ws = workspace("Legacy layout");
+    let id = ws.id;
+    let mut w = modern_client(ws);
+    w.commands.try_iter().for_each(drop);
+    let mut legacy = WorkspaceWidgets::default();
+    legacy.runner.label = Some("Legacy runner".into());
+    workspace_widgets::save(&w.app.widget_directory, id, &legacy).unwrap();
+    let initial = workbench_snapshot(0);
+    let mut migrated = None;
+    for attempt in 0..2 {
+        daemon_workbench_reply(
+            &mut w,
+            id,
+            WorkbenchOperation::Read,
+            Ok(ResponsePayload::Workbench(initial.clone())),
+        );
+        let UiCommand::Workbench {
+            operation: WorkbenchOperation::Migration,
+            request,
+            ..
+        } = w.command()
+        else {
+            panic!("expected a widget seed")
+        };
+        let ClientMessage::SeedLegacyWorkbench { document, .. } = *request else {
+            panic!("expected a seed document");
+        };
+        assert!(!document.layout.split_view);
+        assert_eq!(document.pane_widgets, Some(legacy.clone().into()));
+        assert!(w.idle());
+        if attempt == 0 {
+            w.app.handle_ui_action(UiAction::ToggleZoom);
+            assert!(w.idle());
+            daemon_workbench_reply(
+                &mut w,
+                id,
+                WorkbenchOperation::Migration,
+                Err("Transient write failure".into()),
+            );
+        }
+        migrated = Some(WorkbenchState {
+            revision: 1,
+            document,
+            repo_baseline: None,
+        });
+    }
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Migration,
+        Ok(ResponsePayload::Workbench(migrated.unwrap())),
+    );
+    let (_, revision, saved) = next_layout_save(&w, id);
+    assert_eq!(revision, 1);
+    assert!(saved.document.layout.split_view);
+    assert_eq!(saved.document.pane_widgets, Some(legacy.into()));
+}
+
+#[test]
+fn a_split_toggle_while_switching_keeps_the_destination_dividers() {
+    let first = workspace("First layout");
+    let second = workspace("Second layout");
+    let id = second.id;
+    let mut w = modern_client(first.clone());
+    w.commands.try_iter().for_each(drop);
+    w.app.state.set_workspaces(vec![first.clone(), second]);
+    let mut source = workbench_snapshot(1);
+    source.document.layout.split_view = true;
+    source.document.layout.splits.insert("column".into(), 680);
+    daemon_workbench_reply(
+        &mut w,
+        first.id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(source)),
+    );
+    assert!(!w.app.state.zoomed);
+
+    w.app.activate_workspace(id);
+    assert!(w.app.state.zoomed);
+    w.app.handle_ui_action(UiAction::ToggleZoom);
+    w.commands.try_iter().for_each(drop);
+    let mut destination = workbench_snapshot(3);
+    destination
+        .document
+        .layout
+        .splits
+        .insert("column".into(), 450);
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(destination)),
+    );
+    let (_, revision, saved) = next_layout_save(&w, id);
+    assert_eq!(revision, 3);
+    assert!(saved.document.layout.split_view);
+    assert_eq!(saved.document.layout.splits["column"], 450);
 }
 
 #[test]

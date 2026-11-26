@@ -84,6 +84,7 @@ async fn workbench_configuration_survives_reconnect_and_rejects_a_stale_write() 
                 workspace_id: id,
                 revision: state.revision,
                 document,
+                layout_only: false,
             };
             assert!(
                 matches!(send_rpc(&mut client, 3, update.clone()).await, ResponsePayload::Workbench(state) if state.revision == 1)
@@ -4101,10 +4102,14 @@ async fn workbench_watch_tracks_only_the_selected_workspace_and_rejects_invalid_
                 ResponsePayload::Workbench(state) if state.revision == revision
             ));
             for (workspace_id, name) in [workspaces[1 - watched_idx], workspaces[watched_idx]] {
+                let update = ClientMessage::UpdateWorkbench {
+                    workspace_id,
+                    revision,
+                    document: WorkspaceDocument::new(name.into()),
+                    layout_only: false,
+                };
                 assert!(matches!(
-                    send_rpc(&mut writer, 4, ClientMessage::UpdateWorkbench {
-                        workspace_id, revision, document: WorkspaceDocument::new(name.into())
-                    }).await,
+                    send_rpc(&mut writer, 4, update).await,
                     ResponsePayload::Workbench(state) if state.revision == revision + 1
                 ));
             }

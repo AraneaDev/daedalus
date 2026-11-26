@@ -209,7 +209,7 @@ async fn import(
     linked: bool,
     options: ApplyOptions,
 ) -> Result<(), ClientError> {
-    let preview = match client
+    let mut preview = match client
         .request(ClientMessage::PreviewWorkspaceImport {
             workspace_id: id,
             source,
@@ -226,6 +226,21 @@ async fn import(
         .iter()
         .any(|conflict| !resolutions.contains_key(&conflict.path));
     if options.dry_run || unresolved {
+        if !resolutions.is_empty() && !preview.conflicts.is_empty() {
+            preview = match client
+                .request(ClientMessage::ResolveWorkspaceImport {
+                    workspace_id: id,
+                    revision: preview.revision,
+                    incoming: preview.incoming,
+                    linked,
+                    resolutions,
+                })
+                .await?
+            {
+                ResponsePayload::WorkspaceImportPreview(preview) => preview,
+                response => return Err(unexpected_response(response)),
+            };
+        }
         if options.json {
             println!("{}", serde_json::to_string_pretty(&preview)?);
         } else {
@@ -287,6 +302,7 @@ pub(super) async fn update(
                 workspace_id: id,
                 revision,
                 document,
+                layout_only: false,
             })
             .await?,
     )

@@ -222,7 +222,7 @@ pub struct Registry {
     state_store: Option<StateStore>,
     pub(crate) workbench_store: WorkbenchStore,
     persist_lock: Arc<Mutex<persistence::PersistenceWriteState>>,
-    unresolved_legacy_roots: RwLock<Vec<PersistedWorkspace>>,
+    deferred_workspaces: RwLock<Vec<PersistedWorkspace>>,
     create_lock: Mutex<()>,
     recent_projects: RwLock<Vec<PersistedRecentProject>>,
     project_setups: Arc<RwLock<HashMap<PathBuf, Vec<Assignment>>>>,
@@ -258,7 +258,7 @@ impl Registry {
             state_store,
             workbench_store: WorkbenchStore::new(workbench_directory),
             persist_lock: Arc::new(Mutex::new(persistence::PersistenceWriteState::Unchecked)),
-            unresolved_legacy_roots: RwLock::new(Vec::new()),
+            deferred_workspaces: RwLock::new(Vec::new()),
             create_lock: Mutex::new(()),
             recent_projects: RwLock::new(Vec::new()),
             project_setups: Arc::new(RwLock::new(HashMap::new())),
@@ -336,13 +336,22 @@ impl Registry {
         env: HashMap<String, String>,
         manual_launch: bool,
     ) -> Result<WorkspaceInfo, ProtoError> {
+        let root_dir =
+            std::path::absolute(root_dir).map_err(|err| ProtoError::IoError(err.to_string()))?;
+        let deferred = self.find_deferred_workspace(&root_dir).await;
         let record = self
-            .prepare_workspace_record(name, root_dir, env, manual_launch)
+            .prepare_workspace_record(name, root_dir, env, manual_launch, deferred)
             .await?;
         Ok(self.publish_workspace(record).await)
     }
 
-    /// Allocates an ID and a slot without exposing the workspace to clients.
+    fn available_slot(used_slots: &HashSet<u16>, preferred: Option<u16>) -> Option<u16> {
+        preferred
+            .filter(|slot| !used_slots.contains(slot))
+            .or_else(|| (0..=u16::MAX).find(|slot| !used_slots.contains(slot)))
+    }
+
+    /// Allocates a slot and prepares runtime settings without exposing the workspace.
     /// The caller holds `create_lock` until it publishes or drops the record.
     async fn prepare_workspace_record(
         &self,
@@ -350,6 +359,7 @@ impl Registry {
         root_dir: PathBuf,
         env: HashMap<String, String>,
         manual_launch: bool,
+        deferred: Option<PersistedWorkspace>,
     ) -> Result<WorkspaceRecord, ProtoError> {
         let root_dir =
             std::path::absolute(root_dir).map_err(|err| ProtoError::IoError(err.to_string()))?;
@@ -362,10 +372,25 @@ impl Registry {
 
         let (slot_index, reserved_ports) = {
             let ws_map = self.workspaces.read().await;
-            let used_slots: HashSet<u16> = ws_map.values().map(|ws| ws.slot_index).collect();
-            let slot_index = (0..=u16::MAX)
-                .find(|slot| !used_slots.contains(slot))
-                .ok_or_else(|| ProtoError::Internal("no workspace slots available".to_string()))?;
+            let pending = self.deferred_workspaces.read().await;
+            let used_slots: HashSet<u16> = ws_map
+                .values()
+                .map(|ws| ws.slot_index)
+                .chain(
+                    pending
+                        .iter()
+                        .filter(|entry| {
+                            entry.root_dir.is_absolute()
+                                && deferred.as_ref().is_none_or(|retry| retry.id != entry.id)
+                        })
+                        .map(|entry| entry.slot_index),
+                )
+                .collect();
+            let slot_index =
+                Self::available_slot(&used_slots, deferred.as_ref().map(|entry| entry.slot_index))
+                    .ok_or_else(|| {
+                        ProtoError::Internal("no workspace slots available".to_string())
+                    })?;
             let reserved_ports: HashSet<u16> = ws_map
                 .values()
                 .flat_map(|ws| ws.reserved_ports.iter().copied())
@@ -373,29 +398,51 @@ impl Registry {
             (slot_index, reserved_ports)
         };
 
-        let name_clone = name.clone();
-        let root_clone = root_dir.clone();
+        let mut entry = deferred.unwrap_or_else(|| PersistedWorkspace {
+            id: WorkspaceId::new(),
+            name,
+            root_dir,
+            slot_index,
+            manual_launch,
+            agent_preset: None,
+        });
+        entry.slot_index = slot_index;
+        Self::prepare_registered_workspace(&entry, env, reserved_ports).await
+    }
+
+    async fn prepare_registered_workspace(
+        entry: &PersistedWorkspace,
+        env: HashMap<String, String>,
+        reserved_ports: HashSet<u16>,
+    ) -> Result<WorkspaceRecord, ProtoError> {
+        let name = entry.name.clone();
+        let root_dir = entry.root_dir.clone();
+        let slot_index = entry.slot_index;
         let prepared = tokio::task::spawn_blocking(move || {
-            prepare_workspace_components(&name_clone, &root_clone, slot_index, env, &reserved_ports)
+            prepare_workspace_components(&name, &root_dir, slot_index, env, &reserved_ports)
         })
         .await
         .map_err(|e| ProtoError::Internal(format!("workspace preparation task failed: {e}")))?
         .map_err(|e| ProtoError::IoError(e.to_string()))?;
 
-        let id = WorkspaceId::new();
         Ok(build_workspace_record(
-            id,
-            name,
-            root_dir,
+            entry.id,
+            entry.name.clone(),
+            entry.root_dir.clone(),
             prepared,
-            manual_launch,
+            entry.manual_launch,
         ))
     }
 
     async fn publish_workspace(&self, record: WorkspaceRecord) -> WorkspaceInfo {
         let info = record.to_info(Vec::new());
         self.record_recent_project(&info.name, &info.root_dir).await;
-        self.workspaces.write().await.insert(info.id, record);
+        {
+            let mut workspaces = self.workspaces.write().await;
+            let mut deferred = self.deferred_workspaces.write().await;
+            workspaces.insert(info.id, record);
+            deferred.retain(|entry| entry.id != info.id);
+        }
         self.notify_membership();
         info
     }
@@ -2216,6 +2263,84 @@ SHARED_KEY = "from_manifest"
             .unwrap();
         assert!(store.load().unwrap().workspaces.contains(&unresolved));
         assert_eq!(registry.list_workspaces().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restore_failure_preserves_registration_for_restart_and_explicit_retry() {
+        for restart in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let root = dir.path().join("project");
+            let other = dir.path().join("other");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::create_dir(&other).unwrap();
+            std::fs::write(
+                root.join(".daedalus.toml"),
+                "[agent]\npreset = \"claude\"\n[env]\nSAVED_SETUP = \"kept\"\n",
+            )
+            .unwrap();
+            let store = StateStore::new(dir.path().join("state.json"));
+            let open_registry = || {
+                Registry::new_with_state_store(
+                    test_supervisor(),
+                    ShellIntegration::prepare(dir.path()).unwrap(),
+                    broadcast::channel(8).0,
+                    Some(store.clone()),
+                )
+            };
+            let original = open_registry()
+                .create_workspace_with_mode("original".into(), root.clone(), HashMap::new(), true)
+                .await
+                .unwrap();
+            let persisted = store.load().unwrap().workspaces.remove(0);
+            std::fs::write(root.join(".env"), [0xff]).unwrap();
+
+            let unavailable = open_registry();
+            assert_eq!(unavailable.restore_persisted_workspaces().await.unwrap(), 0);
+            assert_eq!(
+                store.load().unwrap().workspaces,
+                std::slice::from_ref(&persisted)
+            );
+            assert!(unavailable.list_workspaces().await.is_empty());
+            let other_workspace = unavailable
+                .create_workspace("other".into(), other, HashMap::new())
+                .await
+                .unwrap();
+            assert_ne!(other_workspace.slot_index, original.slot_index);
+            assert!(store.load().unwrap().workspaces.contains(&persisted));
+
+            let alias = root.join("..").join("project");
+            assert!(
+                unavailable
+                    .create_workspace("retry".into(), alias.clone(), HashMap::new())
+                    .await
+                    .is_err()
+            );
+            assert!(store.load().unwrap().workspaces.contains(&persisted));
+            std::fs::write(root.join(".env"), "PORT=21470\n").unwrap();
+
+            let recovered = if restart {
+                let registry = open_registry();
+                assert_eq!(registry.restore_persisted_workspaces().await.unwrap(), 2);
+                registry
+                    .workspace_for_directory(root.clone())
+                    .await
+                    .unwrap()
+            } else {
+                unavailable
+                    .create_workspace("retry".into(), alias, HashMap::new())
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(recovered.id, original.id);
+            assert_eq!(recovered.name, original.name);
+            assert_eq!(recovered.root_dir, original.root_dir);
+            assert_eq!(recovered.slot_index, original.slot_index);
+            assert!(!recovered.needs_default_panes());
+            assert_eq!(recovered.injected_env.get("SAVED_SETUP").unwrap(), "kept");
+            let state = store.load().unwrap();
+            assert_eq!(state.workspaces.len(), 2);
+            assert!(state.workspaces.contains(&persisted));
+        }
     }
 
     #[tokio::test]

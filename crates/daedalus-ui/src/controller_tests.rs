@@ -20,8 +20,10 @@ mod widget_viewport;
 
 #[test]
 fn widget_editor_builds_previews_and_saves_a_daemon_definition() {
-    use daedalus_proto::workbench::{WidgetSource, WorkbenchState, WorkspaceDocument};
-    use daedalus_proto::{ClientMessage, ResponsePayload};
+    use daedalus_proto::workbench::{
+        WidgetAction, WidgetResult, WidgetSource, WorkbenchState, WorkspaceDocument,
+    };
+    use daedalus_proto::{ClientMessage, ResponsePayload, StatusLevel};
     use daedalus_ui::settings::Control;
 
     let mut workbench = Workbench::new();
@@ -51,25 +53,77 @@ fn widget_editor_builds_previews_and_saves_a_daemon_definition() {
     settings.set_value(Control::CustomInterval, "5");
     settings.activate(Control::CustomOutput);
     settings.set_value(Control::CustomSummary, "main:text");
+    let url = "https://example.invalid/health";
+    settings.set_value(Control::CustomUrl, url);
     let preview = settings.activate(Control::CustomPreview);
     workbench.app.handle_settings_action(preview);
-    let UiCommand::Workbench { request, .. } = workbench.commands.try_recv().unwrap() else {
+    let UiCommand::Workbench {
+        request, operation, ..
+    } = workbench.command()
+    else {
         panic!("expected a daemon preview")
     };
-    assert!(
-        matches!(*request, ClientMessage::PreviewWidget { definition, .. }
-        if matches!(&definition.sources[0].source, WidgetSource::Command { command, refresh, .. }
-            if command.argv == ["printf", "ready"] && refresh.interval_seconds == Some(5)))
-    );
-    let save = workbench.app.state.settings.activate(Control::CustomSave);
-    workbench.app.handle_settings_action(save);
-    let UiCommand::Workbench { request, .. } = workbench.commands.try_recv().unwrap() else {
-        panic!("expected a daemon save")
+    let ClientMessage::PreviewWidget { definition, .. } = *request else {
+        panic!("expected a widget definition")
     };
     assert!(
-        matches!(*request, ClientMessage::UpdateWorkbench { revision: 2, document, .. }
-        if document.widgets.len() == 1 && document.widgets[0].name == "API health")
+        matches!(&definition.sources[0].source, WidgetSource::Command { command, refresh, .. }
+            if command.argv == ["printf", "ready"] && refresh.interval_seconds == Some(5))
     );
+    assert_eq!(
+        definition.actions[0].action,
+        WidgetAction::OpenUrl { url: url.into() }
+    );
+    let duplicate = workbench
+        .app
+        .state
+        .settings
+        .activate(Control::CustomPreview);
+    workbench.app.handle_settings_action(duplicate);
+    assert!(workbench.commands.try_recv().is_err());
+    let result = WidgetResult {
+        label: "Ready".into(),
+        level: StatusLevel::Ok,
+        details: vec![],
+    };
+    workbench.app.workbench_response(
+        id,
+        operation,
+        Ok(ResponsePayload::WidgetResult(result.clone())),
+    );
+    assert_eq!(workbench.app.state.settings.custom.preview, Some(result));
+    let save = workbench.app.state.settings.activate(Control::CustomSave);
+    workbench.app.handle_settings_action(save);
+    let UiCommand::Workbench {
+        request, operation, ..
+    } = workbench.command()
+    else {
+        panic!("expected a daemon save")
+    };
+    let ClientMessage::UpdateWorkbench {
+        revision: 2,
+        document,
+        ..
+    } = *request
+    else {
+        panic!("expected a saved workspace")
+    };
+    assert_eq!(document.widgets.len(), 1);
+    assert_eq!(document.widgets[0].name, "API health");
+    assert_eq!(
+        document.widgets[0].definition.as_ref().unwrap().actions,
+        definition.actions
+    );
+    workbench.app.workbench_response(
+        id,
+        operation,
+        Ok(ResponsePayload::Workbench(WorkbenchState {
+            revision: 3,
+            document,
+            repo_baseline: None,
+        })),
+    );
+    assert!(workbench.app.state.settings.custom.draft.is_none());
     assert_eq!(
         workbench.app.state.pane_id_for_role(PaneRole::Agent),
         Some(agent)

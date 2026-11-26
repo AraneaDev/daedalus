@@ -1,4 +1,7 @@
+mod subscription;
 mod workbench;
+
+use subscription::{SubscriberExit, Subscription, forward_subscriber_events};
 
 use crate::external_hook::ExternalHookServer;
 use crate::persistence::StateStore;
@@ -8,15 +11,14 @@ use crate::shell_integration::ShellIntegration;
 use crate::supervisor::Supervisor;
 use daedalus_proto::transport::{IpcListener, IpcStream};
 use daedalus_proto::{
-    ClientMessage, PaneId, ProtoError, Request, ResponsePayload, ServerEvent, ServerMessage,
-    default_events_socket_path, default_state_file_path, read_frame, write_frame,
+    ClientMessage, ProtoError, Request, ResponsePayload, ServerMessage, default_events_socket_path,
+    default_state_file_path, read_frame, write_frame,
 };
 use daedalus_vt::{VtConfig, create_vt_engine};
-use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
@@ -185,50 +187,6 @@ impl DaemonServer {
     }
 }
 
-#[derive(Clone, Default)]
-struct SubscriptionFilter {
-    active: bool,
-    pane_ids: Option<HashSet<PaneId>>,
-    /// Older UIs drop the connection on an event variant they do not know, so
-    /// `ProjectSetupChanged` is sent only to connections that asked for it.
-    project_setup_events: bool,
-    workspace_membership_events: bool,
-    workbench: Option<daedalus_proto::WorkspaceId>,
-}
-
-impl SubscriptionFilter {
-    fn matches(&self, event: &ServerEvent) -> bool {
-        if let ServerEvent::WorkbenchChanged { workspace_id, .. } = event {
-            return self.workbench == Some(*workspace_id);
-        }
-        if matches!(event, ServerEvent::WorkspaceMembershipChanged) {
-            return self.workspace_membership_events;
-        }
-        if !self.active {
-            return false;
-        }
-        if matches!(event, ServerEvent::ProjectSetupChanged { .. }) {
-            return self.project_setup_events;
-        }
-        let Some(allowed) = &self.pane_ids else {
-            return true;
-        };
-        match event {
-            ServerEvent::GridDelta(d) => allowed.contains(&d.pane_id),
-            ServerEvent::PaneStatusChanged { pane_id, .. }
-            | ServerEvent::AgentStateChanged { pane_id, .. }
-            | ServerEvent::CommandFinished { pane_id, .. }
-            | ServerEvent::PaneExited { pane_id, .. }
-            | ServerEvent::ResyncRequired { pane_id } => allowed.contains(pane_id),
-            ServerEvent::WorkspaceRuntimeUpdated { .. }
-            | ServerEvent::ExternalStatusUpdated { .. }
-            | ServerEvent::ProjectSetupChanged { .. }
-            | ServerEvent::WorkspaceMembershipChanged
-            | ServerEvent::WorkbenchChanged { .. } => false,
-        }
-    }
-}
-
 async fn wait_for_done(done_rx: &mut watch::Receiver<bool>) {
     while !*done_rx.borrow() {
         if done_rx.changed().await.is_err() {
@@ -251,7 +209,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 async fn handle_client(stream: IpcStream, registry: Arc<Registry>, auth_token: Option<String>) {
     let (mut reader, mut writer) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMessage>(CLIENT_OUTBOUND_CAPACITY);
-    let filter = Arc::new(RwLock::new(SubscriptionFilter::default()));
+    let filter = Arc::new(Subscription::default());
     let (done_tx, mut done_rx) = watch::channel(false);
     let (lag_tx, mut reader_lag) = watch::channel(false);
     let mut writer_lag = reader_lag.clone();
@@ -338,7 +296,7 @@ async fn handle_client(stream: IpcStream, registry: Arc<Registry>, auth_token: O
 
 async fn dispatch_request(
     registry: &Registry,
-    filter: &RwLock<SubscriptionFilter>,
+    filter: &Subscription,
     msg: ClientMessage,
 ) -> Result<ResponsePayload, ProtoError> {
     match msg {
@@ -401,7 +359,7 @@ async fn dispatch_request(
             registry.read_activity(workspace_id, cursor).await?,
         )),
         ClientMessage::WatchWorkspaceMembership => {
-            filter.write().await.workspace_membership_events = true;
+            filter.watch_membership().await;
             Ok(ResponsePayload::Ok)
         }
         ClientMessage::ListWorkspaces => Ok(ResponsePayload::Workspaces(
@@ -572,10 +530,7 @@ async fn dispatch_request(
             pane_ids,
             project_setup_events,
         } => {
-            let mut f = filter.write().await;
-            f.active = true;
-            f.pane_ids = pane_ids.map(|ids| ids.into_iter().collect());
-            f.project_setup_events = project_setup_events;
+            filter.subscribe(pane_ids, project_setup_events).await;
             Ok(ResponsePayload::Ok)
         }
         ClientMessage::PreviewImage { workspace_id, path } => Ok(ResponsePayload::ImagePreview(
@@ -594,12 +549,7 @@ async fn dispatch_request(
             Ok(ResponsePayload::Ok)
         }
         ClientMessage::Unsubscribe => {
-            let mut f = filter.write().await;
-            f.active = false;
-            f.pane_ids = None;
-            f.project_setup_events = false;
-            f.workspace_membership_events = false;
-            f.workbench = None;
+            filter.unsubscribe().await;
             Ok(ResponsePayload::Ok)
         }
         ClientMessage::RunWorkspaceAction {
@@ -634,257 +584,19 @@ async fn dispatch_request(
     }
 }
 
-enum DrainResult {
-    Drained,
-    StillFull,
-    Closed,
-}
-
-fn drain_pending_resync(
-    pending_resync: &mut HashSet<PaneId>,
-    out_tx: &mpsc::Sender<ServerMessage>,
-) -> DrainResult {
-    let pane_ids: Vec<PaneId> = pending_resync.drain().collect();
-    for (idx, pane_id) in pane_ids.iter().enumerate() {
-        let msg = ServerMessage::Event(ServerEvent::ResyncRequired { pane_id: *pane_id });
-        match out_tx.try_send(msg) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                pending_resync.extend(pane_ids[idx..].iter().copied());
-                return DrainResult::StillFull;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                return DrainResult::Closed;
-            }
-        }
-    }
-    DrainResult::Drained
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum SubscriberExit {
-    Closed,
-    Lagged,
-}
-
-async fn forward_subscriber_events(
-    mut event_rx: broadcast::Receiver<ServerEvent>,
-    sub_out_tx: mpsc::Sender<ServerMessage>,
-    sub_filter: Arc<RwLock<SubscriptionFilter>>,
-) -> SubscriberExit {
-    let mut pending_resync: HashSet<PaneId> = HashSet::new();
-
-    loop {
-        let recv_res = if pending_resync.is_empty() {
-            event_rx.recv().await
-        } else {
-            tokio::select! {
-                permit = sub_out_tx.reserve() => {
-                    match permit {
-                        Ok(permit) => {
-                            if let Some(&pane_id) = pending_resync.iter().next() {
-                                pending_resync.remove(&pane_id);
-                                permit.send(ServerMessage::Event(ServerEvent::ResyncRequired {
-                                    pane_id,
-                                }));
-                            }
-                            if let DrainResult::Closed =
-                                drain_pending_resync(&mut pending_resync, &sub_out_tx)
-                            {
-                                break;
-                            }
-                            continue;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                res = event_rx.recv() => res,
-            }
-        };
-
-        match recv_res {
-            Ok(evt) => {
-                if !sub_filter.read().await.matches(&evt) {
-                    continue;
-                }
-                match drain_pending_resync(&mut pending_resync, &sub_out_tx) {
-                    DrainResult::Drained => {}
-                    DrainResult::StillFull => {
-                        if let ServerEvent::GridDelta(delta) = &evt {
-                            pending_resync.insert(delta.pane_id);
-                            continue;
-                        }
-                    }
-                    DrainResult::Closed => break,
-                }
-                match &evt {
-                    ServerEvent::GridDelta(delta) => {
-                        let pane_id = delta.pane_id;
-                        match sub_out_tx.try_send(ServerMessage::Event(evt)) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                pending_resync.insert(pane_id);
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => break,
-                        }
-                    }
-                    _ => {
-                        if sub_out_tx.send(ServerMessage::Event(evt)).await.is_err() {
-                            break;
-                        }
-                        if let DrainResult::Closed =
-                            drain_pending_resync(&mut pending_resync, &sub_out_tx)
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                let has_subscription = {
-                    let filter = sub_filter.read().await;
-                    filter.active
-                        || filter.workspace_membership_events
-                        || filter.workbench.is_some()
-                };
-                if has_subscription {
-                    // Missing updates may affect any pane or workspace.
-                    warn!(
-                        skipped,
-                        "event subscriber lagged; disconnecting stale client"
-                    );
-                    return SubscriberExit::Lagged;
-                }
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
-        }
-    }
-    SubscriberExit::Closed
-}
-
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::subscription::tests::dummy_delta;
     use super::*;
     #[cfg(unix)]
     use crate::supervisor::IsolationMode;
-    use daedalus_proto::{CursorState, GridDelta};
+    #[cfg(unix)]
+    use daedalus_proto::PaneId;
+    #[cfg(unix)]
     use std::time::Duration;
     #[cfg(unix)]
     use tempfile::TempDir;
-
-    fn dummy_delta(pane_id: PaneId, seq: u64) -> ServerEvent {
-        ServerEvent::GridDelta(GridDelta {
-            activity: None,
-            insight: None,
-            terminal_modes: Default::default(),
-            pane_id,
-            seq,
-            cols: 80,
-            rows: 24,
-            cursor: CursorState::default(),
-            history_generation: 0,
-            scrollback_len: None,
-            dirty_rows: Vec::new(),
-        })
-    }
-
-    #[test]
-    fn project_setup_events_require_opt_in_for_global_and_scoped_filters() {
-        let event = ServerEvent::ProjectSetupChanged {
-            root_dir: PathBuf::from("/p"),
-            assignments: Vec::new(),
-        };
-        for pane_ids in [None, Some(HashSet::new())] {
-            let mut filter = SubscriptionFilter {
-                active: true,
-                pane_ids,
-                project_setup_events: false,
-                ..Default::default()
-            };
-            assert!(!filter.matches(&event));
-            filter.project_setup_events = true;
-            assert!(filter.matches(&event));
-        }
-    }
-
-    #[tokio::test]
-    async fn resync_required_is_delivered_after_backpressure_drains() {
-        let (event_tx, _) = broadcast::channel(16);
-        let event_rx = event_tx.subscribe();
-        let (out_tx, mut out_rx) = mpsc::channel(2);
-        let filter = Arc::new(RwLock::new(SubscriptionFilter {
-            active: true,
-            pane_ids: None,
-            ..Default::default()
-        }));
-
-        let handle = tokio::spawn(forward_subscriber_events(event_rx, out_tx, filter));
-
-        let pane_id = PaneId::new();
-        for seq in 1..=4 {
-            event_tx.send(dummy_delta(pane_id, seq)).unwrap();
-        }
-
-        // Yield so forwarder fills the 2-slot mpsc and queues pending_resync
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        let m1 = out_rx.recv().await.unwrap();
-        let m2 = out_rx.recv().await.unwrap();
-        assert!(matches!(
-            m1,
-            ServerMessage::Event(ServerEvent::GridDelta(_))
-        ));
-        assert!(matches!(
-            m2,
-            ServerMessage::Event(ServerEvent::GridDelta(_))
-        ));
-
-        // Even with no further events on event_tx, ResyncRequired must arrive
-        let m3 = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
-            .await
-            .expect("timed out waiting for ResyncRequired")
-            .unwrap();
-        assert_eq!(
-            m3,
-            ServerMessage::Event(ServerEvent::ResyncRequired { pane_id })
-        );
-
-        drop(event_tx);
-        tokio::time::timeout(Duration::from_secs(1), handle)
-            .await
-            .expect("forwarder did not exit on broadcast close")
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn broadcast_lag_ends_subscription_instead_of_forwarding_incomplete_state() {
-        let (events, receiver) = broadcast::channel(2);
-        let (out_tx, mut out_rx) = mpsc::channel(4);
-        let filter = Arc::new(RwLock::new(SubscriptionFilter {
-            active: true,
-            ..Default::default()
-        }));
-        let skipped_pane = PaneId::new();
-        let retained_pane = PaneId::new();
-        events.send(dummy_delta(skipped_pane, 1)).unwrap();
-        events
-            .send(ServerEvent::ProjectSetupChanged {
-                root_dir: PathBuf::from("/workspace"),
-                assignments: Vec::new(),
-            })
-            .unwrap();
-        events.send(dummy_delta(retained_pane, 1)).unwrap();
-        events.send(dummy_delta(retained_pane, 2)).unwrap();
-
-        let exit = tokio::time::timeout(
-            Duration::from_secs(1),
-            forward_subscriber_events(receiver, out_tx, filter),
-        )
-        .await
-        .expect("a lagged stream cannot continue with a partial view");
-        assert_eq!(exit, SubscriberExit::Lagged);
-        assert!(out_rx.recv().await.is_none());
-    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -948,28 +660,6 @@ mod tests {
             .unwrap()
             .is_none()
         );
-    }
-
-    #[tokio::test]
-    async fn event_forwarder_exits_when_outbound_receiver_closes() {
-        let (event_tx, _) = broadcast::channel(16);
-        let event_rx = event_tx.subscribe();
-        let (out_tx, out_rx) = mpsc::channel(1);
-        let filter = Arc::new(RwLock::new(SubscriptionFilter {
-            active: true,
-            pane_ids: None,
-            ..Default::default()
-        }));
-
-        let handle = tokio::spawn(forward_subscriber_events(event_rx, out_tx, filter));
-        drop(out_rx);
-
-        event_tx.send(dummy_delta(PaneId::new(), 1)).unwrap();
-
-        tokio::time::timeout(Duration::from_secs(1), handle)
-            .await
-            .expect("forwarder did not exit when outbound channel closed")
-            .unwrap();
     }
 
     #[cfg(unix)]

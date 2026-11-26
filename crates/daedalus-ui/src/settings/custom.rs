@@ -180,6 +180,15 @@ impl SettingsDialog {
                         };
                         WorkbenchOperation::WidgetPreview(token)
                     }
+                    ClientMessage::InvokeWidgetAction { widget, .. } => {
+                        let Some(detail_session) = self.custom.detail_session() else {
+                            return SettingsAction::None;
+                        };
+                        WorkbenchOperation::WidgetAction {
+                            widget: widget.clone(),
+                            detail_session,
+                        }
+                    }
                     ClientMessage::PreviewWorkspaceImport { .. }
                     | ClientMessage::PreviewWorkspaceCreation { .. }
                     | ClientMessage::ResolveWorkspaceImport { .. } => {
@@ -217,7 +226,7 @@ impl SettingsDialog {
                 self.focus = CustomName;
             }
             CustomEdit => {
-                editor.showing_details = false;
+                editor.close_details();
                 editor.edit();
                 self.focus = CustomName;
                 self.select_all = true;
@@ -230,7 +239,7 @@ impl SettingsDialog {
             }
             CustomBack => {
                 editor.sharing = false;
-                editor.showing_details = false;
+                editor.close_details();
                 editor.advanced = false;
                 editor.draft = None;
                 editor.clear_import_review();

@@ -205,6 +205,9 @@ pub enum ClientMessage {
         workspace_id: WorkspaceId,
         revision: u64,
         document: WorkspaceDocument,
+        /// Preserve all settings outside the layout, including revision-zero defaults.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        layout_only: bool,
     },
     SeedLegacyWorkbench {
         workspace_id: WorkspaceId,

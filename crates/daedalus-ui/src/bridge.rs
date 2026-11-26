@@ -76,6 +76,10 @@ pub enum WorkbenchOperation {
     PaneWidgets(u64),
     WidgetEdit,
     WidgetPreview(uuid::Uuid),
+    WidgetAction {
+        widget: String,
+        detail_session: uuid::Uuid,
+    },
     ImportPreview(uuid::Uuid),
     Import,
     Export(PathBuf),

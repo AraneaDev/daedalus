@@ -476,6 +476,13 @@ Set `DAEDALUS_TEST_PYTHON` to use a different Python interpreter with Xlib insta
 mutation gate fails on surviving or timed-out mutations. Mutation results are written under
 `target/quality/`. Native Ghostty checks require the external Ghostty C library and headers.
 
+Release Please synchronizes the release PR lockfile and verifies that GitHub attaches the
+required `check` and `title` checks to the synchronized PR head. To trigger those checks
+automatically, install a GitHub App on this repository with Contents and Pull requests write
+permissions. Set the `RELEASE_APP_ID` repository variable and the
+`RELEASE_APP_PRIVATE_KEY` repository secret. With the built-in workflow token, GitHub may ask
+a maintainer to approve workflow runs from the release PR page.
+
 The [specification follow-up](docs/spec-follow-up.md) records the remaining implementation work and
 its acceptance tests.
 

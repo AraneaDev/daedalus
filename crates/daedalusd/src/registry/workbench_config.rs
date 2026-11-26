@@ -19,6 +19,22 @@ impl Registry {
             .await
     }
 
+    pub(crate) async fn edit_workbench(
+        &self,
+        id: WorkspaceId,
+        revision: Option<u64>,
+        edit: impl FnOnce(&mut WorkspaceDocument),
+    ) -> Result<Change<WorkbenchState>, ProtoError> {
+        let _guard = self.lock_workspace_lifecycle(id).await?;
+        let mut state = self.workbench(id).await?;
+        if state.revision != revision.unwrap_or(0) {
+            return Ok(Change::Conflict(state));
+        }
+        edit(&mut state.document);
+        self.commit_workbench_locked(id, revision, state.document, RepoLink::Keep)
+            .await
+    }
+
     pub(super) async fn commit_workbench(
         &self,
         id: WorkspaceId,
@@ -27,6 +43,17 @@ impl Registry {
         repo_link: RepoLink,
     ) -> Result<Change<WorkbenchState>, ProtoError> {
         let _guard = self.lock_workspace_lifecycle(id).await?;
+        self.commit_workbench_locked(id, revision, document, repo_link)
+            .await
+    }
+
+    pub(super) async fn commit_workbench_locked(
+        &self,
+        id: WorkspaceId,
+        revision: Option<u64>,
+        document: WorkspaceDocument,
+        repo_link: RepoLink,
+    ) -> Result<Change<WorkbenchState>, ProtoError> {
         let widget_commands = self
             .workspaces
             .read()

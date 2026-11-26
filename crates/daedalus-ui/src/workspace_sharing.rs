@@ -1,5 +1,5 @@
 use super::DaedalusApp;
-use daedalus_proto::workbench::WorkbenchState;
+use daedalus_proto::workbench::{WorkbenchState, WorkspaceDocument};
 use daedalus_proto::{ClientMessage, ResponsePayload, WorkspaceId};
 use daedalus_ui::bridge::{UiCommand, WorkbenchOperation};
 use daedalus_ui::state::ConnectionState;
@@ -68,17 +68,12 @@ impl DaedalusApp {
             return;
         };
         let now = Instant::now();
+        self.prepare_active_workbench_layout();
         if self.watched_workbench != Some(id) {
             self.watched_workbench = Some(id);
             self.state.workbench = None;
             self.state.widget_results.clear();
             self.state.workbench_repo_update = false;
-            if !self.pointer.dragging_divider()
-                && let Some(layout) = self.layout_saves.get(&id).map(|save| save.desired.clone())
-            {
-                self.show_workbench_layout(&layout);
-                self.schedule_resize_flush();
-            }
             self.request_workbench(id, ClientMessage::WatchWorkbench { workspace_id: id });
         }
         if self.widget_refresh_at.is_none_or(|at| now >= at) {
@@ -121,6 +116,9 @@ impl DaedalusApp {
         };
         if !applies {
             return;
+        }
+        if matches!(operation, WorkbenchOperation::Migration) {
+            self.seeding_workbench.remove(&id);
         }
         let previous: Vec<_> = if settings {
             self.state.settings.control_order().collect()
@@ -237,35 +235,12 @@ impl DaedalusApp {
             self.flush_workbench_layout(id);
             return;
         }
-        if state.revision == 0 {
-            self.layout_saves.remove(&id);
-        } else if let Some(save) = self.layout_saves.get_mut(&id) {
-            save.base = Some(state.clone());
+        if let Some(save) = self.layout_saves.get_mut(&id) {
+            save.rebase(&state);
         }
 
-        if state.revision == 0 && self.seeded_workbench.insert(id) {
-            match workspace_widgets::load(&self.widget_directory, id) {
-                Ok(Some(legacy)) => {
-                    let mut document = state.document.clone();
-                    document.pane_widgets = Some(legacy.into());
-                    if self.state.active_workspace_id == Some(id) {
-                        document.layout = self.pointer.splits.portable(!self.state.zoomed);
-                    }
-                    self.request_workbench_as(
-                        id,
-                        WorkbenchOperation::Migration,
-                        ClientMessage::SeedLegacyWorkbench {
-                            workspace_id: id,
-                            document,
-                        },
-                    );
-                }
-                Ok(None) => {}
-                Err(error) => self.show_toast(
-                    format!("Could not read legacy widget settings: {error}"),
-                    true,
-                ),
-            }
+        if state.revision == 0 && !self.layout_saves.contains_key(&id) {
+            self.legacy_workbench_ready(id, &state.document);
         }
 
         let previous_widgets = self.state.workspace_widgets.remove(&id).unwrap_or_default();
@@ -290,6 +265,7 @@ impl DaedalusApp {
             self.refresh_workspace_setup(id);
         }
         if self.state.active_workspace_id == Some(id) {
+            self.layout_workspace = Some(id);
             if state.revision > 0
                 && let Some(workspace) = self.state.active_workspace_mut()
             {
@@ -301,7 +277,7 @@ impl DaedalusApp {
                 .as_ref()
                 .filter(|(workspace, _)| *workspace == id)
                 .map(|(_, state)| state);
-            if !self.pointer.dragging_divider() && state.revision > 0 {
+            if !self.pointer.dragging_divider() {
                 if let Some(layout) = self.layout_saves.get(&id).map(|save| save.desired.clone()) {
                     self.show_workbench_layout(&layout);
                 } else if previous
@@ -325,6 +301,38 @@ impl DaedalusApp {
         self.flush_workbench_layout(id);
     }
 
+    // A layout write at revision zero must wait for the legacy widget seed.
+    fn legacy_workbench_ready(&mut self, id: WorkspaceId, initial: &WorkspaceDocument) -> bool {
+        if self.seeding_workbench.contains(&id) {
+            return false;
+        }
+        match workspace_widgets::load(&self.widget_directory, id) {
+            Ok(None) => true,
+            Ok(Some(legacy)) => {
+                let mut document = initial.clone();
+                document.pane_widgets = Some(legacy.into());
+                if self.request_workbench_as(
+                    id,
+                    WorkbenchOperation::Migration,
+                    ClientMessage::SeedLegacyWorkbench {
+                        workspace_id: id,
+                        document,
+                    },
+                ) {
+                    self.seeding_workbench.insert(id);
+                }
+                false
+            }
+            Err(error) => {
+                self.show_toast(
+                    format!("Could not read legacy widget settings: {error}"),
+                    true,
+                );
+                false
+            }
+        }
+    }
+
     pub(super) fn open_widget_details(&mut self, index: Option<usize>) {
         self.open_workspace_settings();
         if !self.state.settings.open {
@@ -333,8 +341,7 @@ impl DaedalusApp {
         self.state.settings.open_custom_page();
         self.state.settings.focus = daedalus_ui::settings::Control::CustomNew;
         if let Some(index) = index {
-            self.state.settings.custom.selected = index;
-            self.state.settings.custom.showing_details = true;
+            self.state.settings.custom.open_details(index);
             self.state.settings.focus = daedalus_ui::settings::Control::CustomRefresh;
             self.state.settings.custom.preview =
                 self.state.settings.custom.selected().and_then(|widget| {

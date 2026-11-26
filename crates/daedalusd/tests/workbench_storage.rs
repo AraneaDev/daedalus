@@ -4,8 +4,8 @@ use daedalus_proto::workbench::{
     WorkspaceImportSource,
 };
 use daedalus_proto::{
-    ClientMessage, ProtoError, Request, ResponsePayload, ServerMessage, WorkspaceId, read_frame,
-    write_frame,
+    Assignment, ClientMessage, PaneRole, ProtoError, Request, ResponsePayload, ServerMessage,
+    WorkspaceId, read_frame, write_frame,
 };
 use daedalusd::server::DaemonServer;
 use daedalusd::supervisor::{IsolationMode, Supervisor};
@@ -121,6 +121,59 @@ impl DaemonFixture {
 }
 
 #[tokio::test]
+async fn first_layout_preserves_newer_project_setup_and_is_exported_after_restart() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let mut daemon = DaemonFixture::start(root).await;
+    let workspace_id = daemon.workspace(root).await;
+    let mut initial = daemon.workbench(workspace_id).await;
+    assert_eq!(initial.revision, 0);
+    assert!(initial.document.assignments.is_empty());
+    let assignments = vec![Assignment {
+        id: "agent".into(),
+        name: "Agent setup".into(),
+        role: PaneRole::Agent,
+        argv: vec!["agent".into()],
+    }];
+    daemon
+        .call(ClientMessage::SetProjectSetup {
+            workspace_id,
+            assignments: assignments.clone(),
+        })
+        .await
+        .unwrap();
+    initial.document.layout.split_view = true;
+    let reply = daemon
+        .call(ClientMessage::UpdateWorkbench {
+            workspace_id,
+            revision: 0,
+            document: initial.document,
+            layout_only: true,
+        })
+        .await
+        .unwrap();
+    let ResponsePayload::Workbench(saved) = reply else {
+        panic!("expected the first layout save")
+    };
+    assert_eq!(saved.revision, 1);
+    assert_eq!(saved.document.assignments, assignments);
+    assert!(saved.document.layout.split_view);
+    daemon.finish().await;
+
+    let mut daemon = DaemonFixture::start(root).await;
+    assert_eq!(daemon.workbench(workspace_id).await, saved);
+    let ResponsePayload::WorkbenchToml(export) = daemon
+        .call(ClientMessage::ExportWorkspace { workspace_id })
+        .await
+        .unwrap()
+    else {
+        panic!("expected export")
+    };
+    assert!(export.contains("split_view = true"));
+    daemon.finish().await;
+}
+
+#[tokio::test]
 async fn rejected_workbench_write_preserves_the_last_confirmed_document() {
     let scratch = tempfile::tempdir().unwrap();
     let root = scratch.path();
@@ -147,6 +200,7 @@ async fn rejected_workbench_write_preserves_the_last_confirmed_document() {
             workspace_id,
             revision: 1,
             document: WorkspaceDocument::new("Rejected".into()),
+            layout_only: false,
         })
         .await;
     assert!(matches!(rejected, Err(ProtoError::IoError(_))));
@@ -224,6 +278,7 @@ async fn shared_import_reports_repo_availability_and_rejects_both_forms_of_stale
             workspace_id,
             revision: 0,
             document: WorkspaceDocument::new("From another client".into()),
+            layout_only: false,
         })
         .await
         .unwrap();
@@ -493,6 +548,7 @@ async fn linked_import_applies_the_explicit_choices_from_a_renewed_preview() {
             workspace_id,
             revision: linked.revision,
             document: local.clone(),
+            layout_only: false,
         })
         .await
         .unwrap()

@@ -83,12 +83,18 @@ impl Registry {
         assignments: Vec<Assignment>,
     ) -> Result<(), ProtoError> {
         daedalus_proto::validate_assignments(&assignments).map_err(ProtoError::InvalidRequest)?;
+        let _guard = self.lock_workspace_lifecycle(workspace_id).await?;
         let state = self.workbench(workspace_id).await?;
         if state.revision > 0 {
             let mut document = state.document;
             document.assignments = assignments;
             return match self
-                .update_workbench(workspace_id, Some(state.revision), document)
+                .commit_workbench_locked(
+                    workspace_id,
+                    Some(state.revision),
+                    document,
+                    crate::workbench::store::RepoLink::Keep,
+                )
                 .await?
             {
                 crate::workbench::store::Change::Applied(_) => Ok(()),

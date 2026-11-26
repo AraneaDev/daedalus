@@ -95,6 +95,7 @@ impl DaedalusApp {
             }
             UiEvent::Disconnected => {
                 self.pause_layout_saves();
+                self.seeding_workbench.clear();
                 self.watched_workbench = None;
                 self.widget_refresh_at = None;
                 self.setup_disconnected();

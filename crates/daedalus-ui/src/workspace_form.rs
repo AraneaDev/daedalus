@@ -1,7 +1,8 @@
-use crate::layout::Rect;
+mod fields;
+mod layout;
+
 use daedalus_proto::RecentProject;
 use std::path::{Path, PathBuf};
-use unicode_segmentation::UnicodeSegmentation;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -29,23 +30,8 @@ const CONTROLS: [Control; 4] = [
     Control::Save,
 ];
 
-/// Logical height of the new-project form without the recent list.
-const FORM_HEIGHT: f32 = 236.0;
-/// Logical heights of the recent list: its heading band, each row, and the gap below it.
-const RECENT_HEADING: f32 = 40.0;
-const RECENT_ROW: f32 = 34.0;
-const RECENT_GAP: f32 = 6.0;
 /// The dialog shows this many recent projects; the rest stay available to `daedalus-ctl`.
 pub const MAX_RECENT_ROWS: usize = 5;
-
-fn region(area: Rect, x: f32, y: f32, w: f32, h: f32) -> Rect {
-    Rect::new(
-        area.x + x * area.width,
-        area.y + y * area.height,
-        w * area.width,
-        h * area.height,
-    )
-}
 
 pub(crate) fn relative_time(then: u64, now: u64) -> String {
     let age = now.saturating_sub(then);
@@ -124,66 +110,6 @@ impl WorkspaceForm {
             self.cursor = self.value(self.focus).map_or(0, str::len);
             self.select_all = false;
         }
-    }
-
-    fn recent_height(&self) -> f32 {
-        if self.recent.is_empty() {
-            0.0
-        } else {
-            RECENT_HEADING + RECENT_ROW * self.recent.len() as f32 + RECENT_GAP
-        }
-    }
-
-    pub fn modal_rect(&self, w: f32, h: f32, dpi: f32) -> Rect {
-        let width = (w - 16.0 * dpi).max(1.0).min(520.0 * dpi);
-        let height = (h - 16.0 * dpi)
-            .max(1.0)
-            .min((FORM_HEIGHT + self.recent_height()) * dpi);
-        Rect::new((w - width) / 2.0, (h - height) / 2.0, width, height)
-    }
-
-    /// The new-project part of the dialog, below the recent list when there is one.
-    pub fn form_area(&self, modal: Rect) -> Rect {
-        let height = modal.height * FORM_HEIGHT / (FORM_HEIGHT + self.recent_height());
-        Rect::new(modal.x, modal.bottom() - height, modal.width, height)
-    }
-
-    /// The band that holds the "Recent projects" heading, when the list is shown.
-    pub fn recent_heading(&self, modal: Rect) -> Option<Rect> {
-        (!self.recent.is_empty()).then(|| {
-            let unit = (modal.height - self.form_area(modal).height) / self.recent_height();
-            Rect::new(
-                modal.x + 0.04 * modal.width,
-                modal.y,
-                0.92 * modal.width,
-                RECENT_HEADING * unit,
-            )
-        })
-    }
-
-    pub fn controls(&self, modal: Rect) -> Vec<(Control, Rect)> {
-        let form = self.form_area(modal);
-        let unit = (modal.height - form.height) / self.recent_height().max(1.0);
-        let rows = (0..self.recent.len()).map(|i| {
-            let top = RECENT_HEADING + RECENT_ROW * i as f32 + 2.0;
-            (
-                Control::Recent(i),
-                Rect::new(
-                    modal.x + 0.04 * modal.width,
-                    modal.y + top * unit,
-                    0.92 * modal.width,
-                    (RECENT_ROW - 4.0) * unit,
-                ),
-            )
-        });
-        let fields = CONTROLS.into_iter().zip([
-            (0.04, 0.21, 0.92, 0.18),
-            (0.04, 0.40, 0.92, 0.18),
-            (0.04, 0.77, 0.44, 0.17),
-            (0.52, 0.77, 0.44, 0.17),
-        ]);
-        rows.chain(fields.map(|(control, (x, y, w, h))| (control, region(form, x, y, w, h))))
-            .collect()
     }
 
     fn order(&self) -> Vec<Control> {
@@ -275,36 +201,6 @@ impl WorkspaceForm {
         available && (!self.submitting || control == Control::Cancel)
     }
 
-    pub fn value(&self, control: Control) -> Option<&str> {
-        match control {
-            Control::Name => Some(&self.name),
-            Control::Folder => Some(&self.folder),
-            _ => None,
-        }
-    }
-
-    pub fn selection(&self, control: Control) -> std::ops::Range<usize> {
-        if control != self.focus {
-            return 0..0;
-        }
-        if self.select_all {
-            return 0..self.value(control).map_or(0, str::len);
-        }
-        self.cursor..self.cursor
-    }
-
-    pub fn set_value(&mut self, control: Control, value: &str) {
-        if !self.enabled(control)
-            || self.value(control).is_none()
-            || value.chars().any(char::is_control)
-        {
-            return;
-        }
-        self.set_focus(control);
-        self.select_all = true;
-        self.replace(0, 0, value);
-    }
-
     pub fn set_focus(&mut self, control: Control) {
         if !self.enabled(control) {
             return;
@@ -312,35 +208,6 @@ impl WorkspaceForm {
         self.focus = control;
         self.cursor = self.value(self.focus).map_or(0, str::len);
         self.select_all = self.value(self.focus).is_some() && self.cursor > 0;
-    }
-
-    fn replace(&mut self, start: usize, end: usize, text: &str) {
-        let field = match self.focus {
-            Control::Name => &mut self.name,
-            Control::Folder => &mut self.folder,
-            _ => return,
-        };
-        let range = if self.select_all {
-            0..field.len()
-        } else {
-            start..end
-        };
-        self.cursor = range.start + text.len();
-        field.replace_range(range, text);
-        self.select_all = false;
-        if self.focus == Control::Folder
-            && self.name_is_fixed()
-            && let Some((_, name)) = &self.committed_project
-        {
-            self.name.clone_from(name);
-        }
-        self.error = None;
-    }
-
-    pub fn insert_text(&mut self, text: &str) {
-        if !self.submitting && !text.is_empty() && !text.chars().any(char::is_control) {
-            self.replace(self.cursor, self.cursor, text);
-        }
     }
 
     fn submit(&mut self) -> WorkspaceFormAction {
@@ -399,16 +266,6 @@ impl WorkspaceForm {
                 _ => WorkspaceFormAction::None,
             };
         }
-        let field = self.value(self.focus).unwrap_or("");
-        let prev = field[..self.cursor]
-            .grapheme_indices(true)
-            .next_back()
-            .map_or(0, |(i, _)| i);
-        let next = self.cursor
-            + field[self.cursor..]
-                .graphemes(true)
-                .next()
-                .map_or(0, str::len);
         match key {
             Key::Named(NamedKey::Escape) => return WorkspaceFormAction::Cancel,
             Key::Named(NamedKey::Enter) if self.focus == Control::Cancel => {
@@ -445,28 +302,7 @@ impl WorkspaceForm {
                     self.set_focus(control);
                 }
             }
-            Key::Named(NamedKey::Backspace) => self.replace(prev, self.cursor, ""),
-            Key::Named(NamedKey::Delete) => self.replace(self.cursor, next, ""),
-            Key::Named(
-                NamedKey::Home | NamedKey::End | NamedKey::ArrowLeft | NamedKey::ArrowRight,
-            ) => {
-                self.cursor = match key {
-                    Key::Named(NamedKey::Home) => 0,
-                    Key::Named(NamedKey::End) => field.len(),
-                    Key::Named(NamedKey::ArrowLeft) if self.select_all => 0,
-                    Key::Named(NamedKey::ArrowRight) if self.select_all => field.len(),
-                    Key::Named(NamedKey::ArrowLeft) => prev,
-                    _ => next,
-                };
-                self.select_all = false;
-            }
-            Key::Character(s) if mods.control_key() || mods.super_key() => {
-                if s.eq_ignore_ascii_case("a") {
-                    self.select_all = true;
-                }
-            }
-            Key::Character(s) if !mods.alt_key() => self.insert_text(s),
-            _ => {}
+            _ => self.edit_key(key, mods),
         }
         WorkspaceFormAction::None
     }
@@ -506,6 +342,7 @@ impl WorkspaceForm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Rect;
 
     #[test]
     fn returning_to_a_created_workspace_preserves_its_committed_name() {

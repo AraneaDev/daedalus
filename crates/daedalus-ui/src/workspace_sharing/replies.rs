@@ -27,7 +27,9 @@ impl DaedalusApp {
             | ResponsePayload::WorkbenchToml(_) => {
                 self.workspace_sharing_response(settings, operation, response)
             }
-            ResponsePayload::WidgetAction(action) => self.show_widget_action(id, action),
+            ResponsePayload::WidgetAction(action) => {
+                self.show_widget_action(id, settings, operation, action)
+            }
             response => self.widget_editor_response(id, settings, operation, response),
         }
     }
@@ -155,7 +157,13 @@ impl DaedalusApp {
         }
     }
 
-    fn show_widget_action(&mut self, id: WorkspaceId, action: WidgetActionResult) {
+    fn show_widget_action(
+        &mut self,
+        id: WorkspaceId,
+        settings: bool,
+        operation: WorkbenchOperation,
+        action: WidgetActionResult,
+    ) {
         match action {
             WidgetActionResult::Pane(pane) => {
                 if let Some(role) = self.state.panes.get(&pane).map(|state| state.summary.role) {
@@ -170,16 +178,25 @@ impl DaedalusApp {
                     self.show_toast(error.to_string(), true);
                 }
             }
-            WidgetActionResult::Output(result)
-                if self.state.settings.open
-                    && self.state.settings.widget_workspace == Some(id)
-                    && self.state.settings.custom.showing_details =>
-            {
-                self.state.settings.custom.action_output = true;
-                self.state.settings.custom.detail_page = 0;
-                self.state.settings.custom.preview = Some(result);
+            WidgetActionResult::Output(result) => {
+                if settings
+                    && self.state.settings.is_custom_page()
+                    && let WorkbenchOperation::WidgetAction {
+                        widget,
+                        detail_session,
+                    } = operation
+                    && self
+                        .state
+                        .settings
+                        .custom
+                        .matches_detail_session(&widget, detail_session)
+                {
+                    let editor = &mut self.state.settings.custom;
+                    editor.action_output = true;
+                    editor.detail_page = 0;
+                    editor.preview = Some(result);
+                }
             }
-            WidgetActionResult::Output(_) => {}
         }
     }
 }
