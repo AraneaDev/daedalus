@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.21](https://github.com/AraneaDev/daedalus/compare/v0.0.20...v0.0.21) (2026-11-26)
+
+
+### Bug Fixes
+
+* improve workbench reliability and accessibility ([#56](https://github.com/AraneaDev/daedalus/issues/56)) ([e06dfb0](https://github.com/AraneaDev/daedalus/commit/e06dfb07d4976465e52adb05162ead1ccfc15c5b))
+
 ## [0.0.20](https://github.com/AraneaDev/daedalus/compare/v0.0.19...v0.0.20) (2026-11-25)
 
 
