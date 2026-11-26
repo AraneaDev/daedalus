@@ -5,12 +5,18 @@ use daedalus_proto::WorkspaceId;
 pub struct ActionPaletteState {
     pub open: bool,
     pub selected_index: usize,
+    session: u64,
 }
 
 impl ActionPaletteState {
     pub fn open(&mut self) {
+        self.session = self.session.wrapping_add(1);
         self.open = true;
         self.selected_index = 0;
+    }
+
+    pub fn session(&self) -> u64 {
+        self.session
     }
 
     pub fn close(&mut self) {
@@ -41,22 +47,31 @@ impl ActionPaletteState {
 pub struct PickerState {
     pub open: bool,
     pub selected_index: usize,
+    session: u64,
 }
 
 impl PickerState {
     pub fn toggle(&mut self) {
         self.open = !self.open;
+        if self.open {
+            self.session = self.session.wrapping_add(1);
+        }
         if self.selected_index >= AgentPreset::ALL.len() {
             self.selected_index = 0;
         }
     }
 
     pub fn open_with(&mut self, preset: AgentPreset) {
+        self.session = self.session.wrapping_add(1);
         self.open = true;
         self.selected_index = AgentPreset::ALL
             .iter()
             .position(|&p| p == preset)
             .unwrap_or(0);
+    }
+
+    pub fn session(&self) -> u64 {
+        self.session
     }
 
     pub fn close(&mut self) {

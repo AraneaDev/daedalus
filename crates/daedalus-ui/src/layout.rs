@@ -5,6 +5,8 @@ use daedalus_proto::{PaneId, PaneRole, WorkspaceId};
 
 pub const SIDEBAR_LOGICAL_WIDTH: f32 = 240.0;
 pub const CARGO_BAR_LOGICAL_HEIGHT: f32 = 34.;
+pub const WIDGET_BUTTON_MIN_LOGICAL_WIDTH: f32 = 110.;
+pub const WIDGET_BUTTON_GAP_LOGICAL: f32 = 5.;
 pub const HEADER_LOGICAL_HEIGHT: f32 = 26.0;
 const FOCUSED_HEADER_LOGICAL_HEIGHT: f32 = 34.0;
 const TAB_LABEL_PADDING: f32 = 10.0;
@@ -296,7 +298,18 @@ impl WorkspaceLayout {
         scale: f32,
     ) -> impl Iterator<Item = (crate::assignments::CargoPreset, Rect)> {
         self.cargo_bar.into_iter().flat_map(move |bar| {
-            let width = ((bar.width - 24. * scale) / 2.).clamp(0., 112. * scale);
+            let gap = 8. * scale;
+            let button_budget = (bar.width - 3. * gap).max(0.);
+            // Leave space for one readable widget or the overflow button before
+            // widening the Cargo actions to their normal desktop size.
+            let widget_room = if self.widget_bar.is_some() {
+                let slot =
+                    (WIDGET_BUTTON_MIN_LOGICAL_WIDTH + 2. * WIDGET_BUTTON_GAP_LOGICAL) * scale;
+                (button_budget - 2. * 72. * scale).clamp(0., slot)
+            } else {
+                0.
+            };
+            let width = ((button_budget - widget_room) / 2.).min(112. * scale);
             crate::assignments::CargoPreset::ALL
                 .into_iter()
                 .enumerate()
@@ -304,7 +317,7 @@ impl WorkspaceLayout {
                     (
                         preset,
                         Rect::new(
-                            bar.x + 8. * scale + index as f32 * (width + 8. * scale),
+                            bar.x + gap + index as f32 * (width + gap),
                             bar.y + 4. * scale,
                             width,
                             (bar.height - 8. * scale).max(0.),

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::choice_dialogs::ChoiceControls;
 use super::{named, overlay, workspace_controls::WorkspaceControls};
 use accesskit::{Action, ActionRequest, Node, NodeId, Role, TreeId};
 use daedalus_proto::{PaneId, WorkspaceId};
@@ -16,9 +17,11 @@ pub(crate) struct TerminalControls {
     run_tests: Option<(WorkspaceId, NodeId)>,
     cargo: Option<(WorkspaceId, NodeId)>,
     close_modal: Option<(u64, NodeId)>,
+    search: Option<(u64, NodeId)>,
     sidebar: WorkspaceControls,
     panes: HashMap<PaneId, u64>,
     widgets: HashMap<(WorkspaceId, String), NodeId>,
+    choices: ChoiceControls,
 }
 
 pub(super) fn next_control_group(serial: &mut u64) -> NodeId {
@@ -27,6 +30,26 @@ pub(super) fn next_control_group(serial: &mut u64) -> NodeId {
 }
 
 impl TerminalControls {
+    pub(super) fn append_choices(
+        &mut self,
+        state: &AppState,
+        id: NodeId,
+        dialog: &mut Node,
+        nodes: &mut Vec<(NodeId, Node)>,
+        viewport: (f32, f32, f32),
+    ) -> NodeId {
+        self.choices
+            .append(state, id, dialog, nodes, viewport, &mut self.serial)
+    }
+
+    pub(crate) fn choice_action(
+        &self,
+        state: &mut AppState,
+        request: &ActionRequest,
+    ) -> Option<daedalus_ui::input::UiAction> {
+        self.choices.action(state, request)
+    }
+
     pub(super) fn append_sidebar(
         &mut self,
         state: &AppState,
@@ -90,6 +113,21 @@ impl TerminalControls {
 
     pub(super) fn close_modal_base(&self, session: u64) -> Option<NodeId> {
         self.close_modal
+            .filter(|(opened, _)| *opened == session)
+            .map(|(_, base)| base)
+    }
+
+    pub(super) fn register_search(&mut self, session: u64) -> NodeId {
+        if let Some(base) = self.search_base(session) {
+            return base;
+        }
+        let base = next_control_group(&mut self.serial);
+        self.search = Some((session, base));
+        base
+    }
+
+    pub(super) fn search_base(&self, session: u64) -> Option<NodeId> {
+        self.search
             .filter(|(opened, _)| *opened == session)
             .map(|(_, base)| base)
     }

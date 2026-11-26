@@ -1122,6 +1122,15 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                                     accessibility::workspace_action(&mut self.state, &request)
                                 {
                                     self.handle_workspace_form(action);
+                                } else if let Some(action) = self
+                                    .terminal_controls
+                                    .choice_action(&mut self.state, &request)
+                                {
+                                    if action == UiAction::Ignore {
+                                        self.request_redraw();
+                                    } else {
+                                        self.handle_ui_action(action);
+                                    }
                                 } else if let Some(action) = accessibility::action(
                                     &self.state,
                                     &request,
@@ -1302,17 +1311,25 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
             self.history.failed(token);
         }
 
+        let search_bar = if self.accessibility_active
+            && self.state.active_overlay() == Some(ActiveOverlay::Search)
+        {
+            self.search_bar_bounds()
+        } else {
+            None
+        };
         if self.accessibility_active
             && let Some(adapter) = &mut self.accessibility
             && let Some(window) = &self.window
         {
             let size = window.inner_size();
-            let tree = accessibility::workbench_tree(
+            let tree = accessibility::workbench_tree_with_search_bar(
                 &self.state,
                 size.width as f32,
                 size.height as f32,
                 window.scale_factor() as f32,
                 &mut self.terminal_controls,
+                search_bar,
             );
             if self.last_accessibility_tree.as_ref() != Some(&tree) {
                 adapter.update_if_active(|| {

@@ -1,8 +1,21 @@
 use super::DaedalusApp;
 use daedalus_ui::bridge::UiCommand;
 use daedalus_ui::input::{UiAction, filter_modal_text};
+use daedalus_ui::layout::{Rect, overlays::search_bar_rect};
 
 impl DaedalusApp {
+    pub(super) fn search_bar_bounds(&self) -> Option<Rect> {
+        let pane = self.state.search.as_ref()?.pane_id;
+        let metrics = self.viewport_metrics()?;
+        let layout = self.layout_for(metrics);
+        let pane_rect = layout
+            .panes
+            .iter()
+            .find(|rect| self.state.pane_id_for_role(rect.role) == Some(pane))
+            .or_else(|| layout.pane(self.state.focused_role))?;
+        Some(search_bar_rect(pane_rect, metrics.scale_factor))
+    }
+
     pub(super) fn run_pane_search(&self) {
         let Some(ref search) = self.state.search else {
             return;

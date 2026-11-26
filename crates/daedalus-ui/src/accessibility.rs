@@ -2,8 +2,10 @@ mod workspace_form;
 pub(super) use workspace_form::workspace_action;
 mod setup_review;
 pub(super) use setup_review::setup_action;
+mod choice_dialogs;
 mod close_workspace;
 mod overlays;
+mod search;
 mod settings;
 mod terminals;
 mod workspace_controls;
@@ -84,6 +86,9 @@ pub(super) fn action(
         return None;
     }
     let overlay = state.active_overlay();
+    if overlay == Some(ActiveOverlay::Search) {
+        return search::action(state, request, controls);
+    }
     if overlay == Some(ActiveOverlay::CloseWorkspace) {
         return close_workspace::action(state, request, controls);
     }
@@ -165,7 +170,7 @@ fn overlay(state: &AppState) -> Option<(NodeId, Node)> {
             PICKER,
             "Select agent preset",
             format!(
-                "Selected {}. Use Up and Down to choose, Enter to confirm, or Escape to cancel.",
+                "Selected {}. Use Up and Down to choose, Enter to switch, Shift+Enter to add, or Escape to cancel.",
                 state.picker.selected_preset().label()
             ),
         )
@@ -289,12 +294,24 @@ fn tree(state: &AppState, width: f32, height: f32, scale: f32) -> TreeUpdate {
     )
 }
 
+#[cfg(test)]
 pub(super) fn workbench_tree(
     state: &AppState,
     width: f32,
     height: f32,
     scale: f32,
     controls: &mut TerminalControls,
+) -> TreeUpdate {
+    workbench_tree_with_search_bar(state, width, height, scale, controls, None)
+}
+
+pub(super) fn workbench_tree_with_search_bar(
+    state: &AppState,
+    width: f32,
+    height: f32,
+    scale: f32,
+    controls: &mut TerminalControls,
+    search_bar: Option<Rect>,
 ) -> TreeUpdate {
     let mut root = named(Role::Window, "Daedalus Workbench");
     root.set_bounds(bounds(Rect::new(0.0, 0.0, width, height)));
@@ -310,6 +327,16 @@ pub(super) fn workbench_tree(
     if let Some((message, _, _)) = &state.toast {
         status_text.push_str(". ");
         status_text.push_str(message);
+    }
+    if state.active_overlay().is_none()
+        && let Some((title, hint)) = state.terminal_guidance(state.focused_role)
+    {
+        status_text.push_str(". ");
+        status_text.push_str(title);
+        if let Some(hint) = hint {
+            status_text.push_str(". ");
+            status_text.push_str(hint);
+        }
     }
     let mut status = named(Role::Status, status_text);
     status.set_live(Live::Polite);
@@ -328,10 +355,9 @@ pub(super) fn workbench_tree(
             state,
             (id, node),
             &mut nodes,
-            width,
-            height,
-            scale,
+            (width, height, scale),
             controls,
+            search_bar,
         )
     } else if let Some(ws) = state.active_workspace() {
         let mut workspace = named(Role::Group, format!("Workspace {}", ws.name));
@@ -449,6 +475,24 @@ mod tests {
         assert_eq!(status.label(), Some("Connecting to daemon"));
         assert_eq!(status.live(), Some(Live::Polite));
     }
+
+    #[test]
+    fn empty_workspace_guidance_is_announced_until_the_creation_form_opens() {
+        let mut state = AppState::new();
+        state.connection = ConnectionState::Connected;
+        state.set_workspaces(Vec::new());
+        let status_label = |state: &AppState| {
+            let update = tree(state);
+            let status = update.nodes.iter().find(|(id, _)| *id == STATUS).unwrap();
+            status.1.label().unwrap().to_owned()
+        };
+        assert_eq!(
+            status_label(&state),
+            "Connected. No workspaces open. Choose Workspaces → + Workspace."
+        );
+        state.workspace_form.begin(std::path::Path::new("/tmp"));
+        assert_eq!(status_label(&state), "Connected");
+    }
     #[test]
     fn empty_workbench_offers_workspace_creation_and_hides_it_while_editing() {
         let mut state = AppState::new();
@@ -514,8 +558,13 @@ mod tests {
         let first = tree(&state);
         state.picker.move_down();
         let second = tree(&state);
-        assert_eq!(first.focus, PICKER);
-        assert_eq!(second.focus, PICKER);
+        // Native focus follows the selected preset row.
+        for tree in [&first, &second] {
+            let (_, focused) = tree.nodes.iter().find(|(id, _)| *id == tree.focus).unwrap();
+            assert_eq!(focused.role(), Role::Button);
+            assert!(focused.supports_action(Action::Click));
+        }
+        assert_ne!(first.focus, second.focus);
         assert_ne!(first, second);
         let dialog = &second.nodes.iter().find(|n| n.0 == PICKER).unwrap().1;
         assert!(dialog.is_modal());
@@ -527,6 +576,116 @@ mod tests {
         );
         state.picker.close();
         assert_eq!(tree(&state).focus, WINDOW);
+    }
+
+    #[test]
+    fn native_preset_actions_target_rows_and_reject_a_previous_dialog() {
+        use daedalus_ui::state::AgentPreset;
+
+        let mut state = agent_workspace();
+        let mut controls = TerminalControls::default();
+        state.open_picker_with(AgentPreset::Shell);
+        let tree = workbench_tree(&state, 1000., 680., 1., &mut controls);
+        let row = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == Role::Button && node.label() == Some(AgentPreset::Codex.label())
+            })
+            .unwrap()
+            .0;
+        let request = |action| ActionRequest {
+            action,
+            target_tree: TreeId::ROOT,
+            target_node: row,
+            data: None,
+        };
+        assert_eq!(
+            controls.choice_action(&mut state, &request(Action::Focus)),
+            Some(UiAction::Ignore)
+        );
+        assert_eq!(state.picker.selected_preset(), AgentPreset::Codex);
+        assert_eq!(
+            workbench_tree(&state, 1000., 680., 1., &mut controls).focus,
+            row
+        );
+        assert_eq!(
+            controls.choice_action(&mut state, &request(Action::Click)),
+            Some(UiAction::PickerConfirm)
+        );
+        state.picker.close();
+        state.open_picker_with(AgentPreset::Shell);
+        assert_eq!(
+            controls.choice_action(&mut state, &request(Action::Click)),
+            None
+        );
+        assert_eq!(state.picker.selected_preset(), AgentPreset::Shell);
+    }
+
+    #[test]
+    fn native_action_palette_can_reveal_a_row_and_reject_changed_actions() {
+        use daedalus_proto::{CustomAction, WorkspaceManifest};
+
+        let mut state = agent_workspace();
+        state.active_workspace_mut().unwrap().manifest = Some(WorkspaceManifest {
+            actions: (0..8)
+                .map(|index| CustomAction {
+                    id: format!("step-{index}"),
+                    label: format!("Step {index}"),
+                    target: PaneRole::Runner,
+                    command: format!("step-{index}"),
+                    shortcut: None,
+                })
+                .collect(),
+            ..Default::default()
+        });
+        state.open_action_palette();
+        let mut controls = TerminalControls::default();
+        let tree = workbench_tree(&state, 420., 168., 1., &mut controls);
+        let (row, node) = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Step 7"))
+            .unwrap();
+        assert!(node.bounds().is_none());
+        let request = |action| ActionRequest {
+            action,
+            target_tree: TreeId::ROOT,
+            target_node: *row,
+            data: None,
+        };
+        assert_eq!(
+            controls.choice_action(&mut state, &request(Action::Focus)),
+            Some(UiAction::Ignore)
+        );
+        let revealed = workbench_tree(&state, 420., 168., 1., &mut controls);
+        assert_eq!(revealed.focus, *row);
+        assert!(
+            revealed
+                .nodes
+                .iter()
+                .find(|(id, _)| id == row)
+                .unwrap()
+                .1
+                .bounds()
+                .is_some()
+        );
+        assert_eq!(
+            controls.choice_action(&mut state, &request(Action::Click)),
+            Some(UiAction::ActionPaletteConfirm)
+        );
+        state
+            .active_workspace_mut()
+            .unwrap()
+            .manifest
+            .as_mut()
+            .unwrap()
+            .actions[7]
+            .command = "updated".into();
+        assert_eq!(
+            controls.choice_action(&mut state, &request(Action::Click)),
+            None
+        );
     }
     #[test]
     fn search_description_exposes_case_and_navigation_keys() {
@@ -545,8 +704,89 @@ mod tests {
             assert!(detail.contains(expected));
             assert!(detail.contains("F4"));
             assert!(detail.contains("Shift+Enter"));
+            assert!(search.children().iter().any(|id| {
+                update
+                    .nodes
+                    .iter()
+                    .any(|(node_id, node)| node_id == id && node.label() == Some("Match case"))
+            }));
             state.search.as_mut().unwrap().toggle_case();
         }
+    }
+
+    #[test]
+    fn search_controls_follow_results_and_reject_clicks_from_prior_session() {
+        let mut state = agent_workspace();
+        let pane = state.focused_pane_id().unwrap();
+        state.toggle_search(pane);
+        let bar = Rect::new(330., 39., 340., 58.);
+        let mut controls = TerminalControls::default();
+        let render = |state: &AppState, controls: &mut TerminalControls| {
+            workbench_tree_with_search_bar(state, 1000., 600., 1., controls, Some(bar))
+        };
+        let click = |target_node| ActionRequest {
+            action: Action::Click,
+            target_node,
+            target_tree: TreeId::ROOT,
+            data: None,
+        };
+        let first = render(&state, &mut controls);
+        let group = &first
+            .nodes
+            .iter()
+            .find(|entry| entry.0 == SEARCH)
+            .unwrap()
+            .1;
+        let [prev, next, case] = group.children() else {
+            panic!("expected two navigation buttons and a match-case toggle");
+        };
+        let expected_rects = daedalus_ui::layout::overlays::search_controls(bar);
+        for (id, rect) in group.children().iter().zip(expected_rects) {
+            let node = &first.nodes.iter().find(|entry| entry.0 == *id).unwrap().1;
+            assert_eq!(node.bounds(), Some(bounds(rect)));
+            assert_eq!(node.is_disabled(), id != case);
+        }
+        assert_eq!(super::action(&state, &click(*prev), &controls), None);
+        assert_eq!(super::action(&state, &click(*next), &controls), None);
+        assert_eq!(
+            super::action(&state, &click(*case), &controls),
+            Some(UiAction::SearchToggleCase)
+        );
+
+        let search = state.search.as_mut().unwrap();
+        search.toggle_case();
+        search.push_text("find");
+        search.set_results(
+            0,
+            vec![daedalus_proto::SearchMatch {
+                abs_row: 0,
+                start_col: 0,
+                end_col: 4,
+            }],
+        );
+        let populated = render(&state, &mut controls);
+        let toggle = &populated
+            .nodes
+            .iter()
+            .find(|entry| entry.0 == *case)
+            .unwrap()
+            .1;
+        assert_eq!(toggle.role(), Role::CheckBox);
+        assert_eq!(toggle.toggled(), Some(accesskit::Toggled::True));
+        assert_eq!(
+            super::action(&state, &click(*prev), &controls),
+            Some(UiAction::SearchPrev)
+        );
+        assert_eq!(
+            super::action(&state, &click(*next), &controls),
+            Some(UiAction::SearchNext)
+        );
+
+        state.close_search();
+        state.toggle_search(pane);
+        assert_eq!(super::action(&state, &click(*case), &controls), None);
+        render(&state, &mut controls);
+        assert_eq!(super::action(&state, &click(*case), &controls), None);
     }
 
     #[test]

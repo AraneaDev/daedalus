@@ -9,6 +9,7 @@ pub struct SearchState {
     pub query: String,
     pub case_sensitive: bool,
     pub generation: u64,
+    session: u64,
     pub total_scrollback: usize,
     pub matches: Vec<SearchMatch>,
     pub current_index: usize,
@@ -23,16 +24,22 @@ impl SearchState {
     }
 
     pub fn new(pane_id: PaneId) -> Self {
+        let session = Self::next_generation();
         Self {
             pane_id,
             query: String::new(),
             case_sensitive: false,
-            generation: Self::next_generation(),
+            generation: session,
+            session,
             total_scrollback: 0,
             matches: Vec::new(),
             current_index: 0,
             results_received: false,
         }
+    }
+
+    pub fn session(&self) -> u64 {
+        self.session
     }
 
     pub(super) fn invalidate_results(&mut self) {

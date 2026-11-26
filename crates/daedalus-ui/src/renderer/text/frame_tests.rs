@@ -205,12 +205,120 @@ fn settings_frame_shows_selected_command_and_validation_feedback() {
         "button gutters: {left_gap}, {right_gap}"
     );
     frame.state.settings.activate(Control::Codex);
+    frame.labels(1200., 800.);
+    let save = frame
+        .renderer
+        .modal_items
+        .iter()
+        .find(|item| item.buffer.lines[0].text() == "Save")
+        .unwrap();
+    assert_eq!(
+        save.buffer.lines[0].attrs_list().defaults().weight,
+        glyphon::Weight::BOLD
+    );
     frame.state.settings.set_focus(Control::Executable);
     frame.state.settings.set_value(Control::Executable, "");
     frame.state.settings.activate(Control::Save);
     let hint = frame.state.settings.error.clone().unwrap();
     let labels = frame.labels(900., 650.);
     assert!(labels.iter().any(|s| s.contains(&hint)), "{labels:?}");
+}
+
+#[test]
+fn widget_editor_aligns_full_width_field_values() {
+    use daedalus_proto::workbench::{WorkbenchState, WorkspaceDocument};
+
+    let mut frame = Frame::new();
+    let settings = &mut frame.state.settings;
+    settings.begin(vec![]);
+    settings.open_custom_page();
+    settings.custom.accept_snapshot(WorkbenchState {
+        revision: 0,
+        document: WorkspaceDocument::new("Orbit".into()),
+        repo_baseline: None,
+    });
+    settings.custom.create();
+    settings.set_value(Control::CustomName, "Git worktree");
+    settings.set_value(Control::CustomSummary, "main:branch");
+    settings.set_value(Control::CustomDetails, "main:changes");
+    settings.set_focus(Control::CustomSave);
+
+    for size in [(1000., 800.), (420., 600.)] {
+        frame.labels(size.0, size.1);
+        let value_positions = ["Git worktree", "main:branch", "main:changes"].map(|value| {
+            frame
+                .renderer
+                .modal_items
+                .iter()
+                .find(|item| item.buffer.lines[0].text() == value)
+                .unwrap_or_else(|| panic!("missing {value} at {size:?}"))
+                .left
+        });
+        assert_eq!(value_positions, [value_positions[0]; 3]);
+    }
+}
+
+#[test]
+fn import_review_styles_content_as_readable_summary() {
+    use daedalus_proto::{
+        StatusLevel, WorkspaceId,
+        workbench::{WidgetResult, WorkspaceDocument, WorkspaceImportPreview},
+    };
+
+    let mut frame = Frame::new();
+    let settings = &mut frame.state.settings;
+    settings.begin(vec![]);
+    settings.open_custom_page();
+    settings.custom.sharing = true;
+    let document = WorkspaceDocument::new("Orbit".into());
+    settings.custom.import = Some(WorkspaceImportPreview {
+        workspace_id: WorkspaceId::new(),
+        revision: 1,
+        incoming: document.clone(),
+        current: document.clone(),
+        proposed: document,
+        linked: false,
+        conflicts: vec![],
+    });
+    settings.custom.show_import_review(WidgetResult {
+        label: "Orbit".into(),
+        level: StatusLevel::Ok,
+        details: vec![("Coding agent".into(), "codex".into())],
+    });
+
+    let (width, height) = (1000., 800.);
+    frame.labels(width, height);
+    let theme = Theme::dark();
+    let item = frame
+        .renderer
+        .modal_items
+        .iter()
+        .find(|item| item.buffer.lines[0].text() == "Coding agent · codex")
+        .unwrap();
+    assert_eq!(item.default_color, theme.text_primary.to_glyphon_color());
+    let settings = &frame.state.settings;
+    let (_, row) = settings
+        .controls(settings.modal_rect(width, height, 1.))
+        .find(|(control, _)| *control == Control::CustomDetail(0))
+        .unwrap();
+    assert!(!settings.enabled(Control::CustomDetail(0)));
+    let (quads, base) = crate::renderer::collect_quads(
+        &frame.state,
+        &frame.layout,
+        &theme,
+        width,
+        height,
+        1.,
+        frame.renderer.cell_size(),
+    );
+    assert!(quads[base as usize..].iter().any(|quad| {
+        quad.rect[0] >= row.x
+            && quad.rect[0] + quad.rect[2] <= row.right()
+            && quad.rect[1] >= row.y
+            && quad.rect[1] + quad.rect[3] <= row.bottom()
+            && quad.rect[2] > row.width * 0.5
+            && quad.rect[3] <= 1.
+    }));
 }
 
 #[test]

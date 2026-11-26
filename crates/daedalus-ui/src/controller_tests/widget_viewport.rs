@@ -49,6 +49,38 @@ fn center(bounds: Rect) -> (f32, f32) {
     (bounds.x + bounds.width / 2., bounds.y + bounds.height / 2.)
 }
 
+#[test]
+fn narrow_cargo_footer_keeps_pinned_widgets_reachable() {
+    let mut w = Workbench::new();
+    let mut ws = workspace("Cargo and widgets");
+    ws.project.tools.push("Cargo".into());
+    let id = ws.id;
+    w.app.state.set_workspaces(vec![ws]);
+
+    for dpi in [1, 2] {
+        let scale = dpi as f32;
+        let viewport = metrics(320, 550, dpi);
+        for (pins, expected) in [(&[true][..], Some(0)), (&[true, true][..], None)] {
+            w.app.state.workbench = Some((id, widgets(pins)));
+            let layout = w.app.layout_for(viewport);
+            let cargo = layout.cargo_buttons(scale).collect::<Vec<_>>();
+            let [(index, widget)] = layout.widget_buttons.as_slice() else {
+                panic!("expected one reachable widget slot at scale {scale}");
+            };
+            assert_eq!(*index, expected);
+            assert_eq!(cargo.len(), 2);
+            assert!(cargo.iter().all(|(_, rect)| rect.width >= 72. * scale));
+            assert!(cargo[1].1.right() < widget.x);
+            assert!(widget.right() <= viewport.size.width as f32);
+            let (x, y) = center(*widget);
+            assert_eq!(
+                hit_test(&layout, 1, scale, viewport.cell.0, viewport.cell.1, x, y),
+                HitTarget::CustomWidget(expected),
+            );
+        }
+    }
+}
+
 fn click(app: &mut DaedalusApp, metrics: ViewportMetrics, bounds: Rect) {
     let (x, y) = center(bounds);
     app.handle_cursor_moved(x, y);
