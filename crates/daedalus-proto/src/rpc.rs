@@ -5,8 +5,8 @@ use crate::types::{
 };
 use crate::workbench::{
     ConflictChoice, WidgetActionResult, WidgetDefinition, WidgetLibrary, WidgetResult,
-    WidgetSnapshot, WidgetTemplate, WorkbenchState, WorkspaceCreationPreview, WorkspaceDocument,
-    WorkspaceImportPreview, WorkspaceImportSource,
+    WidgetSnapshot, WidgetTemplate, WorkbenchEdit, WorkbenchState, WorkspaceCreationPreview,
+    WorkspaceDocument, WorkspaceImportPreview, WorkspaceImportSource,
 };
 use crate::{ActivityCursor, ActivityPage, Assignment, RecentProject};
 use serde::{Deserialize, Serialize};
@@ -208,6 +208,8 @@ pub enum ClientMessage {
         /// Preserve all settings outside the layout, including revision-zero defaults.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         layout_only: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edit: Option<WorkbenchEdit>,
     },
     SeedLegacyWorkbench {
         workspace_id: WorkspaceId,

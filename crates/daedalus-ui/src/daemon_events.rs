@@ -55,13 +55,20 @@ impl DaedalusApp {
                     self.project_setup_changed(&root_dir, assignments);
                 }
             }
-            UiEvent::ProjectSetupSaveFailed {
+            UiEvent::ProjectSetupMigrationFinished {
                 workspace_id,
-                message,
+                request_id,
+                result,
             } => {
-                self.project_setups.rejected(workspace_id);
-                self.refresh_workspace_setup(workspace_id);
-                self.show_toast(message, true);
+                if self
+                    .project_setups
+                    .finish_migration(workspace_id, request_id, result.is_ok())
+                {
+                    self.refresh_workspace_setup(workspace_id);
+                    if let Err(message) = result {
+                        self.show_toast(message, true);
+                    }
+                }
             }
             UiEvent::WorkspaceSettingsSaved {
                 workspace_id,
@@ -279,13 +286,8 @@ impl DaedalusApp {
 
     fn apply_workspace_list(&mut self, workspaces: Vec<WorkspaceInfo>, initialize: bool) {
         self.project_setups.absorb(&workspaces);
-        for (workspace_id, assignments) in self.project_setups.migrations(&workspaces) {
-            if !self.send_command(UiCommand::SaveProjectSetup {
-                workspace_id,
-                assignments,
-            }) {
-                self.project_setups.rejected(workspace_id);
-            }
+        for migration in self.project_setups.migrations(&workspaces) {
+            self.send_setup_migration(migration);
         }
         self.restore_session_names(&workspaces);
         self.state.set_workspaces(workspaces);

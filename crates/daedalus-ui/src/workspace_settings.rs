@@ -3,6 +3,7 @@ use daedalus_proto::{PaneId, PaneRole, WorkspaceId, WorkspaceInfo};
 use daedalus_ui::{
     assignments::{self, Assignment},
     bridge::{UiCommand, WorkbenchOperation},
+    project_setups::SetupMigration,
     settings::SettingsAction,
     state::{AgentPreset, WorkspaceView},
 };
@@ -76,12 +77,16 @@ impl DaedalusApp {
             self.show_toast("Create a workspace to configure its terminals", false);
             return;
         };
-        match self
+        let id = ws.id;
+        let defaults = initial_assignments(ws, self.config.default_agent);
+        if let Some(migration) = self
             .project_setups
-            .load_or(ws.id, initial_assignments(ws, self.config.default_agent))
+            .retry_migration(&ws.root_dir, &self.state.workspaces)
         {
+            self.send_setup_migration(migration);
+        }
+        match self.project_setups.load_or(id, defaults) {
             Ok(entries) => {
-                let id = ws.id;
                 self.state.close_search();
                 self.state.action_palette.close();
                 self.state.picker.close();
@@ -102,6 +107,22 @@ impl DaedalusApp {
             Err(err) => self.show_toast(err, true),
         }
         self.request_redraw();
+    }
+
+    pub(super) fn send_setup_migration(&mut self, migration: SetupMigration) {
+        let SetupMigration {
+            workspace_id,
+            assignments,
+            request_id,
+        } = migration;
+        if !self.send_command(UiCommand::SaveProjectSetup {
+            workspace_id,
+            assignments,
+            request_id,
+        }) {
+            self.project_setups
+                .finish_migration(workspace_id, request_id, false);
+        }
     }
 
     pub(super) fn handle_settings_action(&mut self, action: SettingsAction) {
@@ -194,6 +215,7 @@ impl DaedalusApp {
                     revision,
                     document,
                     layout_only: false,
+                    edit: Some(daedalus_proto::workbench::WorkbenchEdit::PaneWidgets),
                 },
             ) {
                 self.state.settings.finish_pane_widget_save(id, token);

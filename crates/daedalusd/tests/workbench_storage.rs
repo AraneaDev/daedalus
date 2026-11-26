@@ -1,7 +1,7 @@
 use daedalus_proto::transport::IpcStream;
 use daedalus_proto::workbench::{
-    WidgetDefinition, WidgetTemplate, WorkbenchState, WorkspaceDocument, WorkspaceImportPreview,
-    WorkspaceImportSource,
+    PaneWidgets, WidgetDefinition, WidgetInstance, WidgetTemplate, WorkbenchEdit, WorkbenchState,
+    WorkspaceDocument, WorkspaceImportPreview, WorkspaceImportSource,
 };
 use daedalus_proto::{
     Assignment, ClientMessage, PaneRole, ProtoError, Request, ResponsePayload, ServerMessage,
@@ -120,6 +120,167 @@ impl DaemonFixture {
     }
 }
 
+fn runner(name: &str) -> Vec<Assignment> {
+    vec![Assignment {
+        id: "runner".into(),
+        name: name.into(),
+        role: PaneRole::Runner,
+        argv: vec!["cargo".into(), "test".into()],
+    }]
+}
+
+#[tokio::test]
+async fn first_widget_edits_preserve_newer_project_setup() {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut daemon = DaemonFixture::start(scratch.path()).await;
+    let ResponsePayload::WidgetLibrary(library) = daemon
+        .call(ClientMessage::ListWidgetTemplates)
+        .await
+        .unwrap()
+    else {
+        panic!("expected widget library");
+    };
+    let template = library
+        .templates
+        .into_iter()
+        .find(|item| item.id == "git-worktree")
+        .unwrap();
+    let assignments = runner("New runner");
+    for edit in [WorkbenchEdit::Widgets, WorkbenchEdit::PaneWidgets] {
+        let root = scratch.path().join(format!("{edit:?}"));
+        std::fs::create_dir(&root).unwrap();
+        let workspace_id = daemon.workspace(&root).await;
+        let mut stale = daemon.workbench(workspace_id).await;
+        assert_eq!(stale.revision, 0);
+        assert!(stale.document.assignments.is_empty());
+        daemon
+            .call(ClientMessage::SetProjectSetup {
+                workspace_id,
+                assignments: assignments.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(daemon.workbench(workspace_id).await.revision, 0);
+
+        stale.document.widgets.push(WidgetInstance {
+            id: "branch".into(),
+            name: template.name.clone(),
+            pinned: true,
+            template: Some(template.id.clone()),
+            definition: None,
+        });
+        stale.document.templates.push(template.clone());
+        stale.document.pane_widgets = Some(PaneWidgets::default());
+        let request = ClientMessage::UpdateWorkbench {
+            workspace_id,
+            revision: stale.revision,
+            document: stale.document,
+            layout_only: false,
+            edit: Some(edit),
+        };
+        let ResponsePayload::Workbench(saved) = daemon.call(request.clone()).await.unwrap() else {
+            panic!("expected scoped save");
+        };
+        assert_eq!(saved.document.assignments, assignments);
+        assert_eq!(
+            saved.document.widgets.len(),
+            usize::from(edit == WorkbenchEdit::Widgets)
+        );
+        assert_eq!(
+            saved.document.pane_widgets.is_some(),
+            edit == WorkbenchEdit::PaneWidgets
+        );
+        assert_eq!(
+            daemon.call(request).await.unwrap(),
+            ResponsePayload::WorkbenchConflict(saved)
+        );
+    }
+    daemon.finish().await;
+}
+
+#[tokio::test]
+async fn saved_project_setup_survives_reopen_without_inheriting_a_workspace_import() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let mut daemon = DaemonFixture::start(root).await;
+    let workspace_id = daemon.workspace(root).await;
+    let mut document = daemon.workbench(workspace_id).await.document;
+    document.assignments = runner("Imported runner");
+    let imported = document.clone();
+    let replace = |revision, document| ClientMessage::ApplyWorkspaceImport {
+        workspace_id,
+        revision,
+        incoming: document,
+        linked: false,
+        resolutions: Default::default(),
+    };
+    let ResponsePayload::Workbench(initial) = daemon.call(replace(0, document)).await.unwrap()
+    else {
+        panic!("expected imported workbench");
+    };
+    let latest = runner("Saved project runner");
+    daemon
+        .call(ClientMessage::SetProjectSetup {
+            workspace_id,
+            assignments: latest.clone(),
+        })
+        .await
+        .unwrap();
+    let saved = daemon.workbench(workspace_id).await;
+    assert_eq!(saved.revision, initial.revision + 1);
+    assert_eq!(saved.document.assignments, latest);
+    assert_eq!(
+        daemon
+            .call(replace(initial.revision, imported.clone()))
+            .await
+            .unwrap(),
+        ResponsePayload::WorkbenchConflict(saved.clone())
+    );
+    daemon.finish().await;
+
+    let mut daemon = DaemonFixture::start(root).await;
+    assert_eq!(daemon.workbench(workspace_id).await, saved);
+    let ResponsePayload::Workbench(local) = daemon
+        .call(replace(saved.revision, imported.clone()))
+        .await
+        .unwrap()
+    else {
+        panic!("expected workspace-local replacement");
+    };
+    assert_eq!(local.document.assignments, imported.assignments);
+    daemon
+        .call(ClientMessage::CloseWorkspace {
+            id: workspace_id,
+            compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
+        })
+        .await
+        .unwrap();
+    daemon.finish().await;
+
+    let mut daemon = DaemonFixture::start(root).await;
+    let ResponsePayload::RecentProjects(recent) = daemon
+        .call(ClientMessage::ListRecentProjects)
+        .await
+        .unwrap()
+    else {
+        panic!("expected recent projects");
+    };
+    assert!(
+        recent
+            .iter()
+            .any(|project| project.root_dir == root && project.has_setup)
+    );
+    let reopened = daemon.workspace(root).await;
+    assert_ne!(workspace_id, reopened);
+    assert_eq!(
+        daemon.workbench(reopened).await.document.assignments,
+        latest
+    );
+    daemon.finish().await;
+}
+
 #[tokio::test]
 async fn first_layout_preserves_newer_project_setup_and_is_exported_after_restart() {
     let scratch = tempfile::tempdir().unwrap();
@@ -149,6 +310,7 @@ async fn first_layout_preserves_newer_project_setup_and_is_exported_after_restar
             revision: 0,
             document: initial.document,
             layout_only: true,
+            edit: None,
         })
         .await
         .unwrap();
@@ -201,6 +363,7 @@ async fn rejected_workbench_write_preserves_the_last_confirmed_document() {
             revision: 1,
             document: WorkspaceDocument::new("Rejected".into()),
             layout_only: false,
+            edit: None,
         })
         .await;
     assert!(matches!(rejected, Err(ProtoError::IoError(_))));
@@ -279,6 +442,7 @@ async fn shared_import_reports_repo_availability_and_rejects_both_forms_of_stale
             revision: 0,
             document: WorkspaceDocument::new("From another client".into()),
             layout_only: false,
+            edit: None,
         })
         .await
         .unwrap();
@@ -549,6 +713,7 @@ async fn linked_import_applies_the_explicit_choices_from_a_renewed_preview() {
             revision: linked.revision,
             document: local.clone(),
             layout_only: false,
+            edit: None,
         })
         .await
         .unwrap()

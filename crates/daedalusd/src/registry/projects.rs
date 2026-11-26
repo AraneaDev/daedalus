@@ -1,6 +1,10 @@
+mod setup;
+
+pub(super) use setup::ProjectSetupState;
+
 use super::Registry;
-use crate::persistence::{PersistedProjectSetup, PersistedRecentProject, PersistedState};
-use daedalus_proto::{Assignment, ProtoError, RecentProject, WorkspaceId, WorkspaceInfo};
+use crate::persistence::{PersistedRecentProject, PersistedState};
+use daedalus_proto::RecentProject;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -47,7 +51,7 @@ impl Registry {
                     name: entry.name.clone(),
                     root_dir: entry.root_dir.clone(),
                     last_used: entry.last_used,
-                    has_setup: setups.contains_key(&entry.root_dir),
+                    has_setup: setups.folder(&entry.root_dir).is_some(),
                 })
                 .collect()
         };
@@ -76,61 +80,6 @@ impl Registry {
             .collect()
     }
 
-    /// Stores the pane setup for the workspace's folder, persists it and announces it.
-    pub async fn set_project_setup(
-        &self,
-        workspace_id: WorkspaceId,
-        assignments: Vec<Assignment>,
-    ) -> Result<(), ProtoError> {
-        daedalus_proto::validate_assignments(&assignments).map_err(ProtoError::InvalidRequest)?;
-        let _guard = self.lock_workspace_lifecycle(workspace_id).await?;
-        let state = self.workbench(workspace_id).await?;
-        if state.revision > 0 {
-            let mut document = state.document;
-            document.assignments = assignments;
-            return match self
-                .commit_workbench_locked(
-                    workspace_id,
-                    Some(state.revision),
-                    document,
-                    crate::workbench::store::RepoLink::Keep,
-                )
-                .await?
-            {
-                crate::workbench::store::Change::Applied(_) => Ok(()),
-                crate::workbench::store::Change::Conflict(_) => Err(ProtoError::InvalidRequest(
-                    "The workspace changed. Reopen settings and review the latest assignments."
-                        .into(),
-                )),
-            };
-        }
-        let root_dir = {
-            let ws_map = self.workspaces.read().await;
-            ws_map
-                .get(&workspace_id)
-                .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?
-                .root_dir
-                .clone()
-        };
-        self.persist_project_setup(root_dir, assignments).await
-    }
-
-    pub(crate) async fn attach_project_setup(&self, info: &mut WorkspaceInfo) {
-        if let Ok(state) = self.workbench(info.id).await
-            && state.revision > 0
-        {
-            info.name = state.document.name;
-            info.setup = Some(state.document.assignments);
-            return;
-        }
-        info.setup = self
-            .project_setups
-            .read()
-            .await
-            .get(&info.root_dir)
-            .cloned();
-    }
-
     /// Moves the folder to the front of the recent list and trims the list.
     pub(super) async fn record_recent_project(&self, name: &str, root_dir: &Path) {
         let mut recent = self.recent_projects.write().await;
@@ -148,28 +97,7 @@ impl Registry {
 
     pub(super) async fn load_project_lists(&self, state: &mut PersistedState) {
         *self.recent_projects.write().await = std::mem::take(&mut state.recent_projects);
-        *self.project_setups.write().await = std::mem::take(&mut state.project_setups)
-            .into_iter()
-            .map(|setup| (setup.root_dir, setup.assignments))
-            .collect();
-    }
-
-    pub(super) async fn project_lists_for_persist(
-        &self,
-    ) -> (Vec<PersistedRecentProject>, Vec<PersistedProjectSetup>) {
-        let recent = self.recent_projects.read().await.clone();
-        let mut setups: Vec<PersistedProjectSetup> = self
-            .project_setups
-            .read()
-            .await
-            .iter()
-            .map(|(root_dir, assignments)| PersistedProjectSetup {
-                root_dir: root_dir.clone(),
-                assignments: assignments.clone(),
-            })
-            .collect();
-        setups.sort_by(|a, b| a.root_dir.cmp(&b.root_dir));
-        (recent, setups)
+        self.project_setups.write().await.restore(state);
     }
 }
 
@@ -179,7 +107,9 @@ mod tests {
     use crate::persistence::StateStore;
     use crate::shell_integration::ShellIntegration;
     use crate::supervisor::{IsolationMode, Supervisor};
-    use daedalus_proto::{PaneRole, ServerEvent};
+    use daedalus_proto::{
+        Assignment, PaneRole, ProtoError, ServerEvent, WorkspaceId, WorkspaceInfo,
+    };
     use std::collections::HashMap;
     use tempfile::TempDir;
     use tokio::sync::broadcast;
@@ -476,7 +406,7 @@ mod tests {
             reg.project_setups
                 .write()
                 .await
-                .insert(other.clone(), vec![assignment("x")]);
+                .confirm(other.clone(), vec![assignment("x")], None);
         })
         .await
         .expect("writers must not wait for the folder check");

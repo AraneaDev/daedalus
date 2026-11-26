@@ -182,6 +182,7 @@ impl WidgetEditor {
             revision: state.revision,
             document,
             layout_only: false,
+            edit: Some(daedalus_proto::workbench::WorkbenchEdit::Widgets),
         })
     }
 

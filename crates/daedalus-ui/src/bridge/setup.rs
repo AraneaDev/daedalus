@@ -154,16 +154,18 @@ pub(super) async fn save_project_setup(
     sink: &Arc<dyn UiEventSink>,
     workspace_id: WorkspaceId,
     entries: Vec<Assignment>,
+    request_id: u64,
 ) -> Result<(), RpcError> {
-    if !conn.project_setup_supported {
-        return Ok(());
-    }
-    if let Err(message) = store_on_daemon(conn, workspace_id, &entries).await? {
-        sink.emit(UiEvent::ProjectSetupSaveFailed {
-            workspace_id,
-            message,
-        });
-    }
+    let result = if conn.project_setup_supported {
+        store_on_daemon(conn, workspace_id, &entries).await?
+    } else {
+        Err("This daemon does not support saving project settings.".into())
+    };
+    sink.emit(UiEvent::ProjectSetupMigrationFinished {
+        workspace_id,
+        request_id,
+        result,
+    });
     Ok(())
 }
 

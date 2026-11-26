@@ -36,6 +36,15 @@ pub struct PersistedProjectSetup {
     pub assignments: Vec<Assignment>,
 }
 
+/// Explicit setup changes for a versioned workspace. The folder default and
+/// the workspace edit are persisted together in the daemon snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedWorkspaceSetup {
+    pub workspace_id: WorkspaceId,
+    pub revision: u64,
+    pub assignments: Vec<Assignment>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedState {
     pub version: u32,
@@ -45,6 +54,8 @@ pub struct PersistedState {
     pub recent_projects: Vec<PersistedRecentProject>,
     #[serde(default)]
     pub project_setups: Vec<PersistedProjectSetup>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_setups: Vec<PersistedWorkspaceSetup>,
 }
 
 impl Default for PersistedState {
@@ -54,6 +65,7 @@ impl Default for PersistedState {
             workspaces: Vec::new(),
             recent_projects: Vec::new(),
             project_setups: Vec::new(),
+            workspace_setups: Vec::new(),
         }
     }
 }
@@ -330,6 +342,7 @@ mod tests {
                     argv: vec!["claude".to_string()],
                 }],
             }],
+            workspace_setups: Vec::new(),
         }
     }
 

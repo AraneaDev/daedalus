@@ -153,6 +153,7 @@ impl WorktreeModalState {
 /// State of the centered "Close Workspace" confirmation & worktree cleanup modal (`Ctrl+Shift+D` or sidebar `×`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseWorkspaceModalState {
+    session: u64,
     pub submitting: bool,
     pub open: bool,
     pub workspace_id: Option<WorkspaceId>,
@@ -167,8 +168,13 @@ pub struct CloseWorkspaceModalState {
 }
 
 impl CloseWorkspaceModalState {
+    pub fn session(&self) -> u64 {
+        self.session
+    }
+
     /// Opens the modal populated with defaults for `ws`.
     pub fn open_for_workspace(&mut self, ws: &WorkspaceView) {
+        self.session += 1;
         self.submitting = false;
         self.open = true;
         self.workspace_id = Some(ws.id);
@@ -183,7 +189,10 @@ impl CloseWorkspaceModalState {
     }
 
     pub fn close(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            session: self.session,
+            ..Self::default()
+        };
     }
 
     pub fn toggle_compose(&mut self) {

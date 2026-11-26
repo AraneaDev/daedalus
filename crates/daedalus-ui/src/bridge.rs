@@ -118,6 +118,7 @@ pub enum UiCommand {
     SaveProjectSetup {
         workspace_id: WorkspaceId,
         assignments: Vec<crate::assignments::Assignment>,
+        request_id: u64,
     },
     SaveWorkspaceSettings {
         workspace_id: WorkspaceId,
@@ -257,9 +258,10 @@ pub enum UiEvent {
         root_dir: PathBuf,
         assignments: Vec<crate::assignments::Assignment>,
     },
-    ProjectSetupSaveFailed {
+    ProjectSetupMigrationFinished {
         workspace_id: WorkspaceId,
-        message: String,
+        request_id: u64,
+        result: Result<(), String>,
     },
     WorkspaceSettingsSaved {
         workspace_id: WorkspaceId,
@@ -733,8 +735,9 @@ async fn handle_command(
         UiCommand::SaveProjectSetup {
             workspace_id,
             assignments,
+            request_id,
         } => {
-            setup::save_project_setup(conn, sink, workspace_id, assignments).await?;
+            setup::save_project_setup(conn, sink, workspace_id, assignments, request_id).await?;
         }
         UiCommand::SaveWorkspaceSettings {
             workspace_id,

@@ -77,7 +77,7 @@ impl Registry {
         // recording a recent project.
         let Change::Applied(state) = self
             .workbench_store
-            .update_workspace(record.id, Some(0), preview.incoming, link)
+            .update_workspace(record.id, Some(0), preview.incoming, link, None)
             .await?
         else {
             return Err(ProtoError::Internal(

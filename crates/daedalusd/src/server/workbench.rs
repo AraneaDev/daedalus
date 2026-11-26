@@ -1,5 +1,6 @@
 use super::subscription::Subscription;
 use crate::registry::Registry;
+use daedalus_proto::workbench::WorkbenchEdit;
 use daedalus_proto::{ClientMessage, ProtoError, ResponsePayload};
 
 pub(super) async fn dispatch(
@@ -22,11 +23,19 @@ pub(super) async fn dispatch(
             revision,
             document,
             layout_only,
+            edit,
         } => {
-            let result = if layout_only {
+            let result = if layout_only || edit.is_some() {
                 registry
-                    .edit_workbench(workspace_id, Some(revision), |current| {
-                        current.layout = document.layout;
+                    .edit_workbench(workspace_id, Some(revision), |current| match edit {
+                        Some(WorkbenchEdit::Widgets) => {
+                            current.widgets = document.widgets;
+                            current.templates = document.templates;
+                        }
+                        Some(WorkbenchEdit::PaneWidgets) => {
+                            current.pane_widgets = document.pane_widgets;
+                        }
+                        None => current.layout = document.layout,
                     })
                     .await?
             } else {

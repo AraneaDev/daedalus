@@ -2,9 +2,11 @@ mod restore;
 
 use super::{Registry, WorkspaceRecord};
 use crate::persistence::{
-    PersistedProjectSetup, PersistedState, PersistedWorkspace, STATE_VERSION, StateStore,
+    PersistedProjectSetup, PersistedState, PersistedWorkspace, PersistedWorkspaceSetup,
+    STATE_VERSION, StateStore,
 };
-use daedalus_proto::{Assignment, ProtoError, ServerEvent};
+use daedalus_proto::workbench::WorkbenchState;
+use daedalus_proto::{Assignment, ProtoError, ServerEvent, WorkspaceId};
 use std::io;
 use std::path::PathBuf;
 use tracing::warn;
@@ -63,13 +65,14 @@ impl Registry {
                 .collect()
         };
         workspaces.sort_by_key(|ws| ws.slot_index);
-        let (recent_projects, project_setups) = self.project_lists_for_persist().await;
-        PersistedState {
+        let mut snapshot = PersistedState {
             version: STATE_VERSION,
             workspaces,
-            recent_projects,
-            project_setups,
-        }
+            recent_projects: self.recent_projects.read().await.clone(),
+            ..PersistedState::default()
+        };
+        self.project_setups.read().await.save_into(&mut snapshot);
+        snapshot
     }
 
     pub(super) async fn persist_state(&self) {
@@ -93,8 +96,22 @@ impl Registry {
         &self,
         root_dir: PathBuf,
         assignments: Vec<Assignment>,
+        versioned: Option<(WorkspaceId, WorkbenchState)>,
+        lifecycle: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<(), ProtoError> {
         let mut mode = self.persist_lock.clone().lock_owned().await;
+        let workspace_setup = versioned
+            .as_ref()
+            .map(|(id, state)| PersistedWorkspaceSetup {
+                workspace_id: *id,
+                revision: state.revision,
+                assignments: assignments.clone(),
+            });
+        let runtime = if let Some((id, state)) = versioned {
+            Some((id, state, self.workbench_widget_commands(id).await?))
+        } else {
+            None
+        };
         let snapshot = if let Some(store) = self.state_store.clone() {
             let mut state = self.persistence_snapshot().await;
             let setup = PersistedProjectSetup {
@@ -108,13 +125,22 @@ impl Registry {
                 Ok(index) => state.project_setups[index] = setup,
                 Err(index) => state.project_setups.insert(index, setup),
             }
+            if let Some(setup) = &workspace_setup {
+                match state
+                    .workspace_setups
+                    .binary_search_by_key(&setup.workspace_id.0, |entry| entry.workspace_id.0)
+                {
+                    Ok(index) => state.workspace_setups[index] = setup.clone(),
+                    Err(index) => state.workspace_setups.insert(index, setup.clone()),
+                }
+            }
             Some((store, state))
         } else {
             None
         };
         let project_setups = self.project_setups.clone();
         let event_tx = self.event_tx.clone();
-        // Keep the write lock, state update, and announcement together even if the
+        // Keep the write locks, state update, and announcement together even if the
         // connection drops while the blocking file operation is in progress.
         tokio::task::spawn_blocking(move || {
             if let Some((store, state)) = snapshot {
@@ -122,9 +148,15 @@ impl Registry {
                     ProtoError::IoError(format!("Failed to save project setup: {err}"))
                 })?;
             }
-            project_setups
-                .blocking_write()
-                .insert(root_dir.clone(), assignments.clone());
+            let _lifecycle = lifecycle;
+            project_setups.blocking_write().confirm(
+                root_dir.clone(),
+                assignments.clone(),
+                workspace_setup,
+            );
+            if let Some((id, state, widget_commands)) = runtime {
+                Self::publish_workbench_change(&event_tx, id, &widget_commands, &state);
+            }
             let _ = event_tx.send(ServerEvent::ProjectSetupChanged {
                 root_dir,
                 assignments,

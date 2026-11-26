@@ -296,6 +296,32 @@ pub(super) async fn update(
     revision: u64,
     document: WorkspaceDocument,
 ) -> Result<WorkbenchState, ClientError> {
+    update_workbench(client, id, revision, document, None).await
+}
+
+pub(super) async fn update_widgets(
+    client: &mut DaemonClient,
+    id: WorkspaceId,
+    revision: u64,
+    document: WorkspaceDocument,
+) -> Result<WorkbenchState, ClientError> {
+    update_workbench(
+        client,
+        id,
+        revision,
+        document,
+        Some(daedalus_proto::workbench::WorkbenchEdit::Widgets),
+    )
+    .await
+}
+
+async fn update_workbench(
+    client: &mut DaemonClient,
+    id: WorkspaceId,
+    revision: u64,
+    document: WorkspaceDocument,
+    edit: Option<daedalus_proto::workbench::WorkbenchEdit>,
+) -> Result<WorkbenchState, ClientError> {
     applied(
         client
             .request(ClientMessage::UpdateWorkbench {
@@ -303,6 +329,7 @@ pub(super) async fn update(
                 revision,
                 document,
                 layout_only: false,
+                edit,
             })
             .await?,
     )

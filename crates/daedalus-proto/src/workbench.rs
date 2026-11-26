@@ -5,6 +5,14 @@ use std::collections::BTreeMap;
 pub const WORKSPACE_FORMAT_VERSION: u32 = 1;
 pub const SHARED_WORKSPACE_FILE: &str = ".daedalus-workspace.toml";
 
+/// Fields changed by a scoped update. A missing scope replaces the whole document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkbenchEdit {
+    Widgets,
+    PaneWidgets,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkbenchState {
     pub revision: u64,

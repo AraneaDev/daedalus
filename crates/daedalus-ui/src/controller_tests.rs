@@ -1807,12 +1807,6 @@ fn daemon_backed_settings_save_sends_the_setup_and_follows_changes_from_the_daem
     assert!(
         matches!(w.command(), UiCommand::LaunchAssignment { assignment, .. } if assignment == renamed)
     );
-    w.app.handle_daemon_event(UiEvent::ProjectSetupSaveFailed {
-        workspace_id: id,
-        message: "disk full".into(),
-    });
-    let toast = w.app.state.toast.as_ref().unwrap();
-    assert!(toast.0.contains("disk full") && toast.1);
 }
 
 #[test]
@@ -1856,13 +1850,70 @@ fn local_setups_are_sent_to_the_daemon_once_and_the_files_stay() {
     w.app
         .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws.clone()]));
     assert!(
-        matches!(w.command(), UiCommand::SaveProjectSetup { workspace_id, assignments }
+        matches!(w.command(), UiCommand::SaveProjectSetup { workspace_id, assignments, .. }
             if workspace_id == ws.id && assignments == vec![entry.clone()])
     );
     w.app
         .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws.clone()]));
     assert!(w.idle());
     assert_eq!(daedalus_ui::assignments::load(ws.id).unwrap(), vec![entry]);
+}
+
+#[test]
+fn opening_settings_retries_migration_and_ignores_late_rejections() {
+    const CHILD: &str = "DAEDALUS_TEST_SETUP_MIGRATION_RETRY";
+    if !run_in_isolated_profile(
+        "controller_tests::opening_settings_retries_migration_and_ignores_late_rejections",
+        CHILD,
+    ) {
+        return;
+    }
+    let mut w = Workbench::new();
+    let ws = workspace("Retry");
+    let id = ws.id;
+    let entry = runner_entry("Local");
+    daedalus_ui::assignments::save(id, std::slice::from_ref(&entry)).unwrap();
+    daemon_capabilities(&mut w, true);
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws.clone()]));
+    let UiCommand::SaveProjectSetup {
+        request_id: first, ..
+    } = w.command()
+    else {
+        panic!("expected initial migration");
+    };
+    let failed = |request_id| UiEvent::ProjectSetupMigrationFinished {
+        workspace_id: id,
+        request_id,
+        result: Err("disk full".into()),
+    };
+    w.app.handle_daemon_event(failed(first));
+    let toast = w.app.state.toast.as_ref().unwrap();
+    assert!(toast.0.contains("disk full") && toast.1);
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+    assert!(w.idle());
+    w.app.handle_ui_action(UiAction::WorkspaceSettings);
+    let UiCommand::SaveProjectSetup {
+        request_id: retry,
+        assignments,
+        ..
+    } = w.command()
+    else {
+        panic!("expected settings to retry migration");
+    };
+    assert_ne!(first, retry);
+    assert_eq!(assignments, vec![entry.clone()]);
+    w.app.handle_daemon_event(failed(first));
+    assert_eq!(w.app.project_setups.load(id).unwrap(), vec![entry.clone()]);
+    w.app
+        .handle_daemon_event(UiEvent::ProjectSetupMigrationFinished {
+            workspace_id: id,
+            request_id: retry,
+            result: Ok(()),
+        });
+    w.app.handle_daemon_event(failed(retry));
+    assert_eq!(w.app.project_setups.load(id).unwrap(), vec![entry]);
 }
 
 #[test]

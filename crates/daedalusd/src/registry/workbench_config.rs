@@ -1,12 +1,15 @@
 use super::Registry;
+use crate::workbench::scheduler::WidgetCommands;
 use crate::workbench::store::{Change, RepoLink};
 use daedalus_proto::workbench::{PaneWidgets, WorkbenchState, WorkspaceDocument};
 use daedalus_proto::{Assignment, PaneRole, ProtoError, ServerEvent, WorkspaceId};
+use std::sync::Arc;
 
 impl Registry {
     pub(crate) async fn workbench(&self, id: WorkspaceId) -> Result<WorkbenchState, ProtoError> {
         let initial = self.initial_workbench(id).await?;
-        self.workbench_store.workspace(id, initial).await
+        let setup = self.project_setups.read().await.workspace(id).cloned();
+        self.workbench_store.workspace(id, initial, setup).await
     }
 
     pub(crate) async fn update_workbench(
@@ -54,26 +57,44 @@ impl Registry {
         document: WorkspaceDocument,
         repo_link: RepoLink,
     ) -> Result<Change<WorkbenchState>, ProtoError> {
-        let widget_commands = self
+        let widget_commands = self.workbench_widget_commands(id).await?;
+        let setup = self.project_setups.read().await.workspace(id).cloned();
+        let result = self
+            .workbench_store
+            .update_workspace(id, revision, document, repo_link, setup)
+            .await?;
+        if let Change::Applied(state) = &result {
+            self.project_setups.write().await.forget_workspace(id);
+            Self::publish_workbench_change(&self.event_tx, id, &widget_commands, state);
+        }
+        Ok(result)
+    }
+
+    pub(super) async fn workbench_widget_commands(
+        &self,
+        id: WorkspaceId,
+    ) -> Result<Arc<WidgetCommands>, ProtoError> {
+        Ok(self
             .workspaces
             .read()
             .await
             .get(&id)
             .ok_or(ProtoError::WorkspaceNotFound(id))?
             .widget_commands
-            .clone();
-        let result = self
-            .workbench_store
-            .update_workspace(id, revision, document, repo_link)
-            .await?;
-        if let Change::Applied(state) = &result {
-            widget_commands.reconcile(state);
-            let _ = self.event_tx.send(ServerEvent::WorkbenchChanged {
-                workspace_id: id,
-                revision: state.revision,
-            });
-        }
-        Ok(result)
+            .clone())
+    }
+
+    pub(super) fn publish_workbench_change(
+        events: &tokio::sync::broadcast::Sender<ServerEvent>,
+        id: WorkspaceId,
+        widget_commands: &WidgetCommands,
+        state: &WorkbenchState,
+    ) {
+        widget_commands.reconcile(state);
+        let _ = events.send(ServerEvent::WorkbenchChanged {
+            workspace_id: id,
+            revision: state.revision,
+        });
     }
 
     async fn initial_workbench(&self, id: WorkspaceId) -> Result<WorkspaceDocument, ProtoError> {
@@ -88,7 +109,7 @@ impl Registry {
                 workspace.manifest.clone(),
             )
         };
-        if let Some(assignments) = self.project_setups.read().await.get(&root) {
+        if let Some(assignments) = self.project_setups.read().await.folder(&root) {
             document.assignments.clone_from(assignments);
         }
         if let Some(manifest) = manifest {

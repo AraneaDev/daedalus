@@ -1,5 +1,5 @@
 use super::documents::{validate_template, validate_workspace};
-use crate::persistence::write_json_atomic;
+use crate::persistence::{PersistedWorkspaceSetup, write_json_atomic};
 use daedalus_proto::workbench::{WidgetLibrary, WidgetTemplate, WorkbenchState, WorkspaceDocument};
 use daedalus_proto::{ProtoError, WorkspaceId};
 use serde::de::DeserializeOwned;
@@ -43,13 +43,16 @@ impl WorkbenchStore {
         &self,
         id: WorkspaceId,
         initial: WorkspaceDocument,
+        setup: Option<PersistedWorkspaceSetup>,
     ) -> Result<WorkbenchState, ProtoError> {
         self.access(move |store, memory| {
-            Ok(store.read_workspace(memory, id)?.unwrap_or(WorkbenchState {
-                revision: 0,
-                document: initial,
-                repo_baseline: None,
-            }))
+            Ok(store
+                .read_workspace(memory, id, setup)?
+                .unwrap_or(WorkbenchState {
+                    revision: 0,
+                    document: initial,
+                    repo_baseline: None,
+                }))
         })
         .await
     }
@@ -60,11 +63,12 @@ impl WorkbenchStore {
         revision: Option<u64>,
         document: WorkspaceDocument,
         repo_link: RepoLink,
+        setup: Option<PersistedWorkspaceSetup>,
     ) -> Result<Change<WorkbenchState>, ProtoError> {
         validate_workspace(&document)
             .map_err(|error| ProtoError::InvalidRequest(error.to_string()))?;
         self.access(move |store, memory| {
-            let current = store.read_workspace(memory, id)?;
+            let current = store.read_workspace(memory, id, setup)?;
             let actual = current.as_ref().map_or(0, |state| state.revision);
             if revision.is_some_and(|expected| actual != expected)
                 || revision.is_none() && actual != 0
@@ -156,11 +160,20 @@ impl WorkbenchStore {
         &self,
         memory: &Memory,
         id: WorkspaceId,
+        setup: Option<PersistedWorkspaceSetup>,
     ) -> Result<Option<WorkbenchState>, ProtoError> {
-        if let Some(state) = memory.workspaces.get(&id) {
-            return Ok(Some(state.clone()));
+        let mut state = if let Some(state) = memory.workspaces.get(&id) {
+            Some(state.clone())
+        } else {
+            load_json(self.workspace_path(id).as_deref())?
+        };
+        if let (Some(state), Some(setup)) = (&mut state, setup)
+            && state.revision < setup.revision
+        {
+            state.revision = setup.revision;
+            state.document.assignments = setup.assignments;
         }
-        load_json(self.workspace_path(id).as_deref())
+        Ok(state)
     }
 
     fn read_library(&self, memory: &Memory) -> Result<WidgetLibrary, ProtoError> {
@@ -203,7 +216,7 @@ fn load_json<T: DeserializeOwned>(path: Option<&Path>) -> Result<Option<T>, Prot
     })
 }
 
-fn next_revision(revision: u64) -> Result<u64, ProtoError> {
+pub(crate) fn next_revision(revision: u64) -> Result<u64, ProtoError> {
     revision
         .checked_add(1)
         .ok_or_else(|| ProtoError::Internal("workbench revision exhausted".into()))

@@ -163,6 +163,7 @@ impl DaedalusApp {
                 revision,
                 document,
                 layout_only: true,
+                edit: None,
             }),
         }) {
             self.fail_layout_save(id, "Reconnect to save the workspace layout.".into());

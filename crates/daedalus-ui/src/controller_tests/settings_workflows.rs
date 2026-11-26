@@ -1383,6 +1383,7 @@ fn next_layout_save(w: &Workbench, id: WorkspaceId) -> (WorkbenchOperation, u64,
                 revision,
                 document,
                 layout_only: true,
+                edit: None,
             } = *request
             else {
                 return None;

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use super::{named, overlay};
 use accesskit::{Action, ActionRequest, Node, NodeId, Role, TreeId};
 use daedalus_proto::{PaneId, WorkspaceId};
+use daedalus_ui::assignments::CargoPreset;
 use daedalus_ui::layout::HitTarget;
 use daedalus_ui::state::{AppState, ConnectionState, WorkspaceView};
 
@@ -14,12 +15,69 @@ const WORKSPACE_LIST: NodeId = NodeId(23);
 pub(crate) struct TerminalControls {
     serial: u64,
     run_tests: Option<(WorkspaceId, NodeId)>,
+    cargo: Option<(WorkspaceId, NodeId)>,
+    close_modal: Option<(u64, NodeId)>,
     workspaces: HashMap<WorkspaceId, NodeId>,
     panes: HashMap<PaneId, u64>,
     widgets: HashMap<(WorkspaceId, String), NodeId>,
 }
 
 impl TerminalControls {
+    fn next_control_group(&mut self) -> NodeId {
+        self.serial += 1;
+        NodeId((1 << 61) + self.serial * 8)
+    }
+
+    pub(super) fn append_cargo(
+        &mut self,
+        state: &AppState,
+        workspace: &mut Node,
+        nodes: &mut Vec<(NodeId, Node)>,
+    ) {
+        let Some(id) = state.active_workspace_id.filter(|_| state.show_cargo_bar()) else {
+            self.cargo = None;
+            return;
+        };
+        if self.cargo.is_none_or(|(current, _)| current != id) {
+            self.cargo = Some((id, self.next_control_group()));
+        }
+        if let Some((_, base)) = self.cargo {
+            for (index, preset) in CargoPreset::ALL.into_iter().enumerate() {
+                let node = NodeId(base.0 + index as u64);
+                let mut button = named(Role::Button, preset.label());
+                button.add_action(Action::Click);
+                workspace.push_child(node);
+                nodes.push((node, button));
+            }
+        }
+    }
+
+    pub(super) fn cargo_preset(&self, state: &AppState, target: NodeId) -> Option<CargoPreset> {
+        let (id, base) = self.cargo?;
+        if state.active_workspace_id != Some(id) || !state.show_cargo_bar() {
+            return None;
+        }
+        CargoPreset::ALL
+            .into_iter()
+            .enumerate()
+            .find_map(|(index, preset)| (target == NodeId(base.0 + index as u64)).then_some(preset))
+    }
+
+    pub(super) fn register_close_modal(&mut self, session: u64) -> NodeId {
+        if let Some(base) = self.close_modal_base(session) {
+            return base;
+        }
+        let base = self.next_control_group();
+        self.close_modal = Some((session, base));
+        base
+    }
+
+    pub(super) fn close_modal_base(&self, session: u64) -> Option<NodeId> {
+        self.close_modal
+            .filter(|(opened, _)| *opened == session)
+            .map(|(_, base)| base)
+    }
+
     pub(super) fn append_workspaces(
         &mut self,
         state: &AppState,

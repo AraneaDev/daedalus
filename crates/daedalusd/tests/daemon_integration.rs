@@ -85,6 +85,7 @@ async fn workbench_configuration_survives_reconnect_and_rejects_a_stale_write() 
                 revision: state.revision,
                 document,
                 layout_only: false,
+                edit: None,
             };
             assert!(
                 matches!(send_rpc(&mut client, 3, update.clone()).await, ResponsePayload::Workbench(state) if state.revision == 1)
@@ -4107,6 +4108,7 @@ async fn workbench_watch_tracks_only_the_selected_workspace_and_rejects_invalid_
                     revision,
                     document: WorkspaceDocument::new(name.into()),
                     layout_only: false,
+                    edit: None,
                 };
                 assert!(matches!(
                     send_rpc(&mut writer, 4, update).await,

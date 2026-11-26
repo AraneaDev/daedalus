@@ -216,6 +216,14 @@ impl Merge<'_> {
         local: &Map<String, Value>,
         incoming: &Map<String, Value>,
     ) -> Map<String, Value> {
+        if let (Some(local_kind), Some(incoming_kind), Some(_)) = (
+            local.get("kind").and_then(Value::as_str),
+            incoming.get("kind").and_then(Value::as_str),
+            base.get("kind").and_then(Value::as_str),
+        ) && local_kind != incoming_kind
+        {
+            return self.tagged_variant(path, base, local, incoming);
+        }
         let keys: BTreeSet<_> = base
             .keys()
             .chain(local.keys())
@@ -232,6 +240,53 @@ impl Merge<'_> {
                 Some((key.clone(), value))
             })
             .collect()
+    }
+
+    fn tagged_variant(
+        &mut self,
+        path: &str,
+        base: &Map<String, Value>,
+        local: &Map<String, Value>,
+        incoming: &Map<String, Value>,
+    ) -> Map<String, Value> {
+        // An enum tag and its payload must come from the same side. The identity
+        // and label of a flattened named source or action can still merge separately.
+        const COMMON: [&str; 2] = ["id", "label"];
+        fn payload(record: &Map<String, Value>) -> Map<String, Value> {
+            record
+                .iter()
+                .filter(|(key, _)| !COMMON.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        }
+        let (base_payload, local_payload, incoming_payload) =
+            (payload(base), payload(local), payload(incoming));
+        let mut merged = if base_payload == incoming_payload {
+            local_payload
+        } else if base_payload == local_payload {
+            incoming_payload
+        } else {
+            match self.side(
+                child(path, "$variant"),
+                Some(&base_payload),
+                Some(&local_payload),
+                Some(&incoming_payload),
+            ) {
+                ConflictChoice::Local => local_payload,
+                ConflictChoice::Incoming => incoming_payload,
+            }
+        };
+        for key in COMMON {
+            if let Some(value) = self.value(
+                &child(path, key),
+                base.get(key),
+                local.get(key),
+                incoming.get(key),
+            ) {
+                merged.insert(key.into(), value);
+            }
+        }
+        merged
     }
 
     fn collection(
@@ -323,4 +378,33 @@ fn is_id_collection(path: &str) -> bool {
 
 fn child(path: &str, key: &str) -> String {
     format!("{path}/{}", key.replace('~', "~0").replace('/', "~1"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn action_variant_and_independent_label_changes_merge_without_conflict() {
+        let base = json!({"id": "open", "label": "Open", "kind": "diff"});
+        let rename = json!({"id": "open", "label": "Inspect", "kind": "diff"});
+        let variant = json!({
+            "id": "open", "label": "Open", "kind": "open_url", "url": "https://example.invalid"
+        });
+        let expected = json!({
+            "id": "open", "label": "Inspect", "kind": "open_url", "url": "https://example.invalid"
+        });
+        for (local, incoming) in [(&rename, &variant), (&variant, &rename)] {
+            let mut merge = Merge {
+                resolutions: &BTreeMap::new(),
+                conflicts: Vec::new(),
+            };
+            assert_eq!(
+                merge.value("/actions/open", Some(&base), Some(local), Some(incoming)),
+                Some(expected.clone())
+            );
+            assert!(merge.conflicts.is_empty());
+        }
+    }
 }

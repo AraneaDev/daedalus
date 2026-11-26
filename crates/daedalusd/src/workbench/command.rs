@@ -1,8 +1,9 @@
+mod output;
 mod process_tree;
 
 use super::runtime::SourceFields;
 use daedalus_proto::WorkspaceInfo;
-use daedalus_proto::workbench::{CommandOutput, WidgetResult, WorkspaceCommand};
+use daedalus_proto::workbench::{CommandOutput, WorkspaceCommand};
 use process_tree::ProcessTree;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -26,33 +27,7 @@ async fn execute(
     spec: &WorkspaceCommand,
     output: &CommandOutput,
 ) -> Result<SourceFields, String> {
-    let (program, args) = spec
-        .argv
-        .split_first()
-        .ok_or("The command has no executable")?;
-    let mut process = tokio::process::Command::from(crate::background_command(program));
-    process
-        .args(args)
-        .current_dir(&workspace.root_dir)
-        .kill_on_drop(true)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .envs(&workspace.injected_env)
-        .env("DAEDALUS_WORKSPACE_DIR", &workspace.root_dir)
-        .env(
-            "DAEDALUS_GIT_BRANCH",
-            workspace.git_branch.as_deref().unwrap_or_default(),
-        );
-    for name in &spec.env {
-        let value = workspace
-            .injected_env
-            .get(name)
-            .map(std::ffi::OsString::from)
-            .or_else(|| std::env::var_os(name))
-            .ok_or_else(|| format!("Environment variable '{name}' is missing"))?;
-        process.env(name, value);
-    }
+    let (program, mut process) = prepare_widget_command(workspace, spec)?;
     let start = Instant::now();
     let (mut child, process_tree) = ProcessTree::spawn(&mut process)
         .await
@@ -83,62 +58,41 @@ async fn execute(
             return Err(format!("Command exceeded {} seconds", limit.as_secs()));
         }
     };
-    let status_label = if status.success() { "Passed" } else { "Failed" };
-    let mut fields = SourceFields::from([
-        ("elapsed_ms".into(), start.elapsed().as_millis().to_string()),
-        ("status".into(), status_label.into()),
-        ("label".into(), status_label.into()),
-        (
-            "level".into(),
-            if status.success() { "ok" } else { "error" }.into(),
-        ),
-    ]);
-    if let Some(code) = status.code() {
-        fields.insert("exit_code".into(), code.to_string());
+    output::project_fields(output, status, stdout, stderr, start.elapsed())
+}
+
+fn prepare_widget_command<'a>(
+    workspace: &WorkspaceInfo,
+    spec: &'a WorkspaceCommand,
+) -> Result<(&'a str, tokio::process::Command), String> {
+    let (program, args) = spec
+        .argv
+        .split_first()
+        .ok_or("The command has no executable")?;
+    let mut process = tokio::process::Command::from(crate::background_command(program));
+    process
+        .args(args)
+        .current_dir(&workspace.root_dir)
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .envs(&workspace.injected_env)
+        .env("DAEDALUS_WORKSPACE_DIR", &workspace.root_dir)
+        .env(
+            "DAEDALUS_GIT_BRANCH",
+            workspace.git_branch.as_deref().unwrap_or_default(),
+        );
+    for name in &spec.env {
+        let value = workspace
+            .injected_env
+            .get(name)
+            .map(std::ffi::OsString::from)
+            .or_else(|| std::env::var_os(name))
+            .ok_or_else(|| format!("Environment variable '{name}' is missing"))?;
+        process.env(name, value);
     }
-    if !stderr.trim().is_empty() && !status.success() {
-        fields.insert("detail.stderr".into(), stderr);
-    }
-    match output {
-        CommandOutput::ExitStatus => {}
-        CommandOutput::Text { contains } => {
-            if !stdout.trim().is_empty() {
-                fields.insert("detail.Output".into(), stdout.trim_end().into());
-            }
-            if let Some(line) = stdout.lines().find(|line| {
-                contains
-                    .as_ref()
-                    .is_none_or(|pattern| line.contains(pattern))
-            }) {
-                fields.insert("text".into(), line.into());
-                fields.insert("label".into(), line.into());
-            }
-        }
-        CommandOutput::Json => {
-            let value = serde_json::from_str(&stdout)
-                .map_err(|error| format!("Invalid command JSON: {error}"))?;
-            read_json(&mut fields, "", &value);
-        }
-        CommandOutput::WidgetResult => {
-            let result: WidgetResult = serde_json::from_str(&stdout)
-                .map_err(|error| format!("Invalid widget result: {error}"))?;
-            fields.insert("label".into(), result.label);
-            let level = match result.level {
-                daedalus_proto::StatusLevel::Info => "info",
-                daedalus_proto::StatusLevel::Ok => "ok",
-                daedalus_proto::StatusLevel::Warn => "warn",
-                daedalus_proto::StatusLevel::Error => "error",
-            };
-            fields.insert("level".into(), level.into());
-            fields.extend(
-                result
-                    .details
-                    .into_iter()
-                    .map(|(key, value)| (format!("detail.{key}"), value)),
-            );
-        }
-    }
-    Ok(fields)
+    Ok((program, process))
 }
 
 async fn read_output(input: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<String> {
@@ -151,36 +105,6 @@ async fn read_output(input: impl tokio::io::AsyncRead + Unpin) -> std::io::Resul
         return Err(std::io::Error::other("Command output exceeded 64 KiB"));
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-fn read_json(fields: &mut SourceFields, path: &str, value: &serde_json::Value) {
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, value) in object {
-                let path = if path.is_empty() {
-                    format!("json.{key}")
-                } else {
-                    format!("{path}.{key}")
-                };
-                read_json(fields, &path, value);
-            }
-        }
-        serde_json::Value::Array(array) => {
-            for (index, value) in array.iter().enumerate() {
-                read_json(fields, &format!("{path}.{index}"), value);
-            }
-        }
-        serde_json::Value::Null => {}
-        value => {
-            let path = if path.is_empty() { "json" } else { path };
-            fields.insert(
-                path.into(),
-                value
-                    .as_str()
-                    .map_or_else(|| value.to_string(), str::to_owned),
-            );
-        }
-    }
 }
 
 #[cfg(test)]

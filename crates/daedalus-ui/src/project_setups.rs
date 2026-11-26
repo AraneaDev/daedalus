@@ -3,8 +3,25 @@
 
 use crate::assignments::{self, Assignment};
 use daedalus_proto::{WorkspaceId, types::Workspace, validate_assignments};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupMigration {
+    pub workspace_id: WorkspaceId,
+    pub request_id: u64,
+    pub assignments: Vec<Assignment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MigrationState {
+    Pending {
+        workspace_id: WorkspaceId,
+        request_id: u64,
+    },
+    Failed,
+    Confirmed,
+}
 
 #[derive(Debug, Default)]
 pub struct ProjectSetups {
@@ -15,8 +32,8 @@ pub struct ProjectSetups {
     roots: HashMap<WorkspaceId, PathBuf>,
     /// Last setup the daemon confirmed for each workspace.
     confirmed: HashMap<WorkspaceId, Vec<Assignment>>,
-    migrated: HashSet<WorkspaceId>,
-    migrated_roots: HashSet<PathBuf>,
+    migrations_by_root: HashMap<PathBuf, MigrationState>,
+    next_migration: u64,
 }
 
 impl ProjectSetups {
@@ -40,8 +57,7 @@ impl ProjectSetups {
         self.cache.clear();
         self.roots.clear();
         self.confirmed.clear();
-        self.migrated.clear();
-        self.migrated_roots.clear();
+        self.migrations_by_root.clear();
     }
 
     pub fn absorb<P>(&mut self, workspaces: &[Workspace<P>]) {
@@ -118,37 +134,95 @@ impl ProjectSetups {
         Ok(Some(entries))
     }
 
-    /// Local setups the daemon does not have yet. Each workspace, and each project folder, is
-    /// offered once per connection, and local files are left untouched.
-    pub fn migrations<P>(
-        &mut self,
-        workspaces: &[Workspace<P>],
-    ) -> Vec<(WorkspaceId, Vec<Assignment>)> {
+    /// Offer each folder's legacy setup once, leaving failed attempts for an explicit retry.
+    pub fn migrations<P>(&mut self, workspaces: &[Workspace<P>]) -> Vec<SetupMigration> {
         if !self.daemon_backed {
             return Vec::new();
         }
-        let mut found = Vec::new();
-        for info in workspaces {
-            if info.setup.is_some()
-                || self.migrated.contains(&info.id)
-                || self.migrated_roots.contains(&info.root_dir)
-            {
-                continue;
-            }
-            let path = self.local_path(info.id);
-            if !path.exists() {
-                continue;
-            }
-            let Ok(entries) = assignments::load_from(&path, Vec::new()) else {
-                continue;
-            };
-            self.migrated.insert(info.id);
-            self.migrated_roots.insert(info.root_dir.clone());
-            self.roots.insert(info.id, info.root_dir.clone());
-            self.cache.insert(info.id, entries.clone());
-            found.push((info.id, entries));
+        workspaces
+            .iter()
+            .filter_map(|info| {
+                if self.migrations_by_root.contains_key(&info.root_dir) {
+                    return None;
+                }
+                self.offer_migration(info)
+            })
+            .collect()
+    }
+
+    pub fn retry_migration<P>(
+        &mut self,
+        root: &Path,
+        workspaces: &[Workspace<P>],
+    ) -> Option<SetupMigration> {
+        if self.migrations_by_root.get(root) != Some(&MigrationState::Failed) {
+            return None;
         }
-        found
+        workspaces
+            .iter()
+            .filter(|info| info.root_dir == root)
+            .find_map(|info| self.offer_migration(info))
+    }
+
+    fn offer_migration<P>(&mut self, info: &Workspace<P>) -> Option<SetupMigration> {
+        if info.setup.is_some() || self.confirmed.contains_key(&info.id) {
+            return None;
+        }
+        let path = self.local_path(info.id);
+        if !path.exists() {
+            return None;
+        }
+        let assignments = assignments::load_from(&path, Vec::new()).ok()?;
+        self.next_migration = self.next_migration.wrapping_add(1);
+        let request_id = self.next_migration;
+        self.migrations_by_root.insert(
+            info.root_dir.clone(),
+            MigrationState::Pending {
+                workspace_id: info.id,
+                request_id,
+            },
+        );
+        self.roots.insert(info.id, info.root_dir.clone());
+        self.cache.insert(info.id, assignments.clone());
+        Some(SetupMigration {
+            workspace_id: info.id,
+            request_id,
+            assignments,
+        })
+    }
+
+    /// Return whether the reply belongs to the current attempt for the folder.
+    pub fn finish_migration(
+        &mut self,
+        workspace_id: WorkspaceId,
+        request_id: u64,
+        saved: bool,
+    ) -> bool {
+        let Some(status) = self
+            .roots
+            .get(&workspace_id)
+            .and_then(|root| self.migrations_by_root.get_mut(root))
+        else {
+            return false;
+        };
+        if *status
+            != (MigrationState::Pending {
+                workspace_id,
+                request_id,
+            })
+        {
+            return false;
+        }
+        if saved {
+            *status = MigrationState::Confirmed;
+            if let Some(entries) = self.cache.get(&workspace_id) {
+                self.confirmed.insert(workspace_id, entries.clone());
+            }
+        } else {
+            *status = MigrationState::Failed;
+            self.rejected(workspace_id);
+        }
+        true
     }
 }
 
@@ -267,7 +341,8 @@ mod tests {
         store.set_daemon_backed(true);
         let before = std::fs::read(&file).unwrap();
         let first = store.migrations(std::slice::from_ref(&ws));
-        assert_eq!(first, vec![(ws.id, vec![entry("a")])]);
+        assert_eq!(first[0].workspace_id, ws.id);
+        assert_eq!(first[0].assignments, vec![entry("a")]);
         assert!(store.migrations(std::slice::from_ref(&ws)).is_empty());
         assert_eq!(store.load(ws.id).unwrap(), vec![entry("a")]);
         let mut done = ws.clone();
@@ -358,8 +433,37 @@ mod tests {
         store.set_daemon_backed(false);
         store.save(ws.id, vec![entry("a")]).unwrap();
         store.set_daemon_backed(true);
-        assert_eq!(store.migrations(std::slice::from_ref(&ws)).len(), 1);
-        store.rejected(ws.id);
+        let migration = store.migrations(std::slice::from_ref(&ws)).pop().unwrap();
+        assert!(store.finish_migration(ws.id, migration.request_id, false));
         assert!(store.load(ws.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_migration_retries_once_per_folder_on_explicit_refresh() {
+        let (_dir, mut store) = store();
+        let first = info("/p", None);
+        let second = info("/p", None);
+        store.save(first.id, vec![entry("first")]).unwrap();
+        store.save(second.id, vec![entry("second")]).unwrap();
+        store.set_daemon_backed(true);
+        let workspaces = [first.clone(), second.clone()];
+        let offer = store.migrations(&workspaces).pop().unwrap();
+        assert_eq!(offer.workspace_id, first.id);
+        assert!(store.finish_migration(offer.workspace_id, offer.request_id, false));
+        assert!(store.migrations(&workspaces).is_empty());
+        let retry = store.retry_migration(Path::new("/p"), &[second]).unwrap();
+        assert_ne!(retry.workspace_id, first.id);
+        assert!(!store.finish_migration(offer.workspace_id, offer.request_id, false));
+        assert!(
+            store
+                .retry_migration(Path::new("/p"), &workspaces)
+                .is_none()
+        );
+        assert!(store.finish_migration(retry.workspace_id, retry.request_id, true));
+        assert!(
+            store
+                .retry_migration(Path::new("/p"), &workspaces)
+                .is_none()
+        );
     }
 }

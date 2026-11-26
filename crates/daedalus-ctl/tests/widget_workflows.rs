@@ -446,6 +446,125 @@ async fn repo_updates_require_a_choice_before_replacing_concurrent_local_edits()
     app.finish().await;
 }
 
+#[tokio::test]
+async fn linked_import_applies_the_whole_chosen_variant_and_keeps_independent_labels() {
+    let app = Workbench::start().await;
+    let workspace = app.workspace(app.directory.path()).await;
+    let target = ["--workspace", workspace.as_str()];
+    let config = app.file(".daedalus-workspace.toml");
+    let base = r#"version = 1
+name = "Workbench"
+[[widgets]]
+id = "fixture"
+name = "Fixture"
+pinned = true
+[[widgets.definition.sources]]
+id = "main"
+kind = "published"
+key = "old"
+[[widgets.definition.actions]]
+id = "open"
+label = "Open"
+kind = "open_url"
+url = "https://example.invalid/old"
+"#;
+    std::fs::write(&config, base).unwrap();
+    app.run(&[&["workspace", "import", "--repo"][..], &target].concat())
+        .await;
+
+    let template = app.file("local.toml");
+    std::fs::write(
+        &template,
+        r#"version = 1
+[template]
+id = "fixture"
+name = "Fixture"
+[[template.definition.sources]]
+id = "main"
+kind = "git"
+[[template.definition.actions]]
+id = "open"
+label = "Local label"
+kind = "diff"
+"#,
+    )
+    .unwrap();
+    app.run(
+        &[
+            &[
+                "widget",
+                "edit",
+                "fixture",
+                "--file",
+                template.to_str().unwrap(),
+            ][..],
+            &target,
+        ]
+        .concat(),
+    )
+    .await;
+    std::fs::write(
+        config,
+        base.replace("key = \"old\"", "key = \"incoming\"")
+            .replace("example.invalid/old", "example.invalid/new"),
+    )
+    .unwrap();
+
+    let update = [&["workspace", "update", "--json"][..], &target].concat();
+    let dry_run = [update.as_slice(), &["--dry-run"]].concat();
+    let preview: Value = serde_json::from_str(&app.run(&dry_run).await).unwrap();
+    let paths = preview["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|conflict| conflict["path"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    let source = "/widgets/fixture/definition/sources/main/$variant";
+    let action = "/widgets/fixture/definition/actions/open/$variant";
+    assert_eq!(paths, [action, source]);
+
+    let local_choice = format!("{action}=local");
+    let source_choice = format!("{source}=incoming");
+    let local_preview: Value = serde_json::from_str(
+        &app.run(
+            &[
+                dry_run.as_slice(),
+                &["--resolve", &source_choice, "--resolve", &local_choice],
+            ]
+            .concat(),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(local_preview["conflicts"], serde_json::json!([]));
+    assert_eq!(
+        local_preview["proposed"]["widgets"][0]["definition"]["actions"][0]["kind"],
+        "diff"
+    );
+
+    let action_choice = format!("{action}=incoming");
+    let apply = [
+        update.as_slice(),
+        &["--resolve", &source_choice, "--resolve", &action_choice],
+    ]
+    .concat();
+    let incoming_preview: Value =
+        serde_json::from_str(&app.run(&[apply.as_slice(), &["--dry-run"]].concat()).await).unwrap();
+    let saved: Value = serde_json::from_str(&app.run(&apply).await).unwrap();
+    assert_eq!(incoming_preview["conflicts"], serde_json::json!([]));
+    assert_eq!(incoming_preview["proposed"], saved["document"]);
+    let definition = &saved["document"]["widgets"][0]["definition"];
+    assert_eq!(
+        definition["sources"][0],
+        serde_json::json!({"id": "main", "kind": "published", "key": "incoming"})
+    );
+    assert_eq!(
+        definition["actions"][0],
+        serde_json::json!({"id": "open", "kind": "open_url", "label": "Local label", "url": "https://example.invalid/new"})
+    );
+    app.finish().await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn terminal_editor_updates_a_definition_and_keeps_state_on_cancel() {

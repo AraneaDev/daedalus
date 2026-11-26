@@ -936,15 +936,13 @@ mod tests {
 
     #[test]
     fn compact_close_modal_targets_match_their_keyboard_actions() {
-        use daedalus_ui::state::CloseWorkspaceModalState;
         use winit::keyboard::{Key, NamedKey};
-        let mut state = CloseWorkspaceModalState {
-            open: true,
-            is_dirty: true,
-            is_worktree: true,
-            remove_worktree: true,
-            ..Default::default()
-        };
+        let mut app_state = AppState::new();
+        app_state.close_modal.open = true;
+        app_state.close_modal.is_dirty = true;
+        app_state.close_modal.is_worktree = true;
+        app_state.close_modal.remove_worktree = true;
+        let mut state = app_state.close_modal;
         for (width, height, scale) in [
             (320.0, 180.0, 1.0),
             (640.0, 360.0, 2.0),

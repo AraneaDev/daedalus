@@ -472,6 +472,7 @@ async fn invalid_setup_on_new_daemon_is_rejected_locally() {
             UiCommand::SaveProjectSetup {
                 workspace_id,
                 assignments: invalid,
+                request_id: 42,
             },
         ),
     )
@@ -480,7 +481,11 @@ async fn invalid_setup_on_new_daemon_is_rejected_locally() {
     .unwrap();
     assert!(matches!(
         ui_rx.try_recv(),
-        Ok(UiEvent::ProjectSetupSaveFailed { .. })
+        Ok(UiEvent::ProjectSetupMigrationFinished {
+            request_id: 42,
+            result: Err(_),
+            ..
+        })
     ));
     assert!(
         !drain(&mut seen)

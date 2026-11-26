@@ -2,6 +2,8 @@ mod workspace_form;
 pub(super) use workspace_form::workspace_action;
 mod setup_review;
 pub(super) use setup_review::setup_action;
+mod close_workspace;
+mod overlays;
 mod settings;
 mod terminals;
 mod worktree;
@@ -34,10 +36,6 @@ const SETUP_REVIEW: NodeId = NodeId(19);
 const SETTINGS: NodeId = NodeId(14);
 const OPEN_SETTINGS: NodeId = NodeId(17);
 const TOGGLE_LAYOUT: NodeId = NodeId(20);
-const CARGO_BUTTONS: [(NodeId, daedalus_ui::assignments::CargoPreset); 2] = [
-    (NodeId(21), daedalus_ui::assignments::CargoPreset::Test),
-    (NodeId(22), daedalus_ui::assignments::CargoPreset::Check),
-];
 const NEW_WORKSPACE: NodeId = NodeId(15);
 const VALIDATION: NodeId = NodeId(12);
 const BRANCH_TEXT: NodeId = NodeId(13);
@@ -68,10 +66,8 @@ pub(super) fn action(
                 return Some(UiAction::NewWorkspace);
             }
             node if state.workspace_list_loaded => {
-                if state.show_cargo_bar()
-                    && let Some((_, preset)) = CARGO_BUTTONS.iter().find(|(id, _)| *id == node)
-                {
-                    return Some(UiAction::RunCargo(*preset));
+                if let Some(preset) = controls.cargo_preset(state, node) {
+                    return Some(UiAction::RunCargo(preset));
                 }
                 if controls.is_run_tests(state, node) {
                     return Some(UiAction::RunTests);
@@ -86,9 +82,14 @@ pub(super) fn action(
             _ => {}
         }
     }
-    if state.active_overlay() != Some(ActiveOverlay::Worktree)
-        || request.target_tree != TreeId::ROOT
-    {
+    if request.target_tree != TreeId::ROOT {
+        return None;
+    }
+    let overlay = state.active_overlay();
+    if overlay == Some(ActiveOverlay::CloseWorkspace) {
+        return close_workspace::action(state, request, controls);
+    }
+    if overlay != Some(ActiveOverlay::Worktree) {
         return None;
     }
     let (branch, cancel, create) = worktree_controls(state);
@@ -187,15 +188,6 @@ fn overlay(state: &AppState) -> Option<(NodeId, Node)> {
         let mut detail = vec![modal.workspace_name.clone()];
         if modal.is_dirty {
             detail.push("Worktree has uncommitted changes".to_owned());
-        }
-        if modal.has_compose {
-            detail.push(format!("Stop Docker Compose: {}", modal.compose_down));
-        }
-        if modal.is_worktree {
-            detail.push(format!("Remove worktree: {}", modal.remove_worktree));
-        }
-        if modal.is_dirty && modal.remove_worktree {
-            detail.push(format!("Force removal: {}", modal.force_remove_worktree));
         }
         detail.push(if modal.submitting {
             "Closing workspace.".to_owned()
@@ -336,35 +328,17 @@ pub(super) fn workbench_tree(
         root.push_child(OPEN_NEW_WORKSPACE);
         nodes.push((OPEN_NEW_WORKSPACE, button));
     }
-    let focus = if let Some((id, mut node)) = current_overlay {
-        let mut focus = id;
-        if id == SETUP_REVIEW {
-            focus = setup_review::fields(
-                &state.setup_review,
-                &mut node,
-                &mut nodes,
-                daedalus_ui::setup_review::modal_rect(width, height, scale),
-            );
-        } else if id == SETTINGS {
-            focus = settings::fields(
-                &state.settings,
-                &mut node,
-                &mut nodes,
-                state.settings.modal_rect(width, height, scale),
-            );
-        } else if id == NEW_WORKSPACE {
-            focus = workspace_form::workspace_fields(
-                &state.workspace_form,
-                &mut node,
-                &mut nodes,
-                state.workspace_form.modal_rect(width, height, scale),
-            );
-        } else if id == WORKTREE {
-            focus = worktree::append_fields(state, &mut node, &mut nodes, width, height, scale);
-        }
+    let focus = if let Some((id, node)) = current_overlay {
         root.push_child(id);
-        nodes.push((id, node));
-        focus
+        overlays::append(
+            state,
+            (id, node),
+            &mut nodes,
+            width,
+            height,
+            scale,
+            controls,
+        )
     } else if let Some(ws) = state.active_workspace() {
         let mut workspace = named(Role::Group, format!("Workspace {}", ws.name));
         let mut description = Vec::new();
@@ -398,14 +372,7 @@ pub(super) fn workbench_tree(
         toggle_layout.add_action(Action::Click);
         workspace.push_child(TOGGLE_LAYOUT);
         nodes.push((TOGGLE_LAYOUT, toggle_layout));
-        if state.show_cargo_bar() {
-            for (id, preset) in CARGO_BUTTONS {
-                let mut button = named(Role::Button, preset.label());
-                button.add_action(Action::Click);
-                workspace.push_child(id);
-                nodes.push((id, button));
-            }
-        }
+        controls.append_cargo(state, &mut workspace, &mut nodes);
         workspace.push_child(OPEN_SETTINGS);
         nodes.push((OPEN_SETTINGS, open_settings));
         root.push_child(WORKSPACE);
@@ -470,6 +437,7 @@ mod tests {
     use super::workspace_form::{control_node, form_node};
     use super::*;
     use accesskit::Invalid;
+    use daedalus_ui::assignments::CargoPreset;
     use daedalus_ui::workspace_form::{Control, WorkspaceFormAction};
     fn action(state: &AppState, request: &ActionRequest) -> Option<UiAction> {
         super::action(state, request, &TerminalControls::default())
@@ -988,45 +956,195 @@ mod tests {
         assert_eq!(super::action(&state, &request, &controls), None);
     }
 
+    fn cargo_clicks(tree: &TreeUpdate) -> [(CargoPreset, ActionRequest); CargoPreset::ALL.len()] {
+        CargoPreset::ALL.map(|preset| {
+            let (id, _) = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(preset.label()))
+                .unwrap();
+            (
+                preset,
+                ActionRequest {
+                    action: Action::Click,
+                    target_node: *id,
+                    target_tree: TreeId::ROOT,
+                    data: None,
+                },
+            )
+        })
+    }
+
     #[test]
-    fn cargo_accessibility_actions_require_a_cargo_workspace_and_no_modal() {
+    fn cargo_clicks_are_scoped_to_the_workspace_that_exposed_them() {
         let mut state = agent_workspace();
-        let controls = TerminalControls::default();
-        let click = |node| ActionRequest {
-            action: Action::Click,
-            target_node: node,
-            target_tree: TreeId::ROOT,
-            data: None,
-        };
-        assert_eq!(
-            super::action(&state, &click(TOGGLE_LAYOUT), &controls),
-            Some(UiAction::ToggleZoom)
-        );
-        for (id, _) in CARGO_BUTTONS {
-            assert_eq!(super::action(&state, &click(id), &controls), None);
-        }
+        let mut second = state.workspaces[0].clone();
+        second.id = daedalus_proto::WorkspaceId::new();
+        second.name = "Other cargo project".into();
+        second.panes.clear();
+        second.project.tools.push("Cargo".into());
+        let second_id = second.id;
+        state.workspaces.push(second);
         state
             .active_workspace_mut()
             .unwrap()
             .project
             .tools
             .push("Cargo".into());
-        let current = tree(&state);
-        for (id, preset) in CARGO_BUTTONS {
-            assert!(
-                current
-                    .nodes
-                    .iter()
-                    .any(|(node_id, node)| *node_id == id && node.label() == Some(preset.label()))
-            );
+
+        let mut controls = TerminalControls::default();
+        let first = cargo_clicks(&workbench_tree(&state, 1200., 800., 1., &mut controls));
+        for (preset, click) in &first {
             assert_eq!(
-                super::action(&state, &click(id), &controls),
+                super::action(&state, click, &controls),
+                Some(UiAction::RunCargo(*preset))
+            );
+        }
+
+        state.select_workspace(second_id);
+        for (_, stale) in &first {
+            assert_eq!(super::action(&state, stale, &controls), None);
+        }
+        let second = cargo_clicks(&workbench_tree(&state, 1200., 800., 1., &mut controls));
+        for ((_, stale), (preset, current)) in first.iter().zip(second) {
+            assert_eq!(super::action(&state, stale, &controls), None);
+            assert_eq!(
+                super::action(&state, &current, &controls),
                 Some(UiAction::RunCargo(preset))
             );
         }
+    }
+
+    #[test]
+    fn close_workspace_exposes_clickable_options_and_dialog_buttons() {
+        let mut state = agent_workspace();
+        let workspace = state.active_workspace_mut().unwrap();
+        workspace.compose_project_name = Some("test-project".into());
+        let workspace_id = workspace.id;
+        state.connection = ConnectionState::Connected;
+        assert!(state.open_close_modal_for_workspace(workspace_id));
+        state.close_modal.is_worktree = true;
+        state.close_modal.is_dirty = true;
+        state.close_modal.toggle_worktree();
+
+        let mut controls = TerminalControls::default();
+        let update = workbench_tree(&state, 400., 300., 1.25, &mut controls);
+        let dialog = &update.nodes.iter().find(|(id, _)| *id == CLOSE).unwrap().1;
+        assert_eq!(dialog.children().len(), 5);
+        let mut requests = Vec::new();
+        for (label, expected, toggled) in [
+            (
+                "Stop Docker Compose",
+                UiAction::CloseModalToggleCompose,
+                Some(accesskit::Toggled::True),
+            ),
+            (
+                "Remove Git worktree",
+                UiAction::CloseModalToggleWorktree,
+                Some(accesskit::Toggled::True),
+            ),
+            (
+                "Force removal",
+                UiAction::CloseModalToggleForce,
+                Some(accesskit::Toggled::False),
+            ),
+            ("Cancel", UiAction::CloseModalCancel, None),
+            ("Confirm close", UiAction::CloseModalConfirm, None),
+        ] {
+            let (id, node) = update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .unwrap();
+            assert!(dialog.children().contains(id));
+            assert!(node.bounds().is_some());
+            assert_eq!(node.toggled(), toggled);
+            assert!(node.supports_action(Action::Click));
+            let request = ActionRequest {
+                action: Action::Click,
+                target_node: *id,
+                target_tree: TreeId::ROOT,
+                data: None,
+            };
+            assert_eq!(super::action(&state, &request, &controls), Some(expected));
+            requests.push(request);
+        }
+        assert_eq!(update.focus, requests[3].target_node);
+
+        state.connection = ConnectionState::Reconnecting;
+        assert_eq!(super::action(&state, &requests[4], &controls), None);
+        assert_eq!(
+            super::action(&state, &requests[3], &controls),
+            Some(UiAction::CloseModalCancel)
+        );
+        state.connection = ConnectionState::Connected;
+        state.close_modal.toggle_worktree();
+        assert_eq!(super::action(&state, &requests[2], &controls), None);
+        state.close_modal.submitting = true;
+        let pending = workbench_tree(&state, 400., 300., 1.25, &mut controls);
+        assert_eq!(pending.focus, CLOSE);
+        for request in &requests {
+            assert_eq!(super::action(&state, request, &controls), None);
+            if let Some((_, node)) = pending
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == request.target_node)
+            {
+                assert!(node.is_disabled());
+                assert!(!node.supports_action(Action::Click));
+            }
+        }
+
+        state.close_modal.close();
+        assert!(state.open_close_modal_for_workspace(workspace_id));
+        assert_eq!(super::action(&state, &requests[4], &controls), None);
+        let _ = workbench_tree(&state, 400., 300., 1.25, &mut controls);
+        for request in &requests {
+            assert_eq!(super::action(&state, request, &controls), None);
+        }
+    }
+
+    #[test]
+    fn cargo_accessibility_actions_require_a_cargo_workspace_and_no_modal() {
+        let mut state = agent_workspace();
+        let mut controls = TerminalControls::default();
+        let toggle = ActionRequest {
+            action: Action::Click,
+            target_node: TOGGLE_LAYOUT,
+            target_tree: TreeId::ROOT,
+            data: None,
+        };
+        assert_eq!(
+            super::action(&state, &toggle, &controls),
+            Some(UiAction::ToggleZoom)
+        );
+        let initial = workbench_tree(&state, 1200., 800., 1., &mut controls);
+        for preset in CargoPreset::ALL {
+            assert!(
+                initial
+                    .nodes
+                    .iter()
+                    .all(|(_, node)| node.label() != Some(preset.label()))
+            );
+        }
+
+        state
+            .active_workspace_mut()
+            .unwrap()
+            .project
+            .tools
+            .push("Cargo".into());
+        let current = workbench_tree(&state, 1200., 800., 1., &mut controls);
+        let clicks = cargo_clicks(&current);
         state.worktree_modal.open();
-        for (id, _) in CARGO_BUTTONS {
-            assert_eq!(super::action(&state, &click(id), &controls), None);
+        for (_, click) in &clicks {
+            assert_eq!(super::action(&state, click, &controls), None);
+        }
+
+        state.worktree_modal.close();
+        state.active_workspace_mut().unwrap().project.tools.clear();
+        for (_, click) in &clicks {
+            assert_eq!(super::action(&state, click, &controls), None);
         }
     }
 
