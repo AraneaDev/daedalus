@@ -1,7 +1,10 @@
+mod background_rpc;
 mod launch;
 #[cfg(test)]
 mod negotiation_tests;
+mod recent_projects;
 mod rpc;
+mod session_init;
 mod setup;
 pub(crate) mod terminal;
 mod widget_lane;
@@ -14,16 +17,18 @@ use std::time::Duration;
 
 use daedalus_proto::{
     AgentState, ClientMessage, ContainerHealth, GitWorkspaceStatus, GridRow, GridSnapshot, PaneId,
-    PaneSummary, PortMapping, ProtoError, ResponsePayload, SearchMatch, ServerEvent, WorkspaceId,
+    PaneSummary, PortMapping, ResponsePayload, SearchMatch, ServerEvent, WorkspaceId,
     WorkspaceInfo, WorkspaceManifest,
 };
 use launch::{connect_endpoint, should_auto_spawn_daemon, spawn_daemon_detached};
 use rpc::{RpcConnection, RpcError};
+use session_init::initialize_session;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use workspace::{
     create_and_populate_workspace, create_worktree_and_populate_workspace, ensure_workspace_panes,
-    replace_agent_preset, workspace_name_from_dir,
+    replace_agent_preset,
 };
 
 use crate::state::AgentPreset;
@@ -123,6 +128,7 @@ pub enum UiCommand {
     SaveWorkspaceSettings {
         workspace_id: WorkspaceId,
         assignments: Vec<crate::assignments::Assignment>,
+        expected: daedalus_proto::ProjectSetupBaseline,
         request_id: u64,
     },
     ReadActivity {
@@ -273,6 +279,7 @@ pub enum UiEvent {
         page: daedalus_proto::ActivityPage,
     },
     ActivityReadFailed(u64),
+    /// The session has loaded initial terminal snapshots and can dispatch commands.
     Connected,
     Disconnected,
     WorkspacesLoaded(Vec<WorkspaceInfo>),
@@ -518,115 +525,6 @@ async fn run_bridge(
     }
 }
 
-async fn initialize_session(
-    conn: &mut RpcConnection,
-    config: &BridgeConfig,
-    sink: &Arc<dyn UiEventSink>,
-    bootstrapped: &mut bool,
-    session: &watch::Sender<Option<mpsc::UnboundedSender<UiCommand>>>,
-    cmd_tx: mpsc::UnboundedSender<UiCommand>,
-) -> Result<(), RpcError> {
-    if let Some(token) = config.auth_token.as_ref().filter(|token| !token.is_empty()) {
-        let response = conn
-            .call(ClientMessage::Authenticate {
-                token: token.clone(),
-            })
-            .await?;
-        if !matches!(response, ResponsePayload::Ok) {
-            return Err(RpcError::Proto(ProtoError::InvalidRequest(
-                "unexpected authentication response".into(),
-            )));
-        }
-    }
-    let ResponsePayload::Pong {
-        journal_supported,
-        inspect_setup_supported,
-        recent_projects_supported,
-        project_setup_supported,
-        image_preview_supported,
-        paste_supported,
-        workbench_supported,
-        workspace_membership_supported,
-        runner_assignment_supported,
-        resolved_import_preview_supported,
-        agent_launch_metadata_supported,
-        home_dir,
-        ..
-    } = conn.call(ClientMessage::Ping).await?
-    else {
-        return Err(RpcError::Proto(ProtoError::InvalidRequest(
-            "Unexpected response to daemon handshake.".into(),
-        )));
-    };
-    conn.inspect_setup_supported = inspect_setup_supported;
-    conn.recent_projects_supported = recent_projects_supported;
-    conn.image_preview_supported = image_preview_supported;
-    conn.project_setup_supported = project_setup_supported;
-    conn.paste_supported = paste_supported;
-    conn.workbench_supported = workbench_supported;
-    conn.runner_assignment_supported = runner_assignment_supported;
-    conn.resolved_import_preview_supported = resolved_import_preview_supported;
-    conn.agent_launch_metadata_supported = agent_launch_metadata_supported;
-    let _ = conn
-        .call(ClientMessage::Subscribe {
-            pane_ids: None,
-            project_setup_events: project_setup_supported,
-        })
-        .await?;
-    if workspace_membership_supported {
-        conn.call(ClientMessage::WatchWorkspaceMembership).await?;
-    }
-    session.send_replace(Some(cmd_tx));
-    sink.emit(UiEvent::Connected);
-    sink.emit(UiEvent::WorkbenchCapability(workbench_supported));
-    sink.emit(UiEvent::JournalCapability(journal_supported));
-    sink.emit(UiEvent::DaemonCapabilities {
-        home_dir,
-        project_setups: project_setup_supported,
-        recent_projects: recent_projects_supported,
-    });
-    setup::refresh_recent_projects(conn, sink).await?;
-
-    let workspaces = match conn.call(ClientMessage::ListWorkspaces).await? {
-        ResponsePayload::Workspaces(ws) => ws,
-        _ => {
-            return Err(RpcError::Proto(ProtoError::Internal(
-                "Unexpected workspace list response.".into(),
-            )));
-        }
-    };
-
-    if workspaces.is_empty() && !*bootstrapped && config.bootstrap_explicit_dir {
-        let name = workspace_name_from_dir(&config.initial_dir);
-        create_and_populate_workspace(
-            conn,
-            sink,
-            name,
-            config.initial_dir.clone(),
-            config.default_agent,
-            DEFAULT_PANE_COLS,
-            DEFAULT_PANE_ROWS,
-        )
-        .await?;
-        *bootstrapped = true;
-    } else {
-        *bootstrapped = true;
-        sink.emit(UiEvent::WorkspacesLoaded(workspaces.clone()));
-        for ws in &workspaces {
-            for pane in &ws.panes {
-                if let ResponsePayload::Snapshot(snapshot) = conn
-                    .call(ClientMessage::GetSnapshot { pane_id: pane.id })
-                    .await?
-                {
-                    sink.emit(UiEvent::Snapshot(snapshot));
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 async fn reconcile_membership(
     conn: &RpcConnection,
     sink: &Arc<dyn UiEventSink>,
@@ -649,13 +547,26 @@ async fn session_loop(
 ) {
     let membership = conn.membership_notifications();
     let mut widgets = widget_lane::WidgetLane::new(endpoint, auth_token, sink);
+    let mut recents = JoinSet::new();
+    let mut refresh_recents = conn.recent_projects_supported;
     loop {
+        if refresh_recents && recents.is_empty() {
+            recent_projects::request(&mut recents, endpoint, auth_token);
+            refresh_recents = false;
+        }
         tokio::select! {
             biased;
             _ = conn.disconnected() => {
                 return;
             }
             _ = widgets.join_next(), if widgets.has_jobs() => {}
+            Some(result) = recents.join_next(), if !recents.is_empty() => {
+                match result {
+                    Ok(Ok(projects)) => sink.emit(UiEvent::RecentProjectsLoaded(projects)),
+                    Ok(Err(error)) => warn!(%error, "listing recent projects failed"),
+                    Err(error) => warn!(%error, "recent projects task failed"),
+                }
+            }
             _ = membership.notified() => {
                 if let Err(error) = reconcile_membership(conn, sink).await {
                     debug!("membership reconciliation interrupted: {error:?}");
@@ -668,6 +579,10 @@ async fn session_loop(
                 };
                 if matches!(cmd, UiCommand::Shutdown) {
                     return;
+                }
+                if matches!(cmd, UiCommand::RefreshRecentProjects) {
+                    refresh_recents = conn.recent_projects_supported;
+                    continue;
                 }
                 if conn.workbench_supported && widgets.dispatch(&cmd) {
                     continue;
@@ -729,9 +644,7 @@ async fn handle_command(
         UiCommand::InstallSetupTool { workspace_id, argv } => {
             setup::install(conn, sink, workspace_id, argv).await?;
         }
-        UiCommand::RefreshRecentProjects => {
-            setup::refresh_recent_projects(conn, sink).await?;
-        }
+        UiCommand::RefreshRecentProjects => unreachable!("recents are handled by the session loop"),
         UiCommand::SaveProjectSetup {
             workspace_id,
             assignments,
@@ -742,10 +655,18 @@ async fn handle_command(
         UiCommand::SaveWorkspaceSettings {
             workspace_id,
             assignments,
+            expected,
             request_id,
         } => {
-            setup::save_workspace_settings(conn, sink, workspace_id, assignments, request_id)
-                .await?;
+            setup::save_workspace_settings(
+                conn,
+                sink,
+                workspace_id,
+                assignments,
+                expected,
+                request_id,
+            )
+            .await?;
         }
         UiCommand::ReadActivity {
             workspace_id,

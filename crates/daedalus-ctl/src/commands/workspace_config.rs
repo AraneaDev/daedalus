@@ -2,7 +2,8 @@ use crate::client::{ClientError, DaemonClient};
 use crate::{resolve_dir, unexpected_response};
 use clap::Args;
 use daedalus_proto::workbench::{
-    ConflictChoice, WorkbenchState, WorkspaceDocument, WorkspaceImportSource,
+    ConflictChoice, WorkbenchState, WorkspaceDocument, WorkspaceImportPreview,
+    WorkspaceImportSource,
 };
 use daedalus_proto::{ClientMessage, ResponsePayload, WorkspaceId};
 use std::collections::BTreeMap;
@@ -209,7 +210,7 @@ async fn import(
     linked: bool,
     options: ApplyOptions,
 ) -> Result<(), ClientError> {
-    let mut preview = match client
+    let preview = match client
         .request(ClientMessage::PreviewWorkspaceImport {
             workspace_id: id,
             source,
@@ -221,26 +222,8 @@ async fn import(
         response => return Err(unexpected_response(response)),
     };
     let resolutions = options.resolve.into_iter().collect::<BTreeMap<_, _>>();
-    let unresolved = preview
-        .conflicts
-        .iter()
-        .any(|conflict| !resolutions.contains_key(&conflict.path));
-    if options.dry_run || unresolved {
-        if !resolutions.is_empty() && !preview.conflicts.is_empty() {
-            preview = match client
-                .request(ClientMessage::ResolveWorkspaceImport {
-                    workspace_id: id,
-                    revision: preview.revision,
-                    incoming: preview.incoming,
-                    linked,
-                    resolutions,
-                })
-                .await?
-            {
-                ResponsePayload::WorkspaceImportPreview(preview) => preview,
-                response => return Err(unexpected_response(response)),
-            };
-        }
+    let preview = resolve_import_preview(client, preview, &resolutions).await?;
+    if options.dry_run || !preview.conflicts.is_empty() {
         if options.json {
             println!("{}", serde_json::to_string_pretty(&preview)?);
         } else {
@@ -275,6 +258,29 @@ async fn import(
             .await?,
     )?;
     print_state(&state, options.json)
+}
+
+async fn resolve_import_preview(
+    client: &mut DaemonClient,
+    preview: WorkspaceImportPreview,
+    resolutions: &BTreeMap<String, ConflictChoice>,
+) -> Result<WorkspaceImportPreview, ClientError> {
+    if resolutions.is_empty() || preview.conflicts.is_empty() {
+        return Ok(preview);
+    }
+    match client
+        .request(ClientMessage::ResolveWorkspaceImport {
+            workspace_id: preview.workspace_id,
+            revision: preview.revision,
+            incoming: preview.incoming,
+            linked: preview.linked,
+            resolutions: resolutions.clone(),
+        })
+        .await?
+    {
+        ResponsePayload::WorkspaceImportPreview(preview) => Ok(preview),
+        response => Err(unexpected_response(response)),
+    }
 }
 
 pub(super) async fn workbench(

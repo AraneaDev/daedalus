@@ -11,6 +11,13 @@ pub struct Assignment {
     pub argv: Vec<String>,
 }
 
+/// The saved pane setup shown when the client opened Settings. An unset setup
+/// is distinct from a saved empty list.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSetupBaseline {
+    pub assignments: Option<Vec<Assignment>>,
+}
+
 /// Checks the rules every stored setup must satisfy, wherever it is stored.
 pub fn validate_assignments(assignments: &[Assignment]) -> Result<(), String> {
     let mut ids = std::collections::HashSet::new();

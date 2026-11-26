@@ -4,8 +4,8 @@ use daedalus_proto::workbench::{
     WorkspaceDocument, WorkspaceImportPreview, WorkspaceImportSource,
 };
 use daedalus_proto::{
-    Assignment, ClientMessage, PaneRole, ProtoError, Request, ResponsePayload, ServerMessage,
-    WorkspaceId, read_frame, write_frame,
+    Assignment, ClientMessage, PaneRole, ProjectSetupBaseline, ProtoError, Request,
+    ResponsePayload, ServerMessage, WorkspaceId, read_frame, write_frame,
 };
 use daedalusd::server::DaemonServer;
 use daedalusd::supervisor::{IsolationMode, Supervisor};
@@ -130,6 +130,179 @@ fn runner(name: &str) -> Vec<Assignment> {
 }
 
 #[tokio::test]
+async fn stale_setup_save_returns_current_assignments_across_workbench_changes() {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut daemon = DaemonFixture::start(scratch.path()).await;
+    let root = scratch.path();
+    let workspace_id = daemon.workspace(root).await;
+    let request = |assignments, expected| ClientMessage::SetProjectSetup {
+        workspace_id,
+        assignments,
+        expected: Some(ProjectSetupBaseline {
+            assignments: expected,
+        }),
+    };
+
+    // An open dialog with no saved setup can still save when a different
+    // client creates the first workbench document by changing only its layout.
+    let mut initial = daemon.workbench(workspace_id).await;
+    initial.document.layout.split_view = true;
+    assert!(matches!(
+        daemon
+            .call(ClientMessage::UpdateWorkbench {
+                workspace_id,
+                revision: initial.revision,
+                document: initial.document,
+                layout_only: true,
+                edit: None,
+            })
+            .await
+            .unwrap(),
+        ResponsePayload::Workbench(_)
+    ));
+    let mut original = runner("Original runner");
+    original.push(Assignment {
+        id: "service".into(),
+        name: "Original service".into(),
+        role: PaneRole::Service,
+        argv: vec!["service".into()],
+    });
+    assert_eq!(
+        daemon.call(request(original.clone(), None)).await.unwrap(),
+        ResponsePayload::Ok
+    );
+
+    let mut first = original.clone();
+    first[0].name = "Runner changed by A".into();
+    assert_eq!(
+        daemon
+            .call(request(first.clone(), Some(original.clone())))
+            .await
+            .unwrap(),
+        ResponsePayload::Ok
+    );
+    let saved = daemon.workbench(workspace_id).await;
+    let mut second = original.clone();
+    second[1].name = "Service changed by B".into();
+    assert_eq!(
+        daemon
+            .call(request(second.clone(), Some(original)))
+            .await
+            .unwrap(),
+        ResponsePayload::ProjectSetupConflict(ProjectSetupBaseline {
+            assignments: Some(first.clone()),
+        })
+    );
+    assert_eq!(daemon.workbench(workspace_id).await, saved);
+
+    second[0].name = first[0].name.clone();
+    assert_eq!(
+        daemon
+            .call(request(second.clone(), Some(first)))
+            .await
+            .unwrap(),
+        ResponsePayload::Ok
+    );
+    let persisted = daemon.workbench(workspace_id).await;
+    assert_eq!(persisted.document.assignments, second);
+    assert!(persisted.document.layout.split_view);
+    daemon.finish().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn old_literal_setup_keys_follow_the_project_across_folder_aliases() {
+    use daedalusd::persistence::{
+        PersistedProjectSetup, PersistedRecentProject, PersistedState, StateStore,
+    };
+
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().canonicalize().unwrap();
+    let project = root.join("project");
+    let alias = root.join("alias");
+    std::fs::create_dir(&project).unwrap();
+    std::os::unix::fs::symlink(&project, &alias).unwrap();
+    let original = runner("Legacy setup");
+    let store = StateStore::new(root.join("state.json"));
+    store
+        .save(&PersistedState {
+            project_setups: vec![PersistedProjectSetup {
+                root_dir: alias.clone(),
+                assignments: original.clone(),
+            }],
+            recent_projects: vec![PersistedRecentProject {
+                name: "Seen through alias".into(),
+                root_dir: alias.clone(),
+                last_used: 1,
+            }],
+            ..PersistedState::default()
+        })
+        .unwrap();
+
+    let mut daemon = DaemonFixture::start(&root).await;
+    let ResponsePayload::RecentProjects(recent) = daemon
+        .call(ClientMessage::ListRecentProjects)
+        .await
+        .unwrap()
+    else {
+        panic!("expected recent projects");
+    };
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].root_dir, alias);
+    assert!(recent[0].has_setup);
+
+    let id = daemon.workspace(&project).await;
+    assert_eq!(daemon.workbench(id).await.document.assignments, original);
+    assert_eq!(
+        daemon
+            .call(ClientMessage::ListRecentProjects)
+            .await
+            .unwrap(),
+        ResponsePayload::RecentProjects(Vec::new()),
+    );
+    let latest = runner("Latest setup");
+    assert_eq!(
+        daemon
+            .call(ClientMessage::SetProjectSetup {
+                workspace_id: id,
+                assignments: latest.clone(),
+                expected: Some(ProjectSetupBaseline {
+                    assignments: Some(original)
+                }),
+            })
+            .await
+            .unwrap(),
+        ResponsePayload::Ok,
+    );
+    daemon
+        .call(ClientMessage::CloseWorkspace {
+            id,
+            compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
+        })
+        .await
+        .unwrap();
+    daemon.finish().await;
+
+    let mut daemon = DaemonFixture::start(&root).await;
+    let reopened = daemon.workspace(&alias).await;
+    assert_eq!(
+        daemon.workbench(reopened).await.document.assignments,
+        latest
+    );
+    let ResponsePayload::Workspaces(workspaces) =
+        daemon.call(ClientMessage::ListWorkspaces).await.unwrap()
+    else {
+        panic!("expected open workspaces");
+    };
+    assert_eq!(workspaces[0].root_dir, alias);
+    assert_eq!(workspaces[0].setup.as_deref(), Some(latest.as_slice()));
+    assert_eq!(store.load().unwrap().project_setups[0].root_dir, project);
+    daemon.finish().await;
+}
+
+#[tokio::test]
 async fn first_widget_edits_preserve_newer_project_setup() {
     let scratch = tempfile::tempdir().unwrap();
     let mut daemon = DaemonFixture::start(scratch.path()).await;
@@ -157,6 +330,7 @@ async fn first_widget_edits_preserve_newer_project_setup() {
             .call(ClientMessage::SetProjectSetup {
                 workspace_id,
                 assignments: assignments.clone(),
+                expected: None,
             })
             .await
             .unwrap();
@@ -223,6 +397,7 @@ async fn saved_project_setup_survives_reopen_without_inheriting_a_workspace_impo
         .call(ClientMessage::SetProjectSetup {
             workspace_id,
             assignments: latest.clone(),
+            expected: None,
         })
         .await
         .unwrap();
@@ -300,6 +475,7 @@ async fn first_layout_preserves_newer_project_setup_and_is_exported_after_restar
         .call(ClientMessage::SetProjectSetup {
             workspace_id,
             assignments: assignments.clone(),
+            expected: None,
         })
         .await
         .unwrap();

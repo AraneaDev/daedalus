@@ -567,6 +567,66 @@ kind = "diff"
 
 #[cfg(unix)]
 #[tokio::test]
+async fn resolving_one_template_conflict_can_clear_its_dependent_conflicts() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let app = Workbench::start().await;
+    let workspace = app.workspace(app.directory.path()).await;
+    let config = app.file(".daedalus-workspace.toml");
+    let start = "version = 1\nname = 'Fixture'\n";
+    let template =
+        "\n[[templates]]\nid = 'fixture'\nname = 'Base template'\n[templates.definition]\n";
+    std::fs::write(&config, format!("{start}{template}")).unwrap();
+    app.run(&["workspace", "import", "--repo", "--workspace", &workspace])
+        .await;
+
+    let local = app.file("local.toml");
+    std::fs::write(&local, start).unwrap();
+    let editor = app.file("editor");
+    std::fs::write(&editor, "#!/bin/sh\ncp \"$FIXTURE_LOCAL\" \"$1\"\n").unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o700)).unwrap();
+    output(
+        app.command(&[
+            "workspace",
+            "configure",
+            "--edit",
+            "--workspace",
+            &workspace,
+        ])
+        .env("VISUAL", &editor)
+        .env("FIXTURE_LOCAL", &local)
+        .output()
+        .await
+        .unwrap(),
+    );
+
+    let changed = template.replace("Base template", "Incoming template");
+    let widget = "\n[[widgets]]\nid = 'ref'\nname = 'Template widget'\npinned = true\ntemplate = 'fixture'\n";
+    std::fs::write(&config, format!("{start}{changed}{widget}")).unwrap();
+    let update = ["workspace", "update", "--workspace", &workspace, "--json"];
+    let preview: Value =
+        serde_json::from_str(&app.run(&[&update[..], &["--dry-run"]].concat()).await).unwrap();
+    assert_eq!(preview["conflicts"].as_array().unwrap().len(), 2);
+
+    let applied: Value = serde_json::from_str(
+        &app.run(&[&update[..], &["--resolve", "/templates/fixture=incoming"]].concat())
+            .await,
+    )
+    .unwrap();
+    assert_eq!(applied["document"]["widgets"][0]["template"], "fixture");
+    assert_eq!(
+        applied["document"]["templates"][0]["name"],
+        "Incoming template"
+    );
+    assert_eq!(
+        applied["revision"].as_u64().unwrap(),
+        preview["revision"].as_u64().unwrap() + 1
+    );
+    app.finish().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn terminal_editor_updates_a_definition_and_keeps_state_on_cancel() {
     use std::os::unix::fs::PermissionsExt;
 

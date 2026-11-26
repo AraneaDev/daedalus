@@ -542,12 +542,11 @@ async fn dispatch_request(
         ClientMessage::SetProjectSetup {
             workspace_id,
             assignments,
-        } => {
-            registry
-                .set_project_setup(workspace_id, assignments)
-                .await?;
-            Ok(ResponsePayload::Ok)
-        }
+            expected,
+        } => Ok(registry
+            .try_set_project_setup(workspace_id, assignments, expected)
+            .await?
+            .map_or(ResponsePayload::Ok, ResponsePayload::ProjectSetupConflict)),
         ClientMessage::Unsubscribe => {
             filter.unsubscribe().await;
             Ok(ResponsePayload::Ok)

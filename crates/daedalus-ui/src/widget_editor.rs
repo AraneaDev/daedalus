@@ -5,6 +5,7 @@ use daedalus_proto::workbench::{
 use daedalus_proto::{ClientMessage, WorkspaceId};
 
 mod draft;
+mod fields;
 mod import_review;
 
 pub use draft::WidgetDraft;

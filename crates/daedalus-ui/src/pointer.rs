@@ -464,7 +464,7 @@ impl DaedalusApp {
             }
             HitTarget::SidebarWorkspaceClose(idx) => {
                 if let Some(ws_id) = self.state.workspaces.get(idx).map(|ws| ws.id) {
-                    self.open_close_modal_for_workspace(ws_id);
+                    self.handle_ui_action(UiAction::CloseWorkspaceFromSidebar(ws_id));
                 }
             }
             HitTarget::Widget(_) | HitTarget::CloseSession(_) | HitTarget::SelectSession(_) => {

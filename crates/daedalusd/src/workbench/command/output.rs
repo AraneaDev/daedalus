@@ -1,4 +1,4 @@
-use super::SourceFields;
+use super::{SourceFields, json_fields};
 use daedalus_proto::workbench::{CommandOutput, WidgetResult};
 use std::process::ExitStatus;
 use std::time::Duration;
@@ -44,7 +44,7 @@ pub(super) fn project_fields(
         CommandOutput::Json => {
             let value = serde_json::from_str(&stdout)
                 .map_err(|error| format!("Invalid command JSON: {error}"))?;
-            read_json(&mut fields, "", &value);
+            json_fields::project(&mut fields, &value);
         }
         CommandOutput::WidgetResult => {
             let result: WidgetResult = serde_json::from_str(&stdout)
@@ -66,34 +66,4 @@ pub(super) fn project_fields(
         }
     }
     Ok(fields)
-}
-
-fn read_json(fields: &mut SourceFields, path: &str, value: &serde_json::Value) {
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, value) in object {
-                let path = if path.is_empty() {
-                    format!("json.{key}")
-                } else {
-                    format!("{path}.{key}")
-                };
-                read_json(fields, &path, value);
-            }
-        }
-        serde_json::Value::Array(array) => {
-            for (index, value) in array.iter().enumerate() {
-                read_json(fields, &format!("{path}.{index}"), value);
-            }
-        }
-        serde_json::Value::Null => {}
-        value => {
-            let path = if path.is_empty() { "json" } else { path };
-            fields.insert(
-                path.into(),
-                value
-                    .as_str()
-                    .map_or_else(|| value.to_string(), str::to_owned),
-            );
-        }
-    }
 }

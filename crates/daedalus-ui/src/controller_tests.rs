@@ -1785,6 +1785,7 @@ fn daemon_backed_settings_save_sends_the_setup_and_follows_changes_from_the_daem
         workspace_id,
         assignments,
         request_id,
+        ..
     } = w.command()
     else {
         panic!("expected settings save");
@@ -1960,6 +1961,61 @@ fn rejected_or_unsent_setup_saves_fall_back_to_the_confirmed_setup() {
     );
     assert_eq!(w.app.project_setups.load(id).unwrap(), vec![confirmed]);
 }
+#[test]
+fn pane_setup_conflict_keeps_the_open_settings_draft_and_original_baseline() {
+    use daedalus_ui::settings::{Control, SettingsAction};
+
+    let mut w = Workbench::new();
+    daemon_capabilities(&mut w, true);
+    let original = runner_entry("Original runner");
+    let mut ws = workspace("Concurrent settings");
+    let id = ws.id;
+    let root = ws.root_dir.clone();
+    ws.setup = Some(vec![original.clone()]);
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+    w.app.handle_ui_action(UiAction::WorkspaceSettings);
+    w.app.state.settings.set_value(Control::Name, "My draft");
+
+    let latest = runner_entry("Other client's runner");
+    w.app.handle_daemon_event(UiEvent::ProjectSetupChanged {
+        root_dir: root,
+        assignments: vec![latest.clone()],
+    });
+    let submit = runner_entry("My draft");
+    w.app
+        .handle_settings_action(SettingsAction::Save(vec![submit.clone()]));
+    let UiCommand::SaveWorkspaceSettings {
+        request_id,
+        expected,
+        assignments,
+        ..
+    } = w.command()
+    else {
+        panic!("expected a conditional save");
+    };
+    assert_eq!(expected.assignments, Some(vec![original.clone()]));
+    assert_eq!(assignments, vec![submit.clone()]);
+
+    w.app.handle_daemon_event(UiEvent::WorkspaceSettingsSaved {
+        workspace_id: id,
+        request_id,
+        result: Err("Pane setup changed on another client.".into()),
+    });
+    assert!(w.app.state.settings.open);
+    assert!(!w.app.state.settings.is_saving());
+    assert_eq!(w.app.state.settings.value(Control::Name), Some("My draft"));
+    assert_eq!(w.app.project_setups.load(id).unwrap(), vec![latest]);
+
+    w.app
+        .handle_settings_action(SettingsAction::Save(vec![submit]));
+    assert!(matches!(
+        w.command(),
+        UiCommand::SaveWorkspaceSettings { expected, .. }
+            if expected.assignments == Some(vec![original])
+    ));
+}
+
 #[test]
 fn save_and_launch_waits_for_confirmation_and_preserves_failed_drafts() {
     use daedalus_ui::settings::Control;

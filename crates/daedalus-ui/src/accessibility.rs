@@ -6,6 +6,7 @@ mod close_workspace;
 mod overlays;
 mod settings;
 mod terminals;
+mod workspace_controls;
 mod worktree;
 pub(super) use settings::settings_action;
 pub(super) use terminals::TerminalControls;
@@ -25,7 +26,7 @@ use unicode_segmentation::UnicodeSegmentation;
 const WINDOW: NodeId = NodeId(1);
 const STATUS: NodeId = NodeId(2);
 const WORKSPACE: NodeId = NodeId(3);
-const OPEN_NEW_WORKSPACE: NodeId = NodeId(4);
+use workspace_controls::OPEN_NEW_WORKSPACE;
 const PICKER: NodeId = NodeId(7);
 const ACTIONS: NodeId = NodeId(8);
 const WORKTREE: NodeId = NodeId(9);
@@ -62,9 +63,6 @@ pub(super) fn action(
             OPEN_SETTINGS if state.active_workspace().is_some() => {
                 return Some(UiAction::WorkspaceSettings);
             }
-            OPEN_NEW_WORKSPACE if state.workspace_list_loaded => {
-                return Some(UiAction::NewWorkspace);
-            }
             node if state.workspace_list_loaded => {
                 if let Some(preset) = controls.cargo_preset(state, node) {
                     return Some(UiAction::RunCargo(preset));
@@ -75,8 +73,8 @@ pub(super) fn action(
                 if let Some(id) = controls.failed_run_workspace(state, node) {
                     return Some(UiAction::OpenFailedRun(id));
                 }
-                if let Some(id) = controls.workspace_for_node(state, node) {
-                    return Some(UiAction::SelectWorkspace(id));
+                if let Some(action) = controls.sidebar_action(state, node) {
+                    return Some(action);
                 }
             }
             _ => {}
@@ -319,14 +317,10 @@ pub(super) fn workbench_tree(
     let mut nodes = vec![(STATUS, status)];
     let current_overlay = overlay(state);
     if state.workspace_list_loaded && current_overlay.is_none() {
-        controls.append_workspaces(state, &mut root, &mut nodes);
+        controls.append_sidebar(state, &mut root, &mut nodes);
         controls.append_run_tests(state, &mut root, &mut nodes);
         controls.append_widgets(state, &mut root, &mut nodes);
         controls.append_failed_runs(state, &mut root, &mut nodes);
-        let mut button = named(Role::Button, "New workspace");
-        button.add_action(Action::Click);
-        root.push_child(OPEN_NEW_WORKSPACE);
-        nodes.push((OPEN_NEW_WORKSPACE, button));
     }
     let focus = if let Some((id, node)) = current_overlay {
         root.push_child(id);
@@ -474,6 +468,43 @@ mod tests {
         state.workspace_form.begin(std::path::Path::new("."));
         assert!(tree(&state).nodes.iter().all(|n| n.0 != OPEN_NEW_WORKSPACE));
         assert_eq!(action(&state, &request), None);
+    }
+
+    #[test]
+    fn sidebar_opens_worktree_and_workspace_specific_close_dialogs() {
+        let mut state = agent_workspace();
+        let id = state.active_workspace_id.unwrap();
+        let mut controls = TerminalControls::default();
+        let tree = workbench_tree(&state, 1200., 800., 1., &mut controls);
+        let click = |label: &str| {
+            let (node, control) = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .unwrap();
+            assert!(control.supports_action(Action::Click));
+            ActionRequest {
+                target_tree: TreeId::ROOT,
+                target_node: *node,
+                action: Action::Click,
+                data: None,
+            }
+        };
+        let worktree = click("New Git worktree");
+        let close = click("Close Project");
+        assert_eq!(
+            super::action(&state, &worktree, &controls),
+            Some(UiAction::ToggleWorktreeModal)
+        );
+        assert_eq!(
+            super::action(&state, &close, &controls),
+            Some(UiAction::CloseWorkspaceFromSidebar(id))
+        );
+        state.open_worktree_modal();
+        assert_eq!(super::action(&state, &close, &controls), None);
+        state.worktree_modal.close();
+        state.set_workspaces(Vec::new());
+        assert_eq!(super::action(&state, &close, &controls), None);
     }
 
     #[test]

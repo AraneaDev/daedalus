@@ -2,10 +2,14 @@ use super::super::rpc::RpcConnection;
 use super::super::test_support::ipc_pair;
 use super::super::{WorkbenchOperation, session_loop};
 use super::*;
-use daedalus_proto::transport::IpcListener;
-use daedalus_proto::{PaneId, ProtoError, WorkspaceId};
+use daedalus_proto::transport::{IpcListener, IpcStream};
+use daedalus_proto::{
+    PaneId, ProtoError, Request, ResponsePayload, ServerMessage, WorkspaceId, read_frame,
+    write_frame,
+};
 use std::future::Future;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 struct Sink(mpsc::UnboundedSender<UiEvent>);
@@ -213,7 +217,10 @@ async fn widget_socket_surfaces_authentication_and_protocol_failures() {
             assert!(read_frame::<_, Request>(&mut peer).await.unwrap().is_none());
         };
         let (result, ()) = bounded(async {
-            tokio::join!(run(&endpoint, Some("fixture".into()), request), exchange)
+            tokio::join!(
+                background_rpc::request(&endpoint, Some("fixture"), "widget", request),
+                exchange
+            )
         })
         .await;
         assert!(result.unwrap_err().contains(expected));
@@ -224,9 +231,13 @@ async fn widget_socket_surfaces_authentication_and_protocol_failures() {
         let request = next_request(&mut peer).await;
         reply(&mut peer, request.id + 1, Ok(ResponsePayload::Ok)).await;
     };
-    let (result, ()) =
-        bounded(async { tokio::join!(run(&endpoint, None, action(WorkspaceId::new())), exchange) })
-            .await;
+    let (result, ()) = bounded(async {
+        tokio::join!(
+            background_rpc::request(&endpoint, None, "widget", action(WorkspaceId::new())),
+            exchange
+        )
+    })
+    .await;
     assert_eq!(
         result.unwrap_err(),
         "Unexpected reply on the widget connection."
@@ -234,9 +245,14 @@ async fn widget_socket_surfaces_authentication_and_protocol_failures() {
 
     // The TCP scheme without a socket address fails before a request can be sent.
     assert!(
-        bounded(run(Path::new("tcp://"), None, action(WorkspaceId::new())))
-            .await
-            .is_err()
+        bounded(background_rpc::request(
+            Path::new("tcp://"),
+            None,
+            "widget",
+            action(WorkspaceId::new())
+        ))
+        .await
+        .is_err()
     );
 }
 

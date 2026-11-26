@@ -97,8 +97,11 @@ impl Registry {
         });
     }
 
-    async fn initial_workbench(&self, id: WorkspaceId) -> Result<WorkspaceDocument, ProtoError> {
-        let (mut document, root, manifest) = {
+    pub(super) async fn initial_workbench(
+        &self,
+        id: WorkspaceId,
+    ) -> Result<WorkspaceDocument, ProtoError> {
+        let (mut document, root, canonical_root, manifest) = {
             let workspaces = self.workspaces.read().await;
             let workspace = workspaces
                 .get(&id)
@@ -106,10 +109,16 @@ impl Registry {
             (
                 WorkspaceDocument::new(workspace.name.clone()),
                 workspace.root_dir.clone(),
+                workspace.canonical_root_dir.clone(),
                 workspace.manifest.clone(),
             )
         };
-        if let Some(assignments) = self.project_setups.read().await.folder(&root) {
+        if let Some(assignments) = self
+            .project_setups
+            .read()
+            .await
+            .folder(&root, &canonical_root)
+        {
             document.assignments.clone_from(assignments);
         }
         if let Some(manifest) = manifest {

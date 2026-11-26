@@ -5,6 +5,7 @@ pub(super) use setup::ProjectSetupState;
 use super::Registry;
 use crate::persistence::{PersistedRecentProject, PersistedState};
 use daedalus_proto::RecentProject;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,26 +36,23 @@ impl Registry {
 
     /// `recent_projects` with an injectable folder check and deadline.
     async fn recent_projects_with(&self, check: DirCheck, timeout: Duration) -> Vec<RecentProject> {
-        let open: Vec<PathBuf> = {
+        let open: HashSet<PathBuf> = {
             let ws_map = self.workspaces.read().await;
-            ws_map.values().map(|ws| ws.root_dir.clone()).collect()
+            ws_map
+                .values()
+                .flat_map(|ws| [ws.root_dir.clone(), ws.canonical_root_dir.clone()])
+                .collect()
         };
         // Copy what is needed and release the locks: the folder checks below can hang on a
         // stale mount, and must not hold up writers or other requests.
-        let candidates: Vec<RecentProject> = {
-            let recent = self.recent_projects.read().await;
-            let setups = self.project_setups.read().await;
-            recent
-                .iter()
-                .filter(|entry| !open.contains(&entry.root_dir))
-                .map(|entry| RecentProject {
-                    name: entry.name.clone(),
-                    root_dir: entry.root_dir.clone(),
-                    last_used: entry.last_used,
-                    has_setup: setups.folder(&entry.root_dir).is_some(),
-                })
-                .collect()
-        };
+        let candidates: Vec<_> = self
+            .recent_projects
+            .read()
+            .await
+            .iter()
+            .filter(|entry| !open.contains(&entry.root_dir))
+            .cloned()
+            .collect();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         for (index, entry) in candidates.iter().enumerate() {
@@ -62,21 +60,35 @@ impl Registry {
             let path = entry.root_dir.clone();
             let tx = tx.clone();
             tokio::task::spawn_blocking(move || {
-                let _ = tx.send((index, check(&path)));
+                let canonical = check(&path).then(|| setup::canonical_setup_root(&path));
+                let _ = tx.send((index, canonical));
             });
         }
         drop(tx);
 
-        let mut exists = vec![false; candidates.len()];
+        let mut roots = vec![None; candidates.len()];
         let deadline = tokio::time::Instant::now() + timeout;
         // Folders whose check has not answered by the deadline are left out of this reply.
-        while let Ok(Some((index, is_dir))) = tokio::time::timeout_at(deadline, rx.recv()).await {
-            exists[index] = is_dir;
+        while let Ok(Some((index, root))) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            roots[index] = root;
         }
+        let setups = self.project_setups.read().await;
+        let mut seen = HashSet::new();
         candidates
             .into_iter()
-            .zip(exists)
-            .filter_map(|(entry, is_dir)| is_dir.then_some(entry))
+            .zip(roots)
+            .filter_map(|(entry, canonical)| {
+                let canonical = canonical?;
+                if open.contains(&canonical) || !seen.insert(canonical.clone()) {
+                    return None;
+                }
+                Some(RecentProject {
+                    name: entry.name,
+                    last_used: entry.last_used,
+                    has_setup: setups.folder(&entry.root_dir, &canonical).is_some(),
+                    root_dir: entry.root_dir,
+                })
+            })
             .collect()
     }
 
@@ -96,6 +108,7 @@ impl Registry {
     }
 
     pub(super) async fn load_project_lists(&self, state: &mut PersistedState) {
+        setup::normalize_setup_roots(state).await;
         *self.recent_projects.write().await = std::mem::take(&mut state.recent_projects);
         self.project_setups.write().await.restore(state);
     }

@@ -95,11 +95,12 @@ impl Registry {
     pub(super) async fn persist_project_setup(
         &self,
         root_dir: PathBuf,
+        canonical_root: PathBuf,
         assignments: Vec<Assignment>,
         versioned: Option<(WorkspaceId, WorkbenchState)>,
         lifecycle: tokio::sync::OwnedMutexGuard<()>,
+        mut mode: tokio::sync::OwnedMutexGuard<PersistenceWriteState>,
     ) -> Result<(), ProtoError> {
-        let mut mode = self.persist_lock.clone().lock_owned().await;
         let workspace_setup = versioned
             .as_ref()
             .map(|(id, state)| PersistedWorkspaceSetup {
@@ -115,12 +116,12 @@ impl Registry {
         let snapshot = if let Some(store) = self.state_store.clone() {
             let mut state = self.persistence_snapshot().await;
             let setup = PersistedProjectSetup {
-                root_dir: root_dir.clone(),
+                root_dir: canonical_root.clone(),
                 assignments: assignments.clone(),
             };
             match state
                 .project_setups
-                .binary_search_by(|entry| entry.root_dir.cmp(&root_dir))
+                .binary_search_by(|entry| entry.root_dir.cmp(&canonical_root))
             {
                 Ok(index) => state.project_setups[index] = setup,
                 Err(index) => state.project_setups.insert(index, setup),
@@ -150,7 +151,7 @@ impl Registry {
             }
             let _lifecycle = lifecycle;
             project_setups.blocking_write().confirm(
-                root_dir.clone(),
+                canonical_root,
                 assignments.clone(),
                 workspace_setup,
             );

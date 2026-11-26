@@ -98,6 +98,10 @@ impl DaedalusApp {
                     self.state.workbench = None;
                 }
                 self.state.connection = ConnectionState::Connected;
+                if self.state.workspace_list_loaded {
+                    self.refresh_inactive_layout_saves();
+                    self.ensure_active_workspace_panes();
+                }
                 self.schedule_resize_flush();
             }
             UiEvent::Disconnected => {

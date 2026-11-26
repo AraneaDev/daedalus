@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::{named, overlay};
+use super::{named, overlay, workspace_controls::WorkspaceControls};
 use accesskit::{Action, ActionRequest, Node, NodeId, Role, TreeId};
 use daedalus_proto::{PaneId, WorkspaceId};
 use daedalus_ui::assignments::CargoPreset;
@@ -8,7 +8,6 @@ use daedalus_ui::layout::HitTarget;
 use daedalus_ui::state::{AppState, ConnectionState, WorkspaceView};
 
 const TAB_LIST: NodeId = NodeId(18);
-const WORKSPACE_LIST: NodeId = NodeId(23);
 
 /// Platform requests can arrive after a pane closes. Allocate IDs once and never recycle them.
 #[derive(Default)]
@@ -17,15 +16,32 @@ pub(crate) struct TerminalControls {
     run_tests: Option<(WorkspaceId, NodeId)>,
     cargo: Option<(WorkspaceId, NodeId)>,
     close_modal: Option<(u64, NodeId)>,
-    workspaces: HashMap<WorkspaceId, NodeId>,
+    sidebar: WorkspaceControls,
     panes: HashMap<PaneId, u64>,
     widgets: HashMap<(WorkspaceId, String), NodeId>,
 }
 
+pub(super) fn next_control_group(serial: &mut u64) -> NodeId {
+    *serial += 1;
+    NodeId((1 << 61) + *serial * 8)
+}
+
 impl TerminalControls {
-    fn next_control_group(&mut self) -> NodeId {
-        self.serial += 1;
-        NodeId((1 << 61) + self.serial * 8)
+    pub(super) fn append_sidebar(
+        &mut self,
+        state: &AppState,
+        root: &mut Node,
+        nodes: &mut Vec<(NodeId, Node)>,
+    ) {
+        self.sidebar.append(state, root, nodes, &mut self.serial);
+    }
+
+    pub(super) fn sidebar_action(
+        &self,
+        state: &AppState,
+        target: NodeId,
+    ) -> Option<daedalus_ui::input::UiAction> {
+        self.sidebar.action(state, target)
     }
 
     pub(super) fn append_cargo(
@@ -39,7 +55,7 @@ impl TerminalControls {
             return;
         };
         if self.cargo.is_none_or(|(current, _)| current != id) {
-            self.cargo = Some((id, self.next_control_group()));
+            self.cargo = Some((id, next_control_group(&mut self.serial)));
         }
         if let Some((_, base)) = self.cargo {
             for (index, preset) in CargoPreset::ALL.into_iter().enumerate() {
@@ -67,7 +83,7 @@ impl TerminalControls {
         if let Some(base) = self.close_modal_base(session) {
             return base;
         }
-        let base = self.next_control_group();
+        let base = next_control_group(&mut self.serial);
         self.close_modal = Some((session, base));
         base
     }
@@ -76,57 +92,6 @@ impl TerminalControls {
         self.close_modal
             .filter(|(opened, _)| *opened == session)
             .map(|(_, base)| base)
-    }
-
-    pub(super) fn append_workspaces(
-        &mut self,
-        state: &AppState,
-        root: &mut Node,
-        nodes: &mut Vec<(NodeId, Node)>,
-    ) {
-        self.workspaces
-            .retain(|id, _| state.workspaces.iter().any(|workspace| workspace.id == *id));
-        if state.workspaces.is_empty() {
-            return;
-        }
-        let mut list = named(Role::ListBox, "Workspaces");
-        for workspace in state.workspaces_in_sidebar_order() {
-            let id = *self.workspaces.entry(workspace.id).or_insert_with(|| {
-                self.serial += 1;
-                NodeId((1 << 61) + self.serial * 8)
-            });
-            let mut duplicates = state
-                .workspaces
-                .iter()
-                .filter(|other| other.id != workspace.id && other.name == workspace.name)
-                .peekable();
-            let label = if duplicates.peek().is_some() {
-                let mut label = format!("{} · {}", workspace.name, workspace.root_dir.display());
-                if duplicates.any(|other| other.root_dir == workspace.root_dir) {
-                    label.push_str(&format!(" · {}", workspace.id.0.simple()));
-                }
-                label
-            } else {
-                workspace.name.clone()
-            };
-            let mut option = named(Role::ListBoxOption, label);
-            option.set_selected(state.active_workspace_id == Some(workspace.id));
-            option.add_action(Action::Click);
-            list.push_child(id);
-            nodes.push((id, option));
-        }
-        root.push_child(WORKSPACE_LIST);
-        nodes.push((WORKSPACE_LIST, list));
-    }
-
-    pub(super) fn workspace_for_node(
-        &self,
-        state: &AppState,
-        target: NodeId,
-    ) -> Option<WorkspaceId> {
-        state.workspaces.iter().find_map(|workspace| {
-            (self.workspaces.get(&workspace.id) == Some(&target)).then_some(workspace.id)
-        })
     }
 
     pub(super) fn append_widgets(
@@ -153,10 +118,7 @@ impl TerminalControls {
             let node = *self
                 .widgets
                 .entry((*workspace, widget.id.clone()))
-                .or_insert_with(|| {
-                    self.serial += 1;
-                    NodeId((1 << 61) + self.serial * 8)
-                });
+                .or_insert_with(|| next_control_group(&mut self.serial));
             let mut control = named(Role::Button, format!("Open {} widget", widget.name));
             control.add_action(Action::Click);
             root.push_child(node);
@@ -164,10 +126,10 @@ impl TerminalControls {
         }
     }
     fn pane_base(&mut self, pane: PaneId) -> u64 {
-        *self.panes.entry(pane).or_insert_with(|| {
-            self.serial += 1;
-            (1 << 61) + self.serial * 8
-        })
+        *self
+            .panes
+            .entry(pane)
+            .or_insert_with(|| next_control_group(&mut self.serial).0)
     }
 
     pub(super) fn append_run_tests(
@@ -181,8 +143,7 @@ impl TerminalControls {
             return;
         };
         if self.run_tests.is_none_or(|(id, _)| id != workspace) {
-            self.serial += 1;
-            self.run_tests = Some((workspace, NodeId((1 << 61) + self.serial * 8)));
+            self.run_tests = Some((workspace, next_control_group(&mut self.serial)));
         }
         if let Some((_, node_id)) = self.run_tests {
             let mut button = named(Role::Button, "Run tests");

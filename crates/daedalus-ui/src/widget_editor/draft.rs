@@ -1,6 +1,7 @@
+use super::fields::{edit_fields, format_fields};
 use daedalus_proto::workbench::{
     CommandOutput, NamedAction, NamedSource, RefreshPolicy, WidgetAction, WidgetDefinition,
-    WidgetField, WidgetInstance, WidgetSource, WidgetTemplate, WorkspaceCommand,
+    WidgetInstance, WidgetSource, WidgetTemplate, WorkspaceCommand,
 };
 
 #[derive(Clone, Debug)]
@@ -186,12 +187,8 @@ impl WidgetDraft {
     }
 
     fn update_display(&self, definition: &mut WidgetDefinition) -> Result<(), String> {
-        if self.summary != format_fields(&definition.display.summary) {
-            definition.display.summary = parse_fields(&self.summary)?;
-        }
-        if self.details != format_fields(&definition.display.details) {
-            definition.display.details = parse_fields(&self.details)?;
-        }
+        definition.display.summary = edit_fields(&self.summary, &definition.display.summary)?;
+        definition.display.details = edit_fields(&self.details, &definition.display.details)?;
         Ok(())
     }
 
@@ -226,29 +223,4 @@ fn first_url(actions: &[NamedAction]) -> Option<(usize, &str)> {
             WidgetAction::OpenUrl { url } => Some((index, url.as_str())),
             _ => None,
         })
-}
-
-fn format_fields(fields: &[WidgetField]) -> String {
-    fields
-        .iter()
-        .map(|field| format!("{}:{}", field.source, field.field))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn parse_fields(text: &str) -> Result<Vec<WidgetField>, String> {
-    text.split(',')
-        .map(str::trim)
-        .filter(|field| !field.is_empty())
-        .map(|field| {
-            let (source, field) = field
-                .split_once(':')
-                .ok_or("Use source:field, for example main:branch.")?;
-            Ok(WidgetField {
-                source: source.trim().into(),
-                field: field.trim().into(),
-                label: None,
-            })
-        })
-        .collect()
 }

@@ -2,7 +2,7 @@
 //! folder, when it supports that, and in local files otherwise.
 
 use crate::assignments::{self, Assignment};
-use daedalus_proto::{WorkspaceId, types::Workspace, validate_assignments};
+use daedalus_proto::{ProjectSetupBaseline, WorkspaceId, types::Workspace, validate_assignments};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -106,6 +106,12 @@ impl ProjectSetups {
 
     pub fn load(&self, id: WorkspaceId) -> Result<Vec<Assignment>, String> {
         self.load_or(id, Vec::new())
+    }
+
+    pub fn baseline(&self, id: WorkspaceId) -> ProjectSetupBaseline {
+        ProjectSetupBaseline {
+            assignments: self.cache.get(&id).cloned(),
+        }
     }
 
     pub fn load_or(

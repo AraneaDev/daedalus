@@ -622,6 +622,7 @@ impl DaedalusApp {
             UiAction::SwitchWorkspaceNext => self.switch_workspace_by(1),
             UiAction::SwitchWorkspacePrev => self.switch_workspace_by(-1),
             UiAction::SelectWorkspace(id) => self.activate_workspace(id),
+            UiAction::CloseWorkspaceFromSidebar(id) => self.open_close_modal_for_workspace(id),
             UiAction::PreviewImage => self.preview_image(),
             UiAction::CopySelection => self.copy_focused_selection(),
             UiAction::PasteClipboard => self.paste_clipboard_to_focused(),

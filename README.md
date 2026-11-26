@@ -144,6 +144,11 @@ runner finishes. Available command outputs include exit status, matching text, J
 fields, and a full widget result. Use `DAEDALUS_WORKSPACE_DIR` and
 `DAEDALUS_GIT_BRANCH` in scripts to access workspace context.
 
+For JSON command output, use selectors such as `json:/latency/p95` for a nested value
+or `json:/latency.p95` for a literal dotted key. Dotted selectors still work when they
+identify one value. In the bar and detail field controls, quote a selector that includes
+a comma, as in `main:"json:/names/last,first"`.
+
 Use **Import / export** in the custom widget settings to share one template or the
 full workspace. A workspace file includes its layout, launch assignments, and the
 widget definitions it uses. Commit it as `.daedalus-workspace.toml` to offer the

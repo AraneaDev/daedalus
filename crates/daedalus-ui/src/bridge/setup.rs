@@ -4,11 +4,11 @@ use super::{DEFAULT_PANE_COLS, DEFAULT_PANE_ROWS, UiEvent, UiEventSink};
 use crate::assignments::{self, Assignment};
 use crate::state::AgentPreset;
 use daedalus_proto::{
-    ClientMessage, PaneId, PaneRole, PaneSummary, ProtoError, ResponsePayload, WorkspaceId,
+    ClientMessage, PaneId, PaneRole, PaneSummary, ProjectSetupBaseline, ProtoError,
+    ResponsePayload, WorkspaceId,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::warn;
 
 pub(super) async fn inspect(
     conn: &RpcConnection,
@@ -125,26 +125,43 @@ pub(super) async fn launch_assignment(
     snapshot(conn, sink, pane_id).await
 }
 
+enum SetupSaveError {
+    Conflict,
+    Other(String),
+}
+
+impl SetupSaveError {
+    fn message(self) -> String {
+        match self {
+            Self::Conflict => "Pane setup changed on another client. Your draft is still open. Reopen Settings to review the saved setup.".into(),
+            Self::Other(message) => message,
+        }
+    }
+}
+
 async fn store_on_daemon(
     conn: &RpcConnection,
     workspace_id: WorkspaceId,
     entries: &[Assignment],
-) -> Result<Result<(), String>, RpcError> {
+    expected: Option<ProjectSetupBaseline>,
+) -> Result<Result<(), SetupSaveError>, RpcError> {
     if let Err(message) = daedalus_proto::validate_assignments(entries) {
-        return Ok(Err(message));
+        return Ok(Err(SetupSaveError::Other(message)));
     }
     match conn
         .call(ClientMessage::SetProjectSetup {
             workspace_id,
             assignments: entries.to_vec(),
+            expected,
         })
         .await
     {
         Ok(ResponsePayload::Ok) => Ok(Ok(())),
-        Ok(other) => Ok(Err(format!(
+        Ok(ResponsePayload::ProjectSetupConflict(_)) => Ok(Err(SetupSaveError::Conflict)),
+        Ok(other) => Ok(Err(SetupSaveError::Other(format!(
             "Unexpected reply while saving settings: {other:?}"
-        ))),
-        Err(RpcError::Proto(err)) => Ok(Err(err.to_string())),
+        )))),
+        Err(RpcError::Proto(err)) => Ok(Err(SetupSaveError::Other(err.to_string()))),
         Err(err) => Err(err),
     }
 }
@@ -157,7 +174,19 @@ pub(super) async fn save_project_setup(
     request_id: u64,
 ) -> Result<(), RpcError> {
     let result = if conn.project_setup_supported {
-        store_on_daemon(conn, workspace_id, &entries).await?
+        store_on_daemon(
+            conn,
+            workspace_id,
+            &entries,
+            Some(ProjectSetupBaseline::default()),
+        )
+        .await?
+        .map_err(|error| match error {
+            SetupSaveError::Conflict => {
+                "Using the project setup already saved on the daemon.".into()
+            }
+            SetupSaveError::Other(message) => message,
+        })
     } else {
         Err("This daemon does not support saving project settings.".into())
     };
@@ -174,35 +203,24 @@ pub(super) async fn save_workspace_settings(
     sink: &Arc<dyn UiEventSink>,
     workspace_id: WorkspaceId,
     entries: Vec<Assignment>,
+    expected: ProjectSetupBaseline,
     request_id: u64,
 ) -> Result<(), RpcError> {
     let result = if conn.project_setup_supported {
-        store_on_daemon(conn, workspace_id, &entries).await?
+        store_on_daemon(conn, workspace_id, &entries, Some(expected)).await?
     } else {
-        Err("This daemon does not support saving project settings.".into())
+        Err(SetupSaveError::Other(
+            "This daemon does not support saving project settings.".into(),
+        ))
     };
+    let conflict = matches!(result, Err(SetupSaveError::Conflict));
     sink.emit(UiEvent::WorkspaceSettingsSaved {
         workspace_id,
         request_id,
-        result,
+        result: result.map_err(SetupSaveError::message),
     });
-    Ok(())
-}
-
-pub(super) async fn refresh_recent_projects(
-    conn: &RpcConnection,
-    sink: &Arc<dyn UiEventSink>,
-) -> Result<(), RpcError> {
-    if !conn.recent_projects_supported {
-        return Ok(());
-    }
-    match conn.call(ClientMessage::ListRecentProjects).await {
-        Ok(ResponsePayload::RecentProjects(projects)) => {
-            sink.emit(UiEvent::RecentProjectsLoaded(projects));
-        }
-        Err(RpcError::Proto(error)) => warn!("listing recent projects failed: {error:?}"),
-        Err(error) => return Err(error),
-        Ok(other) => warn!("unexpected reply to ListRecentProjects: {other:?}"),
+    if conflict {
+        super::reconcile_membership(conn, sink).await?;
     }
     Ok(())
 }
@@ -215,7 +233,9 @@ pub(super) async fn apply(
     launch: Vec<String>,
 ) -> Result<(), RpcError> {
     let stored = if conn.project_setup_supported {
-        store_on_daemon(conn, workspace_id, &entries).await?
+        store_on_daemon(conn, workspace_id, &entries, None)
+            .await?
+            .map_err(SetupSaveError::message)
     } else {
         assignments::save(workspace_id, &entries)
     };

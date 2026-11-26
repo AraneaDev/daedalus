@@ -200,6 +200,23 @@ impl DaedalusApp {
         self.show_toast(message, true);
     }
 
+    pub(super) fn reconcile_workbench_layout(&mut self, id: WorkspaceId, layout: &WorkbenchLayout) {
+        self.layout_workspace = Some(id);
+        let previous = self
+            .state
+            .workbench
+            .as_ref()
+            .filter(|(workspace, _)| *workspace == id)
+            .map(|(_, state)| state);
+        if !self.pointer.dragging_divider() {
+            if let Some(layout) = self.layout_saves.get(&id).map(|save| save.desired.clone()) {
+                self.show_workbench_layout(&layout);
+            } else if previous.is_none_or(|previous| &previous.document.layout != layout) {
+                self.show_workbench_layout(layout);
+            }
+        }
+    }
+
     pub(super) fn show_workbench_layout(&mut self, layout: &WorkbenchLayout) {
         self.state.zoomed = !layout.split_view;
         self.pointer.splits = PaneSplits::from_portable(layout);

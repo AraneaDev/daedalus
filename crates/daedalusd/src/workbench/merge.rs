@@ -1,6 +1,6 @@
-use daedalus_proto::workbench::{
-    ConflictChoice, MergeConflict, WidgetDefinition, WorkspaceDocument,
-};
+mod references;
+
+use daedalus_proto::workbench::{ConflictChoice, MergeConflict, WorkspaceDocument};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,125 +50,6 @@ impl Merge<'_> {
             incoming: display(incoming),
         });
         ConflictChoice::Local
-    }
-
-    fn references(
-        &mut self,
-        document: &mut WorkspaceDocument,
-        base: &WorkspaceDocument,
-        local: &WorkspaceDocument,
-        incoming: &WorkspaceDocument,
-    ) {
-        let widget_path = |id: &str| child("/widgets", id);
-        // Reconcile template references per widget. Run in original order so the
-        // same missing reference always yields the same choice in preview and apply.
-        let available_templates: BTreeSet<_> =
-            document.templates.iter().map(|t| &t.id).cloned().collect();
-        let needs_repair =
-            |widget: &daedalus_proto::workbench::WidgetInstance| match &widget.template {
-                Some(id) => !available_templates.contains(id),
-                None => widget.definition.is_none(),
-            };
-        document.widgets.retain_mut(|widget| {
-            if !needs_repair(widget) {
-                return true;
-            }
-            let path = child(&widget_path(&widget.id), "$template_reference");
-            let base_widget = base.widgets.iter().find(|w| w.id == widget.id);
-            let local_widget = local.widgets.iter().find(|w| w.id == widget.id);
-            let incoming_widget = incoming.widgets.iter().find(|w| w.id == widget.id);
-            let (side, replacement) =
-                match self.side(path, base_widget, local_widget, incoming_widget) {
-                    ConflictChoice::Local => (local, local_widget),
-                    ConflictChoice::Incoming => (incoming, incoming_widget),
-                };
-            let Some(replacement) = replacement else {
-                return false;
-            };
-            widget.template.clone_from(&replacement.template);
-            if widget.template.is_none() {
-                widget.definition.clone_from(&replacement.definition);
-            }
-            if let Some(id) = &widget.template
-                && !document.templates.iter().any(|template| template.id == *id)
-                && let Some(template) = side.templates.iter().find(|template| template.id == *id)
-            {
-                document.templates.push(template.clone());
-            }
-            true
-        });
-
-        for template in &mut document.templates {
-            let lookup = |document: &'_ WorkspaceDocument| {
-                document.templates.iter().position(|t| t.id == template.id)
-            };
-            self.source_references(
-                child(&child("/templates", &template.id), "definition"),
-                &mut template.definition,
-                lookup(base).map(|i| &base.templates[i].definition),
-                lookup(local).map(|i| &local.templates[i].definition),
-                lookup(incoming).map(|i| &incoming.templates[i].definition),
-            );
-        }
-        for widget in &mut document.widgets {
-            let Some(definition) = &mut widget.definition else {
-                continue;
-            };
-            let lookup = |document: &'_ WorkspaceDocument| {
-                document.widgets.iter().position(|w| w.id == widget.id)
-            };
-            self.source_references(
-                child(&widget_path(&widget.id), "definition"),
-                definition,
-                lookup(base).and_then(|i| base.widgets[i].definition.as_ref()),
-                lookup(local).and_then(|i| local.widgets[i].definition.as_ref()),
-                lookup(incoming).and_then(|i| incoming.widgets[i].definition.as_ref()),
-            );
-        }
-    }
-
-    fn source_references(
-        &mut self,
-        path: String,
-        definition: &mut WidgetDefinition,
-        base: Option<&WidgetDefinition>,
-        local: Option<&WidgetDefinition>,
-        incoming: Option<&WidgetDefinition>,
-    ) {
-        let has_dangling = definition
-            .display
-            .summary
-            .iter()
-            .chain(&definition.display.details)
-            .chain(definition.rules.iter().map(|rule| &rule.field))
-            .any(|field| {
-                !definition
-                    .sources
-                    .iter()
-                    .any(|source| source.id == field.source)
-            });
-        if !has_dangling {
-            return;
-        }
-        let chosen = match self.side(child(&path, "$source_references"), base, local, incoming) {
-            ConflictChoice::Local => local,
-            ConflictChoice::Incoming => incoming,
-        };
-        if let Some(chosen) = chosen {
-            definition.sources.clone_from(&chosen.sources);
-            definition.display.clone_from(&chosen.display);
-            definition.rules.clone_from(&chosen.rules);
-        } else {
-            let known = |field: &daedalus_proto::workbench::WidgetField| {
-                definition
-                    .sources
-                    .iter()
-                    .any(|source| source.id == field.source)
-            };
-            definition.display.summary.retain(&known);
-            definition.display.details.retain(&known);
-            definition.rules.retain(|rule| known(&rule.field));
-        }
     }
 
     fn value(
@@ -329,7 +210,7 @@ impl Merge<'_> {
             (&local, &incoming)
         };
         let mut seen = BTreeSet::new();
-        first
+        let mut values: BTreeMap<_, _> = first
             .order
             .iter()
             .chain(&second.order)
@@ -344,9 +225,46 @@ impl Merge<'_> {
                     local.values.get(id).copied(),
                     incoming.values.get(id).copied(),
                 )
+                .map(|value| (*id, value))
             })
+            .collect();
+        merge_collection_order(&first.order, &second.order, &base.order, &values)
+            .into_iter()
+            .filter_map(|id| values.remove(id))
             .collect()
     }
+}
+
+fn merge_collection_order<'a>(
+    first: &[&'a str],
+    second: &[&'a str],
+    base: &[&'a str],
+    values: &BTreeMap<&str, Value>,
+) -> Vec<&'a str> {
+    let surviving = |id: &&str| values.contains_key(id);
+    let mut order: Vec<_> = first.iter().copied().filter(surviving).collect();
+    for side in [second, base] {
+        let ordered: BTreeSet<_> = order.iter().copied().collect();
+        let mut before = BTreeMap::new();
+        let mut additions = Vec::new();
+        for id in side.iter().copied().filter(surviving) {
+            if ordered.contains(id) {
+                if !additions.is_empty() {
+                    before.insert(id, std::mem::take(&mut additions));
+                }
+            } else {
+                additions.push(id);
+            }
+        }
+        // Preserve the chosen order of existing entries. An insertion stays
+        // before its next surviving neighbor, and an appended entry stays last.
+        order = order
+            .into_iter()
+            .flat_map(|id| before.remove(id).into_iter().flatten().chain([id]))
+            .chain(additions)
+            .collect();
+    }
+    order
 }
 
 struct Collection<'a> {

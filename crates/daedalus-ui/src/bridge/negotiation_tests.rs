@@ -286,13 +286,6 @@ async fn old_daemon_gets_no_new_requests() {
 
     let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
     let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink(ui_tx));
-    tokio::time::timeout(
-        WAIT,
-        handle_command(&conn, &sink, UiCommand::RefreshRecentProjects),
-    )
-    .await
-    .unwrap()
-    .unwrap();
     // An invalid entry fails local validation, so nothing is written to disk either.
     tokio::time::timeout(
         WAIT,
@@ -348,7 +341,7 @@ async fn old_daemon_gets_no_new_requests() {
 }
 
 #[tokio::test]
-async fn new_daemon_handshake_loads_recent_projects() {
+async fn handshake_publishes_capabilities_before_terminal_readiness() {
     let (conn, _ui, emitted, task, mut seen, _events) = handshake(true).await;
     let order: Vec<&str> = emitted
         .iter()
@@ -366,15 +359,13 @@ async fn new_daemon_handshake_loads_recent_projects() {
                 assert!(*recent_projects);
                 Some("capabilities")
             }
-            UiEvent::RecentProjectsLoaded(projects) => {
-                assert_eq!(projects, &vec![recent()]);
-                Some("recent")
-            }
+            UiEvent::RecentProjectsLoaded(_) => Some("recent"),
             UiEvent::WorkspacesLoaded(_) => Some("workspaces"),
+            UiEvent::Connected => Some("connected"),
             _ => None,
         })
         .collect();
-    assert_eq!(order, ["capabilities", "recent", "workspaces"]);
+    assert_eq!(order, ["capabilities", "workspaces", "connected"]);
     assert!(drain(&mut seen).iter().any(|message| matches!(
         message,
         ClientMessage::Subscribe {
@@ -405,7 +396,7 @@ async fn apply_stores_setup_on_daemon_when_supported() {
     let sent = drain(&mut seen);
     assert!(sent.iter().any(|message| matches!(
         message,
-        ClientMessage::SetProjectSetup { workspace_id: id, assignments: stored }
+        ClientMessage::SetProjectSetup { workspace_id: id, assignments: stored, .. }
             if *id == workspace_id && *stored == entries
     )));
     assert!(matches!(

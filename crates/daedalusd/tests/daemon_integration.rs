@@ -3435,6 +3435,7 @@ async fn recent_projects_round_trip() {
                 role: PaneRole::Agent,
                 argv: sleep_command(),
             }],
+            expected: None,
         },
     )
     .await;
@@ -3511,6 +3512,7 @@ async fn project_setup_events_only_reach_opted_in_clients() {
         ClientMessage::SetProjectSetup {
             workspace_id: ws.id,
             assignments: assignments.clone(),
+            expected: None,
         },
     )
     .await;
