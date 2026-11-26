@@ -11,7 +11,7 @@ pub struct Assignment {
     pub argv: Vec<String>,
 }
 
-/// The saved pane setup shown when the client opened Settings. An unset setup
+/// The saved pane setup the client used as its starting point. An unset setup
 /// is distinct from a saved empty list.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectSetupBaseline {

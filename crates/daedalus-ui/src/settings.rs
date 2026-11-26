@@ -160,6 +160,7 @@ pub struct SettingsDialog {
     pub custom_supported: bool,
     pub custom: WidgetEditor,
     pub widgets: WorkspaceWidgets,
+    pane_widget_baseline: WorkspaceWidgets,
     pub widget_workspace: Option<WorkspaceId>,
     pub setup_baseline: ProjectSetupBaseline,
     pub widgets_saved: bool,

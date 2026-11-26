@@ -61,7 +61,7 @@ impl DaedalusApp {
     }
 
     pub(crate) fn setup_installer_started(&mut self, id: WorkspaceId, pane: PaneId) {
-        if self.setup.workspace != Some(id) {
+        if self.setup.workspace_id() != Some(id) {
             return;
         }
         self.setup.awaiting_mutation = false;
@@ -83,10 +83,11 @@ impl DaedalusApp {
     }
 
     pub(crate) fn reconcile_setup_installer(&mut self) {
+        let workspace_id = self.setup.workspace_id();
         let recovery = self
             .setup
             .installer
-            .reconnect(self.setup.workspace, |workspace, pane| {
+            .reconnect(workspace_id, |workspace, pane| {
                 self.state
                     .panes
                     .get(&pane)

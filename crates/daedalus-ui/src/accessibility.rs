@@ -829,9 +829,23 @@ mod tests {
             Some(WorkspaceFormAction::None)
         );
         assert_eq!(tree(&state).focus, items[1]);
+        state
+            .workspace_form
+            .set_recent(vec![projects[1].clone(), projects[0].clone()]);
+        assert_eq!(tree(&state).focus, items[1]);
         assert_eq!(
             workspace_action(&mut state, &request(items[1], Action::Click)),
             Some(WorkspaceFormAction::Reopen(projects[1].clone()))
+        );
+        state.workspace_form.set_recent(vec![projects[0].clone()]);
+        assert_eq!(
+            workspace_action(&mut state, &request(items[1], Action::Click)),
+            None
+        );
+        state.workspace_form.set_recent(projects.clone());
+        assert_eq!(
+            workspace_action(&mut state, &request(items[1], Action::Click)),
+            None
         );
         state.workspace_form.start_submission();
         let update = tree(&state);

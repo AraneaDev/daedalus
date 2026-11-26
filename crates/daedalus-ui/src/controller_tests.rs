@@ -397,6 +397,7 @@ fn workspace(name: &str) -> WorkspaceInfo {
 #[test]
 fn first_workspace_installs_a_tool_then_applies_review_to_same_workspace() {
     let mut w = Workbench::new();
+    daemon_capabilities(&mut w, true);
     w.begin_review();
     let install = vec!["installer".to_string(), "tool".to_string()];
     w.app
@@ -414,7 +415,9 @@ fn first_workspace_installs_a_tool_then_applies_review_to_same_workspace() {
     w.app
         .handle_setup_action(SetupAction::Install(install.clone()));
     assert!(w.idle());
-    let ws = workspace("Workbench");
+    let mut ws = workspace("Workbench");
+    ws.setup = Some(vec![stored_setup().remove(0)]);
+    let expected_baseline = ws.setup.clone();
     let id = ws.id;
     let pane = ws.panes[2].id;
     w.app.handle_daemon_event(UiEvent::ManualWorkspaceCreated {
@@ -436,8 +439,10 @@ fn first_workspace_installs_a_tool_then_applies_review_to_same_workspace() {
     assert!(!w.app.state.workspace_form.open);
     w.app.handle_daemon_event(UiEvent::Disconnected);
     w.app.handle_daemon_event(UiEvent::Connected);
+    let mut updated = ws;
+    updated.setup = Some(stored_setup());
     w.app
-        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![updated]));
     assert!(w.app.setup_installer_is_running());
     w.app
         .handle_daemon_event(UiEvent::SetupInstallerFinished(pane, Some(7)));
@@ -458,8 +463,10 @@ fn first_workspace_installs_a_tool_then_applies_review_to_same_workspace() {
     assert!(w.app.state.setup_review.feedback.contains("exited 7"));
     w.app.handle_setup_action(SetupAction::Open);
     assert!(
-        matches!(w.command(), UiCommand::ApplySetup { workspace_id, assignments, .. }
-            if workspace_id == id && assignments.iter().any(|a| a.id == "setup-runner" && a.argv == ["cargo", "test"]))
+        matches!(w.command(), UiCommand::ApplySetup { workspace_id, assignments, expected, .. }
+            if workspace_id == id
+                && expected.assignments == expected_baseline
+                && assignments.iter().any(|a| a.id == "setup-runner" && a.argv == ["cargo", "test"]))
     );
     w.app.handle_daemon_event(UiEvent::SetupApplied {
         workspace_id: id,
@@ -476,6 +483,42 @@ fn first_workspace_installs_a_tool_then_applies_review_to_same_workspace() {
     });
     assert!(!w.app.state.setup_review.open);
     assert_eq!(w.app.state.active_workspace_id, Some(id));
+}
+
+#[test]
+fn guided_setup_on_an_old_daemon_remembers_an_explicitly_empty_local_setup() {
+    const CHILD: &str = "DAEDALUS_TEST_GUIDED_LOCAL_SETUP";
+    if !run_in_isolated_profile(
+        "controller_tests::guided_setup_on_an_old_daemon_remembers_an_explicitly_empty_local_setup",
+        CHILD,
+    ) {
+        return;
+    }
+    let mut w = Workbench::new();
+    daemon_capabilities(&mut w, false);
+    w.begin_review();
+    w.app
+        .handle_setup_action(SetupAction::Install(vec!["installer".into()]));
+    let UiCommand::CreateManualWorkspace { session, .. } = w.command() else {
+        panic!("expected workspace creation");
+    };
+    let ws = workspace("Workbench");
+    let id = ws.id;
+    daedalus_ui::assignments::save(id, &[]).unwrap();
+    w.app.handle_daemon_event(UiEvent::ManualWorkspaceCreated {
+        session,
+        workspace: ws,
+    });
+    assert!(matches!(w.command(), UiCommand::InstallSetupTool { .. }));
+    w.app.handle_daemon_event(UiEvent::SetupInstallerFailed {
+        workspace_id: id,
+        message: "simulated installer failure".into(),
+    });
+    w.app.handle_setup_action(SetupAction::Open);
+    let UiCommand::ApplySetup { expected, .. } = w.command() else {
+        panic!("expected to apply the workspace setup");
+    };
+    assert_eq!(expected.assignments, Some(Vec::new()));
 }
 
 #[test]
@@ -2233,17 +2276,10 @@ fn reopen_with_setup_creates_and_launches_agents_only() {
     // The setup only arrives on the workspace the daemon creates.
     let ws = reopen_first(&mut w, Some(stored_setup()));
     assert!(!w.app.state.workspace_form.open);
-    let UiCommand::ApplySetup {
-        workspace_id,
-        assignments,
-        launch,
-    } = w.command()
-    else {
-        panic!("expected the stored setup")
+    let UiCommand::LaunchStoredSetup(workspace_id) = w.command() else {
+        panic!("expected a launch without saving setup")
     };
     assert_eq!(workspace_id, ws.id);
-    assert_eq!(assignments, stored_setup());
-    assert_eq!(launch, ["agent", "reviewer"]);
     w.app.handle_daemon_event(UiEvent::SetupApplied {
         workspace_id,
         error: None,
@@ -2340,7 +2376,7 @@ fn reopen_failures_are_reported_where_the_user_is() {
         session,
         workspace: ws.clone(),
     });
-    assert!(matches!(w.command(), UiCommand::ApplySetup { .. }));
+    assert!(matches!(w.command(), UiCommand::LaunchStoredSetup(_)));
     w.app.handle_daemon_event(UiEvent::SetupApplied {
         workspace_id: ws.id,
         error: Some("agent missing".into()),
@@ -2388,18 +2424,11 @@ fn dismissed_reopen_still_applies_the_stored_setup() {
     start_screen_with_recent(&mut w, true);
     let ws = reopen_dismissed_then_form_reopened(&mut w, Some(stored_setup()));
     let applied = std::iter::from_fn(|| w.commands.try_recv().ok())
-        .find(|command| matches!(command, UiCommand::ApplySetup { .. }));
-    let Some(UiCommand::ApplySetup {
-        workspace_id,
-        assignments,
-        launch,
-    }) = applied
-    else {
+        .find(|command| matches!(command, UiCommand::LaunchStoredSetup(_)));
+    let Some(UiCommand::LaunchStoredSetup(workspace_id)) = applied else {
         panic!("the created workspace must get its setup")
     };
     assert_eq!(workspace_id, ws.id);
-    assert_eq!(assignments, stored_setup());
-    assert_eq!(launch, ["agent", "reviewer"]);
 }
 
 #[test]

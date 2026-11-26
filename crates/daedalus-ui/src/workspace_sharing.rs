@@ -51,7 +51,7 @@ impl DaedalusApp {
             .as_ref()
             .filter(|(workspace, _)| *workspace == id)
         {
-            self.state.settings.custom.state = Some(state.clone());
+            self.state.settings.custom.accept_snapshot(state.clone());
         }
         self.request_workbench(id, ClientMessage::GetWorkbench { workspace_id: id });
         self.request_workbench(id, ClientMessage::ListWidgetTemplates);
@@ -185,18 +185,20 @@ impl DaedalusApp {
         match response {
             Ok(ResponsePayload::Workbench(state)) => {
                 self.load_workbench(id, state);
-                self.state.settings.widgets = self
+                let widgets = self
                     .state
                     .workspace_widgets
                     .get(&id)
                     .cloned()
                     .unwrap_or_default();
+                self.state.settings.reset_pane_widget_draft(widgets);
                 self.state.settings.widgets_saved = true;
             }
             Ok(ResponsePayload::WorkbenchConflict(state)) => {
                 self.load_workbench(id, state);
-                self.state.settings.error =
-                    Some("The widget settings changed. Review the latest values and retry.".into());
+                self.state.settings.error = Some(
+                    "Workspace settings changed during the save. Try again to check your draft against the saved values.".into(),
+                );
             }
             Err(error) => self.state.settings.error = Some(error),
             Ok(_) => self.state.settings.error = Some("Unexpected widget settings reply.".into()),
@@ -210,8 +212,9 @@ impl DaedalusApp {
         }
         self.state.settings.open_custom_page();
         self.state.settings.focus = daedalus_ui::settings::Control::CustomNew;
-        if let Some(index) = index {
-            self.state.settings.custom.open_details(index);
+        if let Some(index) = index
+            && self.state.settings.custom.open_details(index)
+        {
             self.state.settings.focus = daedalus_ui::settings::Control::CustomRefresh;
             self.state.settings.custom.preview =
                 self.state.settings.custom.selected().and_then(|widget| {

@@ -1,7 +1,7 @@
 use super::fields::{edit_fields, format_fields};
 use daedalus_proto::workbench::{
     CommandOutput, NamedAction, NamedSource, RefreshPolicy, WidgetAction, WidgetDefinition,
-    WidgetInstance, WidgetSource, WidgetTemplate, WorkspaceCommand,
+    WidgetInstance, WidgetSource, WidgetTemplate, WorkspaceCommand, WorkspaceDocument,
 };
 
 #[derive(Clone, Debug)]
@@ -110,6 +110,26 @@ impl WidgetDraft {
         self.update_display(&mut definition)?;
         self.update_url(&mut definition.actions);
         widget.definition = Some(definition);
+        Ok(widget)
+    }
+
+    pub(super) fn build_for_document(
+        &self,
+        document: &WorkspaceDocument,
+    ) -> Result<WidgetInstance, String> {
+        let mut widget = self.build()?;
+        // Existing inline definitions stay explicit unless the user chooses a template.
+        if (self.widget.definition.is_none() || self.template.is_some())
+            && let Some(id) = widget.template.as_deref()
+            && let Some(template) = document
+                .templates
+                .iter()
+                .find(|candidate| candidate.id == id)
+                .or(self.template.as_ref())
+            && widget.definition.as_ref() == Some(&template.definition)
+        {
+            widget.definition = None;
+        }
         Ok(widget)
     }
 

@@ -233,6 +233,7 @@ async fn old_literal_setup_keys_follow_the_project_across_folder_aliases() {
             recent_projects: vec![PersistedRecentProject {
                 name: "Seen through alias".into(),
                 root_dir: alias.clone(),
+                canonical_root_dir: None,
                 last_used: 1,
             }],
             ..PersistedState::default()

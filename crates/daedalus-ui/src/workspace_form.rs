@@ -2,7 +2,9 @@ mod fields;
 mod layout;
 
 use daedalus_proto::RecentProject;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,6 +34,7 @@ const CONTROLS: [Control; 4] = [
 
 /// The dialog shows this many recent projects; the rest stay available to `daedalus-ctl`.
 pub const MAX_RECENT_ROWS: usize = 5;
+static NEXT_RECENT_ROW: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn relative_time(then: u64, now: u64) -> String {
     let age = now.saturating_sub(then);
@@ -70,45 +73,63 @@ pub struct WorkspaceForm {
     cursor: usize,
     select_all: bool,
     recent: Vec<RecentProject>,
+    recent_row_ids: Vec<u64>,
     /// Folders that are open as a workspace; they are never offered for reopening.
     open_roots: Vec<PathBuf>,
 }
 
 impl WorkspaceForm {
     pub fn begin(&mut self, folder: &Path) {
+        let recent = std::mem::take(&mut self.recent);
         *self = Self {
             open: true,
             session: self.session.wrapping_add(1),
             folder: folder.to_string_lossy().into_owned(),
-            recent: std::mem::take(&mut self.recent),
             open_roots: std::mem::take(&mut self.open_roots),
             ..Default::default()
         };
+        self.set_recent(recent);
     }
 
     /// Records which folders are open as workspaces and drops their rows from the list now
     /// and from every list set later, so an open project is never reopened a second time.
     pub fn hide_open(&mut self, open_roots: Vec<PathBuf>) {
         self.open_roots = open_roots;
-        let kept = std::mem::take(&mut self.recent);
-        self.set_recent(kept);
+        self.set_recent(self.recent.clone());
     }
 
     /// Replaces the recent projects shown above the form, most recent first.
     pub fn set_recent(&mut self, mut projects: Vec<RecentProject>) {
-        projects.retain(|project| !self.open_roots.contains(&project.root_dir));
+        let mut seen = HashSet::new();
+        projects.retain(|project| {
+            !self.open_roots.contains(&project.root_dir) && seen.insert(project.root_dir.clone())
+        });
         projects.truncate(MAX_RECENT_ROWS);
+        let focused_root = match self.focus {
+            Control::Recent(index) => self.recent.get(index).map(|project| &project.root_dir),
+            _ => None,
+        };
+        let focus = focused_root.map(|root| {
+            projects
+                .iter()
+                .position(|project| &project.root_dir == root)
+                .map_or(Control::Folder, Control::Recent)
+        });
+        self.recent_row_ids = projects
+            .iter()
+            .map(|project| {
+                self.recent
+                    .iter()
+                    .position(|old| old.root_dir == project.root_dir)
+                    .map_or_else(
+                        || NEXT_RECENT_ROW.fetch_add(1, Ordering::Relaxed),
+                        |index| self.recent_row_ids[index],
+                    )
+            })
+            .collect();
         self.recent = projects;
-        if let Control::Recent(i) = self.focus
-            && i >= self.recent.len()
-        {
-            self.focus = match self.recent.len() {
-                0 if self.name_is_fixed() => Control::Folder,
-                0 => Control::Name,
-                len => Control::Recent(len - 1),
-            };
-            self.cursor = self.value(self.focus).map_or(0, str::len);
-            self.select_all = false;
+        if let Some(focus) = focus {
+            self.set_focus(focus);
         }
     }
 
@@ -144,6 +165,10 @@ impl WorkspaceForm {
 
     pub fn recent(&self) -> &[RecentProject] {
         &self.recent
+    }
+
+    pub fn recent_row_id(&self, index: usize) -> u64 {
+        self.recent_row_ids[index]
     }
 
     pub fn revisit(&mut self, folder: &Path, name: &str, created: bool) {
@@ -538,9 +563,9 @@ mod tests {
         // A refreshed, shorter list never leaves focus on a row that is gone.
         form.set_focus(Control::Recent(1));
         form.set_recent(two_projects()[..1].to_vec());
-        assert_eq!(form.focus, Control::Recent(0));
+        assert_eq!(form.focus, Control::Folder);
         form.set_recent(Vec::new());
-        assert_eq!(form.focus, Control::Name);
+        assert_eq!(form.focus, Control::Folder);
     }
 
     #[test]
@@ -593,6 +618,22 @@ mod tests {
         form.open = false;
         form.begin(Path::new("/home/dev"));
         assert_eq!(form.recent().len(), 2);
+    }
+
+    #[test]
+    fn recent_refresh_keeps_focused_project_and_falls_back_if_removed() {
+        let mut form = WorkspaceForm::default();
+        form.begin(Path::new("/home/dev"));
+        let projects = two_projects();
+        form.set_recent(projects.clone());
+        form.set_focus(Control::Recent(0));
+        form.set_recent(vec![projects[1].clone(), projects[0].clone()]);
+        assert_eq!(
+            form.key(&Key::Named(NamedKey::Enter), ModifiersState::empty()),
+            WorkspaceFormAction::Reopen(projects[0].clone())
+        );
+        form.hide_open(vec![projects[0].root_dir.clone()]);
+        assert_eq!(form.focus, Control::Folder);
     }
 
     #[test]

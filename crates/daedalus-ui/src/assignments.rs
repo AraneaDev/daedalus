@@ -1,4 +1,6 @@
-use daedalus_proto::{PaneId, PaneRole, WorkspaceId, default_config_file_path};
+use daedalus_proto::{
+    PaneId, PaneRole, ProjectSetupBaseline, WorkspaceId, default_config_file_path,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -103,15 +105,19 @@ pub fn load_or(
 }
 
 pub(crate) fn load_from(path: &Path, defaults: Vec<Assignment>) -> Result<Vec<Assignment>, String> {
+    Ok(load_stored(path)?.unwrap_or(defaults))
+}
+
+pub(crate) fn load_stored(path: &Path) -> Result<Option<Vec<Assignment>>, String> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(defaults),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("Could not read {}: {error}", path.display())),
     };
     let stored: StoredAssignments = toml::from_str(&contents)
         .map_err(|error| format!("Invalid assignments in {}: {error}", path.display()))?;
     validate(&stored.assignments)?;
-    Ok(stored.assignments)
+    Ok(Some(stored.assignments))
 }
 
 pub fn save(workspace_id: WorkspaceId, assignments: &[Assignment]) -> Result<(), String> {
@@ -119,10 +125,46 @@ pub fn save(workspace_id: WorkspaceId, assignments: &[Assignment]) -> Result<(),
 }
 
 pub(crate) fn save_to(path: &Path, assignments: &[Assignment]) -> Result<(), String> {
+    save_checked(path, assignments, None).map(|_| ())
+}
+
+pub(crate) fn save_if_current(
+    workspace_id: WorkspaceId,
+    assignments: &[Assignment],
+    baseline: &ProjectSetupBaseline,
+) -> Result<bool, String> {
+    save_checked(&workspace_path(workspace_id), assignments, Some(baseline))
+}
+
+fn save_checked(
+    path: &Path,
+    assignments: &[Assignment],
+    baseline: Option<&ProjectSetupBaseline>,
+) -> Result<bool, String> {
     validate(assignments)?;
+    let directory = path.parent().ok_or("Missing assignments directory")?;
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+    // Keep the lock file separate from the atomically replaced assignment file.
+    let lock_path = path.with_extension("lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| format!("Could not open {}: {error}", lock_path.display()))?;
+    lock.lock()
+        .map_err(|error| format!("Could not lock {}: {error}", lock_path.display()))?;
+    if let Some(baseline) = baseline
+        && load_stored(path)? != baseline.assignments
+    {
+        return Ok(false);
+    }
     let contents = toml::to_string(&AssignmentList { assignments })
         .map_err(|error| format!("Could not encode assignments: {error}"))?;
-    write_atomic(path, &contents)
+    write_atomic(path, &contents)?;
+    Ok(true)
 }
 
 pub fn bind(workspace_id: WorkspaceId, pane_id: PaneId, assignment_id: &str) -> Result<(), String> {
@@ -223,6 +265,57 @@ mod tests {
             workspace_path(WorkspaceId::new()),
             workspace_path(WorkspaceId::new())
         );
+    }
+
+    #[test]
+    fn guided_save_preserves_newer_local_assignments_and_explicit_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("assignments/workspace.toml");
+        let missing = ProjectSetupBaseline::default();
+        let guided = assignment();
+
+        save_to(&path, &[]).unwrap();
+        assert!(!save_checked(&path, std::slice::from_ref(&guided), Some(&missing)).unwrap());
+        let blank = ProjectSetupBaseline {
+            assignments: load_stored(&path).unwrap(),
+        };
+        assert_eq!(blank.assignments, Some(vec![]));
+
+        let settings = Assignment {
+            name: "Saved in Settings".into(),
+            ..guided.clone()
+        };
+        save_to(&path, std::slice::from_ref(&settings)).unwrap();
+        assert!(!save_checked(&path, std::slice::from_ref(&guided), Some(&blank)).unwrap());
+        assert_eq!(load_stored(&path).unwrap(), Some(vec![settings]));
+
+        let current = ProjectSetupBaseline {
+            assignments: load_stored(&path).unwrap(),
+        };
+        assert!(save_checked(&path, std::slice::from_ref(&guided), Some(&current)).unwrap());
+        assert_eq!(load_stored(&path).unwrap(), Some(vec![guided]));
+    }
+
+    #[test]
+    fn concurrent_guided_saves_check_the_baseline_under_the_same_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("assignments/workspace.toml");
+        let baseline = ProjectSetupBaseline::default();
+        let start = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            [
+                scope.spawn(|| {
+                    start.wait();
+                    save_checked(&path, &[assignment()], Some(&baseline)).unwrap()
+                }),
+                scope.spawn(|| {
+                    start.wait();
+                    save_checked(&path, &[assignment()], Some(&baseline)).unwrap()
+                }),
+            ]
+            .map(|thread| thread.join().unwrap())
+        });
+        assert_ne!(results[0], results[1]);
     }
 
     #[test]

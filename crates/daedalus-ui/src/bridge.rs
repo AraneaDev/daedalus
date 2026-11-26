@@ -113,7 +113,9 @@ pub enum UiCommand {
         workspace_id: WorkspaceId,
         assignments: Vec<crate::assignments::Assignment>,
         launch: Vec<String>,
+        expected: daedalus_proto::ProjectSetupBaseline,
     },
+    LaunchStoredSetup(WorkspaceId),
     InstallSetupTool {
         workspace_id: WorkspaceId,
         argv: Vec<String>,
@@ -638,8 +640,12 @@ async fn handle_command(
             workspace_id,
             assignments,
             launch,
+            expected,
         } => {
-            setup::apply(conn, sink, workspace_id, assignments, launch).await?;
+            setup::apply(conn, sink, workspace_id, assignments, launch, expected).await?;
+        }
+        UiCommand::LaunchStoredSetup(workspace_id) => {
+            setup::launch_stored(conn, sink, workspace_id).await?;
         }
         UiCommand::InstallSetupTool { workspace_id, argv } => {
             setup::install(conn, sink, workspace_id, argv).await?;

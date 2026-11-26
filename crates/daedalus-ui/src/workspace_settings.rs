@@ -100,12 +100,13 @@ impl DaedalusApp {
                     self.state.has_widget_source(PaneRole::Service),
                     self.state.has_widget_source(PaneRole::Runner),
                 );
-                self.state.settings.widgets = self
+                let widgets = self
                     .state
                     .workspace_widgets
                     .get(&id)
                     .cloned()
                     .unwrap_or_default();
+                self.state.settings.reset_pane_widget_draft(widgets);
             }
             Err(err) => self.show_toast(err, true),
         }
@@ -215,6 +216,23 @@ impl DaedalusApp {
                 self.state.settings.error = Some("Workspace settings are still loading.".into());
                 return;
             };
+            let saved_widgets = snapshot
+                .document
+                .pane_widgets
+                .clone()
+                .map(Into::into)
+                .unwrap_or_default();
+            let widgets = match self
+                .state
+                .settings
+                .reconcile_pane_widget_draft(widgets, saved_widgets)
+            {
+                Ok(widgets) => widgets,
+                Err(message) => {
+                    self.state.settings.error = Some(message.into());
+                    return;
+                }
+            };
             let mut document = snapshot.document.clone();
             document.pane_widgets = Some(widgets.into());
             let revision = snapshot.revision;
@@ -237,7 +255,7 @@ impl DaedalusApp {
         match daedalus_ui::workspace_widgets::save(&self.widget_directory, id, &widgets) {
             Ok(()) => {
                 self.state.workspace_widgets.insert(id, widgets.clone());
-                self.state.settings.widgets = widgets;
+                self.state.settings.reset_pane_widget_draft(widgets);
                 self.state.settings.widgets_saved = true;
                 self.schedule_resize_flush();
             }

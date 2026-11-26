@@ -414,7 +414,8 @@ impl Registry {
 
     async fn publish_workspace(&self, record: WorkspaceRecord) -> WorkspaceInfo {
         let info = record.to_info(Vec::new());
-        self.record_recent_project(&info.name, &info.root_dir).await;
+        self.record_recent_project(&info.name, &info.root_dir, &record.canonical_root_dir)
+            .await;
         {
             let mut workspaces = self.workspaces.write().await;
             let mut deferred = self.deferred_workspaces.write().await;
@@ -602,9 +603,13 @@ impl Registry {
     ) -> Result<(), ProtoError> {
         let project = {
             let ws_map = self.workspaces.read().await;
-            ws_map
-                .get(&workspace_id)
-                .map(|ws| (ws.name.clone(), ws.root_dir.clone()))
+            ws_map.get(&workspace_id).map(|ws| {
+                (
+                    ws.name.clone(),
+                    ws.root_dir.clone(),
+                    ws.canonical_root_dir.clone(),
+                )
+            })
         };
         self.close_workspace_internal(
             workspace_id,
@@ -614,8 +619,9 @@ impl Registry {
             true,
         )
         .await?;
-        if let Some((name, root_dir)) = project {
-            self.record_recent_project(&name, &root_dir).await;
+        if let Some((name, root_dir, canonical_root_dir)) = project {
+            self.record_recent_project(&name, &root_dir, &canonical_root_dir)
+                .await;
             self.persist_state().await;
         }
         Ok(())

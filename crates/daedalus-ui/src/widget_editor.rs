@@ -1,6 +1,6 @@
 use daedalus_proto::workbench::{
     WidgetDefinition, WidgetInstance, WidgetLibrary, WidgetResult, WorkbenchState,
-    WorkspaceImportPreview,
+    WorkspaceDocument, WorkspaceImportPreview,
 };
 use daedalus_proto::{ClientMessage, WorkspaceId};
 
@@ -11,11 +11,22 @@ mod import_review;
 pub use draft::WidgetDraft;
 use import_review::ImportReview;
 
+#[cfg(test)]
+mod tests;
+
+#[derive(Clone, Debug, Default)]
+enum WidgetSelection {
+    #[default]
+    First,
+    Selected(String),
+    Cleared,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct WidgetEditor {
     pub state: Option<WorkbenchState>,
     pub library: WidgetLibrary,
-    pub selected: usize,
+    selection: WidgetSelection,
     pub draft: Option<WidgetDraft>,
     pub preview: Option<WidgetResult>,
     pub sharing: bool,
@@ -35,12 +46,20 @@ pub struct WidgetEditor {
 }
 
 impl WidgetEditor {
-    pub fn open_details(&mut self, index: usize) {
-        self.selected = index;
+    pub fn open_details(&mut self, index: usize) -> bool {
+        let Some(widget) = self
+            .state
+            .as_ref()
+            .and_then(|state| state.document.widgets.get(index))
+        else {
+            return false;
+        };
+        self.selection = WidgetSelection::Selected(widget.id.clone());
         self.showing_details = true;
         self.action_output = false;
         self.detail_page = 0;
         self.detail_session = Some(uuid::Uuid::new_v4());
+        true
     }
 
     pub(crate) fn close_details(&mut self) {
@@ -106,22 +125,39 @@ impl WidgetEditor {
     }
 
     pub fn selected(&self) -> Option<&WidgetInstance> {
-        self.state.as_ref()?.document.widgets.get(self.selected)
+        self.state
+            .as_ref()?
+            .document
+            .widgets
+            .get(self.selected_index()?)
+    }
+
+    pub(crate) fn selected_index(&self) -> Option<usize> {
+        let widgets = &self.state.as_ref()?.document.widgets;
+        match &self.selection {
+            WidgetSelection::First => (!widgets.is_empty()).then_some(0),
+            WidgetSelection::Selected(id) => widgets.iter().position(|widget| widget.id == *id),
+            WidgetSelection::Cleared => None,
+        }
     }
 
     pub fn move_selection(&mut self, step: isize) {
-        let count = self
-            .state
-            .as_ref()
-            .map_or(0, |state| state.document.widgets.len());
-        if count > 0 {
-            self.selected = (self.selected as isize + step).rem_euclid(count as isize) as usize;
+        let Some(state) = &self.state else { return };
+        let widgets = &state.document.widgets;
+        let count = widgets.len() as isize;
+        if count == 0 {
+            return;
         }
+        let index = self.selected_index().map_or_else(
+            || if step < 0 { count - 1 } else { 0 },
+            |index| (index as isize + step).rem_euclid(count),
+        );
+        self.selection = WidgetSelection::Selected(widgets[index as usize].id.clone());
     }
 
     pub fn edit(&mut self) {
         let Some(state) = &self.state else { return };
-        let Some(widget) = state.document.widgets.get(self.selected) else {
+        let Some(widget) = self.selected() else {
             return;
         };
         let definition = state
@@ -173,7 +209,7 @@ impl WidgetEditor {
     pub fn update(
         &self,
         id: WorkspaceId,
-        edit: impl FnOnce(&mut daedalus_proto::workbench::WorkspaceDocument),
+        edit: impl FnOnce(&mut WorkspaceDocument),
     ) -> Option<ClientMessage> {
         let state = self.state.as_ref()?;
         let mut document = state.document.clone();
@@ -185,6 +221,15 @@ impl WidgetEditor {
             layout_only: false,
             edit: Some(daedalus_proto::workbench::WorkbenchEdit::Widgets),
         })
+    }
+
+    pub(crate) fn update_selected(
+        &self,
+        id: WorkspaceId,
+        edit: impl FnOnce(&mut Vec<WidgetInstance>, usize),
+    ) -> Option<ClientMessage> {
+        let index = self.selected_index()?;
+        self.update(id, |document| edit(&mut document.widgets, index))
     }
 
     pub fn accept_snapshot(&mut self, snapshot: WorkbenchState) {
@@ -209,18 +254,34 @@ impl WidgetEditor {
                 draft.revision = snapshot.revision;
             }
         }
-        self.selected = self
-            .selected
-            .min(snapshot.document.widgets.len().saturating_sub(1));
+        let widgets = &snapshot.document.widgets;
+        match &self.selection {
+            WidgetSelection::First => {
+                if let Some(widget) = widgets.first() {
+                    self.selection = WidgetSelection::Selected(widget.id.clone());
+                }
+            }
+            WidgetSelection::Selected(id) if !widgets.iter().any(|widget| widget.id == *id) => {
+                self.selection = WidgetSelection::Cleared;
+                self.close_details();
+                if self.draft.is_none() {
+                    self.clear_preview();
+                }
+            }
+            _ => {}
+        }
         self.state = Some(snapshot);
     }
 
     pub fn draft_matches_saved_widget(&self) -> bool {
         self.draft
             .as_ref()
-            .and_then(|draft| draft.build().ok())
             .zip(self.state.as_ref())
-            .is_some_and(|(widget, state)| state.document.widgets.contains(&widget))
+            .is_some_and(|(draft, state)| {
+                draft
+                    .build_for_document(&state.document)
+                    .is_ok_and(|widget| state.document.widgets.contains(&widget))
+            })
     }
 
     pub fn save(&self, id: WorkspaceId) -> Result<ClientMessage, String> {
@@ -232,7 +293,7 @@ impl WidgetEditor {
         if state.revision != draft.revision {
             return Err("The workspace changed while editing. Reopen this widget to review its current settings.".into());
         }
-        let widget = draft.build()?;
+        let widget = draft.build_for_document(&state.document)?;
         self.update(id, |document| {
             if let Some(template) = draft.template.as_ref()
                 && !document

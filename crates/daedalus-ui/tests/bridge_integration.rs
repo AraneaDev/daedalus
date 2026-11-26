@@ -1431,6 +1431,7 @@ command = ["sh", "-c", "touch unexpected-manifest-launch"]
 #[cfg(unix)]
 #[tokio::test]
 async fn wizard_inspects_installs_and_launches_only_selected_roles() {
+    use daedalus_proto::ProjectSetupBaseline;
     use daedalus_ui::assignments::{self, Assignment};
     // The bridge uses the user's assignment directory. Isolate it without changing
     // the environment of other tests running in this process.
@@ -1476,7 +1477,7 @@ async fn wizard_inspects_installs_and_launches_only_selected_roles() {
             .unwrap();
     });
     let config = BridgeConfig {
-        socket_path: sock,
+        socket_path: sock.clone(),
         initial_dir: project.clone(),
         bootstrap_explicit_dir: false,
         default_agent: AgentPreset::Shell,
@@ -1603,10 +1604,70 @@ async fn wizard_inspects_installs_and_launches_only_selected_roles() {
                 argv: vec!["touch".into(), "unexpected tests".into()],
             },
         ];
+        let changed = vec![Assignment {
+            id: "concurrent".into(),
+            name: "Saved by another client".into(),
+            role: PaneRole::Agent,
+            argv: vec!["touch".into(), "newly saved agent".into()],
+        }];
+        let mut other = IpcStream::connect(&sock).await.unwrap();
+        write_frame(
+            &mut other,
+            &Request {
+                id: 1,
+                payload: ClientMessage::SetProjectSetup {
+                    workspace_id: ws,
+                    assignments: changed.clone(),
+                    expected: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_frame::<_, ServerMessage>(&mut other).await.unwrap(),
+            Some(ServerMessage::Response {
+                id: 1,
+                result: Ok(ResponsePayload::Ok),
+            })
+        );
         assert!(bridge.send(UiCommand::ApplySetup {
             workspace_id: ws,
             assignments: entries.clone(),
-            launch: vec!["agent".into(), "serve".into()]
+            launch: vec!["serve".into()],
+            expected: ProjectSetupBaseline::default()
+        }));
+        loop {
+            match events.recv().await.unwrap() {
+                UiEvent::SetupApplied { error, .. } => {
+                    assert!(error.is_some_and(|message| message.contains("another client")));
+                    break;
+                }
+                UiEvent::AssignmentStarted { .. } => panic!("stale setup launched an assignment"),
+                _ => {}
+            }
+        }
+        assert!(bridge.send(UiCommand::LaunchStoredSetup(ws)));
+        let mut reopened = Vec::new();
+        loop {
+            match events.recv().await.unwrap() {
+                UiEvent::AssignmentStarted { assignment, .. } => reopened.push(assignment),
+                UiEvent::SetupApplied { error, .. } => {
+                    assert_eq!(error, None);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(reopened, changed);
+
+        assert!(bridge.send(UiCommand::ApplySetup {
+            workspace_id: ws,
+            assignments: entries.clone(),
+            launch: vec!["agent".into(), "serve".into()],
+            expected: ProjectSetupBaseline {
+                assignments: Some(changed),
+            },
         }));
         let mut started = Vec::new();
         loop {
@@ -1637,7 +1698,9 @@ async fn wizard_inspects_installs_and_launches_only_selected_roles() {
                 break;
             }
         }
-        while !project.join("started service").exists() || !project.join("installed tool").exists()
+        while !project.join("started service").exists()
+            || !project.join("installed tool").exists()
+            || !project.join("newly saved agent").exists()
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1823,8 +1886,8 @@ async fn held_widget_preview_does_not_delay_typing_or_paste() {
 }
 
 #[tokio::test]
-async fn reconnect_hydrates_terminal_before_ready_and_recents_do_not_delay_input() {
-    use daedalus_proto::{GridSnapshot, PaneId, WorkspaceId, WorkspaceInfo};
+async fn reconnect_hydrates_surviving_pane_before_ready_and_recents_do_not_delay_input() {
+    use daedalus_proto::{GridSnapshot, PaneId, ProtoError, WorkspaceId, WorkspaceInfo};
     use tokio::net::{TcpListener, TcpStream};
 
     async fn reply(peer: &mut TcpStream, result: ResponsePayload) -> ClientMessage {
@@ -1927,6 +1990,11 @@ async fn reconnect_hydrates_terminal_before_ready_and_recents_do_not_delay_input
            has_failure_trace = false"#
     ))
     .unwrap();
+    let closed_pane = PaneId::new();
+    let mut before_close = workspace.clone();
+    let mut closing = workspace.panes[0].clone();
+    closing.id = closed_pane;
+    before_close.panes.insert(0, closing);
 
     tokio::time::timeout(Duration::from_secs(8), async {
         let mut first = handshake(&listener).await;
@@ -1947,15 +2015,31 @@ async fn reconnect_hydrates_terminal_before_ready_and_recents_do_not_delay_input
 
         let mut second = handshake(&listener).await;
         assert_eq!(
-            reply(&mut second, ResponsePayload::Workspaces(vec![workspace])).await,
+            reply(&mut second, ResponsePayload::Workspaces(vec![before_close])).await,
             ClientMessage::ListWorkspaces
         );
-        let snapshot: Request = read_frame(&mut second).await.unwrap().unwrap();
-        assert_eq!(snapshot.payload, ClientMessage::GetSnapshot { pane_id });
+        let vanished: Request = read_frame(&mut second).await.unwrap().unwrap();
+        assert_eq!(
+            vanished.payload,
+            ClientMessage::GetSnapshot {
+                pane_id: closed_pane
+            }
+        );
         assert!(bridge.send(UiCommand::SendInput {
             pane_id,
             data: b"buffered".to_vec(),
         }));
+        write_frame(
+            &mut second,
+            &ServerMessage::Response {
+                id: vanished.id,
+                result: Err(ProtoError::PaneNotFound(closed_pane)),
+            },
+        )
+        .await
+        .unwrap();
+        let snapshot: Request = read_frame(&mut second).await.unwrap().unwrap();
+        assert_eq!(snapshot.payload, ClientMessage::GetSnapshot { pane_id });
         assert!(
             tokio::time::timeout(Duration::from_millis(100), async {
                 while !matches!(events.recv().await.unwrap(), UiEvent::Connected) {}
@@ -1985,8 +2069,32 @@ async fn reconnect_hydrates_terminal_before_ready_and_recents_do_not_delay_input
         )
         .await
         .unwrap();
+        assert_eq!(
+            reply(&mut second, ResponsePayload::Workspaces(vec![workspace])).await,
+            ClientMessage::ListWorkspaces
+        );
         let (mut recents, request_id) = hold_recents(&listener).await;
-        while !matches!(events.recv().await.unwrap(), UiEvent::Connected) {}
+        let mut reconciled = false;
+        loop {
+            match events.recv().await.unwrap() {
+                UiEvent::WorkspaceMembershipLoaded(workspaces) => {
+                    assert_eq!(workspaces.len(), 1);
+                    assert_eq!(
+                        workspaces[0]
+                            .panes
+                            .iter()
+                            .map(|pane| pane.id)
+                            .collect::<Vec<_>>(),
+                        [pane_id]
+                    );
+                    reconciled = true;
+                }
+                UiEvent::Connected => break,
+                UiEvent::Disconnected => panic!("closing a pane disconnected the bridge"),
+                _ => {}
+            }
+        }
+        assert!(reconciled);
         assert_eq!(
             reply(&mut second, ResponsePayload::Ok).await,
             ClientMessage::SendInput {

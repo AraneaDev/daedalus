@@ -295,6 +295,7 @@ async fn old_daemon_gets_no_new_requests() {
             WorkspaceId::new(),
             vec![assignment("")],
             vec![],
+            Default::default(),
         ),
     )
     .await
@@ -387,7 +388,14 @@ async fn apply_stores_setup_on_daemon_when_supported() {
     let entries = vec![assignment("check")];
     tokio::time::timeout(
         WAIT,
-        setup::apply(&conn, &sink, workspace_id, entries.clone(), vec![]),
+        setup::apply(
+            &conn,
+            &sink,
+            workspace_id,
+            entries.clone(),
+            vec![],
+            Default::default(),
+        ),
     )
     .await
     .unwrap()
@@ -446,7 +454,14 @@ async fn invalid_setup_on_new_daemon_is_rejected_locally() {
 
     tokio::time::timeout(
         WAIT,
-        setup::apply(&conn, &sink, workspace_id, invalid.clone(), vec![]),
+        setup::apply(
+            &conn,
+            &sink,
+            workspace_id,
+            invalid.clone(),
+            vec![],
+            Default::default(),
+        ),
     )
     .await
     .unwrap()

@@ -1,0 +1,4 @@
+bash-init.bash text eol=lf
+zshrc text eol=lf
+daedalus.fish text eol=lf
+daedalus.ps1 text eol=lf

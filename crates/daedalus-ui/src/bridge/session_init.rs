@@ -3,7 +3,8 @@ use super::{
     rpc::{RpcConnection, RpcError},
     workspace::{create_and_populate_workspace, workspace_name_from_dir},
 };
-use daedalus_proto::{ClientMessage, ProtoError, ResponsePayload};
+use daedalus_proto::{ClientMessage, PaneId, ProtoError, ResponsePayload, WorkspaceInfo};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
@@ -115,14 +116,7 @@ async fn hydrate_initial_workspaces(
     sink: &Arc<dyn UiEventSink>,
     bootstrapped: &mut bool,
 ) -> Result<(), RpcError> {
-    let workspaces = match conn.call(ClientMessage::ListWorkspaces).await? {
-        ResponsePayload::Workspaces(ws) => ws,
-        _ => {
-            return Err(RpcError::Proto(ProtoError::Internal(
-                "Unexpected workspace list response.".into(),
-            )));
-        }
-    };
+    let workspaces = list_workspaces(conn).await?;
 
     if workspaces.is_empty() && !*bootstrapped && config.bootstrap_explicit_dir {
         let name = workspace_name_from_dir(&config.initial_dir);
@@ -140,17 +134,62 @@ async fn hydrate_initial_workspaces(
     } else {
         *bootstrapped = true;
         sink.emit(UiEvent::WorkspacesLoaded(workspaces.clone()));
-        for ws in &workspaces {
-            for pane in &ws.panes {
-                if let ResponsePayload::Snapshot(snapshot) = conn
-                    .call(ClientMessage::GetSnapshot { pane_id: pane.id })
-                    .await?
-                {
-                    sink.emit(UiEvent::Snapshot(snapshot));
+        let mut hydrated = HashSet::new();
+        if !hydrate_panes(conn, sink, &workspaces, &mut hydrated)
+            .await?
+            .is_empty()
+        {
+            let mut current = list_workspaces(conn).await?;
+            sink.emit(UiEvent::WorkspaceMembershipLoaded(current.clone()));
+            let closed = hydrate_panes(conn, sink, &current, &mut hydrated).await?;
+            if !closed.is_empty() {
+                // Churn can continue during the refresh. Prune those panes locally
+                // and leave ongoing membership updates to the connected session.
+                for workspace in &mut current {
+                    workspace.panes.retain(|pane| !closed.contains(&pane.id));
                 }
+                sink.emit(UiEvent::WorkspaceMembershipLoaded(current));
             }
         }
     }
 
     Ok(())
+}
+
+async fn list_workspaces(conn: &RpcConnection) -> Result<Vec<WorkspaceInfo>, RpcError> {
+    match conn.call(ClientMessage::ListWorkspaces).await? {
+        ResponsePayload::Workspaces(workspaces) => Ok(workspaces),
+        _ => Err(RpcError::Proto(ProtoError::Internal(
+            "Unexpected workspace list response.".into(),
+        ))),
+    }
+}
+
+async fn hydrate_panes(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+    workspaces: &[WorkspaceInfo],
+    hydrated: &mut HashSet<PaneId>,
+) -> Result<HashSet<PaneId>, RpcError> {
+    let mut closed = HashSet::new();
+    for pane in workspaces.iter().flat_map(|workspace| &workspace.panes) {
+        if hydrated.contains(&pane.id) {
+            continue;
+        }
+        match conn
+            .call(ClientMessage::GetSnapshot { pane_id: pane.id })
+            .await
+        {
+            Ok(ResponsePayload::Snapshot(snapshot)) => {
+                hydrated.insert(pane.id);
+                sink.emit(UiEvent::Snapshot(snapshot));
+            }
+            Err(RpcError::Proto(ProtoError::PaneNotFound(id))) if id == pane.id => {
+                closed.insert(id);
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+    }
+    Ok(closed)
 }

@@ -15,17 +15,12 @@ pub(super) fn control_node(form: &WorkspaceForm, control: Control) -> NodeId {
         Control::Folder => form_node(form, 1),
         Control::Cancel => form_node(form, 2),
         Control::Save => form_node(form, 3),
-        Control::Recent(i) => recent_node(form, i as u64),
+        Control::Recent(i) => NodeId((0b110 << 61) | form.recent_row_id(i)),
     }
 }
 
-// Bit 62 next to the form's bit keeps recent rows apart from the form's other nodes.
-fn recent_node(form: &WorkspaceForm, offset: u64) -> NodeId {
-    NodeId((0b11 << 62) | ((form.session() & ((1 << 56) - 1)) << 6) | offset)
-}
-
 fn recent_list_node(form: &WorkspaceForm) -> NodeId {
-    recent_node(form, 63)
+    NodeId((0b111 << 61) | form.session())
 }
 
 pub(crate) fn workspace_action(

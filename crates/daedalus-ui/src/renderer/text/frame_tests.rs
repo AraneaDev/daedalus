@@ -462,8 +462,7 @@ fn custom_widget_chrome_renders_reports_icons_overflow_and_action_details() {
     frame.state.settings.custom_supported = true;
     frame.state.settings.open_custom_page();
     frame.state.settings.custom.accept_snapshot(snapshot);
-    frame.state.settings.custom.showing_details = true;
-    frame.state.settings.custom.selected = 4;
+    assert!(frame.state.settings.custom.open_details(4));
     frame.state.settings.custom.action_output = true;
     frame.state.settings.custom.preview = Some(WidgetResult {
         label: "Runner diagnostics".into(),

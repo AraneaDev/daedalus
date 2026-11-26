@@ -24,6 +24,8 @@ impl SettingsDialog {
                 vec![CustomPrev, CustomEdit, CustomNext],
                 vec![CustomDuplicate, CustomMove, CustomPin, CustomRemove],
             ]);
+        } else if self.custom_enabled(CustomNext) {
+            rows.push(vec![CustomPrev, CustomNext]);
         }
         rows.push(vec![Cancel]);
         rows
@@ -92,17 +94,19 @@ impl SettingsDialog {
         match control {
             CustomNew => self.custom.state.is_some(),
             CustomTemplate => !self.custom.library.templates.is_empty(),
-            CustomPrev | CustomNext => self
-                .custom
-                .state
-                .as_ref()
-                .is_some_and(|state| state.document.widgets.len() > 1),
-            CustomMove => self.custom.selected > 0,
+            CustomPrev | CustomNext => self.custom.state.as_ref().is_some_and(|state| {
+                let count = state.document.widgets.len();
+                count > 1 || (count == 1 && self.custom.selected().is_none())
+            }),
+            CustomEdit | CustomDuplicate | CustomRemove | CustomExportTemplate => {
+                self.custom.selected().is_some()
+            }
+            CustomPin => self.custom.draft.is_some() || self.custom.selected().is_some(),
+            CustomMove => self.custom.selected_index().is_some_and(|index| index > 0),
             CustomApplyImport => self.can_apply_import(),
             CustomResolve | CustomResolveIncoming => {
                 !self.custom.is_reviewing_import() && self.next_import_conflict().is_some()
             }
-            CustomExportTemplate => self.custom.selected().is_some(),
             CustomDetail(_) => false,
             CustomDetailPrev => self.custom.detail_page > 0,
             CustomDetailNext => {
@@ -219,7 +223,6 @@ impl SettingsDialog {
     fn custom_command(&mut self, control: Control) -> Result<Option<ClientMessage>, String> {
         let id = self.widget_workspace.ok_or("No workspace is open")?;
         let editor = &mut self.custom;
-        let selected = editor.selected;
         match control {
             CustomNew => {
                 editor.create();
@@ -252,35 +255,27 @@ impl SettingsDialog {
                 if let Some(draft) = &mut editor.draft {
                     draft.widget.pinned = !draft.widget.pinned;
                 } else {
-                    return Ok(editor.update(id, |doc| {
-                        if let Some(widget) = doc.widgets.get_mut(selected) {
-                            widget.pinned = !widget.pinned;
-                        }
+                    return Ok(editor.update_selected(id, |widgets, index| {
+                        widgets[index].pinned = !widgets[index].pinned;
                     }));
                 }
             }
             CustomDuplicate => {
-                return Ok(editor.update(id, |doc| {
-                    if let Some(widget) = doc.widgets.get(selected) {
-                        let mut copy = widget.clone();
-                        copy.id = uuid::Uuid::new_v4().to_string();
-                        copy.name.push_str(" copy");
-                        doc.widgets.insert(selected + 1, copy);
-                    }
+                return Ok(editor.update_selected(id, |widgets, index| {
+                    let mut copy = widgets[index].clone();
+                    copy.id = uuid::Uuid::new_v4().to_string();
+                    copy.name.push_str(" copy");
+                    widgets.insert(index + 1, copy);
                 }));
             }
             CustomRemove => {
-                return Ok(editor.update(id, |doc| {
-                    if selected < doc.widgets.len() {
-                        doc.widgets.remove(selected);
-                    }
+                return Ok(editor.update_selected(id, |widgets, index| {
+                    widgets.remove(index);
                 }));
             }
             CustomMove => {
-                return Ok(editor.update(id, |doc| {
-                    if selected > 0 && selected < doc.widgets.len() {
-                        doc.widgets.swap(selected, selected - 1);
-                    }
+                return Ok(editor.update_selected(id, |widgets, index| {
+                    widgets.swap(index, index - 1);
                 }));
             }
             CustomTemplate

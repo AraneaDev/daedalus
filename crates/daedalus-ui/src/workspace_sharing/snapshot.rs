@@ -81,7 +81,7 @@ impl DaedalusApp {
         state: &WorkbenchState,
         settings: bool,
     ) {
-        let previous_widgets = self.state.workspace_widgets.remove(&id).unwrap_or_default();
+        self.state.workspace_widgets.remove(&id);
         let effective = state
             .document
             .pane_widgets
@@ -92,9 +92,7 @@ impl DaedalusApp {
         }
         if settings {
             let dialog = &mut self.state.settings;
-            if dialog.widgets == previous_widgets {
-                dialog.widgets = effective.unwrap_or_default();
-            }
+            dialog.receive_pane_widget_snapshot(effective.unwrap_or_default());
             dialog.custom.accept_snapshot(state.clone());
         }
     }

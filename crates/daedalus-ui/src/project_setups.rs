@@ -114,6 +114,17 @@ impl ProjectSetups {
         }
     }
 
+    /// Captures the setup when the guided review's workspace is acknowledged.
+    pub fn guided_baseline<P>(&self, info: &Workspace<P>) -> Result<ProjectSetupBaseline, String> {
+        Ok(ProjectSetupBaseline {
+            assignments: if self.daemon_backed {
+                info.setup.clone()
+            } else {
+                assignments::load_stored(&self.local_path(info.id))?
+            },
+        })
+    }
+
     pub fn load_or(
         &self,
         id: WorkspaceId,

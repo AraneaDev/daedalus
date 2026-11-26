@@ -5,7 +5,7 @@ pub(super) use setup::ProjectSetupState;
 use super::Registry;
 use crate::persistence::{PersistedRecentProject, PersistedState};
 use daedalus_proto::RecentProject;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,6 +18,39 @@ const MAX_RECENT_PROJECTS: usize = 20;
 const DIR_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 type DirCheck = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
+fn resolve_project_root(root: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(root)
+        .ok()
+        .map(daedalus_proto::strip_windows_verbatim_prefix)
+}
+
+async fn resolve_project_roots(
+    mut roots: impl Iterator<Item = PathBuf>,
+) -> HashMap<PathBuf, PathBuf> {
+    let mut checks = tokio::task::JoinSet::new();
+    let check = |checks: &mut tokio::task::JoinSet<_>, root: PathBuf| {
+        checks.spawn_blocking(move || {
+            let canonical = resolve_project_root(&root);
+            (root, canonical)
+        });
+    };
+    for root in roots.by_ref().take(8) {
+        check(&mut checks, root);
+    }
+    // A historical path can be on an unreachable mount.
+    let deadline = tokio::time::Instant::now() + DIR_CHECK_TIMEOUT;
+    let mut resolved = HashMap::new();
+    while let Ok(Some(result)) = tokio::time::timeout_at(deadline, checks.join_next()).await {
+        if let Ok((root, Some(canonical))) = result {
+            resolved.insert(root, canonical);
+        }
+        if let Some(root) = roots.next() {
+            check(&mut checks, root);
+        }
+    }
+    resolved
+}
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -93,25 +126,54 @@ impl Registry {
     }
 
     /// Moves the folder to the front of the recent list and trims the list.
-    pub(super) async fn record_recent_project(&self, name: &str, root_dir: &Path) {
+    pub(super) async fn record_recent_project(
+        &self,
+        name: &str,
+        root_dir: &Path,
+        canonical_root_dir: &Path,
+    ) {
         let mut recent = self.recent_projects.write().await;
-        recent.retain(|entry| entry.root_dir != root_dir);
+        if recent.len() >= MAX_RECENT_PROJECTS
+            && !recent.iter().any(|entry| entry.root_dir == root_dir)
+        {
+            // Resolve the visible paths before a potential eviction. A legacy
+            // mount may be back, or a previously direct path can now be a symlink.
+            let candidates: Vec<_> = recent.iter().map(|entry| entry.root_dir.clone()).collect();
+            drop(recent);
+            let mut resolved = resolve_project_roots(candidates.into_iter()).await;
+            recent = self.recent_projects.write().await;
+            for entry in recent.iter_mut() {
+                if let Some(canonical) = resolved.remove(&entry.root_dir) {
+                    entry.canonical_root_dir = Some(canonical);
+                }
+            }
+        }
+        recent.retain(|entry| entry.root_dir != root_dir && entry.identity() != canonical_root_dir);
         recent.insert(
             0,
             PersistedRecentProject {
                 name: name.to_string(),
                 root_dir: root_dir.to_path_buf(),
+                canonical_root_dir: Some(canonical_root_dir.to_path_buf()),
                 last_used: unix_now(),
             },
         );
-        recent.truncate(MAX_RECENT_PROJECTS);
+        deduplicate_projects(&mut recent);
     }
 
     pub(super) async fn load_project_lists(&self, state: &mut PersistedState) {
-        setup::normalize_setup_roots(state).await;
-        *self.recent_projects.write().await = std::mem::take(&mut state.recent_projects);
+        setup::normalize_project_roots(state).await;
+        let mut recent = std::mem::take(&mut state.recent_projects);
+        deduplicate_projects(&mut recent);
+        *self.recent_projects.write().await = recent;
         self.project_setups.write().await.restore(state);
     }
+}
+
+fn deduplicate_projects(recent: &mut Vec<PersistedRecentProject>) {
+    let mut seen = HashSet::new();
+    recent.retain(|entry| seen.insert(entry.identity().to_path_buf()));
+    recent.truncate(MAX_RECENT_PROJECTS);
 }
 
 #[cfg(test)]
@@ -190,12 +252,76 @@ mod tests {
         let reg = registry_at(tmp.path(), tmp.path().join("state.json"));
         for i in 0..21 {
             let dir = folder(tmp.path(), &format!("p{i}"));
-            reg.record_recent_project(&format!("p{i}"), &dir).await;
+            reg.record_recent_project(&format!("p{i}"), &dir, &dir)
+                .await;
         }
         let recent = reg.recent_projects().await;
         assert_eq!(recent.len(), 20);
         assert_eq!(recent[0].name, "p20");
         assert!(recent.iter().all(|r| r.name != "p0"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reopening_an_alias_preserves_recent_capacity_after_restart() {
+        let tmp = TempDir::new().unwrap();
+        let state_path = tmp.path().join("state.json");
+        let reg = registry_at(tmp.path(), state_path.clone());
+        for i in 0..MAX_RECENT_PROJECTS {
+            let name = format!("project-{i}");
+            let workspace = open(&reg, &name, &folder(tmp.path(), &name)).await;
+            reg.close_workspace(workspace.id, false, false, false)
+                .await
+                .unwrap();
+        }
+        let alias = tmp.path().join("project-alias");
+        let newest = tmp
+            .path()
+            .join(format!("project-{}", MAX_RECENT_PROJECTS - 1));
+        std::os::unix::fs::symlink(&newest, &alias).unwrap();
+        let workspace = open(&reg, "project-alias", &alias).await;
+        reg.close_workspace(workspace.id, false, false, false)
+            .await
+            .unwrap();
+        assert_eq!(reg.recent_projects().await.len(), MAX_RECENT_PROJECTS);
+        drop(reg);
+
+        let store = StateStore::new(state_path.clone());
+        let mut legacy = store.load().unwrap();
+        for project in &mut legacy.recent_projects {
+            project.canonical_root_dir = None;
+        }
+        store.save(&legacy).unwrap();
+
+        let offline_alias = tmp.path().join("offline-alias");
+        std::fs::rename(&alias, &offline_alias).unwrap();
+        let reg = registry_at(tmp.path(), state_path.clone());
+        reg.restore_persisted_workspaces().await.unwrap();
+        std::fs::rename(&offline_alias, &alias).unwrap();
+        let workspace = open(&reg, "physical-path", &newest).await;
+        reg.close_workspace(workspace.id, false, false, false)
+            .await
+            .unwrap();
+        drop(reg);
+
+        let reg = registry_at(tmp.path(), state_path);
+        reg.restore_persisted_workspaces().await.unwrap();
+        let recent = reg.recent_projects().await;
+        assert_eq!(recent.len(), MAX_RECENT_PROJECTS);
+        assert_eq!(recent[0].root_dir, newest);
+        assert_eq!(recent.last().unwrap().name, "project-0");
+
+        let moved = tmp.path().join("moved-project");
+        std::fs::rename(&newest, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &newest).unwrap();
+        let workspace = open(&reg, "moved-project", &moved).await;
+        reg.close_workspace(workspace.id, false, false, false)
+            .await
+            .unwrap();
+        let recent = reg.recent_projects().await;
+        assert_eq!(recent.len(), MAX_RECENT_PROJECTS);
+        assert_eq!(recent[0].root_dir, moved);
+        assert_eq!(recent.last().unwrap().name, "project-0");
     }
 
     #[tokio::test]
@@ -400,7 +526,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let reg = Arc::new(registry_at(tmp.path(), tmp.path().join("state.json")));
         let slow = folder(tmp.path(), "slow");
-        reg.record_recent_project("slow", &slow).await;
+        reg.record_recent_project("slow", &slow, &slow).await;
         let (check, release) = blocking_check(slow);
 
         let lister = {
@@ -415,7 +541,7 @@ mod tests {
 
         let other = folder(tmp.path(), "other");
         tokio::time::timeout(Duration::from_secs(5), async {
-            reg.record_recent_project("other", &other).await;
+            reg.record_recent_project("other", &other, &other).await;
             reg.project_setups
                 .write()
                 .await
@@ -440,8 +566,8 @@ mod tests {
         let reg = registry_at(tmp.path(), tmp.path().join("state.json"));
         let hung = folder(tmp.path(), "hung");
         let fine = folder(tmp.path(), "fine");
-        reg.record_recent_project("hung", &hung).await;
-        reg.record_recent_project("fine", &fine).await;
+        reg.record_recent_project("hung", &hung, &hung).await;
+        reg.record_recent_project("fine", &fine, &fine).await;
         let (check, release) = blocking_check(hung);
 
         let started = std::time::Instant::now();

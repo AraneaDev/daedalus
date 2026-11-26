@@ -27,7 +27,15 @@ pub struct PersistedWorkspace {
 pub struct PersistedRecentProject {
     pub name: String,
     pub root_dir: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_root_dir: Option<PathBuf>,
     pub last_used: u64,
+}
+
+impl PersistedRecentProject {
+    pub(crate) fn identity(&self) -> &Path {
+        self.canonical_root_dir.as_deref().unwrap_or(&self.root_dir)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +339,7 @@ mod tests {
             recent_projects: vec![PersistedRecentProject {
                 name: "alpha".to_string(),
                 root_dir: PathBuf::from("/tmp/alpha"),
+                canonical_root_dir: None,
                 last_used: 1_700_000_000,
             }],
             project_setups: vec![PersistedProjectSetup {

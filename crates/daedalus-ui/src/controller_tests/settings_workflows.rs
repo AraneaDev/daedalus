@@ -218,7 +218,49 @@ fn modern_pane_widget_changes_wait_for_the_daemon() {
 }
 
 #[test]
-fn stale_pane_save_uses_the_other_clients_confirmed_snapshot_and_can_retry() {
+fn decompose_widget_save_preserves_an_independent_service_change() {
+    let ws = workspace("Two roles");
+    let id = ws.id;
+    let mut w = modern_client(ws);
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(snapshot_with_runner_label(
+            1, "Before",
+        ))),
+    );
+    apply_control(&mut w, Control::WidgetsPage);
+    w.app
+        .state
+        .settings
+        .set_value(Control::RunnerLabel, "Draft runner");
+
+    let mut watched = snapshot_with_runner_label(2, "Before");
+    watched
+        .document
+        .pane_widgets
+        .as_mut()
+        .unwrap()
+        .service
+        .label = Some("Saved service".into());
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(watched)),
+    );
+    w.commands.try_iter().for_each(drop);
+    apply_control(&mut w, Control::Save);
+    let (_, _, revision, document) = next_pane_save(&w);
+    assert_eq!(revision, 2);
+    let widgets = document.pane_widgets.unwrap();
+    assert_eq!(widgets.service.label.as_deref(), Some("Saved service"));
+    assert_eq!(widgets.runner.label.as_deref(), Some("Draft runner"));
+}
+
+#[test]
+fn stale_pane_save_preserves_the_draft_and_requires_review_before_retry() {
     let ws = workspace("Two clients");
     let id = ws.id;
     let mut first = modern_client(ws.clone());
@@ -286,6 +328,31 @@ fn stale_pane_save_uses_the_other_clients_confirmed_snapshot_and_can_retry() {
     // Ignore refresh requests emitted while reconciling the conflict.
     second.commands.try_iter().for_each(drop);
     apply_control(&mut second, Control::Save);
+    assert!(second.idle());
+    assert!(
+        second
+            .app
+            .state
+            .settings
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Runner widget settings changed")
+    );
+    assert_eq!(
+        second.app.state.settings.value(Control::RunnerLabel),
+        Some("Second")
+    );
+
+    apply_control(&mut second, Control::Cancel);
+    second.app.open_workspace_settings();
+    second.commands.try_iter().for_each(drop);
+    apply_control(&mut second, Control::WidgetsPage);
+    assert_eq!(
+        second.app.state.settings.value(Control::RunnerLabel),
+        Some("First")
+    );
+    save_runner_label(&mut second, "Second");
     let (_, retry, revision, document) = next_pane_save(&second);
     assert_eq!(revision, 2);
     let accepted = WorkbenchState {
