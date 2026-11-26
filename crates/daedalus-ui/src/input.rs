@@ -26,6 +26,7 @@ pub enum UiAction {
     ActionPaletteCancel,
     ToggleWorktreeModal,
     OpenCloseWorkspaceModal,
+    CloseWorkspaceFromSidebar(WorkspaceId),
     CloseTerminal,
     ToggleSearch,
     NewWorkspace,

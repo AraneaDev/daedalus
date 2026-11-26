@@ -5,6 +5,8 @@ use daedalus_proto::{PaneId, PaneRole, WorkspaceId};
 
 pub const SIDEBAR_LOGICAL_WIDTH: f32 = 240.0;
 pub const CARGO_BAR_LOGICAL_HEIGHT: f32 = 34.;
+pub const WIDGET_BUTTON_MIN_LOGICAL_WIDTH: f32 = 110.;
+pub const WIDGET_BUTTON_GAP_LOGICAL: f32 = 5.;
 pub const HEADER_LOGICAL_HEIGHT: f32 = 26.0;
 const FOCUSED_HEADER_LOGICAL_HEIGHT: f32 = 34.0;
 const TAB_LABEL_PADDING: f32 = 10.0;
@@ -296,7 +298,18 @@ impl WorkspaceLayout {
         scale: f32,
     ) -> impl Iterator<Item = (crate::assignments::CargoPreset, Rect)> {
         self.cargo_bar.into_iter().flat_map(move |bar| {
-            let width = ((bar.width - 24. * scale) / 2.).clamp(0., 112. * scale);
+            let gap = 8. * scale;
+            let button_budget = (bar.width - 3. * gap).max(0.);
+            // Leave space for one readable widget or the overflow button before
+            // widening the Cargo actions to their normal desktop size.
+            let widget_room = if self.widget_bar.is_some() {
+                let slot =
+                    (WIDGET_BUTTON_MIN_LOGICAL_WIDTH + 2. * WIDGET_BUTTON_GAP_LOGICAL) * scale;
+                (button_budget - 2. * 72. * scale).clamp(0., slot)
+            } else {
+                0.
+            };
+            let width = ((button_budget - widget_room) / 2.).min(112. * scale);
             crate::assignments::CargoPreset::ALL
                 .into_iter()
                 .enumerate()
@@ -304,7 +317,7 @@ impl WorkspaceLayout {
                     (
                         preset,
                         Rect::new(
-                            bar.x + 8. * scale + index as f32 * (width + 8. * scale),
+                            bar.x + gap + index as f32 * (width + gap),
                             bar.y + 4. * scale,
                             width,
                             (bar.height - 8. * scale).max(0.),
@@ -654,8 +667,16 @@ impl PaneSplits {
     }
 }
 
-pub fn compute_split_layout(input: &LayoutInput, splits: &PaneSplits) -> WorkspaceLayout {
-    let metrics = LayoutMetrics::for_scale(input.scale_factor);
+struct WorkbenchCanvas {
+    bounds: Rect,
+    stacked: bool,
+    sidebar: Option<Rect>,
+    sidebar_toggle: Option<Rect>,
+    banner: Option<Rect>,
+    compact_recap: Option<Rect>,
+}
+
+fn resolve_workbench_canvas(input: &LayoutInput, metrics: &LayoutMetrics) -> WorkbenchCanvas {
     let window_w = input.window_w.max(0.0);
     let window_h = input.window_h.max(0.0);
 
@@ -734,102 +755,105 @@ pub fn compute_split_layout(input: &LayoutInput, splits: &PaneSplits) -> Workspa
             None
         };
 
-    let stacked = canvas_w < min_split_width;
-    let panes = if input.zoomed {
-        let outer = Rect::new(canvas_x, canvas_y, canvas_w, canvas_h);
-        vec![build_pane_rect(
-            input.focused_role,
+    WorkbenchCanvas {
+        bounds: Rect::new(canvas_x, canvas_y, canvas_w, canvas_h),
+        stacked: canvas_w < min_split_width,
+        sidebar,
+        sidebar_toggle,
+        banner,
+        compact_recap,
+    }
+}
+
+fn split_pane_bounds(
+    canvas: &WorkbenchCanvas,
+    metrics: &LayoutMetrics,
+    splits: &PaneSplits,
+    cell_h: f32,
+) -> [Rect; 3] {
+    let Rect {
+        x: canvas_x,
+        y: canvas_y,
+        width: canvas_w,
+        height: canvas_h,
+    } = canvas.bounds;
+    if canvas.stacked {
+        // Reserve a readable terminal row for each role when the window is short.
+        let one_row = metrics.header_height + 2. * metrics.viewport_pad + cell_h.max(0.);
+        let minimum = one_row.min(canvas_h / 3.);
+        let lower = (canvas_h * splits.lower)
+            .max(2. * minimum)
+            .min(canvas_h - minimum);
+        let agent_h = (canvas_h * splits.upper).max(minimum).min(lower - minimum);
+        let service_h = lower - agent_h;
+        [
+            Rect::new(canvas_x, canvas_y, canvas_w, agent_h),
+            Rect::new(canvas_x, canvas_y + agent_h, canvas_w, service_h),
+            Rect::new(
+                canvas_x,
+                canvas_y + agent_h + service_h,
+                canvas_w,
+                canvas_h - agent_h - service_h,
+            ),
+        ]
+    } else {
+        let agent_w = canvas_w * splits.column;
+        let right_w = (canvas_w - agent_w).max(0.0);
+        let top_h = canvas_h * splits.right_row;
+        let bot_h = (canvas_h - top_h).max(0.0);
+
+        let gutter = (4.0 * metrics.scale_factor).min(canvas_h * 0.02);
+        let inset =
+            |x, y, w, h| Rect::new(x + gutter, y + gutter, w - 2.0 * gutter, h - 2.0 * gutter);
+        let agent_outer = inset(canvas_x, canvas_y, agent_w, canvas_h);
+        let service_outer = inset(canvas_x + agent_w, canvas_y, right_w, top_h);
+        let runner_outer = inset(canvas_x + agent_w, canvas_y + top_h, right_w, bot_h);
+
+        [agent_outer, service_outer, runner_outer]
+    }
+}
+
+pub fn compute_split_layout(input: &LayoutInput, splits: &PaneSplits) -> WorkspaceLayout {
+    let metrics = LayoutMetrics::for_scale(input.scale_factor);
+    let canvas = resolve_workbench_canvas(input, &metrics);
+    let build = |role, outer| {
+        build_pane_rect(
+            role,
             outer,
             &metrics,
             input.cell_w,
             input.cell_h,
             input.runner_has_failure,
-            true,
-        )]
+            input.zoomed,
+        )
+    };
+    let panes = if input.zoomed {
+        vec![build(input.focused_role, canvas.bounds)]
     } else {
-        let (agent_outer, service_outer, runner_outer) = if stacked {
-            // Reserve a readable terminal row for each role when the window is short.
-            let one_row = metrics.header_height + 2. * metrics.viewport_pad + input.cell_h.max(0.);
-            let minimum = one_row.min(canvas_h / 3.);
-            let lower = (canvas_h * splits.lower)
-                .max(2. * minimum)
-                .min(canvas_h - minimum);
-            let agent_h = (canvas_h * splits.upper).max(minimum).min(lower - minimum);
-            let service_h = lower - agent_h;
-            (
-                Rect::new(canvas_x, canvas_y, canvas_w, agent_h),
-                Rect::new(canvas_x, canvas_y + agent_h, canvas_w, service_h),
-                Rect::new(
-                    canvas_x,
-                    canvas_y + agent_h + service_h,
-                    canvas_w,
-                    canvas_h - agent_h - service_h,
-                ),
-            )
-        } else {
-            let agent_w = canvas_w * splits.column;
-            let right_w = (canvas_w - agent_w).max(0.0);
-            let top_h = canvas_h * splits.right_row;
-            let bot_h = (canvas_h - top_h).max(0.0);
-
-            let gutter = (4.0 * metrics.scale_factor).min(canvas_h * 0.02);
-            let inset =
-                |x, y, w, h| Rect::new(x + gutter, y + gutter, w - 2.0 * gutter, h - 2.0 * gutter);
-            let agent_outer = inset(canvas_x, canvas_y, agent_w, canvas_h);
-            let service_outer = inset(canvas_x + agent_w, canvas_y, right_w, top_h);
-            let runner_outer = inset(canvas_x + agent_w, canvas_y + top_h, right_w, bot_h);
-
-            (agent_outer, service_outer, runner_outer)
-        };
-
-        vec![
-            build_pane_rect(
-                PaneRole::Agent,
-                agent_outer,
-                &metrics,
-                input.cell_w,
-                input.cell_h,
-                input.runner_has_failure,
-                false,
-            ),
-            build_pane_rect(
-                PaneRole::Service,
-                service_outer,
-                &metrics,
-                input.cell_w,
-                input.cell_h,
-                input.runner_has_failure,
-                false,
-            ),
-            build_pane_rect(
-                PaneRole::Runner,
-                runner_outer,
-                &metrics,
-                input.cell_w,
-                input.cell_h,
-                input.runner_has_failure,
-                false,
-            ),
-        ]
+        [PaneRole::Agent, PaneRole::Service, PaneRole::Runner]
+            .into_iter()
+            .zip(split_pane_bounds(&canvas, &metrics, splits, input.cell_h))
+            .map(|(role, outer)| build(role, outer))
+            .collect()
     };
 
     WorkspaceLayout {
         insight_rows: Vec::new(),
         widget_bar: None,
         widget_buttons: Vec::new(),
-        compact_recap,
+        compact_recap: canvas.compact_recap,
         close_tab: None,
         named_tabs: Vec::new(),
-        sidebar_toggle,
+        sidebar_toggle: canvas.sidebar_toggle,
         run_tests_button: None,
         layout_button: None,
         cargo_bar: None,
         failed_run_buttons: Vec::new(),
         sidebar_first: 0,
         sidebar_content: None,
-        stacked,
-        sidebar,
-        banner,
+        stacked: canvas.stacked,
+        sidebar: canvas.sidebar,
+        banner: canvas.banner,
         panes,
     }
 }

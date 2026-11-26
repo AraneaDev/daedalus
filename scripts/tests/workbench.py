@@ -90,6 +90,10 @@ class Workbench:
     def pixels(self, x, y, width, height):
         return self.window.get_image(x, y, width, height, X.ZPixmap, 0xFFFFFFFF).data
 
+    def text_mask(self, x, y, width, height):
+        # Keep the text shape when a dialog resize shifts its background gradient.
+        return bytes(green > 100 for green in self.pixels(x, y, width, height)[1::4])
+
     def wait_dialog(self, position, visible=True):
         # Sample the straight top edge, clear of the rounded corner.
         x, y = position
@@ -241,6 +245,8 @@ def exercise(binaries, scratch, screen):
             until(
                 "on-demand test", lambda: runs.exists() and runs.read_text() == "ran\n"
             )
+            # Capture the rendered Run tests control after the action succeeded.
+            tests_button = ui.pixels(1310, 0, 64, 30)
             ui.shortcut("s")
             ui.wait_dialog((395, 214))
             ui.click(850, 284)  # Widgets page
@@ -257,7 +263,7 @@ def exercise(binaries, scratch, screen):
             ui.click(530, 525)  # Show duration
             ui.click(530, 525)  # Hide duration
             ui.click(890, 525)  # Show warnings
-            first_label = ui.pixels(430, 603, 70, 18)
+            unsaved_hint = ui.text_mask(430, 565, 165, 20)
             ui.key("Control_L", "s")
 
             def widget_settings():
@@ -281,16 +287,17 @@ def exercise(binaries, scratch, screen):
                 "show_duration": False,
                 "show_warnings": True,
             }
-            until(
+            saved_hint = until(
                 "widget save acknowledged",
                 lambda: (
-                    ui.action_enabled(1000, 603)
-                    and ui.pixels(430, 603, 70, 18) != first_label
+                    hint
+                    if (hint := ui.text_mask(430, 565, 165, 20)) != unsaved_hint
+                    and ui.action_enabled(1000, 603)
+                    else None
                 ),
             )
             ui.click(910, 365)  # Remove service widget
             ui.wait_dialog((395, 274))
-            second_label = ui.pixels(430, 583, 70, 18)
             ui.key("Control_L", "s")
             until(
                 "removed service widget",
@@ -302,8 +309,8 @@ def exercise(binaries, scratch, screen):
             until(
                 "widget removal acknowledged",
                 lambda: (
-                    ui.action_enabled(1000, 583)
-                    and ui.pixels(430, 583, 70, 18) != second_label
+                    ui.text_mask(430, 545, 165, 20) == saved_hint
+                    and ui.action_enabled(1000, 583)
                 ),
             )
             ui.key("Escape")
@@ -350,6 +357,9 @@ def exercise(binaries, scratch, screen):
             ui = Workbench(screen, client)
             until(
                 "workspace card", lambda: ui.pixel(1209, 74) == bytes.fromhex("b2e589")
+            )
+            until(
+                "Run tests control", lambda: ui.pixels(1310, 0, 64, 30) == tests_button
             )
             ui.shortcut("t")
             until("restored test assignment", lambda: runs.read_text() == "ran\nran\n")

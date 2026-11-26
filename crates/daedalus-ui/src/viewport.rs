@@ -2,7 +2,10 @@ use super::DaedalusApp;
 use daedalus_proto::PaneRole;
 use daedalus_ui::{
     bridge::UiCommand,
-    layout::{LayoutInput, WorkspaceLayout, compute_split_layout},
+    layout::{
+        LayoutInput, WIDGET_BUTTON_GAP_LOGICAL, WIDGET_BUTTON_MIN_LOGICAL_WIDTH, WorkspaceLayout,
+        compute_split_layout,
+    },
     state::ConnectionState,
 };
 use std::sync::Arc;
@@ -92,13 +95,13 @@ impl DaedalusApp {
             }
             if !widgets.is_empty() {
                 layout.widget_bar = Some(bar);
-                let padding = 5. * scale_factor;
+                let padding = WIDGET_BUTTON_GAP_LOGICAL * scale_factor;
                 let start = layout
                     .cargo_buttons(scale_factor)
                     .last()
                     .map_or(padding, |(_, rect)| rect.right() + padding);
                 let room = (bar.right() - start - padding).max(0.);
-                let minimum = 110. * scale_factor;
+                let minimum = WIDGET_BUTTON_MIN_LOGICAL_WIDTH * scale_factor;
                 let max = ((room + padding) / (minimum + padding)) as usize;
                 if max > 0 {
                     let visible = if widgets.len() > max {

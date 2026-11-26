@@ -391,3 +391,99 @@ fn resolving_an_inline_source_conflict_preserves_an_independent_action() {
     assert_eq!(definition.rules.len(), 1);
     assert_eq!(definition.actions[0].id, "diff");
 }
+
+#[test]
+fn resolving_a_missing_source_preserves_other_source_and_display_edits() {
+    use daedalus_proto::workbench::{ConflictChoice, NamedSource};
+    use daedalusd::workbench::documents::validate_workspace;
+    use daedalusd::workbench::merge::merge_workspace;
+
+    let published = |key: &str| WidgetSource::Published { key: key.into() };
+    let mut base = parse_workspace(WORKSPACE).unwrap();
+    let definition = &mut base.templates[0].definition;
+    definition.sources[0].source = published("base");
+    definition.sources.push(NamedSource {
+        id: "spare".into(),
+        source: published("spare"),
+    });
+    let mut local = base.clone();
+    let definition = &mut local.templates[0].definition;
+    definition.sources[0].source = published("local");
+    definition.sources.pop();
+
+    let mut incoming = base.clone();
+    let definition = &mut incoming.templates[0].definition;
+    definition.sources[0].source = published("incoming");
+    definition
+        .display
+        .details
+        .push(definition.display.summary[0].clone());
+    definition.display.summary[0].source = "spare".into();
+
+    for choice in [ConflictChoice::Local, ConflictChoice::Incoming] {
+        let resolutions = [
+            (
+                "/templates/git/definition/sources/git/key".into(),
+                ConflictChoice::Incoming,
+            ),
+            (
+                "/templates/git/definition/$source_references".into(),
+                choice,
+            ),
+        ]
+        .into();
+        let (resolved, conflicts) =
+            merge_workspace(&base, &local, &incoming, &resolutions).unwrap();
+        assert!(conflicts.is_empty());
+        validate_workspace(&resolved).unwrap();
+        let definition = &resolved.templates[0].definition;
+        assert_eq!(definition.sources[0].source, published("incoming"));
+        assert_eq!(definition.display.details[0].source, "git");
+        let restores_spare = choice == ConflictChoice::Incoming;
+        assert_eq!(
+            definition.sources.iter().any(|source| source.id == "spare"),
+            restores_spare
+        );
+        assert_eq!(
+            definition
+                .display
+                .summary
+                .iter()
+                .any(|field| field.source == "spare"),
+            restores_spare
+        );
+    }
+}
+
+#[test]
+fn new_widgets_stay_in_their_gap_when_a_neighbor_is_deleted() {
+    use daedalusd::workbench::merge::merge_workspace;
+
+    let mut base = parse_workspace(WORKSPACE).unwrap();
+    let widget = |id: &str| {
+        let mut widget = parse_workspace(WORKSPACE).unwrap().widgets.remove(0);
+        widget.id = id.into();
+        widget
+    };
+    base.widgets.push(widget("last"));
+
+    let mut local = base.clone();
+    local.widgets[0].name = "Local branch".into();
+    local.widgets.remove(1);
+    local.widgets.insert(1, widget("new-local"));
+    let mut incoming = base.clone();
+    incoming.widgets.insert(1, widget("new-repo"));
+
+    let (merged, conflicts) =
+        merge_workspace(&base, &local, &incoming, &Default::default()).unwrap();
+    assert!(conflicts.is_empty());
+    assert_eq!(merged.widgets[0].name, "Local branch");
+    assert_eq!(
+        merged
+            .widgets
+            .iter()
+            .map(|widget| widget.id.as_str())
+            .collect::<Vec<_>>(),
+        ["branch", "new-local", "new-repo", "last"]
+    );
+}

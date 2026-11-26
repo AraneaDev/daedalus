@@ -432,12 +432,18 @@ fn collect_prepared_quads(
 
     if let Some(toggle) = layout.sidebar_toggle {
         quads.push(QuadInstance::new(toggle, theme.bg_header));
-        if let Some(button) = layout.layout_button {
+        let settings = state.active_workspace_id.map(|_| {
+            crate::layout::settings_button(toggle, cards.and_then(|cards| cards.list.arrows), s)
+        });
+        for button in [layout.layout_button, layout.run_tests_button, settings]
+            .into_iter()
+            .flatten()
+        {
             let surface = Rect::new(
-                button.x,
+                button.x + 1. * s,
                 button.y + 4. * s,
-                button.width - 2. * s,
-                button.height - 8. * s,
+                (button.width - 2. * s).max(0.),
+                (button.height - 8. * s).max(0.),
             );
             quads.push(QuadInstance::new(surface, theme.bg_sidebar).rounded(5. * s, 0., 0.));
         }

@@ -2,6 +2,58 @@ use super::*;
 use daedalus_proto::{Cell, GridRow, GridSnapshot};
 
 #[test]
+fn terminal_readiness_starts_the_hydrated_dormant_workspace() {
+    let mut w = Workbench::new();
+    let mut dormant = workspace("Dormant");
+    let id = dormant.id;
+    dormant.panes.clear();
+    dormant.default_panes_pending = Some(true);
+
+    w.app.handle_daemon_event(UiEvent::Disconnected);
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![dormant]));
+    assert!(w.idle());
+
+    w.app.handle_daemon_event(UiEvent::Connected);
+    assert!(matches!(
+        w.command(),
+        UiCommand::EnsureWorkspacePanes { workspace_id, .. } if workspace_id == id
+    ));
+    assert!(w.idle());
+}
+
+#[test]
+fn removing_active_workspace_starts_only_the_newly_selected_dormant_workspace() {
+    let mut w = Workbench::new();
+    let active = workspace("Current");
+    let mut dormant = workspace("Dormant");
+    dormant.panes.clear();
+    dormant.default_panes_pending = Some(true);
+    let id = dormant.id;
+    w.app.handle_daemon_event(UiEvent::WorkspacesLoaded(vec![
+        active.clone(),
+        dormant.clone(),
+    ]));
+    w.app
+        .handle_daemon_event(UiEvent::WorkspaceMembershipLoaded(vec![
+            active,
+            dormant.clone(),
+        ]));
+    assert!(w.idle());
+
+    w.app
+        .handle_daemon_event(UiEvent::WorkspaceMembershipLoaded(vec![dormant.clone()]));
+    assert_eq!(w.app.state.active_workspace_id, Some(id));
+    assert!(matches!(
+        w.command(),
+        UiCommand::EnsureWorkspacePanes { workspace_id, .. } if workspace_id == id
+    ));
+    w.app
+        .handle_daemon_event(UiEvent::WorkspaceMembershipLoaded(vec![dormant]));
+    assert!(w.idle());
+}
+
+#[test]
 fn membership_reconciles_new_panes_without_stealing_focus_or_resetting_other_grids() {
     let mut w = Workbench::new();
     let mut active = workspace("Current");

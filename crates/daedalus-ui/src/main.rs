@@ -140,7 +140,8 @@ struct DaedalusApp {
     workbench_capable: bool,
     watched_workbench: Option<WorkspaceId>,
     layout_saves: std::collections::HashMap<WorkspaceId, workspace_sharing::LayoutSave>,
-    seeded_workbench: std::collections::HashSet<WorkspaceId>,
+    layout_workspace: Option<WorkspaceId>,
+    seeding_workbench: std::collections::HashSet<WorkspaceId>,
     widget_refresh_at: Option<Instant>,
     daemon_home: Option<PathBuf>,
     setup: setup::SetupFlow,
@@ -209,7 +210,8 @@ impl DaedalusApp {
             workbench_capable: false,
             watched_workbench: None,
             layout_saves: Default::default(),
-            seeded_workbench: Default::default(),
+            layout_workspace: None,
+            seeding_workbench: Default::default(),
             widget_refresh_at: None,
             daemon_home: None,
             setup: Default::default(),
@@ -434,6 +436,7 @@ impl DaedalusApp {
             return;
         }
         self.state.select_workspace(id);
+        self.prepare_active_workbench_layout();
         self.state.close_search();
         self.ensure_active_workspace_panes();
         self.reveal_active_workspace();
@@ -590,6 +593,7 @@ impl DaedalusApp {
                 self.request_redraw();
             }
             UiAction::ToggleZoom => {
+                self.prepare_active_workbench_layout();
                 self.state.zoomed = !self.state.zoomed;
                 self.save_workbench_layout();
                 self.schedule_resize_flush();
@@ -618,6 +622,7 @@ impl DaedalusApp {
             UiAction::SwitchWorkspaceNext => self.switch_workspace_by(1),
             UiAction::SwitchWorkspacePrev => self.switch_workspace_by(-1),
             UiAction::SelectWorkspace(id) => self.activate_workspace(id),
+            UiAction::CloseWorkspaceFromSidebar(id) => self.open_close_modal_for_workspace(id),
             UiAction::PreviewImage => self.preview_image(),
             UiAction::CopySelection => self.copy_focused_selection(),
             UiAction::PasteClipboard => self.paste_clipboard_to_focused(),
@@ -1117,6 +1122,15 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                                     accessibility::workspace_action(&mut self.state, &request)
                                 {
                                     self.handle_workspace_form(action);
+                                } else if let Some(action) = self
+                                    .terminal_controls
+                                    .choice_action(&mut self.state, &request)
+                                {
+                                    if action == UiAction::Ignore {
+                                        self.request_redraw();
+                                    } else {
+                                        self.handle_ui_action(action);
+                                    }
                                 } else if let Some(action) = accessibility::action(
                                     &self.state,
                                     &request,
@@ -1297,17 +1311,25 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
             self.history.failed(token);
         }
 
+        let search_bar = if self.accessibility_active
+            && self.state.active_overlay() == Some(ActiveOverlay::Search)
+        {
+            self.search_bar_bounds()
+        } else {
+            None
+        };
         if self.accessibility_active
             && let Some(adapter) = &mut self.accessibility
             && let Some(window) = &self.window
         {
             let size = window.inner_size();
-            let tree = accessibility::workbench_tree(
+            let tree = accessibility::workbench_tree_with_search_bar(
                 &self.state,
                 size.width as f32,
                 size.height as f32,
                 window.scale_factor() as f32,
                 &mut self.terminal_controls,
+                search_bar,
             );
             if self.last_accessibility_tree.as_ref() != Some(&tree) {
                 adapter.update_if_active(|| {

@@ -3,14 +3,15 @@
 use super::rpc::RpcConnection;
 use super::test_support::ipc_pair;
 use super::{
-    BridgeConfig, UiCommand, UiEvent, UiEventSink, handle_command, initialize_session, setup,
+    AssignmentLaunch, BridgeConfig, UiCommand, UiEvent, UiEventSink, handle_command,
+    initialize_session, session_loop, setup,
 };
 use crate::assignments::{self, Assignment};
 use crate::state::AgentPreset;
 use daedalus_proto::transport::IpcStream;
 use daedalus_proto::{
-    ClientMessage, PaneRole, RecentProject, Request, ResponsePayload, ServerEvent, ServerMessage,
-    WorkspaceId, read_frame, write_frame,
+    ClientMessage, PaneId, PaneRole, RecentProject, Request, ResponsePayload, ServerEvent,
+    ServerMessage, WorkspaceId, read_frame, write_frame,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +41,7 @@ fn pong(supported: bool) -> ResponsePayload {
         workbench_supported: false,
         workspace_membership_supported: false,
         runner_assignment_supported: false,
+        guarded_runner_assignment_supported: false,
         resolved_import_preview_supported: false,
         agent_launch_metadata_supported: false,
         home_dir: supported.then(|| PathBuf::from("/home/test")),
@@ -286,13 +288,6 @@ async fn old_daemon_gets_no_new_requests() {
 
     let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
     let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink(ui_tx));
-    tokio::time::timeout(
-        WAIT,
-        handle_command(&conn, &sink, UiCommand::RefreshRecentProjects),
-    )
-    .await
-    .unwrap()
-    .unwrap();
     // An invalid entry fails local validation, so nothing is written to disk either.
     tokio::time::timeout(
         WAIT,
@@ -302,6 +297,7 @@ async fn old_daemon_gets_no_new_requests() {
             WorkspaceId::new(),
             vec![assignment("")],
             vec![],
+            Default::default(),
         ),
     )
     .await
@@ -348,7 +344,7 @@ async fn old_daemon_gets_no_new_requests() {
 }
 
 #[tokio::test]
-async fn new_daemon_handshake_loads_recent_projects() {
+async fn handshake_publishes_capabilities_before_terminal_readiness() {
     let (conn, _ui, emitted, task, mut seen, _events) = handshake(true).await;
     let order: Vec<&str> = emitted
         .iter()
@@ -366,15 +362,13 @@ async fn new_daemon_handshake_loads_recent_projects() {
                 assert!(*recent_projects);
                 Some("capabilities")
             }
-            UiEvent::RecentProjectsLoaded(projects) => {
-                assert_eq!(projects, &vec![recent()]);
-                Some("recent")
-            }
+            UiEvent::RecentProjectsLoaded(_) => Some("recent"),
             UiEvent::WorkspacesLoaded(_) => Some("workspaces"),
+            UiEvent::Connected => Some("connected"),
             _ => None,
         })
         .collect();
-    assert_eq!(order, ["capabilities", "recent", "workspaces"]);
+    assert_eq!(order, ["capabilities", "workspaces", "connected"]);
     assert!(drain(&mut seen).iter().any(|message| matches!(
         message,
         ClientMessage::Subscribe {
@@ -396,7 +390,14 @@ async fn apply_stores_setup_on_daemon_when_supported() {
     let entries = vec![assignment("check")];
     tokio::time::timeout(
         WAIT,
-        setup::apply(&conn, &sink, workspace_id, entries.clone(), vec![]),
+        setup::apply(
+            &conn,
+            &sink,
+            workspace_id,
+            entries.clone(),
+            vec![],
+            Default::default(),
+        ),
     )
     .await
     .unwrap()
@@ -405,7 +406,7 @@ async fn apply_stores_setup_on_daemon_when_supported() {
     let sent = drain(&mut seen);
     assert!(sent.iter().any(|message| matches!(
         message,
-        ClientMessage::SetProjectSetup { workspace_id: id, assignments: stored }
+        ClientMessage::SetProjectSetup { workspace_id: id, assignments: stored, .. }
             if *id == workspace_id && *stored == entries
     )));
     assert!(matches!(
@@ -455,7 +456,14 @@ async fn invalid_setup_on_new_daemon_is_rejected_locally() {
 
     tokio::time::timeout(
         WAIT,
-        setup::apply(&conn, &sink, workspace_id, invalid.clone(), vec![]),
+        setup::apply(
+            &conn,
+            &sink,
+            workspace_id,
+            invalid.clone(),
+            vec![],
+            Default::default(),
+        ),
     )
     .await
     .unwrap()
@@ -472,6 +480,7 @@ async fn invalid_setup_on_new_daemon_is_rejected_locally() {
             UiCommand::SaveProjectSetup {
                 workspace_id,
                 assignments: invalid,
+                request_id: 42,
             },
         ),
     )
@@ -480,7 +489,11 @@ async fn invalid_setup_on_new_daemon_is_rejected_locally() {
     .unwrap();
     assert!(matches!(
         ui_rx.try_recv(),
-        Ok(UiEvent::ProjectSetupSaveFailed { .. })
+        Ok(UiEvent::ProjectSetupMigrationFinished {
+            request_id: 42,
+            result: Err(_),
+            ..
+        })
     ));
     assert!(
         !drain(&mut seen)
@@ -492,70 +505,98 @@ async fn invalid_setup_on_new_daemon_is_rejected_locally() {
 }
 
 #[tokio::test]
-async fn preview_only_queries_capable_daemon_and_validates_reply() {
+async fn image_preview_keeps_terminal_input_moving_and_checks_capability_and_reply() {
+    use tokio::net::TcpListener;
     for supported in [false, true] {
-        let (conn, _, _, task, mut seen, _events) = handshake(supported).await;
-        let (tx, mut ui) = mpsc::unbounded_channel();
-        let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink(tx));
-        let id = WorkspaceId::new();
-        let pane = daedalus_proto::PaneId::new();
-        for path in ["sample.png", "bad.png"] {
-            let cmd = UiCommand::PreviewImage {
-                workspace_id: id,
-                pane_id: pane,
-                path: path.into(),
-            };
-            tokio::time::timeout(WAIT, handle_command(&conn, &sink, cmd))
-                .await
-                .unwrap()
-                .unwrap();
-            let event = ui.try_recv().unwrap();
-            if supported && path == "sample.png" {
-                assert!(
-                    matches!(event,UiEvent::ImagePreview{pane_id,image} if pane_id == pane && image.valid())
-                );
-            } else {
-                assert!(matches!(event, UiEvent::Toast { is_error: true, .. }));
+        tokio::time::timeout(WAIT, async {
+            let (mut conn, _, _, daemon, mut seen, _events) = handshake(supported).await;
+            conn.recent_projects_supported = false;
+            conn.workbench_supported = false;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = PathBuf::from(format!("tcp://{}", listener.local_addr().unwrap()));
+            let (tx, mut ui) = mpsc::unbounded_channel();
+            let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink(tx));
+            let (commands, mut incoming) = mpsc::unbounded_channel();
+            let bridge = tokio::spawn(async move {
+                session_loop(&mut conn, &sink, &mut incoming, &endpoint, Some("fixture")).await;
+                conn.close().await;
+            });
+            let workspace_id = WorkspaceId::new();
+            let pane_id = PaneId::new();
+            for (path, valid) in [("sample.png", true), ("bad.png", false)] {
+                let token = uuid::Uuid::new_v4();
+                commands
+                    .send(UiCommand::PreviewImage {
+                        workspace_id,
+                        pane_id,
+                        token,
+                        path: path.into(),
+                    })
+                    .unwrap();
+                if supported {
+                    let (mut peer, _) = listener.accept().await.unwrap();
+                    let Request { id, payload } = read_frame(&mut peer).await.unwrap().unwrap();
+                    assert_eq!(payload, ClientMessage::Authenticate { token: "fixture".into() });
+                    write_frame(&mut peer, &ServerMessage::Response { id, result: Ok(ResponsePayload::Ok) })
+                        .await.unwrap();
+                    let Request { id, payload } = read_frame(&mut peer).await.unwrap().unwrap();
+                    assert_eq!(payload, ClientMessage::PreviewImage { workspace_id, path: path.into() });
+
+                    commands.send(UiCommand::SendInput { pane_id, data: b"typing".to_vec() }).unwrap();
+                    while !matches!(seen.recv().await.unwrap(), ClientMessage::SendInput { pane_id: target, data } if target == pane_id && data == b"typing") {}
+
+                    let image = daedalus_proto::rpc::ImagePreview {
+                        width: 1,
+                        height: 1,
+                        rgba: if valid { vec![0, 0, 0, 255] } else { vec![] },
+                    };
+                    write_frame(&mut peer, &ServerMessage::Response { id, result: Ok(ResponsePayload::ImagePreview(image)) })
+                        .await.unwrap();
+                }
+                let UiEvent::ImagePreview { pane_id: target, token: received, result } = ui.recv().await.unwrap() else {
+                    panic!("expected image preview response");
+                };
+                assert_eq!((target, received), (pane_id, token));
+                assert_eq!(result.is_ok(), supported && valid);
             }
-            assert_eq!(drain(&mut seen).iter().any(|r| matches!(r,ClientMessage::PreviewImage{workspace_id,path:p} if *workspace_id == id && p == path)),supported);
-        }
-        conn.close().await;
-        task.abort();
+            commands.send(UiCommand::Shutdown).unwrap();
+            bridge.await.unwrap();
+            daemon.abort();
+        }).await.unwrap();
     }
 }
 
 #[tokio::test]
 async fn saved_runner_launch_negotiates_identity_without_changing_ad_hoc_launch() {
-    for (supported, saved_runner) in [(true, true), (true, false), (false, true)] {
+    for (supported, guarded, launch, expected) in [
+        (true, false, AssignmentLaunch::SavedRunner, Some(false)),
+        (true, true, AssignmentLaunch::ReviewedRunner, Some(true)),
+        (true, false, AssignmentLaunch::ReviewedRunner, None),
+        (true, false, AssignmentLaunch::Direct, None),
+        (false, false, AssignmentLaunch::SavedRunner, None),
+    ] {
         let (client, server) = ipc_pair().await;
         let (task, mut seen, _) = fake_daemon(server, pong(false));
         let (ui_tx, _) = mpsc::unbounded_channel();
         let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink(ui_tx));
         let mut conn = RpcConnection::new(client, Arc::clone(&sink));
         conn.runner_assignment_supported = supported;
+        conn.guarded_runner_assignment_supported = guarded;
         let workspace_id = WorkspaceId::new();
         let entry = assignment("Runner");
         let result = tokio::time::timeout(
             WAIT,
-            setup::launch_assignment(
-                &conn,
-                &sink,
-                workspace_id,
-                entry.clone(),
-                saved_runner,
-                80,
-                24,
-            ),
+            setup::launch_assignment(&conn, &sink, workspace_id, entry.clone(), launch, 80, 24),
         )
         .await
         .unwrap();
         // The fake daemon records the request and returns a generic Ok.
         assert!(result.is_err());
         let request = seen.try_recv().unwrap();
-        if supported && saved_runner {
+        if let Some(checked) = expected {
             assert!(matches!(request, ClientMessage::LaunchRunnerAssignment {
-                workspace_id: id, assignment_id, cols: 80, rows: 24,
-            } if id == workspace_id && assignment_id == entry.id));
+                workspace_id: id, assignment_id, expected, cols: 80, rows: 24,
+            } if id == workspace_id && assignment_id == entry.id && expected == checked.then_some(entry)));
         } else {
             assert!(matches!(request, ClientMessage::SpawnPane {
                 workspace_id: id, role: PaneRole::Runner, command: Some(argv), cols: 80, rows: 24, ..
@@ -563,4 +604,42 @@ async fn saved_runner_launch_negotiates_identity_without_changing_ad_hoc_launch(
         }
         task.abort();
     }
+}
+
+#[tokio::test]
+async fn saved_shell_preset_uses_default_shell_while_literal_command_keeps_argv() {
+    let (client, server) = ipc_pair().await;
+    let (task, mut seen, _) = fake_daemon(server, pong(false));
+    let (ui_tx, _) = mpsc::unbounded_channel();
+    let sink: Arc<dyn UiEventSink> = Arc::new(ChannelSink(ui_tx));
+    let conn = RpcConnection::new(client, Arc::clone(&sink));
+    let workspace_id = WorkspaceId::new();
+    for id in ["manifest-agent", "manifest-agent-command", "setup-agent"] {
+        let entry = Assignment {
+            id: id.into(),
+            name: "Shell".into(),
+            role: PaneRole::Agent,
+            argv: vec!["shell".into()],
+        };
+        assert!(
+            setup::launch_assignment(
+                &conn,
+                &sink,
+                workspace_id,
+                entry.clone(),
+                AssignmentLaunch::Direct,
+                80,
+                24,
+            )
+            .await
+            .is_err()
+        );
+        let expected = (id != "manifest-agent").then_some(entry.argv);
+        assert!(
+            matches!(seen.try_recv().unwrap(), ClientMessage::SpawnPane {
+            workspace_id: owner, role: PaneRole::Agent, command, ..
+        } if owner == workspace_id && command == expected)
+        );
+    }
+    task.abort();
 }

@@ -5,12 +5,18 @@ use daedalus_proto::WorkspaceId;
 pub struct ActionPaletteState {
     pub open: bool,
     pub selected_index: usize,
+    session: u64,
 }
 
 impl ActionPaletteState {
     pub fn open(&mut self) {
+        self.session = self.session.wrapping_add(1);
         self.open = true;
         self.selected_index = 0;
+    }
+
+    pub fn session(&self) -> u64 {
+        self.session
     }
 
     pub fn close(&mut self) {
@@ -41,22 +47,31 @@ impl ActionPaletteState {
 pub struct PickerState {
     pub open: bool,
     pub selected_index: usize,
+    session: u64,
 }
 
 impl PickerState {
     pub fn toggle(&mut self) {
         self.open = !self.open;
+        if self.open {
+            self.session = self.session.wrapping_add(1);
+        }
         if self.selected_index >= AgentPreset::ALL.len() {
             self.selected_index = 0;
         }
     }
 
     pub fn open_with(&mut self, preset: AgentPreset) {
+        self.session = self.session.wrapping_add(1);
         self.open = true;
         self.selected_index = AgentPreset::ALL
             .iter()
             .position(|&p| p == preset)
             .unwrap_or(0);
+    }
+
+    pub fn session(&self) -> u64 {
+        self.session
     }
 
     pub fn close(&mut self) {
@@ -153,6 +168,7 @@ impl WorktreeModalState {
 /// State of the centered "Close Workspace" confirmation & worktree cleanup modal (`Ctrl+Shift+D` or sidebar `×`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseWorkspaceModalState {
+    session: u64,
     pub submitting: bool,
     pub open: bool,
     pub workspace_id: Option<WorkspaceId>,
@@ -167,8 +183,13 @@ pub struct CloseWorkspaceModalState {
 }
 
 impl CloseWorkspaceModalState {
+    pub fn session(&self) -> u64 {
+        self.session
+    }
+
     /// Opens the modal populated with defaults for `ws`.
     pub fn open_for_workspace(&mut self, ws: &WorkspaceView) {
+        self.session += 1;
         self.submitting = false;
         self.open = true;
         self.workspace_id = Some(ws.id);
@@ -183,7 +204,10 @@ impl CloseWorkspaceModalState {
     }
 
     pub fn close(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            session: self.session,
+            ..Self::default()
+        };
     }
 
     pub fn toggle_compose(&mut self) {

@@ -148,6 +148,7 @@ pub struct AppState {
     workspace_focus: HashMap<WorkspaceId, PaneRole>,
     selected_panes: HashMap<(WorkspaceId, PaneRole), PaneId>,
     pub image_preview: Option<(PaneId, daedalus_proto::rpc::ImagePreview)>,
+    pub pending_image_preview: Option<(PaneId, uuid::Uuid)>,
     pub sidebar_override: Option<bool>,
     pub sidebar_first: usize,
     pub zoomed: bool,
@@ -235,6 +236,7 @@ impl AppState {
             panes: HashMap::new(),
             focused_role: PaneRole::Agent,
             image_preview: None,
+            pending_image_preview: None,
             sidebar_override: None,
             sidebar_first: 0,
             workspace_focus: HashMap::new(),
@@ -331,6 +333,41 @@ impl AppState {
             ws.default_panes_pending = Some(false);
         }
         self.spawning_workspaces.remove(&workspace_id);
+    }
+
+    /// Status and recovery guidance shared by the visible terminal and the screen reader.
+    pub fn terminal_guidance(
+        &self,
+        role: PaneRole,
+    ) -> Option<(&'static str, Option<&'static str>)> {
+        if self.connection != ConnectionState::Connected
+            || role != self.focused_role
+            || self.pane_id_for_role(role).is_some()
+        {
+            return None;
+        }
+        let Some(workspace) = self.active_workspace() else {
+            return (self.workspace_list_loaded && self.workspaces.is_empty()).then_some((
+                "No workspaces open",
+                Some("Choose Workspaces → + Workspace."),
+            ));
+        };
+        if self.spawning_workspaces.contains(&workspace.id) {
+            return Some(("Starting terminals…", None));
+        }
+        if workspace.needs_default_panes() {
+            return None;
+        }
+        let title = if workspace.panes.is_empty() {
+            "No terminals open"
+        } else {
+            match role {
+                PaneRole::Agent => "No agent terminal open",
+                PaneRole::Service => "No service terminal open",
+                PaneRole::Runner => "No runner terminal open",
+            }
+        };
+        Some((title, Some("Open Settings to launch a terminal.")))
     }
 
     /// Opens the Agent preset picker modal while ensuring other modals are closed.

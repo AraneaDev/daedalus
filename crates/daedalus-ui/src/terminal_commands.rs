@@ -29,6 +29,7 @@ impl DaedalusApp {
             .is_some_and(|(id, _)| *id == pane_id)
         {
             self.state.image_preview = None;
+            self.state.pending_image_preview = None;
             self.request_redraw();
             return;
         }
@@ -42,11 +43,15 @@ impl DaedalusApp {
             );
             return;
         };
-        self.send_command(UiCommand::PreviewImage {
+        let token = uuid::Uuid::new_v4();
+        if self.send_command(UiCommand::PreviewImage {
             workspace_id: pane.summary.workspace_id,
             pane_id,
+            token,
             path,
-        });
+        }) {
+            self.state.pending_image_preview = Some((pane_id, token));
+        }
     }
 
     pub(super) fn copy_focused_selection(&mut self) {

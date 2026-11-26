@@ -671,6 +671,14 @@ impl Grid {
     }
 }
 
+fn search_lowercase(text: &str) -> impl Iterator<Item = char> + '_ {
+    // Fold both Greek lowercase sigma forms to one scalar. Using per-character
+    // lowering for both strings keeps case handling independent of cell boundaries.
+    text.chars()
+        .map(|ch| if ch == 'ς' { 'σ' } else { ch })
+        .flat_map(char::to_lowercase)
+}
+
 pub(crate) fn search_rows<C: AsRef<[Cell]>>(
     query: &str,
     case_sensitive: bool,
@@ -684,7 +692,7 @@ pub(crate) fn search_rows<C: AsRef<[Cell]>>(
     let needle = if case_sensitive {
         query
     } else {
-        needle_owned = query.to_lowercase();
+        needle_owned = search_lowercase(query).collect::<String>();
         &needle_owned
     };
     if needle.is_empty() {
@@ -706,11 +714,7 @@ pub(crate) fn search_rows<C: AsRef<[Cell]>>(
             if case_sensitive {
                 haystack.push_str(&cell.text);
             } else {
-                for ch in cell.text.chars() {
-                    for lc in ch.to_lowercase() {
-                        haystack.push(lc);
-                    }
-                }
+                haystack.extend(search_lowercase(&cell.text));
             }
             let added = haystack.len() - start;
             byte_to_col.resize(byte_to_col.len() + added, col_u16);

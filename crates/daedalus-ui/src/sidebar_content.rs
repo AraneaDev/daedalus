@@ -173,10 +173,13 @@ impl SidebarContent {
         let first = first.min(max_first);
         let mut y = top;
         let mut rects = Vec::new();
+        let mut has_workspace = false;
         for row in &rows[first..] {
             let h = row.height(workspaces, scale);
+            let is_workspace = matches!(row, SidebarRow::Workspace(_));
+            let may_condense = rects.is_empty() || (is_workspace && !has_workspace);
             if y + h + m.sidebar_row_gap > limit
-                && (!rects.is_empty() || available < m.header_height.min(h))
+                && (!may_condense || limit - y < m.header_height.min(h))
             {
                 break;
             }
@@ -187,6 +190,7 @@ impl SidebarContent {
                 h.min(limit - y),
             );
             rects.push(rect);
+            has_workspace |= is_workspace;
             y = rect.bottom() + m.sidebar_row_gap;
         }
         let visible = first..first + rects.len();
@@ -214,6 +218,31 @@ impl SidebarContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_grouped_sidebar_keeps_a_workspace_card_below_its_heading() {
+        for scale in [1., 2.] {
+            let sidebar = Rect::new(0., 0., 240. * scale, 180. * scale);
+            let list = SidebarContent::layout(
+                vec![
+                    SidebarRow::Heading("Repository".into()),
+                    SidebarRow::Workspace(0),
+                ],
+                &[],
+                sidebar,
+                0,
+                scale,
+            );
+            assert_eq!(list.visible, 0..2);
+            let [heading, card] = list.rects.as_slice() else {
+                panic!("expected a heading and a condensed workspace card");
+            };
+            assert!(heading.bottom() < card.y);
+            assert!(card.height >= crate::layout::HEADER_LOGICAL_HEIGHT * scale);
+            assert!(card.height < SIDEBAR_ROW_LOGICAL_HEIGHT * scale);
+            assert!(card.bottom() < list.new_workspace.y);
+        }
+    }
 
     fn labels(paths: &[&Path]) -> Vec<String> {
         let mut counts = HashMap::new();

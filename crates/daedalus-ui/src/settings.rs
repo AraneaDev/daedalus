@@ -2,7 +2,7 @@ use crate::{
     assignments::Assignment, layout::Rect, widget_editor::WidgetEditor,
     workspace_widgets::WorkspaceWidgets,
 };
-use daedalus_proto::WorkspaceId;
+use daedalus_proto::{ProjectSetupBaseline, WorkspaceId};
 use std::sync::atomic::{AtomicU64, Ordering};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 mod assignments;
@@ -147,6 +147,7 @@ struct PendingSave {
     request_id: u64,
     workspace_id: WorkspaceId,
     launch: Option<Assignment>,
+    assignments: Vec<Assignment>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -159,7 +160,9 @@ pub struct SettingsDialog {
     pub custom_supported: bool,
     pub custom: WidgetEditor,
     pub widgets: WorkspaceWidgets,
+    pane_widget_baseline: WorkspaceWidgets,
     pub widget_workspace: Option<WorkspaceId>,
+    pub setup_baseline: ProjectSetupBaseline,
     pub widgets_saved: bool,
     automatic_service_widget: bool,
     automatic_runner_widget: bool,
@@ -202,13 +205,19 @@ impl SettingsDialog {
         }
     }
 
-    pub fn start_save(&mut self, workspace_id: WorkspaceId, launch: Option<Assignment>) -> u64 {
+    pub fn start_save(
+        &mut self,
+        workspace_id: WorkspaceId,
+        launch: Option<Assignment>,
+        assignments: Vec<Assignment>,
+    ) -> u64 {
         let request_id = NEXT_SAVE_REQUEST.fetch_add(1, Ordering::Relaxed);
         self.error = None;
         self.pending_save = Some(PendingSave {
             request_id,
             workspace_id,
             launch,
+            assignments,
         });
         request_id
     }
@@ -217,12 +226,17 @@ impl SettingsDialog {
         &mut self,
         workspace_id: WorkspaceId,
         request_id: u64,
+        saved: bool,
     ) -> Option<Option<Assignment>> {
         let pending = self.pending_save.as_ref()?;
         if pending.workspace_id != workspace_id || pending.request_id != request_id {
             return None;
         }
-        self.pending_save.take().map(|pending| pending.launch)
+        let pending = self.pending_save.take()?;
+        if saved {
+            self.setup_baseline.assignments = Some(pending.assignments);
+        }
+        Some(pending.launch)
     }
 
     pub fn fail_pending_save(&mut self, message: String) {

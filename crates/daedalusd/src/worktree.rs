@@ -249,6 +249,22 @@ pub(crate) fn create_worktree_for_registration(
     create_branch: bool,
     base_dir: &Path,
 ) -> Result<CreatedWorktree, String> {
+    let target = prepare_worktree_target(repo_dir, branch, base_dir)?;
+    let new_branch = add_worktree(&target.repo_root, &target.path, branch, create_branch)?;
+    confirm_created_worktree(target, new_branch)
+}
+
+struct WorktreeTarget {
+    repo_root: PathBuf,
+    primary_root: PathBuf,
+    path: PathBuf,
+}
+
+fn prepare_worktree_target(
+    repo_dir: &Path,
+    branch: &str,
+    base_dir: &Path,
+) -> Result<WorktreeTarget, String> {
     if !repo_dir.is_dir() {
         return Err(format!(
             "repository path is not a directory: {}",
@@ -298,12 +314,24 @@ pub(crate) fn create_worktree_for_registration(
             target.display()
         ));
     }
+    Ok(WorktreeTarget {
+        repo_root,
+        primary_root,
+        path: target,
+    })
+}
 
+fn add_worktree(
+    repo_root: &Path,
+    target: &Path,
+    branch: &str,
+    create_branch: bool,
+) -> Result<Option<CreatedBranch>, String> {
     // Record the original tip before hooks or another Git process can change the new branch.
     let new_branch = create_branch.then(|| CreatedBranch {
         name: branch.to_owned(),
         start: run_git_with_timeout(
-            &repo_root,
+            repo_root,
             &[
                 OsStr::new("rev-parse"),
                 OsStr::new("--verify"),
@@ -323,7 +351,7 @@ pub(crate) fn create_worktree_for_registration(
             OsStr::new("--"),
             target.as_os_str(),
         ];
-        run_git_with_timeout(&repo_root, &args)?
+        run_git_with_timeout(repo_root, &args)?
     } else {
         let args = [
             OsStr::new("worktree"),
@@ -332,7 +360,7 @@ pub(crate) fn create_worktree_for_registration(
             target.as_os_str(),
             OsStr::new(branch),
         ];
-        run_git_with_timeout(&repo_root, &args)?
+        run_git_with_timeout(repo_root, &args)?
     };
 
     if !add_out.status.success() {
@@ -341,15 +369,21 @@ pub(crate) fn create_worktree_for_registration(
             add_out.stderr.trim()
         ));
     }
+    Ok(new_branch)
+}
 
-    let canonical_target = canonicalize_path(&target);
+fn confirm_created_worktree(
+    target: WorktreeTarget,
+    new_branch: Option<CreatedBranch>,
+) -> Result<CreatedWorktree, String> {
+    let canonical_target = canonicalize_path(&target.path);
     let recovery = || {
         format!(
             "git added the checkout at {}. Inspect it with git worktree list before retrying",
-            target.display()
+            target.path.display()
         )
     };
-    let info = discover_worktrees(&repo_root)
+    let info = discover_worktrees(&target.repo_root)
         .map_err(|error| format!("{error}. {}", recovery()))?
         .into_iter()
         .find(|wt| canonicalize_path(&wt.path) == canonical_target)
@@ -362,7 +396,7 @@ pub(crate) fn create_worktree_for_registration(
     Ok(CreatedWorktree {
         info,
         canonical_target,
-        primary_root,
+        primary_root: target.primary_root,
         new_branch,
     })
 }

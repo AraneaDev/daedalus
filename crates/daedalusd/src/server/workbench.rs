@@ -1,11 +1,11 @@
-use super::SubscriptionFilter;
+use super::subscription::Subscription;
 use crate::registry::Registry;
+use daedalus_proto::workbench::WorkbenchEdit;
 use daedalus_proto::{ClientMessage, ProtoError, ResponsePayload};
-use tokio::sync::RwLock;
 
 pub(super) async fn dispatch(
     registry: &Registry,
-    filter: &RwLock<SubscriptionFilter>,
+    filter: &Subscription,
     request: ClientMessage,
 ) -> Result<ResponsePayload, ProtoError> {
     match request {
@@ -13,7 +13,7 @@ pub(super) async fn dispatch(
             registry.workbench(workspace_id).await?,
         )),
         ClientMessage::WatchWorkbench { workspace_id } => {
-            filter.write().await.workbench = Some(workspace_id);
+            filter.watch_workbench(workspace_id).await;
             Ok(ResponsePayload::Workbench(
                 registry.workbench(workspace_id).await?,
             ))
@@ -22,10 +22,27 @@ pub(super) async fn dispatch(
             workspace_id,
             revision,
             document,
+            layout_only,
+            edit,
         } => {
-            let result = registry
-                .update_workbench(workspace_id, Some(revision), document)
-                .await?;
+            let result = if layout_only || edit.is_some() {
+                registry
+                    .edit_workbench(workspace_id, Some(revision), |current| match edit {
+                        Some(WorkbenchEdit::Widgets) => {
+                            current.widgets = document.widgets;
+                            current.templates = document.templates;
+                        }
+                        Some(WorkbenchEdit::PaneWidgets) => {
+                            current.pane_widgets = document.pane_widgets;
+                        }
+                        None => current.layout = document.layout,
+                    })
+                    .await?
+            } else {
+                registry
+                    .update_workbench(workspace_id, Some(revision), document)
+                    .await?
+            };
             Ok(workbench_response(result))
         }
         ClientMessage::SeedLegacyWorkbench {
@@ -33,7 +50,11 @@ pub(super) async fn dispatch(
             document,
         } => {
             let result = registry
-                .update_workbench(workspace_id, None, document)
+                .edit_workbench(workspace_id, None, |current| {
+                    let assignments = std::mem::take(&mut current.assignments);
+                    *current = document;
+                    current.assignments = assignments;
+                })
                 .await?;
             Ok(workbench_response(result))
         }

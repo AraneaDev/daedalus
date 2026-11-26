@@ -1,5 +1,8 @@
+mod installer;
+
+use self::installer::SetupInstaller;
 use super::{DaedalusApp, UiCommand};
-use daedalus_proto::{PaneId, PaneRole, PaneStatus, SetupInspection, WorkspaceId, WorkspaceInfo};
+use daedalus_proto::{PaneRole, ProjectSetupBaseline, SetupInspection, WorkspaceId, WorkspaceInfo};
 use daedalus_ui::{
     assignments::Assignment,
     links::{DetectedLink, open_link},
@@ -15,15 +18,21 @@ enum SetupStep {
         assignments: Vec<Assignment>,
         launch: Vec<String>,
     },
+    LaunchStored,
 }
 
 enum AfterCreate {
     Step(SetupStep),
-    /// A reopened recent project: apply the setup the daemon returns with the workspace.
+    /// A reopened recent project: launch the stored agent assignments.
     /// `form` is the start-screen session that asked for it.
     Reopen {
         form: u64,
     },
+}
+
+struct SetupWorkspace {
+    id: WorkspaceId,
+    baseline: Result<ProjectSetupBaseline, String>,
 }
 
 #[derive(Default)]
@@ -31,60 +40,25 @@ pub(super) struct SetupFlow {
     first_list_seen: bool,
     request: u64,
     folder_request: Option<(u64, String, PathBuf)>,
-    workspace: Option<WorkspaceId>,
+    workspace: Option<SetupWorkspace>,
     after_create: Option<AfterCreate>,
-    installer: Option<PaneId>,
-    reconciling_installer: bool,
+    installer: SetupInstaller,
     editing_folder: bool,
     /// Start-screen session of a recent project being reopened with its stored setup.
     reopen: Option<u64>,
     awaiting_mutation: bool,
-    installer_result: Option<String>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum InstallerRecovery {
-    Resume(WorkspaceId, PaneId),
-    Finished(PaneId, Option<i32>),
 }
 
 impl SetupFlow {
-    fn wait_for_installer_snapshot(&mut self) -> bool {
-        self.reconciling_installer = self.installer.is_some();
-        self.reconciling_installer
-    }
-
-    fn reconnected_installer(
-        &mut self,
-        status: impl FnOnce(WorkspaceId, PaneId) -> Option<PaneStatus>,
-    ) -> Option<InstallerRecovery> {
-        if !std::mem::take(&mut self.reconciling_installer) {
-            return None;
-        }
-        let (workspace, pane) = self.workspace.zip(self.installer)?;
-        Some(match status(workspace, pane) {
-            Some(PaneStatus::Exited { code }) => InstallerRecovery::Finished(pane, code),
-            None => InstallerRecovery::Finished(pane, None),
-            Some(_) => InstallerRecovery::Resume(workspace, pane),
-        })
-    }
-
-    fn finish_installer(&mut self, pane: PaneId) -> bool {
-        if self.reconciling_installer || self.installer != Some(pane) {
-            return false;
-        }
-        self.installer = None;
-        true
+    fn workspace_id(&self) -> Option<WorkspaceId> {
+        self.workspace.as_ref().map(|workspace| workspace.id)
     }
 }
 
 impl DaedalusApp {
-    pub(super) fn setup_installer_is_running(&self) -> bool {
-        self.setup.installer.is_some()
-    }
     pub(super) fn reset_setup_draft(&mut self) {
         self.setup.editing_folder = false;
-        self.setup.installer_result = None;
+        self.setup.installer.feedback = None;
         self.setup.workspace = None;
         self.setup.folder_request = None;
         self.setup.reopen = None;
@@ -146,18 +120,10 @@ impl DaedalusApp {
 
     /// The reopened workspace exists: start it from its stored setup, or review it.
     fn reopened(&mut self, form: u64, ws: &WorkspaceInfo) -> Option<SetupStep> {
-        if let Some(assignments) = ws.setup.clone() {
+        if ws.setup.is_some() {
             self.setup.reopen = Some(form);
             self.state.workspace_form.finish_submission(form, None);
-            let launch = assignments
-                .iter()
-                .filter(|entry| entry.role == PaneRole::Agent)
-                .map(|entry| entry.id.clone())
-                .collect();
-            return Some(SetupStep::Apply {
-                assignments,
-                launch,
-            });
+            return Some(SetupStep::LaunchStored);
         }
         // The setup is gone since the list was made. The review then belongs to this
         // workspace, so its Open applies here instead of creating the workspace again.
@@ -202,7 +168,8 @@ impl DaedalusApp {
                     self.state.setup_review.refresh(info);
                     self.state.setup_review.feedback = self
                         .setup
-                        .installer_result
+                        .installer
+                        .feedback
                         .take()
                         .unwrap_or_else(|| "Tool check complete.".into());
                 }
@@ -299,15 +266,15 @@ impl DaedalusApp {
     }
 
     fn prepare_setup(&mut self, action: SetupStep) {
-        if self.state.setup_review.busy || self.setup.installer.is_some() {
+        if self.state.setup_review.busy || self.setup.installer.is_running() {
             return;
         }
-        if let Some(id) = self
+        if self
             .setup
-            .workspace
-            .filter(|id| self.state.workspaces.iter().any(|ws| ws.id == *id))
+            .workspace_id()
+            .is_some_and(|id| self.state.workspaces.iter().any(|ws| ws.id == id))
         {
-            self.run_setup_action(id, action);
+            self.run_setup_action(action);
         } else {
             self.setup.request = self.setup.request.wrapping_add(1);
             let cmd = UiCommand::CreateManualWorkspace {
@@ -321,17 +288,34 @@ impl DaedalusApp {
         }
     }
 
-    fn run_setup_action(&mut self, workspace_id: WorkspaceId, action: SetupStep) {
+    fn run_setup_action(&mut self, action: SetupStep) {
+        let Some(workspace) = &self.setup.workspace else {
+            return;
+        };
+        let workspace_id = workspace.id;
         let cmd = match action {
             SetupStep::Install(argv) => UiCommand::InstallSetupTool { workspace_id, argv },
             SetupStep::Apply {
                 assignments,
                 launch,
-            } => UiCommand::ApplySetup {
-                workspace_id,
-                assignments,
-                launch,
-            },
+            } => {
+                let expected = match &workspace.baseline {
+                    Ok(baseline) => baseline.clone(),
+                    Err(message) => {
+                        self.state.setup_review.busy = false;
+                        self.state.setup_review.feedback.clone_from(message);
+                        self.request_redraw();
+                        return;
+                    }
+                };
+                UiCommand::ApplySetup {
+                    workspace_id,
+                    assignments,
+                    launch,
+                    expected,
+                }
+            }
+            SetupStep::LaunchStored => UiCommand::LaunchStoredSetup(workspace_id),
         };
         self.setup.awaiting_mutation = self.setup_send(cmd, "Preparing workspace…");
     }
@@ -342,14 +326,17 @@ impl DaedalusApp {
         if self.setup.request == session
             && let Some(action) = self.setup.after_create.take()
         {
-            self.setup.workspace = Some(id);
+            self.setup.workspace = Some(SetupWorkspace {
+                id,
+                baseline: self.project_setups.guided_baseline(&ws),
+            });
             self.state.select_workspace(id);
             let action = match action {
                 AfterCreate::Reopen { form } => self.reopened(form, &ws),
                 AfterCreate::Step(step) => Some(step),
             };
             if let Some(action) = action {
-                self.run_setup_action(id, action);
+                self.run_setup_action(action);
             }
         }
         self.schedule_resize_flush();
@@ -376,7 +363,7 @@ impl DaedalusApp {
     pub(super) fn setup_applied(&mut self, id: WorkspaceId, error: Option<String>) {
         self.setup.awaiting_mutation = false;
         self.refresh_test_runner(id);
-        if self.setup.workspace != Some(id) {
+        if self.setup.workspace_id() != Some(id) {
             return;
         }
         if let Some(message) = error {
@@ -393,71 +380,16 @@ impl DaedalusApp {
 
     pub(super) fn setup_failed(&mut self, id: WorkspaceId, message: String) {
         self.setup.awaiting_mutation = false;
-        if self.setup.workspace == Some(id) && self.setup.reopen.take().is_some() {
+        if self.setup.workspace_id() == Some(id) && self.setup.reopen.take().is_some() {
             // A reopened project never showed the review, so there is nothing to return to.
             self.state.setup_review.busy = false;
             self.setup.workspace = None;
             self.show_toast(message, true);
-        } else if self.setup.workspace == Some(id) {
+        } else if self.setup.workspace_id() == Some(id) {
             self.state.setup_review.busy = false;
             self.state.setup_review.open = true;
             self.state.setup_review.feedback = message;
         }
-    }
-
-    pub(super) fn setup_installer_started(&mut self, id: WorkspaceId, pane: PaneId) {
-        if self.setup.workspace != Some(id) {
-            return;
-        }
-        self.setup.awaiting_mutation = false;
-        self.setup.installer = Some(pane);
-        self.state.setup_review.open = false;
-        self.state.select_workspace(id);
-        if let Some(p) = self.state.panes.get(&pane) {
-            let role = p.summary.role;
-            let status = p.summary.status;
-            self.state
-                .session_names
-                .insert(pane, "Setup installer".into());
-            self.state.select_session(id, role, pane);
-            if let PaneStatus::Exited { code } = status {
-                self.setup_installer_finished(pane, code);
-            }
-        }
-        self.schedule_resize_flush();
-    }
-
-    pub(super) fn reconcile_setup_installer(&mut self) {
-        let recovery = self.setup.reconnected_installer(|workspace, pane| {
-            self.state
-                .panes
-                .get(&pane)
-                .filter(|p| p.summary.workspace_id == workspace)
-                .map(|p| p.summary.status)
-        });
-        match recovery {
-            Some(InstallerRecovery::Resume(workspace, pane)) => {
-                self.setup_installer_started(workspace, pane)
-            }
-            Some(InstallerRecovery::Finished(pane, code)) => {
-                self.setup_installer_finished(pane, code)
-            }
-            None => {}
-        }
-    }
-
-    pub(super) fn setup_installer_finished(&mut self, pane: PaneId, code: Option<i32>) {
-        if !self.setup.finish_installer(pane) {
-            return;
-        }
-        self.setup.installer_result = Some(match code {
-            Some(0) => "Installer finished. Tool availability refreshed.".into(),
-            Some(code) => format!("Installer exited {code}. See Setup installer for its output."),
-            None => "Setup terminal closed. Tool availability refreshed.".into(),
-        });
-        self.state.setup_review.open = true;
-        self.state.setup_review.busy = false;
-        self.handle_setup_action(SetupAction::Check);
     }
 
     pub(super) fn setup_disconnected(&mut self) {
@@ -473,7 +405,7 @@ impl DaedalusApp {
             self.show_toast("Connection lost during setup. Check the workspace list and Settings before retrying.", true);
             return;
         }
-        if self.setup.wait_for_installer_snapshot() {
+        if self.setup.installer.wait_for_snapshot() {
             self.state.setup_review.open = false;
             self.state.setup_review.busy = true;
             return;
@@ -483,48 +415,6 @@ impl DaedalusApp {
             self.state.setup_review.busy = false;
             self.state.setup_review.feedback =
                 "Connection lost. Check the workspace and tools after reconnecting.".into();
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn installer_reconnect_resumes_or_completes_exactly_once() {
-        let workspace = WorkspaceId::new();
-        let pane = PaneId::new();
-        for (status, expected) in [
-            (
-                Some(PaneStatus::Busy),
-                InstallerRecovery::Resume(workspace, pane),
-            ),
-            (
-                Some(PaneStatus::Exited { code: Some(7) }),
-                InstallerRecovery::Finished(pane, Some(7)),
-            ),
-            (None, InstallerRecovery::Finished(pane, None)),
-        ] {
-            let mut setup = SetupFlow {
-                workspace: Some(workspace),
-                installer: Some(pane),
-                ..Default::default()
-            };
-            assert!(setup.wait_for_installer_snapshot());
-            assert_eq!(setup.installer, Some(pane));
-            assert!(!setup.finish_installer(pane));
-            assert_eq!(
-                setup.reconnected_installer(|w, p| {
-                    assert_eq!((w, p), (workspace, pane));
-                    status
-                }),
-                Some(expected)
-            );
-            assert_eq!(setup.reconnected_installer(|_, _| unreachable!()), None);
-            assert!(!setup.finish_installer(PaneId::new()));
-            assert!(setup.finish_installer(pane));
-            assert!(!setup.finish_installer(pane));
         }
     }
 }

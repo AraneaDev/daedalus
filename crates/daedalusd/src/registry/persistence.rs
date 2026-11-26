@@ -1,18 +1,27 @@
-use super::{Registry, WorkspaceRecord, build_workspace_record, prepare_workspace_components};
+mod restore;
+
+use super::{Registry, WorkspaceRecord};
 use crate::persistence::{
-    PersistedProjectSetup, PersistedState, PersistedWorkspace, STATE_VERSION, StateStore,
+    PersistedProjectSetup, PersistedState, PersistedWorkspace, PersistedWorkspaceSetup,
+    STATE_VERSION, StateStore,
 };
+use daedalus_proto::workbench::WorkbenchState;
 use daedalus_proto::{Assignment, ProtoError, ServerEvent, WorkspaceId};
-use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
-use tracing::{info, warn};
+use std::sync::Arc;
+use tracing::warn;
 
 pub(super) enum PersistenceWriteState {
     Unchecked,
     Missing,
     Loaded,
     Rejected,
+}
+
+pub(super) enum WorkspaceChange {
+    Register(Box<WorkspaceRecord>),
+    Close(WorkspaceId),
 }
 
 fn write_snapshot(
@@ -49,20 +58,128 @@ fn rejected_snapshot(path: &std::path::Path) -> io::Error {
 }
 
 impl Registry {
+    /// Persists the proposed lifecycle change before publishing it to any client.
+    pub(super) async fn commit_workspace_change(
+        &self,
+        change: WorkspaceChange,
+    ) -> Result<(), ProtoError> {
+        let mut mode = self.persist_lock.clone().lock_owned().await;
+        let (id, name, root, canonical_root) = {
+            let workspaces = self.workspaces.read().await;
+            let record = match &change {
+                WorkspaceChange::Register(record) => record.as_ref(),
+                WorkspaceChange::Close(id) => workspaces
+                    .get(id)
+                    .ok_or(ProtoError::WorkspaceNotFound(*id))?,
+            };
+            (
+                record.id,
+                record.name.clone(),
+                record.root_dir.clone(),
+                record.canonical_root_dir.clone(),
+            )
+        };
+        let recent = self
+            .recent_projects_after_contact(&name, &root, &canonical_root)
+            .await;
+        let mut state = self.persistence_snapshot().await;
+        let previous = match &change {
+            WorkspaceChange::Register(record)
+                if record.pending_compose_override.is_some()
+                    && self.state_store.is_some()
+                    && !matches!(*mode, PersistenceWriteState::Rejected) =>
+            {
+                Some(state.clone())
+            }
+            _ => None,
+        };
+        state.workspaces.retain(|workspace| workspace.id != id);
+        match &change {
+            WorkspaceChange::Register(record) => {
+                state.workspaces.push(record.to_persisted());
+                state
+                    .workspaces
+                    .sort_by_key(|workspace| workspace.slot_index);
+            }
+            WorkspaceChange::Close(_) => state
+                .workspace_setups
+                .retain(|setup| setup.workspace_id != id),
+        }
+        state.recent_projects.clone_from(&recent);
+
+        let store = self.state_store.clone();
+        let mut workspaces = self.workspaces.clone().write_owned().await;
+        let mut deferred = self.deferred_workspaces.clone().write_owned().await;
+        let project_setups = Arc::clone(&self.project_setups);
+        let recent_projects = Arc::clone(&self.recent_projects);
+        let event_tx = self.event_tx.clone();
+        // Hold publication and write guards through the blocking save so the
+        // in-memory result follows a committed write even if the caller leaves.
+        tokio::task::spawn_blocking(move || {
+            if let Some(store) = &store {
+                if matches!(*mode, PersistenceWriteState::Rejected) {
+                    warn!(workspace = %id, "workspace change is temporary because the startup snapshot was rejected");
+                } else {
+                    write_snapshot(store, &mut mode, &state)
+                        .map_err(|err| ProtoError::IoError(format!("Failed to save workspace state: {err}")))?;
+                }
+            }
+            match change {
+                WorkspaceChange::Register(mut record) => {
+                    if let Err(error) = record.install_compose_override() {
+                        let message = format!("Failed to write the workspace Compose override: {error}");
+                        if let (Some(store), Some(previous)) = (&store, &previous)
+                            && let Err(restore) = store.save(previous)
+                        {
+                            return Err(ProtoError::IoError(format!(
+                                "{message}. Failed to restore the previous workspace snapshot at {}: {restore}",
+                                store.path().display()
+                            )));
+                        }
+                        return Err(ProtoError::IoError(message));
+                    }
+                    workspaces.insert(id, *record);
+                    deferred.retain(|entry| entry.id != id);
+                }
+                WorkspaceChange::Close(_) => {
+                    if let Some(record) = workspaces.remove(&id) {
+                        record.widget_commands.close();
+                    }
+                    project_setups.blocking_write().forget_workspace(id);
+                }
+            }
+            *recent_projects.blocking_write() = recent;
+            drop(deferred);
+            drop(workspaces);
+            let _ = event_tx.send(ServerEvent::WorkspaceMembershipChanged);
+            drop(mode);
+            Ok(())
+        })
+        .await
+        .map_err(|err| ProtoError::Internal(format!("Workspace state save task failed: {err}")))?
+    }
+
     async fn persistence_snapshot(&self) -> PersistedState {
         let mut workspaces: Vec<PersistedWorkspace> = {
             let ws_map = self.workspaces.read().await;
-            ws_map.values().map(WorkspaceRecord::to_persisted).collect()
+            // Read both collections together so a retry cannot move a registration
+            // between them halfway through the snapshot.
+            let deferred = self.deferred_workspaces.read().await;
+            ws_map
+                .values()
+                .map(WorkspaceRecord::to_persisted)
+                .chain(deferred.iter().cloned())
+                .collect()
         };
-        workspaces.extend(self.unresolved_legacy_roots.read().await.iter().cloned());
         workspaces.sort_by_key(|ws| ws.slot_index);
-        let (recent_projects, project_setups) = self.project_lists_for_persist().await;
-        PersistedState {
+        let mut snapshot = PersistedState {
             version: STATE_VERSION,
             workspaces,
-            recent_projects,
-            project_setups,
-        }
+            recent_projects: self.recent_projects.read().await.clone(),
+            ..PersistedState::default()
+        };
+        self.project_setups.read().await.save_into(&mut snapshot);
+        snapshot
     }
 
     pub(super) async fn persist_state(&self) {
@@ -85,21 +202,45 @@ impl Registry {
     pub(super) async fn persist_project_setup(
         &self,
         root_dir: PathBuf,
+        canonical_root: PathBuf,
         assignments: Vec<Assignment>,
+        versioned: Option<(WorkspaceId, WorkbenchState)>,
+        lifecycle: tokio::sync::OwnedMutexGuard<()>,
+        mut mode: tokio::sync::OwnedMutexGuard<PersistenceWriteState>,
     ) -> Result<(), ProtoError> {
-        let mut mode = self.persist_lock.clone().lock_owned().await;
+        let workspace_setup = versioned
+            .as_ref()
+            .map(|(id, state)| PersistedWorkspaceSetup {
+                workspace_id: *id,
+                revision: state.revision,
+                assignments: assignments.clone(),
+            });
+        let runtime = if let Some((id, state)) = versioned {
+            Some((id, state, self.workbench_widget_commands(id).await?))
+        } else {
+            None
+        };
         let snapshot = if let Some(store) = self.state_store.clone() {
             let mut state = self.persistence_snapshot().await;
             let setup = PersistedProjectSetup {
-                root_dir: root_dir.clone(),
+                root_dir: canonical_root.clone(),
                 assignments: assignments.clone(),
             };
             match state
                 .project_setups
-                .binary_search_by(|entry| entry.root_dir.cmp(&root_dir))
+                .binary_search_by(|entry| entry.root_dir.cmp(&canonical_root))
             {
                 Ok(index) => state.project_setups[index] = setup,
                 Err(index) => state.project_setups.insert(index, setup),
+            }
+            if let Some(setup) = &workspace_setup {
+                match state
+                    .workspace_setups
+                    .binary_search_by_key(&setup.workspace_id.0, |entry| entry.workspace_id.0)
+                {
+                    Ok(index) => state.workspace_setups[index] = setup.clone(),
+                    Err(index) => state.workspace_setups.insert(index, setup.clone()),
+                }
             }
             Some((store, state))
         } else {
@@ -107,7 +248,7 @@ impl Registry {
         };
         let project_setups = self.project_setups.clone();
         let event_tx = self.event_tx.clone();
-        // Keep the write lock, state update, and announcement together even if the
+        // Keep the write locks, state update, and announcement together even if the
         // connection drops while the blocking file operation is in progress.
         tokio::task::spawn_blocking(move || {
             if let Some((store, state)) = snapshot {
@@ -115,9 +256,15 @@ impl Registry {
                     ProtoError::IoError(format!("Failed to save project setup: {err}"))
                 })?;
             }
-            project_setups
-                .blocking_write()
-                .insert(root_dir.clone(), assignments.clone());
+            let _lifecycle = lifecycle;
+            project_setups.blocking_write().confirm(
+                canonical_root,
+                assignments.clone(),
+                workspace_setup,
+            );
+            if let Some((id, state, widget_commands)) = runtime {
+                Self::publish_workbench_change(&event_tx, id, &widget_commands, &state);
+            }
             let _ = event_tx.send(ServerEvent::ProjectSetupChanged {
                 root_dir,
                 assignments,
@@ -127,166 +274,5 @@ impl Registry {
         })
         .await
         .map_err(|err| ProtoError::Internal(format!("Project setup save task failed: {err}")))?
-    }
-
-    /// Restores persisted workspaces from `state.json` as dormant workspaces (`panes: []`),
-    /// skipping entries whose `root_dir` no longer exists and refreshing isolation, git branch,
-    /// and `.daedalus.toml` manifest.
-    pub async fn restore_persisted_workspaces(&self) -> io::Result<usize> {
-        let Some(store) = self.state_store.clone() else {
-            return Ok(0);
-        };
-
-        let create_guard = self.create_lock.lock().await;
-        let mut mode = self.persist_lock.lock().await;
-        if matches!(*mode, PersistenceWriteState::Rejected) {
-            return Err(rejected_snapshot(store.path()));
-        }
-        let load_path = store.path().to_path_buf();
-        let loaded = tokio::task::spawn_blocking(move || store.load_snapshot())
-            .await
-            .map_err(io::Error::other)
-            .and_then(|result| result);
-        let mut persisted_state = match loaded {
-            Ok(Some(state)) => {
-                *mode = PersistenceWriteState::Loaded;
-                state
-            }
-            Ok(None) => {
-                *mode = PersistenceWriteState::Missing;
-                return Ok(0);
-            }
-            Err(err) => {
-                *mode = PersistenceWriteState::Rejected;
-                return Err(io::Error::new(
-                    err.kind(),
-                    format!("failed to load {}: {err}", load_path.display()),
-                ));
-            }
-        };
-
-        self.load_project_lists(&mut persisted_state).await;
-
-        if persisted_state.workspaces.is_empty() {
-            return Ok(0);
-        }
-
-        persisted_state.workspaces.sort_by_key(|ws| ws.slot_index);
-
-        let (mut used_slots, mut reserved_ports, mut existing_ids) = {
-            let ws_map = self.workspaces.read().await;
-            let used_slots: HashSet<u16> = ws_map.values().map(|ws| ws.slot_index).collect();
-            let reserved_ports: HashSet<u16> = ws_map
-                .values()
-                .flat_map(|ws| ws.reserved_ports.iter().copied())
-                .collect();
-            let existing_ids: HashSet<WorkspaceId> = ws_map.keys().copied().collect();
-            (used_slots, reserved_ports, existing_ids)
-        };
-
-        let mut unresolved = Vec::new();
-        let mut restored_records = Vec::new();
-        let mut needs_resave = false;
-
-        for entry in persisted_state.workspaces {
-            if existing_ids.contains(&entry.id) {
-                needs_resave = true;
-                continue;
-            }
-            if entry.root_dir.is_relative() {
-                warn!(workspace_id = %entry.id, root_dir = %entry.root_dir.display(),
-                    "legacy relative root has no recorded base; set its absolute root in state.json with the daemon stopped");
-                unresolved.push(entry);
-                continue;
-            }
-            if !entry.root_dir.is_dir() {
-                info!(
-                    workspace_id = %entry.id,
-                    root_dir = %entry.root_dir.display(),
-                    "skipping persisted workspace whose root_dir no longer exists"
-                );
-                needs_resave = true;
-                continue;
-            }
-
-            let slot_index = if !used_slots.contains(&entry.slot_index) {
-                entry.slot_index
-            } else if let Some(slot) = (0..=u16::MAX).find(|s| !used_slots.contains(s)) {
-                needs_resave = true;
-                slot
-            } else {
-                warn!(workspace_id = %entry.id, "no workspace slots available during restore");
-                needs_resave = true;
-                continue;
-            };
-
-            let name_clone = entry.name.clone();
-            let root_clone = entry.root_dir.clone();
-            let reserved_clone = reserved_ports.clone();
-            let prepared_res = tokio::task::spawn_blocking(move || {
-                prepare_workspace_components(
-                    &name_clone,
-                    &root_clone,
-                    slot_index,
-                    HashMap::new(),
-                    &reserved_clone,
-                )
-            })
-            .await;
-
-            let prepared = match prepared_res {
-                Ok(Ok(p)) => p,
-                Ok(Err(err)) => {
-                    warn!(
-                        workspace_id = %entry.id,
-                        root_dir = %entry.root_dir.display(),
-                        error = %err,
-                        "failed to prepare isolation for persisted workspace; skipping"
-                    );
-                    needs_resave = true;
-                    continue;
-                }
-                Err(err) => {
-                    warn!(workspace_id = %entry.id, error = %err, "workspace restore task panicked");
-                    needs_resave = true;
-                    continue;
-                }
-            };
-
-            let record = build_workspace_record(
-                entry.id,
-                entry.name,
-                entry.root_dir,
-                prepared,
-                entry.manual_launch,
-            );
-            used_slots.insert(record.slot_index);
-            reserved_ports.extend(record.reserved_ports.iter().copied());
-            existing_ids.insert(record.id);
-            restored_records.push(record);
-        }
-
-        *self.unresolved_legacy_roots.write().await = unresolved;
-        let restored_count = restored_records.len();
-        if restored_count > 0 {
-            let mut ws_map = self.workspaces.write().await;
-            for record in restored_records {
-                ws_map.insert(record.id, record);
-            }
-        }
-        drop(mode);
-        drop(create_guard);
-
-        if needs_resave {
-            self.persist_state().await;
-        }
-        if restored_count > 0 {
-            info!(
-                count = restored_count,
-                "restored dormant workspaces from state.json"
-            );
-        }
-
-        Ok(restored_count)
     }
 }

@@ -993,6 +993,7 @@ async fn queued_terminal_input_stays_with_its_connection() {
                     workbench_supported: false,
                     workspace_membership_supported: false,
                     runner_assignment_supported: false,
+                    guarded_runner_assignment_supported: false,
                     resolved_import_preview_supported: false,
                     agent_launch_metadata_supported: false,
                     home_dir: None,
@@ -1376,7 +1377,7 @@ command = ["sh", "-c", "touch unexpected-manifest-launch"]
                 assert!(bridge.send(UiCommand::LaunchAssignment {
                     workspace_id: ws.id,
                     assignment: assignment.clone(),
-                    saved_runner: false,
+                    launch: daedalus_ui::bridge::AssignmentLaunch::Direct,
                     cols: 80,
                     rows: 24
                 }));
@@ -1431,6 +1432,7 @@ command = ["sh", "-c", "touch unexpected-manifest-launch"]
 #[cfg(unix)]
 #[tokio::test]
 async fn wizard_inspects_installs_and_launches_only_selected_roles() {
+    use daedalus_proto::ProjectSetupBaseline;
     use daedalus_ui::assignments::{self, Assignment};
     // The bridge uses the user's assignment directory. Isolate it without changing
     // the environment of other tests running in this process.
@@ -1476,7 +1478,7 @@ async fn wizard_inspects_installs_and_launches_only_selected_roles() {
             .unwrap();
     });
     let config = BridgeConfig {
-        socket_path: sock,
+        socket_path: sock.clone(),
         initial_dir: project.clone(),
         bootstrap_explicit_dir: false,
         default_agent: AgentPreset::Shell,
@@ -1603,10 +1605,70 @@ async fn wizard_inspects_installs_and_launches_only_selected_roles() {
                 argv: vec!["touch".into(), "unexpected tests".into()],
             },
         ];
+        let changed = vec![Assignment {
+            id: "concurrent".into(),
+            name: "Saved by another client".into(),
+            role: PaneRole::Agent,
+            argv: vec!["touch".into(), "newly saved agent".into()],
+        }];
+        let mut other = IpcStream::connect(&sock).await.unwrap();
+        write_frame(
+            &mut other,
+            &Request {
+                id: 1,
+                payload: ClientMessage::SetProjectSetup {
+                    workspace_id: ws,
+                    assignments: changed.clone(),
+                    expected: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_frame::<_, ServerMessage>(&mut other).await.unwrap(),
+            Some(ServerMessage::Response {
+                id: 1,
+                result: Ok(ResponsePayload::Ok),
+            })
+        );
         assert!(bridge.send(UiCommand::ApplySetup {
             workspace_id: ws,
             assignments: entries.clone(),
-            launch: vec!["agent".into(), "serve".into()]
+            launch: vec!["serve".into()],
+            expected: ProjectSetupBaseline::default()
+        }));
+        loop {
+            match events.recv().await.unwrap() {
+                UiEvent::SetupApplied { error, .. } => {
+                    assert!(error.is_some_and(|message| message.contains("another client")));
+                    break;
+                }
+                UiEvent::AssignmentStarted { .. } => panic!("stale setup launched an assignment"),
+                _ => {}
+            }
+        }
+        assert!(bridge.send(UiCommand::LaunchStoredSetup(ws)));
+        let mut reopened = Vec::new();
+        loop {
+            match events.recv().await.unwrap() {
+                UiEvent::AssignmentStarted { assignment, .. } => reopened.push(assignment),
+                UiEvent::SetupApplied { error, .. } => {
+                    assert_eq!(error, None);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(reopened, changed);
+
+        assert!(bridge.send(UiCommand::ApplySetup {
+            workspace_id: ws,
+            assignments: entries.clone(),
+            launch: vec!["agent".into(), "serve".into()],
+            expected: ProjectSetupBaseline {
+                assignments: Some(changed),
+            },
         }));
         let mut started = Vec::new();
         loop {
@@ -1637,7 +1699,9 @@ async fn wizard_inspects_installs_and_launches_only_selected_roles() {
                 break;
             }
         }
-        while !project.join("started service").exists() || !project.join("installed tool").exists()
+        while !project.join("started service").exists()
+            || !project.join("installed tool").exists()
+            || !project.join("newly saved agent").exists()
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1820,4 +1884,242 @@ async fn held_widget_preview_does_not_delay_typing_or_paste() {
         .unwrap();
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn reconnect_hydrates_surviving_pane_before_ready_and_recents_do_not_delay_input() {
+    use daedalus_proto::{GridSnapshot, PaneId, ProtoError, WorkspaceId, WorkspaceInfo};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn reply(peer: &mut TcpStream, result: ResponsePayload) -> ClientMessage {
+        let request: Request = read_frame(peer).await.unwrap().unwrap();
+        write_frame(
+            peer,
+            &ServerMessage::Response {
+                id: request.id,
+                result: Ok(result),
+            },
+        )
+        .await
+        .unwrap();
+        request.payload
+    }
+
+    async fn handshake(listener: &TcpListener) -> TcpStream {
+        let (mut peer, _) = listener.accept().await.unwrap();
+        assert_eq!(
+            reply(&mut peer, ResponsePayload::Ok).await,
+            ClientMessage::Authenticate {
+                token: "fixture-token".into()
+            }
+        );
+        assert_eq!(
+            reply(
+                &mut peer,
+                ResponsePayload::Pong {
+                    version: "test".into(),
+                    vt_backend: "builtin".into(),
+                    isolation_mode: "test".into(),
+                    journal_supported: false,
+                    inspect_setup_supported: false,
+                    recent_projects_supported: true,
+                    project_setup_supported: false,
+                    image_preview_supported: false,
+                    paste_supported: false,
+                    workbench_supported: false,
+                    workspace_membership_supported: false,
+                    runner_assignment_supported: false,
+                    guarded_runner_assignment_supported: false,
+                    resolved_import_preview_supported: false,
+                    agent_launch_metadata_supported: false,
+                    home_dir: None,
+                },
+            )
+            .await,
+            ClientMessage::Ping
+        );
+        assert_eq!(
+            reply(&mut peer, ResponsePayload::Ok).await,
+            ClientMessage::Subscribe {
+                pane_ids: None,
+                project_setup_events: false,
+            }
+        );
+        peer
+    }
+
+    async fn hold_recents(listener: &TcpListener) -> (TcpStream, u64) {
+        let (mut peer, _) = listener.accept().await.unwrap();
+        assert_eq!(
+            reply(&mut peer, ResponsePayload::Ok).await,
+            ClientMessage::Authenticate {
+                token: "fixture-token".into()
+            }
+        );
+        let request: Request = read_frame(&mut peer).await.unwrap().unwrap();
+        assert_eq!(request.payload, ClientMessage::ListRecentProjects);
+        (peer, request.id)
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let bridge = DaemonBridge::start(
+        BridgeConfig {
+            bootstrap_explicit_dir: false,
+            socket_path: format!("tcp://{}", listener.local_addr().unwrap()).into(),
+            initial_dir: ".".into(),
+            default_agent: AgentPreset::Shell,
+            auto_spawn_daemon: false,
+            auth_token: Some("fixture-token".into()),
+        },
+        Arc::new(ChannelSink { tx }),
+    );
+    let workspace_id = WorkspaceId::new();
+    let pane_id = PaneId::new();
+    let workspace: WorkspaceInfo = toml::from_str(&format!(
+        r#"id = "{workspace_id}"
+           name = "Existing project"
+           root_dir = "."
+           slot_index = 0
+           injected_env = {{}}
+           [[panes]]
+           id = "{pane_id}"
+           workspace_id = "{workspace_id}"
+           role = "agent"
+           status = "idle"
+           cols = 80
+           rows = 24
+           has_failure_trace = false"#
+    ))
+    .unwrap();
+    let closed_pane = PaneId::new();
+    let mut before_close = workspace.clone();
+    let mut closing = workspace.panes[0].clone();
+    closing.id = closed_pane;
+    before_close.panes.insert(0, closing);
+
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let mut first = handshake(&listener).await;
+        assert_eq!(
+            reply(&mut first, ResponsePayload::Workspaces(vec![])).await,
+            ClientMessage::ListWorkspaces
+        );
+        let (mut first_recents, _) = hold_recents(&listener).await;
+        drop(first);
+        while !matches!(events.recv().await.unwrap(), UiEvent::Disconnected) {}
+        assert!(
+            read_frame::<_, Request>(&mut first_recents)
+                .await
+                .unwrap()
+                .is_none(),
+            "ending a session must cancel its recents connection"
+        );
+
+        let mut second = handshake(&listener).await;
+        assert_eq!(
+            reply(&mut second, ResponsePayload::Workspaces(vec![before_close])).await,
+            ClientMessage::ListWorkspaces
+        );
+        let vanished: Request = read_frame(&mut second).await.unwrap().unwrap();
+        assert_eq!(
+            vanished.payload,
+            ClientMessage::GetSnapshot {
+                pane_id: closed_pane
+            }
+        );
+        assert!(bridge.send(UiCommand::SendInput {
+            pane_id,
+            data: b"buffered".to_vec(),
+        }));
+        write_frame(
+            &mut second,
+            &ServerMessage::Response {
+                id: vanished.id,
+                result: Err(ProtoError::PaneNotFound(closed_pane)),
+            },
+        )
+        .await
+        .unwrap();
+        let snapshot: Request = read_frame(&mut second).await.unwrap().unwrap();
+        assert_eq!(snapshot.payload, ClientMessage::GetSnapshot { pane_id });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), async {
+                while !matches!(events.recv().await.unwrap(), UiEvent::Connected) {}
+            })
+            .await
+            .is_err(),
+            "readiness must wait for terminal hydration"
+        );
+        write_frame(
+            &mut second,
+            &ServerMessage::Response {
+                id: snapshot.id,
+                result: Ok(ResponsePayload::Snapshot(GridSnapshot {
+                    terminal_modes: Default::default(),
+                    pane_id,
+                    seq: 1,
+                    cols: 80,
+                    rows: 24,
+                    cursor: Default::default(),
+                    rows_data: vec![],
+                    scrollback_len: 0,
+                    history_generation: 0,
+                    insight: None,
+                    activity: None,
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reply(&mut second, ResponsePayload::Workspaces(vec![workspace])).await,
+            ClientMessage::ListWorkspaces
+        );
+        let (mut recents, request_id) = hold_recents(&listener).await;
+        let mut reconciled = false;
+        loop {
+            match events.recv().await.unwrap() {
+                UiEvent::WorkspaceMembershipLoaded(workspaces) => {
+                    assert_eq!(workspaces.len(), 1);
+                    assert_eq!(
+                        workspaces[0]
+                            .panes
+                            .iter()
+                            .map(|pane| pane.id)
+                            .collect::<Vec<_>>(),
+                        [pane_id]
+                    );
+                    reconciled = true;
+                }
+                UiEvent::Connected => break,
+                UiEvent::Disconnected => panic!("closing a pane disconnected the bridge"),
+                _ => {}
+            }
+        }
+        assert!(reconciled);
+        assert_eq!(
+            reply(&mut second, ResponsePayload::Ok).await,
+            ClientMessage::SendInput {
+                pane_id,
+                data: b"buffered".to_vec(),
+            }
+        );
+        write_frame(
+            &mut recents,
+            &ServerMessage::Response {
+                id: request_id,
+                result: Ok(ResponsePayload::RecentProjects(vec![])),
+            },
+        )
+        .await
+        .unwrap();
+        loop {
+            if let UiEvent::RecentProjectsLoaded(projects) = events.recv().await.unwrap() {
+                assert!(projects.is_empty());
+                break;
+            }
+        }
+    })
+    .await
+    .expect("bridge stalled during reconnect or recents fetch");
 }

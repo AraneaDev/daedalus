@@ -1,14 +1,14 @@
 use super::rpc::{RpcConnection, RpcError};
 use super::workspace::emit_spawned_pane;
-use super::{DEFAULT_PANE_COLS, DEFAULT_PANE_ROWS, UiEvent, UiEventSink};
+use super::{AssignmentLaunch, DEFAULT_PANE_COLS, DEFAULT_PANE_ROWS, UiEvent, UiEventSink};
 use crate::assignments::{self, Assignment};
 use crate::state::AgentPreset;
 use daedalus_proto::{
-    ClientMessage, PaneId, PaneRole, PaneSummary, ProtoError, ResponsePayload, WorkspaceId,
+    ClientMessage, PaneId, PaneRole, PaneSummary, ProjectSetupBaseline, ProtoError,
+    ResponsePayload, WorkspaceId,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::warn;
 
 pub(super) async fn inspect(
     conn: &RpcConnection,
@@ -82,7 +82,7 @@ pub(super) async fn launch_assignment(
     sink: &Arc<dyn UiEventSink>,
     workspace_id: WorkspaceId,
     assignment: Assignment,
-    saved_runner: bool,
+    launch: AssignmentLaunch,
     cols: u16,
     rows: u16,
 ) -> Result<(), RpcError> {
@@ -94,11 +94,17 @@ pub(super) async fn launch_assignment(
     } else {
         None
     };
-    let summary = if saved_runner && conn.runner_assignment_supported {
+    let use_saved_runner = match launch {
+        AssignmentLaunch::Direct => false,
+        AssignmentLaunch::SavedRunner => conn.runner_assignment_supported,
+        AssignmentLaunch::ReviewedRunner => conn.guarded_runner_assignment_supported,
+    };
+    let summary = if use_saved_runner {
         match conn
             .call(ClientMessage::LaunchRunnerAssignment {
                 workspace_id,
                 assignment_id: assignment.id.clone(),
+                expected: (launch == AssignmentLaunch::ReviewedRunner).then(|| assignment.clone()),
                 cols,
                 rows,
             })
@@ -112,7 +118,8 @@ pub(super) async fn launch_assignment(
             }
         }
     } else {
-        let command = (!assignment.argv.is_empty()).then(|| assignment.argv.clone());
+        let command = (!assignment.argv.is_empty() && !assignment.uses_default_shell())
+            .then(|| assignment.argv.clone());
         spawn(conn, workspace_id, assignment.role, command, cols, rows).await?
     };
     let pane_id = summary.id;
@@ -125,26 +132,43 @@ pub(super) async fn launch_assignment(
     snapshot(conn, sink, pane_id).await
 }
 
+enum SetupSaveError {
+    Conflict,
+    Other(String),
+}
+
+impl SetupSaveError {
+    fn message(self) -> String {
+        match self {
+            Self::Conflict => "Pane setup changed on another client. Your draft is still open. Reopen Settings to review the saved setup.".into(),
+            Self::Other(message) => message,
+        }
+    }
+}
+
 async fn store_on_daemon(
     conn: &RpcConnection,
     workspace_id: WorkspaceId,
     entries: &[Assignment],
-) -> Result<Result<(), String>, RpcError> {
+    expected: ProjectSetupBaseline,
+) -> Result<Result<(), SetupSaveError>, RpcError> {
     if let Err(message) = daedalus_proto::validate_assignments(entries) {
-        return Ok(Err(message));
+        return Ok(Err(SetupSaveError::Other(message)));
     }
     match conn
         .call(ClientMessage::SetProjectSetup {
             workspace_id,
             assignments: entries.to_vec(),
+            expected: Some(expected),
         })
         .await
     {
         Ok(ResponsePayload::Ok) => Ok(Ok(())),
-        Ok(other) => Ok(Err(format!(
+        Ok(ResponsePayload::ProjectSetupConflict(_)) => Ok(Err(SetupSaveError::Conflict)),
+        Ok(other) => Ok(Err(SetupSaveError::Other(format!(
             "Unexpected reply while saving settings: {other:?}"
-        ))),
-        Err(RpcError::Proto(err)) => Ok(Err(err.to_string())),
+        )))),
+        Err(RpcError::Proto(err)) => Ok(Err(SetupSaveError::Other(err.to_string()))),
         Err(err) => Err(err),
     }
 }
@@ -154,16 +178,30 @@ pub(super) async fn save_project_setup(
     sink: &Arc<dyn UiEventSink>,
     workspace_id: WorkspaceId,
     entries: Vec<Assignment>,
+    request_id: u64,
 ) -> Result<(), RpcError> {
-    if !conn.project_setup_supported {
-        return Ok(());
-    }
-    if let Err(message) = store_on_daemon(conn, workspace_id, &entries).await? {
-        sink.emit(UiEvent::ProjectSetupSaveFailed {
+    let result = if conn.project_setup_supported {
+        store_on_daemon(
+            conn,
             workspace_id,
-            message,
-        });
-    }
+            &entries,
+            ProjectSetupBaseline::default(),
+        )
+        .await?
+        .map_err(|error| match error {
+            SetupSaveError::Conflict => {
+                "Using the project setup already saved on the daemon.".into()
+            }
+            SetupSaveError::Other(message) => message,
+        })
+    } else {
+        Err("This daemon does not support saving project settings.".into())
+    };
+    sink.emit(UiEvent::ProjectSetupMigrationFinished {
+        workspace_id,
+        request_id,
+        result,
+    });
     Ok(())
 }
 
@@ -172,35 +210,24 @@ pub(super) async fn save_workspace_settings(
     sink: &Arc<dyn UiEventSink>,
     workspace_id: WorkspaceId,
     entries: Vec<Assignment>,
+    expected: ProjectSetupBaseline,
     request_id: u64,
 ) -> Result<(), RpcError> {
     let result = if conn.project_setup_supported {
-        store_on_daemon(conn, workspace_id, &entries).await?
+        store_on_daemon(conn, workspace_id, &entries, expected).await?
     } else {
-        Err("This daemon does not support saving project settings.".into())
+        Err(SetupSaveError::Other(
+            "This daemon does not support saving project settings.".into(),
+        ))
     };
+    let conflict = matches!(result, Err(SetupSaveError::Conflict));
     sink.emit(UiEvent::WorkspaceSettingsSaved {
         workspace_id,
         request_id,
-        result,
+        result: result.map_err(SetupSaveError::message),
     });
-    Ok(())
-}
-
-pub(super) async fn refresh_recent_projects(
-    conn: &RpcConnection,
-    sink: &Arc<dyn UiEventSink>,
-) -> Result<(), RpcError> {
-    if !conn.recent_projects_supported {
-        return Ok(());
-    }
-    match conn.call(ClientMessage::ListRecentProjects).await {
-        Ok(ResponsePayload::RecentProjects(projects)) => {
-            sink.emit(UiEvent::RecentProjectsLoaded(projects));
-        }
-        Err(RpcError::Proto(error)) => warn!("listing recent projects failed: {error:?}"),
-        Err(error) => return Err(error),
-        Ok(other) => warn!("unexpected reply to ListRecentProjects: {other:?}"),
+    if conflict {
+        super::reconcile_membership(conn, sink).await?;
     }
     Ok(())
 }
@@ -211,32 +238,109 @@ pub(super) async fn apply(
     workspace_id: WorkspaceId,
     entries: Vec<Assignment>,
     launch: Vec<String>,
+    expected: ProjectSetupBaseline,
 ) -> Result<(), RpcError> {
     let stored = if conn.project_setup_supported {
-        store_on_daemon(conn, workspace_id, &entries).await?
+        store_on_daemon(conn, workspace_id, &entries, expected).await?
     } else {
-        assignments::save(workspace_id, &entries)
+        match assignments::save_if_current(workspace_id, &entries, &expected) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(SetupSaveError::Conflict),
+            Err(message) => Err(SetupSaveError::Other(message)),
+        }
     };
-    if let Err(message) = stored {
+    if let Err(error) = stored {
+        let conflict = matches!(error, SetupSaveError::Conflict);
         sink.emit(UiEvent::SetupApplied {
             workspace_id,
-            error: Some(message),
+            error: Some(match error {
+                SetupSaveError::Conflict => "Pane setup changed on another client. Close the review and open Settings to review the saved setup.".into(),
+                SetupSaveError::Other(message) => message,
+            }),
         });
+        if conflict && conn.project_setup_supported {
+            super::reconcile_membership(conn, sink).await?;
+        }
         return Ok(());
     }
+    launch_entries(
+        conn,
+        sink,
+        workspace_id,
+        entries
+            .into_iter()
+            .filter(|entry| launch.contains(&entry.id)),
+    )
+    .await
+}
+
+pub(super) async fn launch_stored(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+    workspace_id: WorkspaceId,
+) -> Result<(), RpcError> {
+    // Settings may have changed after the workspace creation reply. Launch
+    // from a fresh read without persisting the creation-time snapshot.
+    let result = match conn.call(ClientMessage::ListWorkspaces).await {
+        Ok(ResponsePayload::Workspaces(workspaces)) => workspaces
+            .into_iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| ProtoError::WorkspaceNotFound(workspace_id).to_string())
+            .and_then(|workspace| {
+                let entries = workspace.setup.ok_or_else(|| {
+                    "This workspace has no saved pane setup. Open Settings to configure it."
+                        .to_owned()
+                })?;
+                // Legacy daemon state may have been written before validation.
+                daedalus_proto::validate_assignments(&entries)?;
+                Ok(entries)
+            }),
+        Ok(_) => Err("Unexpected reply while loading the saved setup.".into()),
+        Err(RpcError::Proto(error)) => Err(error.to_string()),
+        Err(error) => return Err(error),
+    };
+    match result {
+        Ok(entries) => {
+            launch_entries(
+                conn,
+                sink,
+                workspace_id,
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.role == PaneRole::Agent),
+            )
+            .await
+        }
+        Err(message) => {
+            sink.emit(UiEvent::SetupApplied {
+                workspace_id,
+                error: Some(message),
+            });
+            Ok(())
+        }
+    }
+}
+
+async fn launch_entries(
+    conn: &RpcConnection,
+    sink: &Arc<dyn UiEventSink>,
+    workspace_id: WorkspaceId,
+    entries: impl IntoIterator<Item = Assignment>,
+) -> Result<(), RpcError> {
     let mut failures = Vec::new();
-    for entry in entries
-        .into_iter()
-        .filter(|entry| launch.contains(&entry.id))
-    {
+    for entry in entries {
         let name = entry.name.clone();
-        let saved_runner = conn.project_setup_supported && entry.role == PaneRole::Runner;
+        let launch = if conn.project_setup_supported && entry.role == PaneRole::Runner {
+            AssignmentLaunch::ReviewedRunner
+        } else {
+            AssignmentLaunch::Direct
+        };
         match launch_assignment(
             conn,
             sink,
             workspace_id,
             entry,
-            saved_runner,
+            launch,
             DEFAULT_PANE_COLS,
             DEFAULT_PANE_ROWS,
         )
@@ -253,10 +357,7 @@ pub(super) async fn apply(
     });
     if !failures.is_empty() {
         sink.emit(UiEvent::Toast {
-            message: format!(
-                "Workspace saved. Open Settings to edit or retry {}.",
-                failures.join(" · ")
-            ),
+            message: format!("Open Settings to edit or retry {}.", failures.join(" · ")),
             is_error: true,
         });
     }

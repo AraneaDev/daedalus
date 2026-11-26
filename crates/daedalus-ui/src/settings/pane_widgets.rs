@@ -1,4 +1,5 @@
 use super::{Control, SettingsAction, SettingsDialog};
+use crate::workspace_widgets::WorkspaceWidgets;
 use Control::*;
 use daedalus_proto::PaneRole;
 
@@ -6,6 +7,50 @@ impl SettingsDialog {
     pub fn set_automatic_widgets(&mut self, service: bool, runner: bool) {
         self.automatic_service_widget = service;
         self.automatic_runner_widget = runner;
+    }
+
+    pub fn reset_pane_widget_draft(&mut self, widgets: WorkspaceWidgets) {
+        if self.is_pane_widgets_page() && self.widgets != widgets {
+            self.from_end = 0;
+        }
+        self.pane_widget_baseline.clone_from(&widgets);
+        self.widgets = widgets;
+    }
+
+    pub fn receive_pane_widget_snapshot(&mut self, widgets: WorkspaceWidgets) {
+        if self.widgets == self.pane_widget_baseline {
+            self.reset_pane_widget_draft(widgets);
+        }
+    }
+
+    pub fn reconcile_pane_widget_draft(
+        &self,
+        requested: WorkspaceWidgets,
+        saved: WorkspaceWidgets,
+    ) -> Result<WorkspaceWidgets, &'static str> {
+        let baseline = &self.pane_widget_baseline;
+        // Treat enablement and its configuration as one edit. Removing a widget
+        // clears its configuration and must conflict with a concurrent edit to it.
+        let (service, service_enabled) = merge_role(
+            (&baseline.service, baseline.service_enabled),
+            (&self.widgets.service, self.widgets.service_enabled),
+            (&requested.service, requested.service_enabled),
+            (&saved.service, saved.service_enabled),
+        )
+        .ok_or("Service widget settings changed. Reopen Settings to review the saved values.")?;
+        let (runner, runner_enabled) = merge_role(
+            (&baseline.runner, baseline.runner_enabled),
+            (&self.widgets.runner, self.widgets.runner_enabled),
+            (&requested.runner, requested.runner_enabled),
+            (&saved.runner, saved.runner_enabled),
+        )
+        .ok_or("Runner widget settings changed. Reopen Settings to review the saved values.")?;
+        Ok(WorkspaceWidgets {
+            service: service.clone(),
+            runner: runner.clone(),
+            service_enabled,
+            runner_enabled,
+        })
     }
 
     fn widget_present(&self, role: PaneRole) -> bool {
@@ -159,6 +204,16 @@ impl SettingsDialog {
             _ => {}
         }
         SettingsAction::None
+    }
+}
+
+fn merge_role<T: Eq>(baseline: T, draft: T, requested: T, saved: T) -> Option<T> {
+    if draft == baseline || requested == baseline {
+        Some(saved)
+    } else if saved == baseline || saved == requested {
+        Some(requested)
+    } else {
+        None
     }
 }
 

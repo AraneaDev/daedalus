@@ -5,7 +5,7 @@ mod ports;
 pub(crate) use compose::find_compose_file;
 pub use compose::run_compose_down;
 use compose::{
-    ParsedPortEntry, parse_compose_ports, sanitize_compose_project, write_compose_override,
+    ParsedPortEntry, parse_compose_ports, render_compose_override, sanitize_compose_project,
 };
 use dotenv::{rewrite_localhost_url_port, scan_env_file};
 use ports::allocate_port_offset;
@@ -22,6 +22,17 @@ pub struct IsolationPlan {
     pub compose_override_path: Option<PathBuf>,
     pub injected_env: HashMap<String, String>,
     pub remapped_ports: HashMap<u16, u16>,
+}
+
+pub(crate) struct PreparedComposeOverride {
+    path: PathBuf,
+    yaml: String,
+}
+
+impl PreparedComposeOverride {
+    pub(crate) fn install(self) -> io::Result<()> {
+        crate::persistence::write_bytes_atomic(&self.path, self.yaml.as_bytes())
+    }
 }
 
 /// Computes a conflict-free port offset, rewrites `.env` port/URL variables,
@@ -72,6 +83,29 @@ pub fn prepare_workspace_isolation_with_extra_ports(
     reserved_ports: &HashSet<u16>,
     extra_ports: &[u16],
 ) -> io::Result<IsolationPlan> {
+    let (plan, compose_override) = plan_workspace_isolation(
+        name,
+        root_dir,
+        slot_index,
+        caller_env,
+        reserved_ports,
+        extra_ports,
+    )?;
+    if let Some(compose_override) = compose_override {
+        compose_override.install()?;
+    }
+    Ok(plan)
+}
+
+/// Calculates runtime isolation and renders Compose output without writing it.
+pub(crate) fn plan_workspace_isolation(
+    name: &str,
+    root_dir: &Path,
+    slot_index: u16,
+    caller_env: &HashMap<String, String>,
+    reserved_ports: &HashSet<u16>,
+    extra_ports: &[u16],
+) -> io::Result<(IsolationPlan, Option<PreparedComposeOverride>)> {
     let env_scan = scan_env_file(root_dir)?;
     let mut env_lookup = env_scan.all_vars.clone();
     for (k, v) in caller_env {
@@ -120,17 +154,24 @@ pub fn prepare_workspace_isolation_with_extra_ports(
     }
 
     let mut injected_env = HashMap::new();
-    let (compose_project_name, compose_override_path) = match compose_file {
+    let (compose_project_name, compose_override) = match compose_file {
         Some(base_path) => {
             let project = sanitize_compose_project(name, slot_index);
-            let override_path = write_compose_override(root_dir, &compose_services, port_offset)?;
+            let override_path = root_dir.join(".daedalus").join("compose.override.yml");
+            let yaml = render_compose_override(&compose_services, port_offset)?;
             let sep = if cfg!(windows) { ";" } else { ":" };
             injected_env.insert("COMPOSE_PROJECT_NAME".to_string(), project.clone());
             injected_env.insert(
                 "COMPOSE_FILE".to_string(),
                 format!("{}{sep}{}", base_path.display(), override_path.display()),
             );
-            (Some(project), Some(override_path))
+            (
+                Some(project),
+                Some(PreparedComposeOverride {
+                    path: override_path,
+                    yaml,
+                }),
+            )
         }
         None => (None, None),
     };
@@ -152,14 +193,15 @@ pub fn prepare_workspace_isolation_with_extra_ports(
         injected_env.insert(k.clone(), v.clone());
     }
 
-    Ok(IsolationPlan {
+    let plan = IsolationPlan {
         slot_index,
         port_offset,
         compose_project_name,
-        compose_override_path,
+        compose_override_path: compose_override.as_ref().map(|output| output.path.clone()),
         injected_env,
         remapped_ports,
-    })
+    };
+    Ok((plan, compose_override))
 }
 
 #[cfg(test)]

@@ -2,7 +2,8 @@ use crate::client::{ClientError, DaemonClient};
 use crate::{resolve_dir, unexpected_response};
 use clap::Args;
 use daedalus_proto::workbench::{
-    ConflictChoice, WorkbenchState, WorkspaceDocument, WorkspaceImportSource,
+    ConflictChoice, WorkbenchState, WorkspaceDocument, WorkspaceImportPreview,
+    WorkspaceImportSource,
 };
 use daedalus_proto::{ClientMessage, ResponsePayload, WorkspaceId};
 use std::collections::BTreeMap;
@@ -221,11 +222,8 @@ async fn import(
         response => return Err(unexpected_response(response)),
     };
     let resolutions = options.resolve.into_iter().collect::<BTreeMap<_, _>>();
-    let unresolved = preview
-        .conflicts
-        .iter()
-        .any(|conflict| !resolutions.contains_key(&conflict.path));
-    if options.dry_run || unresolved {
+    let preview = resolve_import_preview(client, preview, &resolutions).await?;
+    if options.dry_run || !preview.conflicts.is_empty() {
         if options.json {
             println!("{}", serde_json::to_string_pretty(&preview)?);
         } else {
@@ -262,6 +260,29 @@ async fn import(
     print_state(&state, options.json)
 }
 
+async fn resolve_import_preview(
+    client: &mut DaemonClient,
+    preview: WorkspaceImportPreview,
+    resolutions: &BTreeMap<String, ConflictChoice>,
+) -> Result<WorkspaceImportPreview, ClientError> {
+    if resolutions.is_empty() || preview.conflicts.is_empty() {
+        return Ok(preview);
+    }
+    match client
+        .request(ClientMessage::ResolveWorkspaceImport {
+            workspace_id: preview.workspace_id,
+            revision: preview.revision,
+            incoming: preview.incoming,
+            linked: preview.linked,
+            resolutions: resolutions.clone(),
+        })
+        .await?
+    {
+        ResponsePayload::WorkspaceImportPreview(preview) => Ok(preview),
+        response => Err(unexpected_response(response)),
+    }
+}
+
 pub(super) async fn workbench(
     client: &mut DaemonClient,
     id: WorkspaceId,
@@ -281,12 +302,40 @@ pub(super) async fn update(
     revision: u64,
     document: WorkspaceDocument,
 ) -> Result<WorkbenchState, ClientError> {
+    update_workbench(client, id, revision, document, None).await
+}
+
+pub(super) async fn update_widgets(
+    client: &mut DaemonClient,
+    id: WorkspaceId,
+    revision: u64,
+    document: WorkspaceDocument,
+) -> Result<WorkbenchState, ClientError> {
+    update_workbench(
+        client,
+        id,
+        revision,
+        document,
+        Some(daedalus_proto::workbench::WorkbenchEdit::Widgets),
+    )
+    .await
+}
+
+async fn update_workbench(
+    client: &mut DaemonClient,
+    id: WorkspaceId,
+    revision: u64,
+    document: WorkspaceDocument,
+    edit: Option<daedalus_proto::workbench::WorkbenchEdit>,
+) -> Result<WorkbenchState, ClientError> {
     applied(
         client
             .request(ClientMessage::UpdateWorkbench {
                 workspace_id: id,
                 revision,
                 document,
+                layout_only: false,
+                edit,
             })
             .await?,
     )

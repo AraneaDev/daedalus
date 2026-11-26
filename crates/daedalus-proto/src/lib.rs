@@ -9,7 +9,7 @@ pub mod workbench;
 
 pub use activity::{ActivityCursor, ActivityEntry, ActivityKind, ActivityPage};
 pub use codec::{CodecError, MAX_FRAME_SIZE, read_frame, write_frame};
-pub use project::{Assignment, RecentProject, validate_assignments};
+pub use project::{Assignment, ProjectSetupBaseline, RecentProject, validate_assignments};
 pub use rpc::{
     ClientMessage, ProtoError, Request, ResponsePayload, ServerEvent, ServerMessage,
     SetupInspection,

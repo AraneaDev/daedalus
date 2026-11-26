@@ -1,4 +1,7 @@
-use super::{AppState, ChromeLineSpec, Rect, TextRenderer, Theme};
+use super::{
+    AppState, CHROME_FONT_SIZE_LOGICAL, CHROME_SUB_FONT_SIZE_LOGICAL, ChromeLineSpec, Rect,
+    TextRenderer, Theme,
+};
 
 impl TextRenderer {
     pub(super) fn build_settings_items(&mut self, state: &AppState, theme: &Theme, w: f32, h: f32) {
@@ -8,7 +11,8 @@ impl TextRenderer {
             .min(state.settings.content_scale(modal))
             .min(modal.width / 420.0);
         let dialog = &state.settings;
-        let glyph_width = self.cell_w * (14.0 * scale) / (self.font_size_logical * dpi);
+        let glyph_width =
+            self.cell_w * (CHROME_FONT_SIZE_LOGICAL * scale) / (self.font_size_logical * dpi);
         let mut line = |text: &str, rect: Rect, size: f32, color, bold, centered| {
             let inset = 11.0 * scale;
             let spec = ChromeLineSpec {
@@ -80,7 +84,16 @@ impl TextRenderer {
                 .or_else(|| (c == crate::settings::Control::Role).then(|| "Pane".to_owned()))
             {
                 let caption_width = if dialog.is_custom_page() {
-                    ((caption.chars().count() as f32 * 8.0 + 24.0) * scale).min(r.width * 0.70)
+                    // Line up the editor's values even when neighboring captions differ in length.
+                    // The standalone import path and JSON field carry longer descriptions.
+                    let width = match c {
+                        crate::settings::Control::CustomRoot
+                        | crate::settings::Control::CustomDefinition => {
+                            caption.chars().count() as f32 * 8.0 + 24.0
+                        }
+                        _ => 160.0,
+                    };
+                    (width * scale).min(r.width * 0.68)
                 } else {
                     (100.0 * scale).min(r.width * 0.38)
                 };
@@ -93,16 +106,27 @@ impl TextRenderer {
                 line(
                     &caption,
                     Rect::new(r.x, r.y, caption_width, r.height),
-                    super::CHROME_SUB_FONT_SIZE_LOGICAL,
+                    CHROME_SUB_FONT_SIZE_LOGICAL,
                     theme.text_muted,
                     false,
                     false,
                 );
-                line(value_text, value, 14.0, theme.text_primary, active, false);
+                line(
+                    value_text,
+                    value,
+                    CHROME_FONT_SIZE_LOGICAL,
+                    theme.text_primary,
+                    active,
+                    false,
+                );
                 continue;
             }
             let label = dialog.label(c);
-            let color = if !dialog.enabled(c) {
+            let read_only = dialog.is_import_review_text(c);
+            let enabled = dialog.enabled(c);
+            let color = if read_only {
+                theme.text_primary
+            } else if !enabled {
                 theme.text_muted
             } else if c.primary() {
                 theme.bg_window
@@ -114,16 +138,16 @@ impl TextRenderer {
             line(
                 &label,
                 r,
-                14.0,
+                CHROME_FONT_SIZE_LOGICAL,
                 color,
-                active,
-                !dialog.is_import_review_text(c),
+                active || (enabled && c.primary()),
+                !read_only,
             );
         }
         line(
             dialog.hint(),
             row(modal.height - 87.0 * unit, 32.0 * unit),
-            12.0,
+            CHROME_SUB_FONT_SIZE_LOGICAL,
             if dialog.error.is_some() {
                 theme.status_err
             } else {

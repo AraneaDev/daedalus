@@ -181,11 +181,13 @@ fn templates_can_be_saved_applied_reordered_and_shared_from_the_editor() {
     activate(&mut w, Control::CustomPrev);
     activate(&mut w, Control::CustomPin);
     let pinned = accept_edit(&mut w, id, WorkbenchOperation::Read);
-    assert!(pinned.widgets[w.app.state.settings.custom.selected].pinned);
+    assert!(w.app.state.settings.custom.selected().unwrap().pinned);
+    assert_eq!(pinned.widgets.len(), 2);
     activate(&mut w, Control::CustomRemove);
     let remaining = accept_edit(&mut w, id, WorkbenchOperation::Read);
     assert_eq!(remaining.widgets.len(), 1);
 
+    activate(&mut w, Control::CustomNext);
     activate(&mut w, Control::CustomSharing);
     let path = w.root.path().join("template.toml");
     w.app

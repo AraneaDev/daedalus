@@ -1,3 +1,4 @@
+mod panes;
 mod persistence;
 mod projects;
 mod status;
@@ -5,50 +6,28 @@ mod widget_runtime;
 mod workbench_config;
 mod workbench_import;
 
+use self::panes::DefaultPanes;
+use self::persistence::WorkspaceChange;
 use crate::isolation;
 use crate::journal::Journal;
 use crate::manifest;
 use crate::pane_actor::PaneHandle;
 use crate::persistence::{PersistedRecentProject, PersistedWorkspace, StateStore};
-use crate::runtime_monitor::WorkspaceMonitorTarget;
+use crate::runtime_monitor::{ActiveMonitorTarget, WorkspaceMonitorTarget};
 use crate::shell_integration::ShellIntegration;
 use crate::supervisor::{IsolationMode, Supervisor};
 use crate::workbench::scheduler::WidgetCommands;
 use crate::workbench::store::WorkbenchStore;
 use crate::worktree::{self, WorktreeError};
 use daedalus_proto::{
-    AgentState, Assignment, ContainerHealth, ExternalStatus, FailureTrace, GitWorkspaceStatus,
-    GitWorktreeInfo, PaneId, PaneRole, PaneStatus, PaneSummary, PortMapping, ProtoError,
-    ServerEvent, WorkspaceId, WorkspaceInfo, WorkspaceManifest,
+    AgentState, ContainerHealth, ExternalStatus, FailureTrace, GitWorkspaceStatus, GitWorktreeInfo,
+    PaneId, PaneRole, PaneStatus, PaneSummary, PortMapping, ProtoError, ServerEvent, WorkspaceId,
+    WorkspaceInfo, WorkspaceManifest,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, broadcast};
-
-const DEFAULT_ROLES: [PaneRole; 3] = [PaneRole::Agent, PaneRole::Service, PaneRole::Runner];
-
-enum DefaultPanes {
-    Manual,
-    Pending(HashSet<PaneRole>),
-    Complete,
-}
-
-impl DefaultPanes {
-    fn record_install(&mut self, role: PaneRole, is_default: bool) {
-        if let Self::Pending(roles) = self {
-            // A manually populated workspace keeps the pane arrangement its caller selected.
-            if !is_default && roles.is_empty() {
-                *self = Self::Complete;
-            } else {
-                roles.insert(role);
-                if DEFAULT_ROLES.iter().all(|role| roles.contains(role)) {
-                    *self = Self::Complete;
-                }
-            }
-        }
-    }
-}
 
 struct WorkspaceRecord {
     id: WorkspaceId,
@@ -58,12 +37,15 @@ struct WorkspaceRecord {
     slot_index: u16,
     port_offset: u16,
     compose_project_name: Option<String>,
+    pending_compose_override: Option<isolation::PreparedComposeOverride>,
     git_branch: Option<String>,
     git_status: Option<GitWorkspaceStatus>,
     injected_env: HashMap<String, String>,
     reserved_ports: HashSet<u16>,
     pane_ids: Vec<PaneId>,
     default_panes: DefaultPanes,
+    compose_removed: bool,
+    worktree_removed: bool,
     lifecycle: std::sync::Arc<Mutex<()>>,
     widget_commands: Arc<WidgetCommands>,
     journal: Journal,
@@ -75,6 +57,13 @@ struct WorkspaceRecord {
 }
 
 impl WorkspaceRecord {
+    fn install_compose_override(&mut self) -> std::io::Result<()> {
+        if let Some(compose_override) = self.pending_compose_override.take() {
+            compose_override.install()?;
+        }
+        Ok(())
+    }
+
     fn to_info(&self, panes: Vec<PaneSummary>) -> WorkspaceInfo {
         WorkspaceInfo {
             id: self.id,
@@ -83,7 +72,9 @@ impl WorkspaceRecord {
             slot_index: self.slot_index,
             injected_env: self.injected_env.clone(),
             panes,
-            default_panes_pending: Some(matches!(self.default_panes, DefaultPanes::Pending(_))),
+            default_panes_pending: Some(
+                !self.worktree_removed && matches!(self.default_panes, DefaultPanes::Pending(_)),
+            ),
             port_offset: self.port_offset,
             compose_project_name: self.compose_project_name.clone(),
             git_branch: self.git_branch.clone(),
@@ -123,6 +114,7 @@ impl WorkspaceRecord {
 
 struct PreparedWorkspaceComponents {
     plan: isolation::IsolationPlan,
+    compose_override: Option<isolation::PreparedComposeOverride>,
     git_branch: Option<String>,
     git_status: Option<GitWorkspaceStatus>,
     canonical_root_dir: PathBuf,
@@ -148,7 +140,7 @@ fn prepare_workspace_components(
         .unwrap_or_default();
     merged_env.extend(caller_env);
 
-    let plan = isolation::prepare_workspace_isolation_with_extra_ports(
+    let (plan, compose_override) = isolation::plan_workspace_isolation(
         name,
         root_dir,
         slot_index,
@@ -170,6 +162,7 @@ fn prepare_workspace_components(
     Ok(PreparedWorkspaceComponents {
         project,
         plan,
+        compose_override,
         git_branch,
         git_status,
         canonical_root_dir,
@@ -193,6 +186,7 @@ fn build_workspace_record(
         slot_index: prepared.plan.slot_index,
         port_offset: prepared.plan.port_offset,
         compose_project_name: prepared.plan.compose_project_name,
+        pending_compose_override: prepared.compose_override,
         git_branch: prepared.git_branch,
         git_status: prepared.git_status,
         injected_env: prepared.plan.injected_env,
@@ -203,6 +197,8 @@ fn build_workspace_record(
         } else {
             DefaultPanes::Pending(HashSet::new())
         },
+        compose_removed: false,
+        worktree_removed: false,
         lifecycle: Default::default(),
         widget_commands: Default::default(),
         journal: Journal::default(),
@@ -222,12 +218,12 @@ pub struct Registry {
     state_store: Option<StateStore>,
     pub(crate) workbench_store: WorkbenchStore,
     persist_lock: Arc<Mutex<persistence::PersistenceWriteState>>,
-    unresolved_legacy_roots: RwLock<Vec<PersistedWorkspace>>,
+    deferred_workspaces: Arc<RwLock<Vec<PersistedWorkspace>>>,
     create_lock: Mutex<()>,
-    recent_projects: RwLock<Vec<PersistedRecentProject>>,
-    project_setups: Arc<RwLock<HashMap<PathBuf, Vec<Assignment>>>>,
+    recent_projects: Arc<RwLock<Vec<PersistedRecentProject>>>,
+    project_setups: Arc<RwLock<projects::ProjectSetupState>>,
     worktrees_dir: std::sync::RwLock<Option<PathBuf>>,
-    workspaces: RwLock<HashMap<WorkspaceId, WorkspaceRecord>>,
+    workspaces: Arc<RwLock<HashMap<WorkspaceId, WorkspaceRecord>>>,
     panes: RwLock<HashMap<PaneId, PaneHandle>>,
 }
 
@@ -258,12 +254,12 @@ impl Registry {
             state_store,
             workbench_store: WorkbenchStore::new(workbench_directory),
             persist_lock: Arc::new(Mutex::new(persistence::PersistenceWriteState::Unchecked)),
-            unresolved_legacy_roots: RwLock::new(Vec::new()),
+            deferred_workspaces: Default::default(),
             create_lock: Mutex::new(()),
-            recent_projects: RwLock::new(Vec::new()),
-            project_setups: Arc::new(RwLock::new(HashMap::new())),
+            recent_projects: Default::default(),
+            project_setups: Default::default(),
             worktrees_dir: std::sync::RwLock::new(None),
-            workspaces: RwLock::new(HashMap::new()),
+            workspaces: Default::default(),
             panes: RwLock::new(HashMap::new()),
         }
     }
@@ -321,11 +317,12 @@ impl Registry {
         manual_launch: bool,
     ) -> Result<WorkspaceInfo, ProtoError> {
         let create_guard = self.create_lock.lock().await;
-        let info = self
+        let mut info = self
             .register_workspace(name, root_dir, env, manual_launch)
             .await?;
         drop(create_guard);
-        Ok(self.finish_workspace_creation(info).await)
+        self.attach_project_setup(&mut info).await;
+        Ok(info)
     }
 
     /// Registers the workspace while the caller holds `create_lock`.
@@ -336,13 +333,22 @@ impl Registry {
         env: HashMap<String, String>,
         manual_launch: bool,
     ) -> Result<WorkspaceInfo, ProtoError> {
+        let root_dir =
+            std::path::absolute(root_dir).map_err(|err| ProtoError::IoError(err.to_string()))?;
+        let deferred = self.find_deferred_workspace(&root_dir).await;
         let record = self
-            .prepare_workspace_record(name, root_dir, env, manual_launch)
+            .prepare_workspace_record(name, root_dir, env, manual_launch, deferred)
             .await?;
-        Ok(self.publish_workspace(record).await)
+        self.publish_workspace(record).await
     }
 
-    /// Allocates an ID and a slot without exposing the workspace to clients.
+    fn available_slot(used_slots: &HashSet<u16>, preferred: Option<u16>) -> Option<u16> {
+        preferred
+            .filter(|slot| !used_slots.contains(slot))
+            .or_else(|| (0..=u16::MAX).find(|slot| !used_slots.contains(slot)))
+    }
+
+    /// Allocates a slot and prepares runtime settings without exposing the workspace.
     /// The caller holds `create_lock` until it publishes or drops the record.
     async fn prepare_workspace_record(
         &self,
@@ -350,6 +356,7 @@ impl Registry {
         root_dir: PathBuf,
         env: HashMap<String, String>,
         manual_launch: bool,
+        deferred: Option<PersistedWorkspace>,
     ) -> Result<WorkspaceRecord, ProtoError> {
         let root_dir =
             std::path::absolute(root_dir).map_err(|err| ProtoError::IoError(err.to_string()))?;
@@ -362,10 +369,25 @@ impl Registry {
 
         let (slot_index, reserved_ports) = {
             let ws_map = self.workspaces.read().await;
-            let used_slots: HashSet<u16> = ws_map.values().map(|ws| ws.slot_index).collect();
-            let slot_index = (0..=u16::MAX)
-                .find(|slot| !used_slots.contains(slot))
-                .ok_or_else(|| ProtoError::Internal("no workspace slots available".to_string()))?;
+            let pending = self.deferred_workspaces.read().await;
+            let used_slots: HashSet<u16> = ws_map
+                .values()
+                .map(|ws| ws.slot_index)
+                .chain(
+                    pending
+                        .iter()
+                        .filter(|entry| {
+                            entry.root_dir.is_absolute()
+                                && deferred.as_ref().is_none_or(|retry| retry.id != entry.id)
+                        })
+                        .map(|entry| entry.slot_index),
+                )
+                .collect();
+            let slot_index =
+                Self::available_slot(&used_slots, deferred.as_ref().map(|entry| entry.slot_index))
+                    .ok_or_else(|| {
+                        ProtoError::Internal("no workspace slots available".to_string())
+                    })?;
             let reserved_ports: HashSet<u16> = ws_map
                 .values()
                 .flat_map(|ws| ws.reserved_ports.iter().copied())
@@ -373,37 +395,50 @@ impl Registry {
             (slot_index, reserved_ports)
         };
 
-        let name_clone = name.clone();
-        let root_clone = root_dir.clone();
+        let mut entry = deferred.unwrap_or_else(|| PersistedWorkspace {
+            id: WorkspaceId::new(),
+            name,
+            root_dir,
+            slot_index,
+            manual_launch,
+            agent_preset: None,
+        });
+        entry.slot_index = slot_index;
+        Self::prepare_registered_workspace(&entry, env, reserved_ports).await
+    }
+
+    async fn prepare_registered_workspace(
+        entry: &PersistedWorkspace,
+        env: HashMap<String, String>,
+        reserved_ports: HashSet<u16>,
+    ) -> Result<WorkspaceRecord, ProtoError> {
+        let name = entry.name.clone();
+        let root_dir = entry.root_dir.clone();
+        let slot_index = entry.slot_index;
         let prepared = tokio::task::spawn_blocking(move || {
-            prepare_workspace_components(&name_clone, &root_clone, slot_index, env, &reserved_ports)
+            prepare_workspace_components(&name, &root_dir, slot_index, env, &reserved_ports)
         })
         .await
         .map_err(|e| ProtoError::Internal(format!("workspace preparation task failed: {e}")))?
         .map_err(|e| ProtoError::IoError(e.to_string()))?;
 
-        let id = WorkspaceId::new();
         Ok(build_workspace_record(
-            id,
-            name,
-            root_dir,
+            entry.id,
+            entry.name.clone(),
+            entry.root_dir.clone(),
             prepared,
-            manual_launch,
+            entry.manual_launch,
         ))
     }
 
-    async fn publish_workspace(&self, record: WorkspaceRecord) -> WorkspaceInfo {
+    async fn publish_workspace(
+        &self,
+        record: WorkspaceRecord,
+    ) -> Result<WorkspaceInfo, ProtoError> {
         let info = record.to_info(Vec::new());
-        self.record_recent_project(&info.name, &info.root_dir).await;
-        self.workspaces.write().await.insert(info.id, record);
-        self.notify_membership();
-        info
-    }
-
-    async fn finish_workspace_creation(&self, mut info: WorkspaceInfo) -> WorkspaceInfo {
-        self.persist_state().await;
-        self.attach_project_setup(&mut info).await;
-        info
+        self.commit_workspace_change(WorkspaceChange::Register(Box::new(record)))
+            .await?;
+        Ok(info)
     }
 
     pub async fn discover_worktrees(
@@ -463,7 +498,7 @@ impl Registry {
         // Git hooks can run while other workspace requests proceed. Serialize registration
         // and rollback from here, and check whether a request already claimed this checkout.
         let create_guard = self.create_lock.lock().await;
-        let info = match self
+        let mut info = match self
             .register_workspace(name, path.clone(), env, false)
             .await
         {
@@ -491,7 +526,8 @@ impl Registry {
             }
         };
         drop(create_guard);
-        Ok(self.finish_workspace_creation(info).await)
+        self.attach_project_setup(&mut info).await;
+        Ok(info)
     }
 
     pub async fn list_workspaces(&self) -> Vec<WorkspaceInfo> {
@@ -564,319 +600,6 @@ impl Registry {
         Ok(lifecycle.lock_owned().await)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn spawn_pane(
-        &self,
-        workspace_id: WorkspaceId,
-        role: PaneRole,
-        command: Option<Vec<String>>,
-        shell: Option<String>,
-        cols: u16,
-        rows: u16,
-        pane_env: HashMap<String, String>,
-    ) -> Result<PaneSummary, ProtoError> {
-        let _lifecycle = self.lock_workspace_lifecycle(workspace_id).await?;
-        self.install_pane(
-            workspace_id,
-            role,
-            command,
-            shell,
-            cols,
-            rows,
-            pane_env,
-            None,
-            false,
-            None,
-        )
-        .await
-    }
-
-    pub(crate) async fn launch_runner_assignment(
-        &self,
-        workspace_id: WorkspaceId,
-        assignment_id: &str,
-        cols: u16,
-        rows: u16,
-    ) -> Result<PaneSummary, ProtoError> {
-        let _lifecycle = self.lock_workspace_lifecycle(workspace_id).await?;
-        let assignment = self
-            .workbench(workspace_id)
-            .await?
-            .document
-            .assignments
-            .into_iter()
-            .find(|entry| entry.id == assignment_id && entry.role == PaneRole::Runner)
-            .ok_or_else(|| {
-                ProtoError::InvalidRequest(format!("No saved runner assignment '{assignment_id}'"))
-            })?;
-        self.install_pane(
-            workspace_id,
-            PaneRole::Runner,
-            Some(assignment.argv),
-            None,
-            cols,
-            rows,
-            HashMap::new(),
-            None,
-            false,
-            Some(assignment.id),
-        )
-        .await
-    }
-
-    pub async fn ensure_default_pane(
-        &self,
-        workspace_id: WorkspaceId,
-        role: PaneRole,
-        command: Option<Vec<String>>,
-        cols: u16,
-        rows: u16,
-    ) -> Result<daedalus_proto::ResponsePayload, ProtoError> {
-        use daedalus_proto::ResponsePayload;
-        let _lifecycle = self.lock_workspace_lifecycle(workspace_id).await?;
-        let workspaces = self.workspaces.read().await;
-        let ws = workspaces
-            .get(&workspace_id)
-            .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
-        if matches!(&ws.default_panes, DefaultPanes::Pending(done) if !done.contains(&role)) {
-            drop(workspaces);
-            let workbench = self.workbench(workspace_id).await?;
-            let saved = (workbench.revision > 0)
-                .then(|| {
-                    workbench
-                        .document
-                        .assignments
-                        .into_iter()
-                        .find(|entry| entry.role == role)
-                })
-                .flatten();
-            let assignment_id = saved
-                .as_ref()
-                .filter(|_| role == PaneRole::Runner)
-                .map(|entry| entry.id.clone());
-            let command = if let Some(saved) = saved {
-                if role == PaneRole::Agent && saved.argv == ["shell"] {
-                    None
-                } else {
-                    Some(saved.argv)
-                }
-            } else {
-                command
-            };
-            return self
-                .install_pane(
-                    workspace_id,
-                    role,
-                    command,
-                    None,
-                    cols,
-                    rows,
-                    HashMap::new(),
-                    None,
-                    true,
-                    assignment_id,
-                )
-                .await
-                .map(ResponsePayload::PaneSpawned);
-        }
-
-        let existing = {
-            let panes = self.panes.read().await;
-            ws.pane_ids
-                .iter()
-                .rev()
-                .filter_map(|id| panes.get(id))
-                .find(|pane| pane.role() == role)
-                .cloned()
-        };
-        drop(workspaces);
-        let summary = match existing {
-            Some(handle) => Some(handle.summary().await?),
-            None => None,
-        };
-        Ok(ResponsePayload::DefaultPaneExisting(summary))
-    }
-
-    pub async fn replace_agent_pane(
-        &self,
-        workspace_id: WorkspaceId,
-        old_pane_id: Option<PaneId>,
-        command: Option<Vec<String>>,
-        cols: u16,
-        rows: u16,
-    ) -> Result<PaneSummary, ProtoError> {
-        let _lifecycle = self.lock_workspace_lifecycle(workspace_id).await?;
-        {
-            let workspaces = self.workspaces.read().await;
-            let ws = workspaces
-                .get(&workspace_id)
-                .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
-            let panes = self.panes.read().await;
-            let mut agents = ws
-                .pane_ids
-                .iter()
-                .filter(|id| panes.get(id).is_some_and(|p| p.role() == PaneRole::Agent));
-            match old_pane_id {
-                Some(id) if !agents.any(|agent_id| *agent_id == id) => {
-                    return Err(ProtoError::PaneNotFound(id));
-                }
-                None if agents.next().is_some() => {
-                    return Err(ProtoError::InvalidRequest(
-                        "workspace already has an Agent pane".into(),
-                    ));
-                }
-                _ => {}
-            }
-        }
-        self.install_pane(
-            workspace_id,
-            PaneRole::Agent,
-            command,
-            None,
-            cols,
-            rows,
-            HashMap::new(),
-            old_pane_id,
-            false,
-            None,
-        )
-        .await
-    }
-
-    /// The caller holds the workspace lifecycle lock until installation completes.
-    #[allow(clippy::too_many_arguments)]
-    async fn install_pane(
-        &self,
-        workspace_id: WorkspaceId,
-        role: PaneRole,
-        command: Option<Vec<String>>,
-        shell: Option<String>,
-        cols: u16,
-        rows: u16,
-        pane_env: HashMap<String, String>,
-        old_pane_id: Option<PaneId>,
-        is_default: bool,
-        assignment_id: Option<String>,
-    ) -> Result<PaneSummary, ProtoError> {
-        let (root_dir, mut merged_env, journal, manifest_preset) = {
-            let ws_map = self.workspaces.read().await;
-            let ws = ws_map
-                .get(&workspace_id)
-                .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
-            (
-                ws.root_dir.clone(),
-                ws.injected_env.clone(),
-                ws.journal.clone(),
-                ws.manifest
-                    .as_ref()
-                    .filter(|_| role == PaneRole::Agent)
-                    .filter(|manifest| {
-                        command.as_ref().is_some_and(|argv| {
-                            !argv.is_empty() && manifest.agent_command.as_ref() == Some(argv)
-                        })
-                    })
-                    .and_then(|manifest| manifest.agent_preset.as_deref())
-                    .and_then(daedalus_proto::canonical_agent_preset),
-            )
-        };
-        merged_env.extend(pane_env);
-
-        let pane_id = PaneId::new();
-        let launch = self
-            .shell_integration
-            .build_launch_spec(command.as_deref(), shell.as_deref());
-
-        let mut spawned = self
-            .supervisor
-            .spawn_pty(
-                workspace_id,
-                pane_id,
-                role,
-                &root_dir,
-                cols,
-                rows,
-                &launch,
-                &merged_env,
-            )
-            .map_err(ProtoError::SpawnFailed)?;
-        if spawned.launch_preset.is_none() {
-            spawned.launch_preset = manifest_preset.map(str::to_owned);
-        }
-
-        let handle = PaneHandle::spawn_journaled(
-            workspace_id,
-            pane_id,
-            role,
-            cols,
-            rows,
-            spawned,
-            self.event_tx.clone(),
-            journal,
-        )
-        .with_assignment_id(assignment_id);
-
-        let summary = match handle.summary().await {
-            Ok(s) => s,
-            Err(e) => {
-                handle.close().await;
-                return Err(e);
-            }
-        };
-
-        let previous = {
-            let mut workspaces = self.workspaces.write().await;
-            let ws = workspaces
-                .get_mut(&workspace_id)
-                .expect("workspace lifecycle lock held");
-            let mut panes = self.panes.write().await;
-            let previous = old_pane_id.and_then(|old| {
-                ws.pane_ids.retain(|id| *id != old);
-                panes.remove(&old)
-            });
-            ws.pane_ids.push(pane_id);
-            ws.default_panes.record_install(role, is_default);
-            panes.insert(pane_id, handle);
-            previous
-        };
-        self.notify_membership();
-        if let Some(previous) = previous {
-            previous.close().await;
-        }
-
-        Ok(summary)
-    }
-
-    pub async fn get_pane(&self, pane_id: PaneId) -> Result<PaneHandle, ProtoError> {
-        self.panes
-            .read()
-            .await
-            .get(&pane_id)
-            .cloned()
-            .ok_or(ProtoError::PaneNotFound(pane_id))
-    }
-
-    pub async fn close_pane(&self, pane_id: PaneId) -> Result<(), ProtoError> {
-        let workspace_id = self.get_pane(pane_id).await?.workspace_id();
-        let _lifecycle = self.lock_workspace_lifecycle(workspace_id).await?;
-        let handle = self
-            .panes
-            .write()
-            .await
-            .remove(&pane_id)
-            .ok_or(ProtoError::PaneNotFound(pane_id))?;
-        if let Some(ws) = self
-            .workspaces
-            .write()
-            .await
-            .get_mut(&handle.workspace_id())
-        {
-            ws.pane_ids.retain(|id| *id != pane_id);
-        }
-        self.notify_membership();
-        handle.close().await;
-        Ok(())
-    }
-
     fn notify_membership(&self) {
         let _ = self.event_tx.send(ServerEvent::WorkspaceMembershipChanged);
     }
@@ -888,12 +611,6 @@ impl Registry {
         remove_worktree: bool,
         force_remove_worktree: bool,
     ) -> Result<(), ProtoError> {
-        let project = {
-            let ws_map = self.workspaces.read().await;
-            ws_map
-                .get(&workspace_id)
-                .map(|ws| (ws.name.clone(), ws.root_dir.clone()))
-        };
         self.close_workspace_internal(
             workspace_id,
             compose_down,
@@ -901,12 +618,7 @@ impl Registry {
             force_remove_worktree,
             true,
         )
-        .await?;
-        if let Some((name, root_dir)) = project {
-            self.record_recent_project(&name, &root_dir).await;
-            self.persist_state().await;
-        }
-        Ok(())
+        .await
     }
 
     async fn close_workspace_internal(
@@ -918,12 +630,18 @@ impl Registry {
         persist: bool,
     ) -> Result<(), ProtoError> {
         let _lifecycle = self.lock_workspace_lifecycle(workspace_id).await?;
-        let (root_dir, project) = {
+        let (root_dir, project, remove_worktree) = {
             let workspaces = self.workspaces.read().await;
             let ws = workspaces
                 .get(&workspace_id)
                 .ok_or(ProtoError::WorkspaceNotFound(workspace_id))?;
-            (ws.root_dir.clone(), ws.compose_project_name.clone())
+            (
+                ws.root_dir.clone(),
+                ws.compose_project_name
+                    .clone()
+                    .filter(|_| compose_down && !ws.compose_removed),
+                remove_worktree && !ws.worktree_removed,
+            )
         };
         if remove_worktree {
             let path = root_dir.clone();
@@ -948,22 +666,8 @@ impl Registry {
                 .drain(..)
                 .filter_map(|id| panes.remove(&id))
                 .collect();
-            if (remove_worktree || (compose_down && project.is_some()))
-                && !handles.is_empty()
-                && !matches!(ws.default_panes, DefaultPanes::Manual)
-            {
-                // Cleanup can still fail. Reopen roles drained by this close while
-                // preserving any roles the user had already left closed.
-                let mut finished = match &ws.default_panes {
-                    DefaultPanes::Pending(roles) => roles.clone(),
-                    DefaultPanes::Manual | DefaultPanes::Complete => {
-                        DEFAULT_ROLES.into_iter().collect()
-                    }
-                };
-                for handle in &handles {
-                    finished.remove(&handle.role());
-                }
-                ws.default_panes = DefaultPanes::Pending(finished);
+            if persist {
+                ws.default_panes.record_drained(&handles);
             }
             handles
         };
@@ -972,7 +676,7 @@ impl Registry {
             handle.close().await;
         }
 
-        let project = project.filter(|_| compose_down);
+        let compose_removed = project.is_some();
         if let Err(error) = Self::remove_workspace_resources(
             root_dir,
             project,
@@ -987,12 +691,34 @@ impl Registry {
             return Err(error);
         }
 
-        if let Some(workspace) = self.workspaces.write().await.remove(&workspace_id) {
-            workspace.widget_commands.close();
-        }
-        self.notify_membership();
         if persist {
-            self.persist_state().await;
+            if (compose_removed || remove_worktree)
+                && let Some(workspace) = self.workspaces.write().await.get_mut(&workspace_id)
+            {
+                workspace.compose_removed |= compose_removed;
+                workspace.worktree_removed |= remove_worktree;
+            }
+            if let Err(error) = self
+                .commit_workspace_change(WorkspaceChange::Close(workspace_id))
+                .await
+            {
+                if had_panes || compose_removed || remove_worktree {
+                    self.notify_membership();
+                    return Err(ProtoError::IoError(format!(
+                        "Workspace cleanup completed and the registration was retained for retry. {error}"
+                    )));
+                }
+                return Err(error);
+            }
+        } else {
+            if let Some(workspace) = self.workspaces.write().await.remove(&workspace_id) {
+                workspace.widget_commands.close();
+            }
+            self.project_setups
+                .write()
+                .await
+                .forget_workspace(workspace_id);
+            self.notify_membership();
         }
         Ok(())
     }
@@ -1194,22 +920,14 @@ impl Registry {
                 ProtoError::InvalidRequest(format!("no live {} pane in workspace", action.target))
             })?;
 
-        let data = match action.target {
-            PaneRole::Agent => {
-                let mut bytes = daedalus_proto::wrap_bracketed_paste(action.command.as_bytes());
-                bytes.push(b'\r');
-                bytes
-            }
-            PaneRole::Service | PaneRole::Runner => {
-                let mut bytes = action.command.into_bytes();
-                #[cfg(windows)]
-                bytes.extend_from_slice(b"\r\n");
-                #[cfg(not(windows))]
-                bytes.push(b'\n');
-                bytes
-            }
-        };
-
+        let mut data = action.command.into_bytes();
+        if action.target == PaneRole::Agent {
+            return pane_handle.paste_and_submit(data).await;
+        }
+        #[cfg(windows)]
+        data.extend_from_slice(b"\r\n");
+        #[cfg(not(windows))]
+        data.push(b'\n');
         pane_handle.send_input(data).await
     }
 
@@ -1253,22 +971,37 @@ impl Registry {
     }
 
     pub async fn monitor_targets(&self) -> Vec<WorkspaceMonitorTarget> {
+        self.monitor_targets_with_roots()
+            .await
+            .into_iter()
+            .map(|target| target.snapshot)
+            .collect()
+    }
+
+    pub(crate) async fn monitor_targets_with_roots(&self) -> Vec<ActiveMonitorTarget> {
         let ws_map = self.workspaces.read().await;
         let pane_map = self.panes.read().await;
         ws_map
             .values()
             .map(|ws| {
-                let root_pids = ws
+                let monitor_roots: Vec<_> = ws
                     .pane_ids
                     .iter()
                     .filter_map(|pid| pane_map.get(pid))
-                    .filter_map(|handle| handle.root_pid())
+                    .filter_map(PaneHandle::monitor_root)
                     .collect();
-                WorkspaceMonitorTarget {
-                    workspace_id: ws.id,
-                    root_dir: ws.root_dir.clone(),
-                    compose_project_name: ws.compose_project_name.clone(),
-                    root_pids,
+                let root_pids = monitor_roots
+                    .iter()
+                    .filter_map(|root| root.live_pid())
+                    .collect();
+                ActiveMonitorTarget {
+                    snapshot: WorkspaceMonitorTarget {
+                        workspace_id: ws.id,
+                        root_dir: ws.root_dir.clone(),
+                        compose_project_name: ws.compose_project_name.clone(),
+                        root_pids,
+                    },
+                    monitor_roots,
                 }
             })
             .collect()
@@ -2031,6 +1764,8 @@ mod tests {
         .expect("timed out waiting for PaneExited");
 
         assert_eq!(exit_code, Some(42));
+        assert!(registry.get_pane(summary.id).await.is_ok());
+        assert!(registry.monitor_targets().await[0].root_pids.is_empty());
         registry.close_all().await;
     }
 
@@ -2160,6 +1895,240 @@ SHARED_KEY = "from_manifest"
     }
 
     #[tokio::test]
+    async fn failed_lifecycle_snapshot_keeps_registration_retriable_and_consistent() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.json");
+        let backup = dir.path().join("state.saved");
+        let open_registry = || {
+            Registry::new_with_state_store(
+                test_supervisor(),
+                ShellIntegration::prepare(dir.path()).unwrap(),
+                broadcast::channel(8).0,
+                Some(StateStore::new(state_path.clone())),
+            )
+        };
+        let registry = open_registry();
+        let project = dir.path().join("project");
+        let other = dir.path().join("other");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let saved = registry
+            .create_workspace("existing".into(), project, HashMap::new())
+            .await
+            .unwrap();
+
+        std::fs::rename(&state_path, &backup).unwrap();
+        std::fs::create_dir(&state_path).unwrap();
+        let mut events = registry.subscribe_events();
+        let failed_create = registry
+            .create_workspace("unpublished".into(), other.clone(), HashMap::new())
+            .await;
+        let failed_close = registry
+            .close_workspace(saved.id, false, false, false)
+            .await;
+        assert!(
+            matches!(failed_create, Err(ProtoError::IoError(_))),
+            "{failed_create:?}"
+        );
+        assert!(
+            matches!(failed_close, Err(ProtoError::IoError(_))),
+            "{failed_close:?}"
+        );
+        assert_eq!(registry.list_workspaces().await[0].id, saved.id);
+        assert_eq!(registry.list_workspaces().await.len(), 1);
+        assert!(registry.recent_projects().await.is_empty());
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        std::fs::remove_dir(&state_path).unwrap();
+        std::fs::rename(&backup, &state_path).unwrap();
+        assert_eq!(
+            StateStore::new(state_path.clone())
+                .load()
+                .unwrap()
+                .workspaces[0]
+                .id,
+            saved.id
+        );
+        registry
+            .close_workspace(saved.id, false, false, false)
+            .await
+            .unwrap();
+        let created = registry
+            .create_workspace("persisted".into(), other, HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(created.slot_index, saved.slot_index);
+        drop(registry);
+
+        let registry = open_registry();
+        assert_eq!(registry.restore_persisted_workspaces().await.unwrap(), 1);
+        assert_eq!(registry.list_workspaces().await[0].id, created.id);
+    }
+
+    #[tokio::test]
+    async fn failed_registration_preserves_the_existing_compose_override() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.json");
+        let backup = dir.path().join("state.saved");
+        let registry = Registry::new_with_state_store(
+            test_supervisor(),
+            ShellIntegration::prepare(dir.path()).unwrap(),
+            broadcast::channel(8).0,
+            Some(StateStore::new(state_path.clone())),
+        );
+        std::fs::write(
+            dir.path().join("compose.yml"),
+            "services:\n  app:\n    ports:\n      - '18640:80'\n",
+        )
+        .unwrap();
+        let first = registry
+            .create_workspace("existing".into(), dir.path().into(), HashMap::new())
+            .await
+            .unwrap();
+        let override_path = dir.path().join(".daedalus/compose.override.yml");
+        let original = std::fs::read(&override_path).unwrap();
+
+        std::fs::rename(&state_path, &backup).unwrap();
+        std::fs::create_dir(&state_path).unwrap();
+        let failed = registry
+            .create_workspace("rejected".into(), dir.path().into(), HashMap::new())
+            .await;
+        assert!(matches!(failed, Err(ProtoError::IoError(_))), "{failed:?}");
+        assert_eq!(std::fs::read(&override_path).unwrap(), original);
+        assert_eq!(registry.list_workspaces().await[0].id, first.id);
+    }
+
+    #[tokio::test]
+    async fn failed_compose_install_restores_the_previous_workspace_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.json");
+        let store = StateStore::new(state_path);
+        let registry = Registry::new_with_state_store(
+            test_supervisor(),
+            ShellIntegration::prepare(dir.path()).unwrap(),
+            broadcast::channel(8).0,
+            Some(store.clone()),
+        );
+        registry
+            .create_workspace("existing".into(), dir.path().into(), HashMap::new())
+            .await
+            .unwrap();
+        let previous = store.load().unwrap();
+        let project = dir.path().join("project");
+        let override_path = project.join(".daedalus/compose.override.yml");
+        std::fs::create_dir_all(&override_path).unwrap();
+        std::fs::write(project.join("compose.yml"), "services: {}\n").unwrap();
+        let mut events = registry.subscribe_events();
+
+        let result = registry
+            .create_workspace("blocked".into(), project.clone(), HashMap::new())
+            .await;
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to write the workspace Compose override")
+        );
+        assert_eq!(store.load().unwrap(), previous);
+        assert_eq!(registry.list_workspaces().await.len(), 1);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        std::fs::remove_dir(&override_path).unwrap();
+        registry
+            .create_workspace("retry".into(), project, HashMap::new())
+            .await
+            .unwrap();
+        assert!(override_path.is_file());
+    }
+
+    #[tokio::test]
+    async fn failed_worktree_snapshot_rolls_back_creation_and_allows_close_retry() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        let state_path = dir.path().join("state.json");
+        let backup = dir.path().join("state.saved");
+        let registry = Registry::new_with_state_store(
+            test_supervisor(),
+            ShellIntegration::prepare(dir.path()).unwrap(),
+            broadcast::channel(16).0,
+            Some(StateStore::new(state_path.clone())),
+        );
+        registry.set_worktrees_dir(dir.path().join("worktrees"));
+        let original = registry
+            .create_workspace("original".into(), repo.clone(), HashMap::new())
+            .await
+            .unwrap();
+        let block_save = || {
+            std::fs::rename(&state_path, &backup).unwrap();
+            std::fs::create_dir(&state_path).unwrap();
+        };
+        let recover = || {
+            std::fs::remove_dir(&state_path).unwrap();
+            std::fs::rename(&backup, &state_path).unwrap();
+        };
+        let create = || {
+            registry.create_worktree_workspace(repo.clone(), "topic".into(), true, HashMap::new())
+        };
+        block_save();
+        assert!(matches!(create().await, Err(ProtoError::IoError(_))));
+        assert_eq!(registry.list_workspaces().await.len(), 1);
+        recover();
+        let worktree = create().await.unwrap();
+
+        block_save();
+        let error = registry
+            .close_workspace(worktree.id, false, true, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("registration was retained for retry")
+        );
+        assert!(!worktree.root_dir.exists());
+        assert_eq!(registry.list_workspaces().await.len(), 2);
+        recover();
+        registry
+            .close_workspace(worktree.id, false, true, false)
+            .await
+            .unwrap();
+        let loaded = StateStore::new(state_path).load().unwrap();
+        assert_eq!(loaded.workspaces.len(), 1);
+        assert_eq!(loaded.workspaces[0].id, original.id);
+    }
+
+    #[tokio::test]
     async fn rejected_snapshots_survive_workspace_mutations() {
         for original in [br#"{ "version": 99 }"#.as_slice(), b"{invalid json"] {
             let dir = TempDir::new().unwrap();
@@ -2216,6 +2185,84 @@ SHARED_KEY = "from_manifest"
             .unwrap();
         assert!(store.load().unwrap().workspaces.contains(&unresolved));
         assert_eq!(registry.list_workspaces().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restore_failure_preserves_registration_for_restart_and_explicit_retry() {
+        for restart in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let root = dir.path().join("project");
+            let other = dir.path().join("other");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::create_dir(&other).unwrap();
+            std::fs::write(
+                root.join(".daedalus.toml"),
+                "[agent]\npreset = \"claude\"\n[env]\nSAVED_SETUP = \"kept\"\n",
+            )
+            .unwrap();
+            let store = StateStore::new(dir.path().join("state.json"));
+            let open_registry = || {
+                Registry::new_with_state_store(
+                    test_supervisor(),
+                    ShellIntegration::prepare(dir.path()).unwrap(),
+                    broadcast::channel(8).0,
+                    Some(store.clone()),
+                )
+            };
+            let original = open_registry()
+                .create_workspace_with_mode("original".into(), root.clone(), HashMap::new(), true)
+                .await
+                .unwrap();
+            let persisted = store.load().unwrap().workspaces.remove(0);
+            std::fs::write(root.join(".env"), [0xff]).unwrap();
+
+            let unavailable = open_registry();
+            assert_eq!(unavailable.restore_persisted_workspaces().await.unwrap(), 0);
+            assert_eq!(
+                store.load().unwrap().workspaces,
+                std::slice::from_ref(&persisted)
+            );
+            assert!(unavailable.list_workspaces().await.is_empty());
+            let other_workspace = unavailable
+                .create_workspace("other".into(), other, HashMap::new())
+                .await
+                .unwrap();
+            assert_ne!(other_workspace.slot_index, original.slot_index);
+            assert!(store.load().unwrap().workspaces.contains(&persisted));
+
+            let alias = root.join("..").join("project");
+            assert!(
+                unavailable
+                    .create_workspace("retry".into(), alias.clone(), HashMap::new())
+                    .await
+                    .is_err()
+            );
+            assert!(store.load().unwrap().workspaces.contains(&persisted));
+            std::fs::write(root.join(".env"), "PORT=21470\n").unwrap();
+
+            let recovered = if restart {
+                let registry = open_registry();
+                assert_eq!(registry.restore_persisted_workspaces().await.unwrap(), 2);
+                registry
+                    .workspace_for_directory(root.clone())
+                    .await
+                    .unwrap()
+            } else {
+                unavailable
+                    .create_workspace("retry".into(), alias, HashMap::new())
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(recovered.id, original.id);
+            assert_eq!(recovered.name, original.name);
+            assert_eq!(recovered.root_dir, original.root_dir);
+            assert_eq!(recovered.slot_index, original.slot_index);
+            assert!(!recovered.needs_default_panes());
+            assert_eq!(recovered.injected_env.get("SAVED_SETUP").unwrap(), "kept");
+            let state = store.load().unwrap();
+            assert_eq!(state.workspaces.len(), 2);
+            assert!(state.workspaces.contains(&persisted));
+        }
     }
 
     #[tokio::test]

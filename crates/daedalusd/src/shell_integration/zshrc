@@ -1,0 +1,30 @@
+# Daedalus non-destructive zsh shell integration (OSC 7 + OSC 133)
+export ZDOTDIR="${DAEDALUS_ORIG_ZDOTDIR:-$HOME}"
+if [ -r "$ZDOTDIR/.zshrc" ]; then
+    source "$ZDOTDIR/.zshrc"
+fi
+
+autoload -Uz add-zsh-hook
+
+__daedalus_first_prompt=1
+
+__daedalus_precmd() {
+    local exit_code=$?
+    if [[ "$__daedalus_first_prompt" -eq 0 ]]; then
+        printf '\033]133;D;%d\007' "$exit_code"
+    fi
+    __daedalus_first_prompt=0
+    local encoded_pwd="${PWD// /%20}"
+    printf '\033]7;file://%s%s\007' "${HOST:-localhost}" "$encoded_pwd"
+}
+
+__daedalus_preexec() {
+    printf '\033]133;C\007'
+}
+
+if [[ "$PROMPT" != *"133;A"* ]]; then
+    PROMPT=$'%{\e]133;A\a%}'"${PROMPT}"$'%{\e]133;B\a%}'
+fi
+
+add-zsh-hook precmd __daedalus_precmd
+add-zsh-hook preexec __daedalus_preexec

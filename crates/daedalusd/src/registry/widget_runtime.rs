@@ -774,7 +774,7 @@ mod tests {
             .unwrap();
         for (id, code) in [("unit", 0), ("integration", 7)] {
             let runner = registry
-                .launch_runner_assignment(workspace.id, id, 80, 24)
+                .launch_runner_assignment(workspace.id, id, None, 80, 24)
                 .await
                 .unwrap();
             let handle = registry.get_pane(runner.id).await.unwrap();

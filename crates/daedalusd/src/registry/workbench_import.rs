@@ -64,6 +64,7 @@ impl Registry {
                 preview.root_dir,
                 Default::default(),
                 false,
+                None,
             )
             .await?;
         let link = if preview.linked {
@@ -76,7 +77,7 @@ impl Registry {
         // recording a recent project.
         let Change::Applied(state) = self
             .workbench_store
-            .update_workspace(record.id, Some(0), preview.incoming, link)
+            .update_workspace(record.id, Some(0), preview.incoming, link, None)
             .await?
         else {
             return Err(ProtoError::Internal(
@@ -84,13 +85,23 @@ impl Registry {
             ));
         };
         record.widget_commands.reconcile(&state);
-        let mut workspace = self.publish_workspace(record).await;
+        let id = record.id;
+        let mut workspace = match self.publish_workspace(record).await {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                if let Err(cleanup) = self.workbench_store.discard_unpublished_workspace(id).await {
+                    return Err(ProtoError::IoError(format!(
+                        "{error}. Could not remove the unpublished workbench document for {id}: {cleanup}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
         let _ = self.event_tx.send(ServerEvent::WorkbenchChanged {
             workspace_id: workspace.id,
             revision: state.revision,
         });
         drop(create_guard);
-        self.persist_state().await;
         workspace.setup = Some(state.document.assignments);
         Ok(workspace)
     }
@@ -332,13 +343,19 @@ mod tests {
         let assignments = preview.incoming.assignments.clone();
         let mut events = registry.subscribe_events();
 
-        // Hold registry persistence after membership so the second client observes
-        // precisely the state published before Apply returns.
+        // Membership must wait for persistence and expose the reviewed assignment.
         let hold = registry.persist_lock.clone().lock_owned().await;
         let apply = tokio::spawn({
             let registry = registry.clone();
             async move { registry.apply_workspace_creation(preview).await }
         });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err()
+        );
+        assert!(registry.list_workspaces().await.is_empty());
+        drop(hold);
         let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
             .await
             .unwrap()
@@ -377,12 +394,43 @@ mod tests {
         })
         .await
         .unwrap();
-        drop(hold);
         let imported = apply.await.unwrap().unwrap();
         assert_eq!(imported.id, id);
         assert_eq!(imported.setup, Some(assignments));
         registry.close_all().await;
         assert_eq!(data, "reviewed");
+    }
+
+    #[tokio::test]
+    async fn failed_registry_snapshot_does_not_publish_an_import_or_keep_its_document() {
+        let dir = TempDir::new().unwrap();
+        let registry = registry(dir.path());
+        let known = registry
+            .create_workspace("Known".into(), dir.path().into(), Default::default())
+            .await
+            .unwrap();
+        let state_path = dir.path().join("state.json");
+        std::fs::rename(&state_path, dir.path().join("state.backup")).unwrap();
+        std::fs::create_dir(state_path).unwrap();
+        let mut events = registry.subscribe_events();
+
+        let error = registry
+            .apply_workspace_creation(preview(dir.path()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProtoError::IoError(_)), "{error:?}");
+        assert_eq!(registry.list_workspaces().await.len(), 1);
+        assert_eq!(registry.list_workspaces().await[0].id, known.id);
+        assert!(
+            std::fs::read_dir(dir.path().join("workbench"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

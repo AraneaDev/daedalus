@@ -23,9 +23,22 @@ impl DaedalusApp {
                 operation,
                 response,
             } => self.workbench_response(workspace_id, operation, *response),
-            UiEvent::ImagePreview { pane_id, image } => {
-                if self.state.focused_pane_id() == Some(pane_id) && image.valid() {
-                    self.state.image_preview = Some((pane_id, image));
+            UiEvent::ImagePreview {
+                pane_id,
+                token,
+                result,
+            } => {
+                if self.state.pending_image_preview == Some((pane_id, token)) {
+                    self.state.pending_image_preview = None;
+                    if self.state.focused_pane_id() == Some(pane_id) {
+                        match result {
+                            Ok(image) if image.valid() => {
+                                self.state.image_preview = Some((pane_id, image));
+                            }
+                            Ok(_) => self.show_toast("Invalid preview received.", true),
+                            Err(error) => self.show_toast(error, true),
+                        }
+                    }
                 }
             }
             UiEvent::JournalCapability(supported) => self.history.connection(supported),
@@ -55,13 +68,20 @@ impl DaedalusApp {
                     self.project_setup_changed(&root_dir, assignments);
                 }
             }
-            UiEvent::ProjectSetupSaveFailed {
+            UiEvent::ProjectSetupMigrationFinished {
                 workspace_id,
-                message,
+                request_id,
+                result,
             } => {
-                self.project_setups.rejected(workspace_id);
-                self.refresh_workspace_setup(workspace_id);
-                self.show_toast(message, true);
+                if self
+                    .project_setups
+                    .finish_migration(workspace_id, request_id, result.is_ok())
+                {
+                    self.refresh_workspace_setup(workspace_id);
+                    if let Err(message) = result {
+                        self.show_toast(message, true);
+                    }
+                }
             }
             UiEvent::WorkspaceSettingsSaved {
                 workspace_id,
@@ -91,10 +111,16 @@ impl DaedalusApp {
                     self.state.workbench = None;
                 }
                 self.state.connection = ConnectionState::Connected;
+                if self.state.workspace_list_loaded {
+                    self.refresh_inactive_layout_saves();
+                    self.ensure_active_workspace_panes();
+                }
                 self.schedule_resize_flush();
             }
             UiEvent::Disconnected => {
+                self.state.pending_image_preview = None;
                 self.pause_layout_saves();
+                self.seeding_workbench.clear();
                 self.watched_workbench = None;
                 self.widget_refresh_at = None;
                 self.setup_disconnected();
@@ -122,24 +148,10 @@ impl DaedalusApp {
                     self.state.close_modal.submitting = false;
                 }
             }
-            UiEvent::WorkspaceCloseFailed(workspaces) => {
-                self.state.set_workspaces(workspaces);
-                self.prune_layout_saves();
-                self.schedule_resize_flush();
-            }
             UiEvent::WorkspacesLoaded(workspaces) => self.apply_workspace_list(workspaces, true),
-            UiEvent::WorkspaceMembershipLoaded(workspaces) => {
-                let new_panes: Vec<_> = workspaces
-                    .iter()
-                    .flat_map(|workspace| &workspace.panes)
-                    .filter_map(|pane| {
-                        (!self.state.panes.contains_key(&pane.id)).then_some(pane.id)
-                    })
-                    .collect();
+            UiEvent::WorkspaceMembershipLoaded(workspaces)
+            | UiEvent::WorkspaceCloseFailed(workspaces) => {
                 self.apply_workspace_list(workspaces, false);
-                for pane_id in new_panes {
-                    self.send_command(UiCommand::RequestSnapshot { pane_id });
-                }
             }
             UiEvent::SetupInspected { session, result } => self.setup_inspected(session, result),
             UiEvent::SetupInstallerStarted {
@@ -277,14 +289,19 @@ impl DaedalusApp {
     }
 
     fn apply_workspace_list(&mut self, workspaces: Vec<WorkspaceInfo>, initialize: bool) {
+        let previously_active = self.state.active_workspace_id;
+        let new_panes = if initialize {
+            Vec::new()
+        } else {
+            workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.panes)
+                .filter_map(|pane| (!self.state.panes.contains_key(&pane.id)).then_some(pane.id))
+                .collect()
+        };
         self.project_setups.absorb(&workspaces);
-        for (workspace_id, assignments) in self.project_setups.migrations(&workspaces) {
-            if !self.send_command(UiCommand::SaveProjectSetup {
-                workspace_id,
-                assignments,
-            }) {
-                self.project_setups.rejected(workspace_id);
-            }
+        for migration in self.project_setups.migrations(&workspaces) {
+            self.send_setup_migration(migration);
         }
         self.restore_session_names(&workspaces);
         self.state.set_workspaces(workspaces);
@@ -293,7 +310,12 @@ impl DaedalusApp {
         if initialize {
             self.refresh_inactive_layout_saves();
             self.offer_first_workspace();
+        }
+        if initialize || self.state.active_workspace_id != previously_active {
             self.ensure_active_workspace_panes();
+        }
+        for pane_id in new_panes {
+            self.send_command(UiCommand::RequestSnapshot { pane_id });
         }
         self.schedule_resize_flush();
     }

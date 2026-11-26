@@ -49,11 +49,98 @@ fn center(bounds: Rect) -> (f32, f32) {
     (bounds.x + bounds.width / 2., bounds.y + bounds.height / 2.)
 }
 
+#[test]
+fn narrow_cargo_footer_keeps_pinned_widgets_reachable() {
+    let mut w = Workbench::new();
+    let mut ws = workspace("Cargo and widgets");
+    ws.project.tools.push("Cargo".into());
+    let id = ws.id;
+    w.app.state.set_workspaces(vec![ws]);
+
+    for dpi in [1, 2] {
+        let scale = dpi as f32;
+        let viewport = metrics(320, 550, dpi);
+        for (pins, expected) in [(&[true][..], Some(0)), (&[true, true][..], None)] {
+            w.app.state.workbench = Some((id, widgets(pins)));
+            let layout = w.app.layout_for(viewport);
+            let cargo = layout.cargo_buttons(scale).collect::<Vec<_>>();
+            let [(index, widget)] = layout.widget_buttons.as_slice() else {
+                panic!("expected one reachable widget slot at scale {scale}");
+            };
+            assert_eq!(*index, expected);
+            assert_eq!(cargo.len(), 2);
+            assert!(cargo.iter().all(|(_, rect)| rect.width >= 72. * scale));
+            assert!(cargo[1].1.right() < widget.x);
+            assert!(widget.right() <= viewport.size.width as f32);
+            let (x, y) = center(*widget);
+            assert_eq!(
+                hit_test(&layout, 1, scale, viewport.cell.0, viewport.cell.1, x, y),
+                HitTarget::CustomWidget(expected),
+            );
+        }
+    }
+}
+
 fn click(app: &mut DaedalusApp, metrics: ViewportMetrics, bounds: Rect) {
     let (x, y) = center(bounds);
     app.handle_cursor_moved(x, y);
     app.click_at(metrics);
     app.pointer.end_drag();
+}
+
+#[test]
+fn delayed_widget_output_keeps_the_current_details_view() {
+    let mut w = Workbench::new();
+    let ws = workspace("Delayed actions");
+    let id = ws.id;
+    w.app.state.set_workspaces(vec![ws]);
+    w.app
+        .handle_daemon_event(UiEvent::WorkbenchCapability(true));
+    w.app.state.workbench = Some((id, widgets(&[true, true])));
+    let refresh = WidgetResult {
+        label: "Current details".into(),
+        level: StatusLevel::Ok,
+        details: vec![],
+    };
+    w.app.state.widget_results = [0, 1]
+        .map(|index| WidgetSnapshot {
+            id: format!("widget-{index}"),
+            result: refresh.clone(),
+        })
+        .to_vec();
+    let output = WidgetResult {
+        label: "Earlier action output".into(),
+        level: StatusLevel::Info,
+        details: vec![],
+    };
+
+    for next_widget in [1, 0] {
+        w.app.open_widget_details(Some(0));
+        w.commands.try_iter().for_each(drop);
+        let action = w.app.state.settings.activate(Control::CustomViewAction(0));
+        w.app.handle_settings_action(action);
+        let UiCommand::Workbench { operation, .. } = w.command() else {
+            panic!("expected a widget action")
+        };
+        if next_widget == 0 {
+            let close = w.app.state.settings.activate(Control::Cancel);
+            w.app.handle_settings_action(close);
+        }
+        w.app.open_widget_details(Some(next_widget));
+        assert_eq!(
+            w.app.state.settings.heading(),
+            format!("Widget {next_widget}")
+        );
+        w.app.handle_daemon_event(UiEvent::Workbench {
+            workspace_id: id,
+            operation,
+            response: Box::new(Ok(ResponsePayload::WidgetAction(
+                WidgetActionResult::Output(output.clone()),
+            ))),
+        });
+        assert_eq!(w.app.state.settings.custom.preview, Some(refresh.clone()));
+        assert!(!w.app.state.settings.custom.action_output);
+    }
 }
 
 #[test]
@@ -232,14 +319,24 @@ fn footer_overflow_opens_the_custom_list_and_details_actions_restore_terminal_fo
     assert_eq!(w.app.state.settings.focus, Control::CustomViewAction(0));
     let action = accessibility::settings_action(&mut w.app.state, &request(Action::Click)).unwrap();
     w.app.handle_settings_action(action);
+    let UiCommand::Workbench {
+        workspace_id,
+        operation,
+        request,
+    } = w.command()
+    else {
+        panic!("expected a widget action")
+    };
+    assert_eq!(workspace_id, id);
     assert!(
-        matches!(w.command(), UiCommand::Workbench { workspace_id, request, .. }
-        if workspace_id == id && matches!(request.as_ref(), ClientMessage::InvokeWidgetAction { widget, action, .. }
-            if widget == "widget-1" && action == "terminal"))
+        matches!(request.as_ref(), ClientMessage::InvokeWidgetAction { widget, action, .. }
+            if widget == "widget-1" && action == "terminal")
     );
+    w.app.open_widget_details(Some(2));
+    w.commands.try_iter().for_each(drop);
     w.app.handle_daemon_event(UiEvent::Workbench {
         workspace_id: id,
-        operation: WorkbenchOperation::Read,
+        operation,
         response: Box::new(Ok(ResponsePayload::WidgetAction(WidgetActionResult::Pane(
             runner,
         )))),

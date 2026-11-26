@@ -102,10 +102,21 @@ pub fn save(
     workspace: WorkspaceId,
     widgets: &WorkspaceWidgets,
 ) -> Result<(), String> {
+    update(directory, workspace, |_| Ok(widgets.clone())).map(|_| ())
+}
+
+pub fn update(
+    directory: &Path,
+    workspace: WorkspaceId,
+    edit: impl FnOnce(WorkspaceWidgets) -> Result<WorkspaceWidgets, String>,
+) -> Result<WorkspaceWidgets, String> {
     let path = directory.join(format!("{workspace}.toml"));
-    let contents = toml::to_string_pretty(widgets)
+    let _lock = crate::assignments::lock_for_write(&path)?;
+    let widgets = edit(load_from(&path)?.unwrap_or_default())?;
+    let contents = toml::to_string_pretty(&widgets)
         .map_err(|err| format!("Could not serialize workspace widget settings: {err}"))?;
-    crate::assignments::write_atomic(&path, &contents)
+    crate::assignments::write_atomic(&path, &contents)?;
+    Ok(widgets)
 }
 
 #[cfg(test)]

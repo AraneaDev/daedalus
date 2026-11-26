@@ -368,15 +368,10 @@ fn resolve_port_expr(expr: &str, env_lookup: &HashMap<String, String>) -> Option
     None
 }
 
-pub(super) fn write_compose_override(
-    root_dir: &Path,
+pub(super) fn render_compose_override(
     compose_services: &BTreeMap<String, Vec<ParsedPortEntry>>,
     port_offset: u16,
-) -> io::Result<PathBuf> {
-    let daedalus_dir = root_dir.join(".daedalus");
-    std::fs::create_dir_all(&daedalus_dir)?;
-    let override_path = daedalus_dir.join("compose.override.yml");
-
+) -> io::Result<String> {
     let mut remappable_services = Vec::new();
     for (svc_name, entries) in compose_services {
         let has_remappable = entries
@@ -443,8 +438,19 @@ pub(super) fn write_compose_override(
         }
     }
 
-    std::fs::write(&override_path, yaml)?;
-    Ok(override_path)
+    Ok(yaml)
+}
+
+#[cfg(test)]
+fn write_compose_override(
+    root_dir: &Path,
+    compose_services: &BTreeMap<String, Vec<ParsedPortEntry>>,
+    port_offset: u16,
+) -> io::Result<PathBuf> {
+    let path = root_dir.join(".daedalus").join("compose.override.yml");
+    let yaml = render_compose_override(compose_services, port_offset)?;
+    crate::persistence::write_bytes_atomic(&path, yaml.as_bytes())?;
+    Ok(path)
 }
 
 fn format_remapped_port(

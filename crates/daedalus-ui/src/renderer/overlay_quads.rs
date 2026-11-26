@@ -226,6 +226,17 @@ impl OverlayQuads<'_> {
         );
         let modal = state.settings.modal_rect(screen_w, screen_h, s);
         for (control, rect) in state.settings.controls(modal) {
+            if state.settings.is_import_review_text(control) {
+                let inset = 11.0 * s;
+                quads.push(QuadInstance::from_xywh(
+                    rect.x + inset,
+                    rect.bottom() - border_w,
+                    (rect.width - 2.0 * inset).max(0.0),
+                    border_w,
+                    theme.border_unfocused,
+                ));
+                continue;
+            }
             let field = Rect::new(
                 rect.x + 2. * s,
                 rect.y + 2. * s,

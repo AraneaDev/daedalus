@@ -1,10 +1,14 @@
 mod command_line;
+mod controls;
+mod fields;
+
 use crate::layout::Rect;
 use crate::setup_tools::{guide_url, install_command};
 use command_line::CommandLine;
+pub use controls::{modal_rect, region};
 use daedalus_proto::{PaneRole, SetupInspection};
+use fields::CommandFields;
 use std::path::PathBuf;
-use unicode_segmentation::UnicodeSegmentation;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 pub const ROLES: [PaneRole; 3] = [PaneRole::Agent, PaneRole::Service, PaneRole::Runner];
@@ -50,29 +54,12 @@ pub struct SetupReview {
     pub busy: bool,
     pub focus: Control,
     inspection: Option<SetupInspection>,
-    fields: [String; 3],
+    fields: CommandFields,
     launch: [bool; 3],
     missing_index: usize,
     checked: Vec<String>,
     tool_revision: u64,
-    caret: usize,
-    selected: bool,
     revision: u64,
-}
-
-pub fn modal_rect(w: f32, h: f32, dpi: f32) -> Rect {
-    let width = (w - 12. * dpi).max(1.).min(700. * dpi);
-    let height = (h - 12. * dpi).max(1.).min(500. * dpi);
-    Rect::new((w - width) / 2., (h - height) / 2., width, height)
-}
-
-pub fn region(m: Rect, x: f32, y: f32, w: f32, h: f32) -> Rect {
-    Rect::new(
-        m.x + m.width * x,
-        m.y + m.height * y,
-        m.width * w,
-        m.height * h,
-    )
 }
 
 impl SetupReview {
@@ -99,7 +86,7 @@ impl SetupReview {
             open: true,
             name,
             folder,
-            fields,
+            fields: CommandFields::new(fields),
             launch: [true, false, false],
             inspection: Some(inspection),
             revision: self.revision.wrapping_add(1),
@@ -127,62 +114,6 @@ impl SetupReview {
     pub fn host(&self) -> &str {
         self.inspection.as_ref().map_or("", |i| i.host.as_str())
     }
-    pub fn command(&self, index: usize) -> &str {
-        &self.fields[index]
-    }
-    pub fn selection(&self, index: usize) -> std::ops::Range<usize> {
-        if self.focus != Control::Command(index) {
-            0..0
-        } else if self.selected {
-            0..self.fields[index].len()
-        } else {
-            self.caret..self.caret
-        }
-    }
-    pub fn caret(&self) -> usize {
-        self.caret
-    }
-
-    fn command_line(&self) -> CommandLine {
-        self.inspection.as_ref().map_or(CommandLine::Posix, |host| {
-            CommandLine::for_platform(&host.platform)
-        })
-    }
-
-    pub fn commands(&self) -> Result<Vec<(PaneRole, Vec<String>, bool)>, String> {
-        let mut result = vec![];
-        for (i, role) in ROLES.into_iter().enumerate() {
-            let argv = self
-                .command_line()
-                .parse(&self.fields[i])
-                .map_err(|_| format!("Close the quote in the {} command.", role_label(i)))?;
-            if argv.is_empty() {
-                continue;
-            }
-            if argv[0].is_empty() {
-                return Err(format!("Enter an executable for {}.", role_label(i)));
-            }
-            result.push((role, argv, self.launch[i]));
-        }
-        Ok(result)
-    }
-
-    pub fn executables(&self) -> Vec<String> {
-        let mut tools = vec![];
-        for field in &self.fields {
-            if let Some(exe) = self
-                .command_line()
-                .parse(field)
-                .ok()
-                .and_then(|args| args.into_iter().next())
-                && !tools.contains(&exe)
-            {
-                tools.push(exe);
-            }
-        }
-        tools
-    }
-
     fn missing(&self) -> Vec<String> {
         self.executables()
             .into_iter()
@@ -226,37 +157,6 @@ impl SetupReview {
             }
             _ => "Needs check",
         }
-    }
-
-    pub fn controls(&self, m: Rect) -> Vec<(Control, Rect)> {
-        let mut rows = Vec::new();
-        for i in 0..3 {
-            let y = 0.225 + i as f32 * 0.135;
-            rows.push((Control::Command(i), region(m, 0.035, y, 0.70, 0.068)));
-            rows.push((Control::Launch(i), region(m, 0.753, y, 0.212, 0.068)));
-        }
-        rows.push((Control::Agent, region(m, 0.753, 0.153, 0.212, 0.056)));
-        if self.tool().is_some() {
-            rows.push((Control::Tool, region(m, 0.035, 0.615, 0.38, 0.071)));
-            if self.install().is_some() {
-                rows.push((Control::Install, region(m, 0.43, 0.615, 0.24, 0.071)));
-            }
-            if self.guide().is_some() {
-                rows.push((Control::Guide, region(m, 0.69, 0.615, 0.275, 0.071)));
-            }
-        }
-        if self.dependency_install().is_some() {
-            rows.push((Control::Dependencies, region(m, 0.035, 0.747, 0.93, 0.058)));
-        }
-        for (c, x, w) in [
-            (Control::Back, 0.035, 0.135),
-            (Control::Cancel, 0.183, 0.155),
-            (Control::Check, 0.355, 0.245),
-            (Control::Open, 0.62, 0.345),
-        ] {
-            rows.push((c, region(m, x, 0.875, w, 0.09)));
-        }
-        rows
     }
 
     fn dependency_install(&self) -> Option<&Vec<String>> {
@@ -314,47 +214,6 @@ impl SetupReview {
         }
     }
 
-    pub fn set_focus(&mut self, c: Control) {
-        if !self.enabled(c) {
-            return;
-        }
-        self.focus = c;
-        self.caret = if let Control::Command(i) = c {
-            self.fields[i].len()
-        } else {
-            0
-        };
-        self.selected = self.caret > 0;
-    }
-    pub fn set_value(&mut self, i: usize, value: &str) {
-        if self.busy || value.chars().any(char::is_control) {
-            return;
-        }
-        self.tool_revision = self.tool_revision.wrapping_add(1);
-        self.fields[i] = value.into();
-        self.set_focus(Control::Command(i));
-        self.selected = false;
-        self.feedback.clear();
-    }
-    fn replace(&mut self, range: std::ops::Range<usize>, text: &str) {
-        if let Control::Command(i) = self.focus {
-            let range = if self.selected {
-                0..self.fields[i].len()
-            } else {
-                range
-            };
-            self.caret = range.start + text.len();
-            self.tool_revision = self.tool_revision.wrapping_add(1);
-            self.fields[i].replace_range(range, text);
-            self.selected = false;
-            self.feedback.clear();
-        }
-    }
-    pub fn insert_text(&mut self, text: &str) {
-        if !self.busy && !text.is_empty() && !text.chars().any(char::is_control) {
-            self.replace(self.caret..self.caret, text);
-        }
-    }
     pub fn activate(&mut self, c: Control) -> SetupAction {
         if !self.enabled(c) {
             return SetupAction::None;
@@ -383,10 +242,10 @@ impl SetupReview {
                 }
                 let index = choices
                     .iter()
-                    .position(|a| *a == self.fields[0])
+                    .position(|a| *a == self.fields.values[0])
                     .map_or(0, |i| (i + 1) % choices.len());
                 self.tool_revision = self.tool_revision.wrapping_add(1);
-                self.fields[0] = choices.swap_remove(index);
+                self.fields.values[0] = choices.swap_remove(index);
                 self.feedback.clear();
             }
             Control::Tool => {
@@ -444,9 +303,8 @@ impl SetupReview {
             Key::Named(NamedKey::Escape) => return SetupAction::Cancel,
             Key::Named(NamedKey::Tab) => {
                 let list: Vec<_> = self
-                    .controls(Rect::new(0., 0., 1., 1.))
+                    .ordered_controls()
                     .into_iter()
-                    .map(|(c, _)| c)
                     .filter(|c| self.enabled(*c))
                     .collect();
                 let p = list.iter().position(|c| *c == self.focus).unwrap_or(0);
@@ -461,48 +319,7 @@ impl SetupReview {
             Key::Named(NamedKey::Space) if !matches!(self.focus, Control::Command(_)) => {
                 return self.activate(self.focus);
             }
-            _ => {
-                if let Control::Command(i) = self.focus {
-                    let value = &self.fields[i];
-                    let prev = value[..self.caret]
-                        .grapheme_indices(true)
-                        .next_back()
-                        .map_or(0, |(n, _)| n);
-                    let next = self.caret
-                        + value[self.caret..]
-                            .graphemes(true)
-                            .next()
-                            .map_or(0, str::len);
-                    match key {
-                        Key::Named(
-                            NamedKey::Home
-                            | NamedKey::End
-                            | NamedKey::ArrowLeft
-                            | NamedKey::ArrowRight,
-                        ) => {
-                            self.caret = match key {
-                                Key::Named(NamedKey::Home) => 0,
-                                Key::Named(NamedKey::End) => value.len(),
-                                Key::Named(NamedKey::ArrowLeft) if self.selected => 0,
-                                Key::Named(NamedKey::ArrowRight) if self.selected => value.len(),
-                                Key::Named(NamedKey::ArrowLeft) => prev,
-                                _ => next,
-                            };
-                            self.selected = false;
-                        }
-                        Key::Named(NamedKey::Backspace) => self.replace(prev..self.caret, ""),
-                        Key::Named(NamedKey::Delete) => self.replace(self.caret..next, ""),
-                        Key::Named(NamedKey::Space) => self.insert_text(" "),
-                        Key::Character(c) if mods.control_key() || mods.super_key() => {
-                            if c.eq_ignore_ascii_case("a") {
-                                self.selected = true;
-                            }
-                        }
-                        Key::Character(c) if !mods.alt_key() => self.insert_text(c),
-                        _ => (),
-                    }
-                }
-            }
+            _ => self.command_key(key, mods),
         }
         SetupAction::None
     }

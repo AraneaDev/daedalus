@@ -5,10 +5,10 @@ use crate::types::{
 };
 use crate::workbench::{
     ConflictChoice, WidgetActionResult, WidgetDefinition, WidgetLibrary, WidgetResult,
-    WidgetSnapshot, WidgetTemplate, WorkbenchState, WorkspaceCreationPreview, WorkspaceDocument,
-    WorkspaceImportPreview, WorkspaceImportSource,
+    WidgetSnapshot, WidgetTemplate, WorkbenchEdit, WorkbenchState, WorkspaceCreationPreview,
+    WorkspaceDocument, WorkspaceImportPreview, WorkspaceImportSource,
 };
-use crate::{ActivityCursor, ActivityPage, Assignment, RecentProject};
+use crate::{ActivityCursor, ActivityPage, Assignment, ProjectSetupBaseline, RecentProject};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -148,6 +148,8 @@ pub enum ClientMessage {
     LaunchRunnerAssignment {
         workspace_id: WorkspaceId,
         assignment_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected: Option<Assignment>,
         cols: u16,
         rows: u16,
     },
@@ -189,6 +191,8 @@ pub enum ClientMessage {
     SetProjectSetup {
         workspace_id: WorkspaceId,
         assignments: Vec<Assignment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected: Option<ProjectSetupBaseline>,
     },
     Unsubscribe,
     RunWorkspaceAction {
@@ -205,6 +209,11 @@ pub enum ClientMessage {
         workspace_id: WorkspaceId,
         revision: u64,
         document: WorkspaceDocument,
+        /// Preserve all settings outside the layout, including revision-zero defaults.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        layout_only: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edit: Option<WorkbenchEdit>,
     },
     SeedLegacyWorkbench {
         workspace_id: WorkspaceId,
@@ -307,6 +316,8 @@ pub enum ResponsePayload {
         #[serde(default)]
         runner_assignment_supported: bool,
         #[serde(default)]
+        guarded_runner_assignment_supported: bool,
+        #[serde(default)]
         home_dir: Option<PathBuf>,
         #[serde(default)]
         resolved_import_preview_supported: bool,
@@ -315,6 +326,7 @@ pub enum ResponsePayload {
     },
     ImagePreview(ImagePreview),
     RecentProjects(Vec<RecentProject>),
+    ProjectSetupConflict(ProjectSetupBaseline),
     SetupInspection(SetupInspection),
     Activity(ActivityPage),
     WorkspaceCreated(WorkspaceInfo),

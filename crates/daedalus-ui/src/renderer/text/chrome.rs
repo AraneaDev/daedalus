@@ -13,33 +13,25 @@ use crate::renderer::{
 use crate::state::WorkspaceView;
 use daedalus_proto::{PaneRole, PaneStatus};
 
-fn empty_terminal_message(
-    state: &AppState,
-    role: PaneRole,
-) -> Option<(&'static str, &'static str)> {
-    if state.connection != crate::state::ConnectionState::Connected
-        || role != state.focused_role
-        || state.pane_id_for_role(role).is_some()
-    {
-        return None;
-    }
-    let Some(workspace) = state.active_workspace() else {
-        return (state.workspace_list_loaded && state.workspaces.is_empty())
-            .then_some(("No workspaces open", "Choose Workspaces → + Workspace."));
-    };
-    if workspace.needs_default_panes() || state.spawning_workspaces.contains(&workspace.id) {
-        return None;
-    }
-    let title = if workspace.panes.is_empty() {
-        "No terminals open"
+fn workspace_disclosure_labels(
+    expanded: bool,
+    workspace: Option<&str>,
+    remote_host: Option<&str>,
+) -> [Option<String>; 5] {
+    let arrow = if expanded { "▾" } else { "▸" };
+    let current = workspace.filter(|_| !expanded);
+    let title = if let Some(name) = current {
+        format!("{arrow} Workspaces · {name}")
     } else {
-        match role {
-            PaneRole::Agent => "No agent terminal open",
-            PaneRole::Service => "No service terminal open",
-            PaneRole::Runner => "No runner terminal open",
-        }
+        format!("{arrow} Workspaces")
     };
-    Some((title, "Open Settings to launch a terminal."))
+    [
+        remote_host.map(|host| format!("{title}  [REMOTE: {host}]")),
+        Some(title),
+        current.map(|name| format!("{arrow} {name}")),
+        Some(format!("{arrow} List")),
+        Some(arrow.to_owned()),
+    ]
 }
 
 fn widget_status_label(level: daedalus_proto::StatusLevel, text: &str) -> String {
@@ -263,24 +255,24 @@ impl TextRenderer {
         if let Some(mut toggle) = layout.sidebar_toggle {
             if state.active_workspace_id.is_some() {
                 let button = crate::layout::settings_button(toggle, arrows, s);
-                self.push_chrome_line(ChromeLineSpec {
+                self.push_chrome_button(ChromeLineSpec {
                     text: "Settings",
                     bounds: button,
                     left: button.x + 3. * s,
                     top: button.y + (button.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                    max_w: button.width - 3. * s,
+                    max_w: button.width - 6. * s,
                     font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
                     line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
                     color: theme.border_focused,
                     bold: true,
                 });
                 let left = if let Some(run) = layout.run_tests_button {
-                    self.push_chrome_line(ChromeLineSpec {
+                    self.push_chrome_button(ChromeLineSpec {
                         text: "Run tests",
                         bounds: run,
                         left: run.x + 3. * s,
                         top: run.y + (run.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                        max_w: run.width - 3. * s,
+                        max_w: run.width - 6. * s,
                         font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
                         line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
                         color: theme.border_focused,
@@ -310,40 +302,35 @@ impl TextRenderer {
             } else if let Some((up, _)) = arrows {
                 toggle.width = (up.x - toggle.x).max(0.0);
             }
-            let arrow = if layout.sidebar.is_some() {
-                "▾"
-            } else {
-                "▸"
-            };
-            let suffix = state
-                .remote_host
-                .as_ref()
-                .map(|host| format!("  [REMOTE: {host}]"))
-                .unwrap_or_default();
-            let name = state
-                .active_workspace()
-                .map_or("Select", |ws| ws.name.as_str());
-            let max_w = (toggle.width - 24.0 * s).max(1.0);
-            let glyph_width = self.cell_w * CHROME_FONT_SIZE_LOGICAL / self.font_size_logical;
-            let label = truncate_right_with_ellipsis(
-                &if layout.sidebar.is_some() {
-                    format!("{arrow} Workspaces{suffix}")
-                } else {
-                    format!("{arrow} Workspaces · {name}{suffix}")
-                },
-                (max_w / glyph_width) as usize,
+            let inset = (toggle.width * 0.12).clamp(3.0 * s, 10.0 * s);
+            let max_w = (toggle.width - 2.0 * inset).max(1.0);
+            let labels = workspace_disclosure_labels(
+                layout.sidebar.is_some(),
+                state.active_workspace().map(|ws| ws.name.as_str()),
+                state.remote_host.as_deref(),
             );
-            self.push_chrome_line(ChromeLineSpec {
-                text: &label,
-                left: toggle.x + 12.0 * s,
-                top: toggle.y + (toggle.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                max_w,
-                bounds: toggle,
-                font_size_logical: CHROME_FONT_SIZE_LOGICAL,
-                line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
-                color: theme.text_primary,
-                bold: true,
-            });
+            for label in labels.into_iter().flatten() {
+                // Shape candidates before choosing one. The chrome uses a
+                // proportional font, while terminal cell widths are monospace.
+                let unwrapped = label.len() as f32 * CHROME_FONT_SIZE_LOGICAL * s * 2.0;
+                let spec = ChromeLineSpec {
+                    text: &label,
+                    left: toggle.x + inset,
+                    top: toggle.y + (toggle.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                    max_w: unwrapped,
+                    bounds: toggle,
+                    font_size_logical: CHROME_FONT_SIZE_LOGICAL,
+                    line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                    color: theme.text_primary,
+                    bold: true,
+                };
+                if let Some(item) = self.build_chrome_item(spec, false)
+                    && item.buffer.layout_runs().all(|run| run.line_w <= max_w)
+                {
+                    self.chrome_items.push(item);
+                    break;
+                }
+            }
         }
     }
 
@@ -624,11 +611,14 @@ impl TextRenderer {
 
     fn build_empty_pane_text(&mut self, state: &AppState, pane_rect: &PaneRect, theme: &Theme) {
         let s = self.scale_factor;
-        if let Some((title, hint)) = empty_terminal_message(state, pane_rect.role) {
+        if let Some((title, hint)) = state.terminal_guidance(pane_rect.role) {
             let body = pane_rect.viewport;
             let inset = 8.0 * s;
             let mut top = body.y + inset;
-            for (text, bold) in [(title, true), (hint, false)] {
+            for (text, bold) in [(title, true)]
+                .into_iter()
+                .chain(hint.map(|hint| (hint, false)))
+            {
                 if top + CHROME_LINE_HEIGHT_LOGICAL * s > body.bottom() {
                     break;
                 }
@@ -785,6 +775,48 @@ mod tests {
     use daedalus_proto::{AgentState, ExternalStatus, PaneId, StatusLevel};
 
     #[test]
+    fn workspace_disclosure_keeps_a_complete_label_when_actions_crowd_the_header() {
+        let (device, queue) = wgpu::Device::noop(&Default::default());
+        let mut renderer = TextRenderer::new(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            1440,
+            900,
+            1.,
+            14.,
+            None,
+        );
+        let (state, _) = make_state_with_agent_row();
+        let mut layout = crate::layout::compute_layout(&crate::layout::LayoutInput {
+            window_w: 1440.,
+            window_h: 900.,
+            scale_factor: 1.,
+            cell_w: 8.,
+            cell_h: 19.,
+            sidebar_override: Some(true),
+            has_top_banner: false,
+            zoomed: false,
+            focused_role: state.focused_role,
+            runner_has_failure: false,
+        });
+        layout.enable_run_tests(1.);
+        layout.enable_layout_button(1.);
+        renderer.build_sidebar_toggle_text(&state, &layout, &Theme::dark(), None);
+        let disclosure = renderer.chrome_items.last().unwrap();
+        assert!(matches!(disclosure.buffer.lines[0].text(), "▾ List" | "▾"));
+        let edge = layout.layout_button.unwrap().x;
+        assert!(
+            disclosure
+                .buffer
+                .layout_runs()
+                .all(|run| disclosure.left + run.line_w <= edge)
+        );
+        let labels = workspace_disclosure_labels(false, Some("Orbit"), None);
+        assert_eq!(labels[2].as_deref(), Some("▸ Orbit"));
+    }
+
+    #[test]
     fn chrome_draws_recap_banner_and_empty_pane_text_in_order_at_both_widths() {
         use crate::layout::{LayoutInput, compute_layout};
         let (device, queue) = wgpu::Device::noop(&Default::default());
@@ -863,25 +895,28 @@ mod tests {
     fn a_connection_without_a_workspace_list_waits_before_showing_creation_guidance() {
         let mut state = AppState::new();
         state.connection = crate::state::ConnectionState::Connected;
-        assert_eq!(empty_terminal_message(&state, PaneRole::Agent), None);
+        assert_eq!(state.terminal_guidance(PaneRole::Agent), None);
     }
 
     #[test]
     fn empty_terminal_guidance_tracks_workspace_and_focused_role() {
         let (mut state, _) = make_state_with_agent_row();
         let id = state.focused_pane_id().unwrap();
-        assert_eq!(empty_terminal_message(&state, PaneRole::Agent), None);
-        assert_eq!(empty_terminal_message(&state, PaneRole::Runner), None);
+        assert_eq!(state.terminal_guidance(PaneRole::Agent), None);
+        assert_eq!(state.terminal_guidance(PaneRole::Runner), None);
         state.focused_role = PaneRole::Runner;
         assert_eq!(
-            empty_terminal_message(&state, PaneRole::Runner).unwrap().0,
+            state.terminal_guidance(PaneRole::Runner).unwrap().0,
             "No runner terminal open",
         );
         state.active_workspace_mut().unwrap().default_panes_pending = Some(false);
         state.remove_session(id);
         assert_eq!(
-            empty_terminal_message(&state, PaneRole::Runner),
-            Some(("No terminals open", "Open Settings to launch a terminal.")),
+            state.terminal_guidance(PaneRole::Runner),
+            Some((
+                "No terminals open",
+                Some("Open Settings to launch a terminal.")
+            )),
         );
     }
 
@@ -890,17 +925,27 @@ mod tests {
         let (mut state, _) = make_state_with_agent_row();
         let id = state.focused_pane_id().unwrap();
         state.remove_session(id);
-        state.active_workspace_mut().unwrap().default_panes_pending = Some(true);
-        assert_eq!(empty_terminal_message(&state, PaneRole::Agent), None);
-        state.active_workspace_mut().unwrap().default_panes_pending = Some(false);
+        let workspace = state.active_workspace_mut().unwrap();
+        workspace.default_panes_pending = Some(true);
+        let workspace_id = workspace.id;
+        assert_eq!(state.terminal_guidance(PaneRole::Agent), None);
+        assert!(state.mark_workspace_spawning(workspace_id));
+        assert_eq!(
+            state.terminal_guidance(PaneRole::Agent),
+            Some(("Starting terminals…", None))
+        );
+        state.finish_workspace_spawning(workspace_id, true);
         state.connection = crate::state::ConnectionState::Reconnecting;
-        assert_eq!(empty_terminal_message(&state, PaneRole::Agent), None);
+        assert_eq!(state.terminal_guidance(PaneRole::Agent), None);
         state.connection = crate::state::ConnectionState::Connected;
         // An empty list from the daemon confirms the last workspace has closed.
         state.set_workspaces(Vec::new());
         assert_eq!(
-            empty_terminal_message(&state, PaneRole::Agent),
-            Some(("No workspaces open", "Choose Workspaces → + Workspace."))
+            state.terminal_guidance(PaneRole::Agent),
+            Some((
+                "No workspaces open",
+                Some("Choose Workspaces → + Workspace.")
+            ))
         );
     }
 

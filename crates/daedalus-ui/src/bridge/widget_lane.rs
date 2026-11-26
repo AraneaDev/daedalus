@@ -1,11 +1,7 @@
-use super::{UiCommand, UiEvent, UiEventSink};
-use daedalus_proto::transport::IpcStream;
-use daedalus_proto::{
-    ClientMessage, Request, ResponsePayload, ServerMessage, read_frame, write_frame,
-};
+use super::{UiCommand, UiEvent, UiEventSink, background_rpc};
+use daedalus_proto::ClientMessage;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::task::JoinSet;
 
 pub(super) struct WidgetLane<'a> {
@@ -89,7 +85,10 @@ impl<'a> WidgetLane<'a> {
         let auth_token = self.auth_token.map(str::to_owned);
         let sink = Arc::clone(self.sink);
         self.jobs.spawn(async move {
-            let response = run(&endpoint, auth_token, request).await;
+            // Widget execution uses its configured limits. Dropping the lane
+            // cancels the outstanding request and its separate connection.
+            let response =
+                background_rpc::request(&endpoint, auth_token.as_deref(), "widget", request).await;
             // Polling is advisory. A failed poll will be retried by the controller.
             if status.is_some() || response.is_ok() {
                 sink.emit(UiEvent::Workbench {
@@ -100,52 +99,6 @@ impl<'a> WidgetLane<'a> {
             }
         });
         true
-    }
-}
-
-async fn run(
-    endpoint: &Path,
-    auth_token: Option<String>,
-    request: ClientMessage,
-) -> Result<ResponsePayload, String> {
-    let mut stream = tokio::time::timeout(Duration::from_secs(30), async {
-        let mut stream = IpcStream::connect(endpoint)
-            .await
-            .map_err(|error| error.to_string())?;
-        if let Some(token) = auth_token {
-            let response = call(&mut stream, 1, ClientMessage::Authenticate { token }).await?;
-            if response != ResponsePayload::Ok {
-                return Err("Unexpected authentication response for the widget connection.".into());
-            }
-        }
-        Ok::<_, String>(stream)
-    })
-    .await
-    .map_err(|_| "The widget connection timed out.".to_string())??;
-
-    // Execution uses the limits configured in the widget. Ending the main session drops
-    // this separate connection with its outstanding request.
-    call(&mut stream, 2, request).await
-}
-
-async fn call(
-    stream: &mut IpcStream,
-    id: u64,
-    payload: ClientMessage,
-) -> Result<ResponsePayload, String> {
-    write_frame(stream, &Request { id, payload })
-        .await
-        .map_err(|error| error.to_string())?;
-    match read_frame::<_, ServerMessage>(stream)
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        Some(ServerMessage::Response {
-            id: response_id,
-            result,
-        }) if response_id == id => result.map_err(|error| error.to_string()),
-        Some(_) => Err("Unexpected reply on the widget connection.".into()),
-        None => Err("The widget connection closed before reporting a result.".into()),
     }
 }
 

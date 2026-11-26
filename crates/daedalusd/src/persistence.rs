@@ -27,12 +27,29 @@ pub struct PersistedWorkspace {
 pub struct PersistedRecentProject {
     pub name: String,
     pub root_dir: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_root_dir: Option<PathBuf>,
     pub last_used: u64,
+}
+
+impl PersistedRecentProject {
+    pub(crate) fn identity(&self) -> &Path {
+        self.canonical_root_dir.as_deref().unwrap_or(&self.root_dir)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedProjectSetup {
     pub root_dir: PathBuf,
+    pub assignments: Vec<Assignment>,
+}
+
+/// Explicit setup changes for a versioned workspace. The folder default and
+/// the workspace edit are persisted together in the daemon snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedWorkspaceSetup {
+    pub workspace_id: WorkspaceId,
+    pub revision: u64,
     pub assignments: Vec<Assignment>,
 }
 
@@ -45,6 +62,8 @@ pub struct PersistedState {
     pub recent_projects: Vec<PersistedRecentProject>,
     #[serde(default)]
     pub project_setups: Vec<PersistedProjectSetup>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_setups: Vec<PersistedWorkspaceSetup>,
 }
 
 impl Default for PersistedState {
@@ -54,6 +73,7 @@ impl Default for PersistedState {
             workspaces: Vec::new(),
             recent_projects: Vec::new(),
             project_setups: Vec::new(),
+            workspace_setups: Vec::new(),
         }
     }
 }
@@ -105,6 +125,13 @@ impl StateStore {
 }
 
 pub(crate) fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|e| io::Error::other(format!("failed to serialize {}: {e}", path.display())))?;
+    bytes.push(b'\n');
+    write_bytes_atomic(path, &bytes)
+}
+
+pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         #[cfg_attr(not(unix), allow(unused_variables))]
         let created = !parent.exists();
@@ -114,10 +141,6 @@ pub(crate) fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Resu
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
     }
-
-    let mut bytes = serde_json::to_vec_pretty(value)
-        .map_err(|e| io::Error::other(format!("failed to serialize {}: {e}", path.display())))?;
-    bytes.push(b'\n');
 
     let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp_name = format!(
@@ -142,7 +165,7 @@ pub(crate) fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Resu
     let write_res = (|| -> io::Result<()> {
         #[cfg(unix)]
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         Ok(())
     })();
@@ -319,6 +342,7 @@ mod tests {
             recent_projects: vec![PersistedRecentProject {
                 name: "alpha".to_string(),
                 root_dir: PathBuf::from("/tmp/alpha"),
+                canonical_root_dir: None,
                 last_used: 1_700_000_000,
             }],
             project_setups: vec![PersistedProjectSetup {
@@ -330,6 +354,7 @@ mod tests {
                     argv: vec!["claude".to_string()],
                 }],
             }],
+            workspace_setups: Vec::new(),
         }
     }
 

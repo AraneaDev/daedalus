@@ -20,8 +20,10 @@ mod widget_viewport;
 
 #[test]
 fn widget_editor_builds_previews_and_saves_a_daemon_definition() {
-    use daedalus_proto::workbench::{WidgetSource, WorkbenchState, WorkspaceDocument};
-    use daedalus_proto::{ClientMessage, ResponsePayload};
+    use daedalus_proto::workbench::{
+        WidgetAction, WidgetResult, WidgetSource, WorkbenchState, WorkspaceDocument,
+    };
+    use daedalus_proto::{ClientMessage, ResponsePayload, StatusLevel};
     use daedalus_ui::settings::Control;
 
     let mut workbench = Workbench::new();
@@ -51,25 +53,77 @@ fn widget_editor_builds_previews_and_saves_a_daemon_definition() {
     settings.set_value(Control::CustomInterval, "5");
     settings.activate(Control::CustomOutput);
     settings.set_value(Control::CustomSummary, "main:text");
+    let url = "https://example.invalid/health";
+    settings.set_value(Control::CustomUrl, url);
     let preview = settings.activate(Control::CustomPreview);
     workbench.app.handle_settings_action(preview);
-    let UiCommand::Workbench { request, .. } = workbench.commands.try_recv().unwrap() else {
+    let UiCommand::Workbench {
+        request, operation, ..
+    } = workbench.command()
+    else {
         panic!("expected a daemon preview")
     };
-    assert!(
-        matches!(*request, ClientMessage::PreviewWidget { definition, .. }
-        if matches!(&definition.sources[0].source, WidgetSource::Command { command, refresh, .. }
-            if command.argv == ["printf", "ready"] && refresh.interval_seconds == Some(5)))
-    );
-    let save = workbench.app.state.settings.activate(Control::CustomSave);
-    workbench.app.handle_settings_action(save);
-    let UiCommand::Workbench { request, .. } = workbench.commands.try_recv().unwrap() else {
-        panic!("expected a daemon save")
+    let ClientMessage::PreviewWidget { definition, .. } = *request else {
+        panic!("expected a widget definition")
     };
     assert!(
-        matches!(*request, ClientMessage::UpdateWorkbench { revision: 2, document, .. }
-        if document.widgets.len() == 1 && document.widgets[0].name == "API health")
+        matches!(&definition.sources[0].source, WidgetSource::Command { command, refresh, .. }
+            if command.argv == ["printf", "ready"] && refresh.interval_seconds == Some(5))
     );
+    assert_eq!(
+        definition.actions[0].action,
+        WidgetAction::OpenUrl { url: url.into() }
+    );
+    let duplicate = workbench
+        .app
+        .state
+        .settings
+        .activate(Control::CustomPreview);
+    workbench.app.handle_settings_action(duplicate);
+    assert!(workbench.commands.try_recv().is_err());
+    let result = WidgetResult {
+        label: "Ready".into(),
+        level: StatusLevel::Ok,
+        details: vec![],
+    };
+    workbench.app.workbench_response(
+        id,
+        operation,
+        Ok(ResponsePayload::WidgetResult(result.clone())),
+    );
+    assert_eq!(workbench.app.state.settings.custom.preview, Some(result));
+    let save = workbench.app.state.settings.activate(Control::CustomSave);
+    workbench.app.handle_settings_action(save);
+    let UiCommand::Workbench {
+        request, operation, ..
+    } = workbench.command()
+    else {
+        panic!("expected a daemon save")
+    };
+    let ClientMessage::UpdateWorkbench {
+        revision: 2,
+        document,
+        ..
+    } = *request
+    else {
+        panic!("expected a saved workspace")
+    };
+    assert_eq!(document.widgets.len(), 1);
+    assert_eq!(document.widgets[0].name, "API health");
+    assert_eq!(
+        document.widgets[0].definition.as_ref().unwrap().actions,
+        definition.actions
+    );
+    workbench.app.workbench_response(
+        id,
+        operation,
+        Ok(ResponsePayload::Workbench(WorkbenchState {
+            revision: 3,
+            document,
+            repo_baseline: None,
+        })),
+    );
+    assert!(workbench.app.state.settings.custom.draft.is_none());
     assert_eq!(
         workbench.app.state.pane_id_for_role(PaneRole::Agent),
         Some(agent)
@@ -343,6 +397,7 @@ fn workspace(name: &str) -> WorkspaceInfo {
 #[test]
 fn first_workspace_installs_a_tool_then_applies_review_to_same_workspace() {
     let mut w = Workbench::new();
+    daemon_capabilities(&mut w, true);
     w.begin_review();
     let install = vec!["installer".to_string(), "tool".to_string()];
     w.app
@@ -360,7 +415,9 @@ fn first_workspace_installs_a_tool_then_applies_review_to_same_workspace() {
     w.app
         .handle_setup_action(SetupAction::Install(install.clone()));
     assert!(w.idle());
-    let ws = workspace("Workbench");
+    let mut ws = workspace("Workbench");
+    ws.setup = Some(vec![stored_setup().remove(0)]);
+    let expected_baseline = ws.setup.clone();
     let id = ws.id;
     let pane = ws.panes[2].id;
     w.app.handle_daemon_event(UiEvent::ManualWorkspaceCreated {
@@ -382,8 +439,10 @@ fn first_workspace_installs_a_tool_then_applies_review_to_same_workspace() {
     assert!(!w.app.state.workspace_form.open);
     w.app.handle_daemon_event(UiEvent::Disconnected);
     w.app.handle_daemon_event(UiEvent::Connected);
+    let mut updated = ws;
+    updated.setup = Some(stored_setup());
     w.app
-        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![updated]));
     assert!(w.app.setup_installer_is_running());
     w.app
         .handle_daemon_event(UiEvent::SetupInstallerFinished(pane, Some(7)));
@@ -404,8 +463,10 @@ fn first_workspace_installs_a_tool_then_applies_review_to_same_workspace() {
     assert!(w.app.state.setup_review.feedback.contains("exited 7"));
     w.app.handle_setup_action(SetupAction::Open);
     assert!(
-        matches!(w.command(), UiCommand::ApplySetup { workspace_id, assignments, .. }
-            if workspace_id == id && assignments.iter().any(|a| a.id == "setup-runner" && a.argv == ["cargo", "test"]))
+        matches!(w.command(), UiCommand::ApplySetup { workspace_id, assignments, expected, .. }
+            if workspace_id == id
+                && expected.assignments == expected_baseline
+                && assignments.iter().any(|a| a.id == "setup-runner" && a.argv == ["cargo", "test"]))
     );
     w.app.handle_daemon_event(UiEvent::SetupApplied {
         workspace_id: id,
@@ -422,6 +483,42 @@ fn first_workspace_installs_a_tool_then_applies_review_to_same_workspace() {
     });
     assert!(!w.app.state.setup_review.open);
     assert_eq!(w.app.state.active_workspace_id, Some(id));
+}
+
+#[test]
+fn guided_setup_on_an_old_daemon_remembers_an_explicitly_empty_local_setup() {
+    const CHILD: &str = "DAEDALUS_TEST_GUIDED_LOCAL_SETUP";
+    if !run_in_isolated_profile(
+        "controller_tests::guided_setup_on_an_old_daemon_remembers_an_explicitly_empty_local_setup",
+        CHILD,
+    ) {
+        return;
+    }
+    let mut w = Workbench::new();
+    daemon_capabilities(&mut w, false);
+    w.begin_review();
+    w.app
+        .handle_setup_action(SetupAction::Install(vec!["installer".into()]));
+    let UiCommand::CreateManualWorkspace { session, .. } = w.command() else {
+        panic!("expected workspace creation");
+    };
+    let ws = workspace("Workbench");
+    let id = ws.id;
+    daedalus_ui::assignments::save(id, &[]).unwrap();
+    w.app.handle_daemon_event(UiEvent::ManualWorkspaceCreated {
+        session,
+        workspace: ws,
+    });
+    assert!(matches!(w.command(), UiCommand::InstallSetupTool { .. }));
+    w.app.handle_daemon_event(UiEvent::SetupInstallerFailed {
+        workspace_id: id,
+        message: "simulated installer failure".into(),
+    });
+    w.app.handle_setup_action(SetupAction::Open);
+    let UiCommand::ApplySetup { expected, .. } = w.command() else {
+        panic!("expected to apply the workspace setup");
+    };
+    assert_eq!(expected.assignments, Some(Vec::new()));
 }
 
 #[test]
@@ -1731,6 +1828,7 @@ fn daemon_backed_settings_save_sends_the_setup_and_follows_changes_from_the_daem
         workspace_id,
         assignments,
         request_id,
+        ..
     } = w.command()
     else {
         panic!("expected settings save");
@@ -1753,12 +1851,6 @@ fn daemon_backed_settings_save_sends_the_setup_and_follows_changes_from_the_daem
     assert!(
         matches!(w.command(), UiCommand::LaunchAssignment { assignment, .. } if assignment == renamed)
     );
-    w.app.handle_daemon_event(UiEvent::ProjectSetupSaveFailed {
-        workspace_id: id,
-        message: "disk full".into(),
-    });
-    let toast = w.app.state.toast.as_ref().unwrap();
-    assert!(toast.0.contains("disk full") && toast.1);
 }
 
 #[test]
@@ -1802,13 +1894,70 @@ fn local_setups_are_sent_to_the_daemon_once_and_the_files_stay() {
     w.app
         .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws.clone()]));
     assert!(
-        matches!(w.command(), UiCommand::SaveProjectSetup { workspace_id, assignments }
+        matches!(w.command(), UiCommand::SaveProjectSetup { workspace_id, assignments, .. }
             if workspace_id == ws.id && assignments == vec![entry.clone()])
     );
     w.app
         .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws.clone()]));
     assert!(w.idle());
     assert_eq!(daedalus_ui::assignments::load(ws.id).unwrap(), vec![entry]);
+}
+
+#[test]
+fn opening_settings_retries_migration_and_ignores_late_rejections() {
+    const CHILD: &str = "DAEDALUS_TEST_SETUP_MIGRATION_RETRY";
+    if !run_in_isolated_profile(
+        "controller_tests::opening_settings_retries_migration_and_ignores_late_rejections",
+        CHILD,
+    ) {
+        return;
+    }
+    let mut w = Workbench::new();
+    let ws = workspace("Retry");
+    let id = ws.id;
+    let entry = runner_entry("Local");
+    daedalus_ui::assignments::save(id, std::slice::from_ref(&entry)).unwrap();
+    daemon_capabilities(&mut w, true);
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws.clone()]));
+    let UiCommand::SaveProjectSetup {
+        request_id: first, ..
+    } = w.command()
+    else {
+        panic!("expected initial migration");
+    };
+    let failed = |request_id| UiEvent::ProjectSetupMigrationFinished {
+        workspace_id: id,
+        request_id,
+        result: Err("disk full".into()),
+    };
+    w.app.handle_daemon_event(failed(first));
+    let toast = w.app.state.toast.as_ref().unwrap();
+    assert!(toast.0.contains("disk full") && toast.1);
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+    assert!(w.idle());
+    w.app.handle_ui_action(UiAction::WorkspaceSettings);
+    let UiCommand::SaveProjectSetup {
+        request_id: retry,
+        assignments,
+        ..
+    } = w.command()
+    else {
+        panic!("expected settings to retry migration");
+    };
+    assert_ne!(first, retry);
+    assert_eq!(assignments, vec![entry.clone()]);
+    w.app.handle_daemon_event(failed(first));
+    assert_eq!(w.app.project_setups.load(id).unwrap(), vec![entry.clone()]);
+    w.app
+        .handle_daemon_event(UiEvent::ProjectSetupMigrationFinished {
+            workspace_id: id,
+            request_id: retry,
+            result: Ok(()),
+        });
+    w.app.handle_daemon_event(failed(retry));
+    assert_eq!(w.app.project_setups.load(id).unwrap(), vec![entry]);
 }
 
 #[test]
@@ -1855,6 +2004,61 @@ fn rejected_or_unsent_setup_saves_fall_back_to_the_confirmed_setup() {
     );
     assert_eq!(w.app.project_setups.load(id).unwrap(), vec![confirmed]);
 }
+#[test]
+fn pane_setup_conflict_keeps_the_open_settings_draft_and_original_baseline() {
+    use daedalus_ui::settings::{Control, SettingsAction};
+
+    let mut w = Workbench::new();
+    daemon_capabilities(&mut w, true);
+    let original = runner_entry("Original runner");
+    let mut ws = workspace("Concurrent settings");
+    let id = ws.id;
+    let root = ws.root_dir.clone();
+    ws.setup = Some(vec![original.clone()]);
+    w.app
+        .handle_daemon_event(UiEvent::WorkspacesLoaded(vec![ws]));
+    w.app.handle_ui_action(UiAction::WorkspaceSettings);
+    w.app.state.settings.set_value(Control::Name, "My draft");
+
+    let latest = runner_entry("Other client's runner");
+    w.app.handle_daemon_event(UiEvent::ProjectSetupChanged {
+        root_dir: root,
+        assignments: vec![latest.clone()],
+    });
+    let submit = runner_entry("My draft");
+    w.app
+        .handle_settings_action(SettingsAction::Save(vec![submit.clone()]));
+    let UiCommand::SaveWorkspaceSettings {
+        request_id,
+        expected,
+        assignments,
+        ..
+    } = w.command()
+    else {
+        panic!("expected a conditional save");
+    };
+    assert_eq!(expected.assignments, Some(vec![original.clone()]));
+    assert_eq!(assignments, vec![submit.clone()]);
+
+    w.app.handle_daemon_event(UiEvent::WorkspaceSettingsSaved {
+        workspace_id: id,
+        request_id,
+        result: Err("Pane setup changed on another client.".into()),
+    });
+    assert!(w.app.state.settings.open);
+    assert!(!w.app.state.settings.is_saving());
+    assert_eq!(w.app.state.settings.value(Control::Name), Some("My draft"));
+    assert_eq!(w.app.project_setups.load(id).unwrap(), vec![latest]);
+
+    w.app
+        .handle_settings_action(SettingsAction::Save(vec![submit]));
+    assert!(matches!(
+        w.command(),
+        UiCommand::SaveWorkspaceSettings { expected, .. }
+            if expected.assignments == Some(vec![original])
+    ));
+}
+
 #[test]
 fn save_and_launch_waits_for_confirmation_and_preserves_failed_drafts() {
     use daedalus_ui::settings::Control;
@@ -2072,17 +2276,10 @@ fn reopen_with_setup_creates_and_launches_agents_only() {
     // The setup only arrives on the workspace the daemon creates.
     let ws = reopen_first(&mut w, Some(stored_setup()));
     assert!(!w.app.state.workspace_form.open);
-    let UiCommand::ApplySetup {
-        workspace_id,
-        assignments,
-        launch,
-    } = w.command()
-    else {
-        panic!("expected the stored setup")
+    let UiCommand::LaunchStoredSetup(workspace_id) = w.command() else {
+        panic!("expected a launch without saving setup")
     };
     assert_eq!(workspace_id, ws.id);
-    assert_eq!(assignments, stored_setup());
-    assert_eq!(launch, ["agent", "reviewer"]);
     w.app.handle_daemon_event(UiEvent::SetupApplied {
         workspace_id,
         error: None,
@@ -2179,7 +2376,7 @@ fn reopen_failures_are_reported_where_the_user_is() {
         session,
         workspace: ws.clone(),
     });
-    assert!(matches!(w.command(), UiCommand::ApplySetup { .. }));
+    assert!(matches!(w.command(), UiCommand::LaunchStoredSetup(_)));
     w.app.handle_daemon_event(UiEvent::SetupApplied {
         workspace_id: ws.id,
         error: Some("agent missing".into()),
@@ -2227,18 +2424,11 @@ fn dismissed_reopen_still_applies_the_stored_setup() {
     start_screen_with_recent(&mut w, true);
     let ws = reopen_dismissed_then_form_reopened(&mut w, Some(stored_setup()));
     let applied = std::iter::from_fn(|| w.commands.try_recv().ok())
-        .find(|command| matches!(command, UiCommand::ApplySetup { .. }));
-    let Some(UiCommand::ApplySetup {
-        workspace_id,
-        assignments,
-        launch,
-    }) = applied
-    else {
+        .find(|command| matches!(command, UiCommand::LaunchStoredSetup(_)));
+    let Some(UiCommand::LaunchStoredSetup(workspace_id)) = applied else {
         panic!("the created workspace must get its setup")
     };
     assert_eq!(workspace_id, ws.id);
-    assert_eq!(assignments, stored_setup());
-    assert_eq!(launch, ["agent", "reviewer"]);
 }
 
 #[test]
@@ -2502,9 +2692,23 @@ fn selected_png_preview_preserves_terminal_focus_selection_and_scroll() {
         .unwrap();
     w.app.pointer.position = (button.x + 1., button.y + 1.);
     w.app.click_at(metrics);
-    assert!(
-        matches!(w.command(), UiCommand::PreviewImage {workspace_id: ws, pane_id, path} if ws == workspace_id && pane_id == pane && path == "image.png")
+    let UiCommand::PreviewImage {
+        workspace_id: ws,
+        pane_id,
+        token: older,
+        path,
+    } = w.command()
+    else {
+        panic!("expected image preview request");
+    };
+    assert_eq!(
+        (ws, pane_id, path.as_str()),
+        (workspace_id, pane, "image.png")
     );
+    w.app.handle_ui_action(UiAction::PreviewImage);
+    let UiCommand::PreviewImage { token, .. } = w.command() else {
+        panic!("expected replacement image preview request");
+    };
     let image = ImagePreview {
         width: 3,
         height: 1,
@@ -2512,12 +2716,19 @@ fn selected_png_preview_preserves_terminal_focus_selection_and_scroll() {
     };
     w.app.handle_daemon_event(UiEvent::ImagePreview {
         pane_id: PaneId::new(),
-        image: image.clone(),
+        token,
+        result: Ok(image.clone()),
+    });
+    w.app.handle_daemon_event(UiEvent::ImagePreview {
+        pane_id: pane,
+        token: older,
+        result: Ok(image.clone()),
     });
     assert!(w.app.state.image_preview.is_none());
     w.app.handle_daemon_event(UiEvent::ImagePreview {
         pane_id: pane,
-        image,
+        token,
+        result: Ok(image),
     });
     for width in [320, 1440] {
         let metrics = ViewportMetrics {

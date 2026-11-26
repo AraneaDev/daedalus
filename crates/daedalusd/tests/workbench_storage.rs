@@ -1,11 +1,11 @@
 use daedalus_proto::transport::IpcStream;
 use daedalus_proto::workbench::{
-    WidgetDefinition, WidgetTemplate, WorkbenchState, WorkspaceDocument, WorkspaceImportPreview,
-    WorkspaceImportSource,
+    PaneWidgets, WidgetDefinition, WidgetInstance, WidgetTemplate, WorkbenchEdit, WorkbenchState,
+    WorkspaceDocument, WorkspaceImportPreview, WorkspaceImportSource,
 };
 use daedalus_proto::{
-    ClientMessage, ProtoError, Request, ResponsePayload, ServerMessage, WorkspaceId, read_frame,
-    write_frame,
+    Assignment, ClientMessage, PaneRole, ProjectSetupBaseline, ProtoError, Request,
+    ResponsePayload, ServerMessage, WorkspaceId, read_frame, write_frame,
 };
 use daedalusd::server::DaemonServer;
 use daedalusd::supervisor::{IsolationMode, Supervisor};
@@ -120,6 +120,519 @@ impl DaemonFixture {
     }
 }
 
+fn runner(name: &str) -> Vec<Assignment> {
+    vec![Assignment {
+        id: "runner".into(),
+        name: name.into(),
+        role: PaneRole::Runner,
+        argv: vec!["cargo".into(), "test".into()],
+    }]
+}
+
+#[tokio::test]
+async fn stale_setup_save_returns_current_assignments_across_workbench_changes() {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut daemon = DaemonFixture::start(scratch.path()).await;
+    let root = scratch.path();
+    let workspace_id = daemon.workspace(root).await;
+    let request = |assignments, expected| ClientMessage::SetProjectSetup {
+        workspace_id,
+        assignments,
+        expected: Some(ProjectSetupBaseline {
+            assignments: expected,
+        }),
+    };
+
+    // An open dialog with no saved setup can still save when a different
+    // client creates the first workbench document by changing only its layout.
+    let mut initial = daemon.workbench(workspace_id).await;
+    initial.document.layout.split_view = true;
+    assert!(matches!(
+        daemon
+            .call(ClientMessage::UpdateWorkbench {
+                workspace_id,
+                revision: initial.revision,
+                document: initial.document,
+                layout_only: true,
+                edit: None,
+            })
+            .await
+            .unwrap(),
+        ResponsePayload::Workbench(_)
+    ));
+    let mut original = runner("Original runner");
+    original.push(Assignment {
+        id: "service".into(),
+        name: "Original service".into(),
+        role: PaneRole::Service,
+        argv: vec!["service".into()],
+    });
+    assert_eq!(
+        daemon.call(request(original.clone(), None)).await.unwrap(),
+        ResponsePayload::Ok
+    );
+
+    let mut first = original.clone();
+    first[0].name = "Runner changed by A".into();
+    assert_eq!(
+        daemon
+            .call(request(first.clone(), Some(original.clone())))
+            .await
+            .unwrap(),
+        ResponsePayload::Ok
+    );
+    let saved = daemon.workbench(workspace_id).await;
+    let mut second = original.clone();
+    second[1].name = "Service changed by B".into();
+    assert_eq!(
+        daemon
+            .call(request(second.clone(), Some(original)))
+            .await
+            .unwrap(),
+        ResponsePayload::ProjectSetupConflict(ProjectSetupBaseline {
+            assignments: Some(first.clone()),
+        })
+    );
+    assert_eq!(daemon.workbench(workspace_id).await, saved);
+
+    second[0].name = first[0].name.clone();
+    assert_eq!(
+        daemon
+            .call(request(second.clone(), Some(first)))
+            .await
+            .unwrap(),
+        ResponsePayload::Ok
+    );
+    let persisted = daemon.workbench(workspace_id).await;
+    assert_eq!(persisted.document.assignments, second);
+    assert!(persisted.document.layout.split_view);
+    daemon.finish().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn old_literal_setup_keys_follow_the_project_across_folder_aliases() {
+    use daedalusd::persistence::{
+        PersistedProjectSetup, PersistedRecentProject, PersistedState, StateStore,
+    };
+
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().canonicalize().unwrap();
+    let project = root.join("project");
+    let alias = root.join("alias");
+    std::fs::create_dir(&project).unwrap();
+    std::os::unix::fs::symlink(&project, &alias).unwrap();
+    let original = runner("Legacy setup");
+    let store = StateStore::new(root.join("state.json"));
+    store
+        .save(&PersistedState {
+            project_setups: vec![PersistedProjectSetup {
+                root_dir: alias.clone(),
+                assignments: original.clone(),
+            }],
+            recent_projects: vec![PersistedRecentProject {
+                name: "Seen through alias".into(),
+                root_dir: alias.clone(),
+                canonical_root_dir: None,
+                last_used: 1,
+            }],
+            ..PersistedState::default()
+        })
+        .unwrap();
+
+    let mut daemon = DaemonFixture::start(&root).await;
+    let ResponsePayload::RecentProjects(recent) = daemon
+        .call(ClientMessage::ListRecentProjects)
+        .await
+        .unwrap()
+    else {
+        panic!("expected recent projects");
+    };
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].root_dir, alias);
+    assert!(recent[0].has_setup);
+
+    let id = daemon.workspace(&project).await;
+    assert_eq!(daemon.workbench(id).await.document.assignments, original);
+    assert_eq!(
+        daemon
+            .call(ClientMessage::ListRecentProjects)
+            .await
+            .unwrap(),
+        ResponsePayload::RecentProjects(Vec::new()),
+    );
+    let latest = runner("Latest setup");
+    assert_eq!(
+        daemon
+            .call(ClientMessage::SetProjectSetup {
+                workspace_id: id,
+                assignments: latest.clone(),
+                expected: Some(ProjectSetupBaseline {
+                    assignments: Some(original)
+                }),
+            })
+            .await
+            .unwrap(),
+        ResponsePayload::Ok,
+    );
+    daemon
+        .call(ClientMessage::CloseWorkspace {
+            id,
+            compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
+        })
+        .await
+        .unwrap();
+    daemon.finish().await;
+
+    let mut daemon = DaemonFixture::start(&root).await;
+    let reopened = daemon.workspace(&alias).await;
+    assert_eq!(
+        daemon.workbench(reopened).await.document.assignments,
+        latest
+    );
+    let ResponsePayload::Workspaces(workspaces) =
+        daemon.call(ClientMessage::ListWorkspaces).await.unwrap()
+    else {
+        panic!("expected open workspaces");
+    };
+    assert_eq!(workspaces[0].root_dir, alias);
+    assert_eq!(workspaces[0].setup.as_deref(), Some(latest.as_slice()));
+    assert_eq!(store.load().unwrap().project_setups[0].root_dir, project);
+    daemon.finish().await;
+}
+
+#[tokio::test]
+async fn first_widget_edits_preserve_newer_project_setup() {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut daemon = DaemonFixture::start(scratch.path()).await;
+    let ResponsePayload::WidgetLibrary(library) = daemon
+        .call(ClientMessage::ListWidgetTemplates)
+        .await
+        .unwrap()
+    else {
+        panic!("expected widget library");
+    };
+    let template = library
+        .templates
+        .into_iter()
+        .find(|item| item.id == "git-worktree")
+        .unwrap();
+    let assignments = runner("New runner");
+    for edit in [WorkbenchEdit::Widgets, WorkbenchEdit::PaneWidgets] {
+        let root = scratch.path().join(format!("{edit:?}"));
+        std::fs::create_dir(&root).unwrap();
+        let workspace_id = daemon.workspace(&root).await;
+        let mut stale = daemon.workbench(workspace_id).await;
+        assert_eq!(stale.revision, 0);
+        assert!(stale.document.assignments.is_empty());
+        daemon
+            .call(ClientMessage::SetProjectSetup {
+                workspace_id,
+                assignments: assignments.clone(),
+                expected: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(daemon.workbench(workspace_id).await.revision, 0);
+
+        stale.document.widgets.push(WidgetInstance {
+            id: "branch".into(),
+            name: template.name.clone(),
+            pinned: true,
+            template: Some(template.id.clone()),
+            definition: None,
+        });
+        stale.document.templates.push(template.clone());
+        stale.document.pane_widgets = Some(PaneWidgets::default());
+        let request = ClientMessage::UpdateWorkbench {
+            workspace_id,
+            revision: stale.revision,
+            document: stale.document,
+            layout_only: false,
+            edit: Some(edit),
+        };
+        let ResponsePayload::Workbench(saved) = daemon.call(request.clone()).await.unwrap() else {
+            panic!("expected scoped save");
+        };
+        assert_eq!(saved.document.assignments, assignments);
+        assert_eq!(
+            saved.document.widgets.len(),
+            usize::from(edit == WorkbenchEdit::Widgets)
+        );
+        assert_eq!(
+            saved.document.pane_widgets.is_some(),
+            edit == WorkbenchEdit::PaneWidgets
+        );
+        assert_eq!(
+            daemon.call(request).await.unwrap(),
+            ResponsePayload::WorkbenchConflict(saved)
+        );
+    }
+    daemon.finish().await;
+}
+
+#[tokio::test]
+async fn first_workbench_write_respects_explicit_setup_and_manifest_preset() {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut daemon = DaemonFixture::start(scratch.path()).await;
+    for (name, preset, saved) in [
+        ("empty", "shell", Some(Vec::new())),
+        ("partial", "shell", Some(runner("Explicit runner"))),
+        ("inherited", "CoDeX", None),
+        ("shell-preset", "SHELL", None),
+        ("shell-command", "shell", None),
+    ] {
+        let root = scratch.path().join(name);
+        std::fs::create_dir(&root).unwrap();
+        let explicit_command = if name == "shell-command" {
+            "command = [\"shell\"]\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            root.join(".daedalus.toml"),
+            format!("[agent]\npreset = \"{preset}\"\n{explicit_command}[runner]\ncommand = [\"cargo\", \"test\"]\n"),
+        )
+        .unwrap();
+        let workspace_id = daemon.workspace(&root).await;
+        let initial = daemon.workbench(workspace_id).await;
+        if let Some(assignments) = &saved {
+            daemon
+                .call(ClientMessage::SetProjectSetup {
+                    workspace_id,
+                    assignments: assignments.clone(),
+                    expected: None,
+                })
+                .await
+                .unwrap();
+        }
+        let ResponsePayload::Workbench(written) = daemon
+            .call(ClientMessage::UpdateWorkbench {
+                workspace_id,
+                revision: initial.revision,
+                document: initial.document,
+                layout_only: true,
+                edit: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected a saved layout");
+        };
+        if let Some(assignments) = saved {
+            assert_eq!(written.document.assignments, assignments);
+        } else {
+            let agent = &written.document.assignments[0];
+            assert_eq!(
+                agent.argv,
+                [if name == "inherited" {
+                    "codex"
+                } else {
+                    "shell"
+                }]
+            );
+            assert_eq!(agent.uses_default_shell(), name == "shell-preset");
+            assert_eq!(written.document.assignments[1].role, PaneRole::Runner);
+        }
+    }
+    daemon.finish().await;
+}
+
+#[tokio::test]
+async fn reviewed_runner_launch_rejects_a_second_clients_command_edit() {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut daemon = DaemonFixture::start(scratch.path()).await;
+    let workspace_id = daemon.workspace(scratch.path()).await;
+    let reviewed = runner("Reviewed runner").remove(0);
+    daemon
+        .call(ClientMessage::SetProjectSetup {
+            workspace_id,
+            assignments: vec![reviewed.clone()],
+            expected: None,
+        })
+        .await
+        .unwrap();
+    let primary = IpcStream::connect(&scratch.path().join("control.sock"))
+        .await
+        .unwrap();
+    let second = std::mem::replace(&mut daemon.client, primary);
+    let updated = Assignment {
+        argv: vec!["updated-runner".into()],
+        ..reviewed.clone()
+    };
+    daemon
+        .call(ClientMessage::SetProjectSetup {
+            workspace_id,
+            assignments: vec![updated],
+            expected: Some(ProjectSetupBaseline {
+                assignments: Some(vec![reviewed.clone()]),
+            }),
+        })
+        .await
+        .unwrap();
+    daemon.client = second;
+    let response = daemon
+        .call(ClientMessage::LaunchRunnerAssignment {
+            workspace_id,
+            assignment_id: reviewed.id.clone(),
+            expected: Some(reviewed),
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(response, ProtoError::InvalidRequest(message)
+        if message.contains("saved runner changed")));
+    let ResponsePayload::Workspaces(workspaces) =
+        daemon.call(ClientMessage::ListWorkspaces).await.unwrap()
+    else {
+        panic!("expected open workspaces");
+    };
+    assert!(workspaces[0].panes.is_empty());
+    daemon.finish().await;
+}
+
+#[tokio::test]
+async fn saved_project_setup_survives_reopen_without_inheriting_a_workspace_import() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let mut daemon = DaemonFixture::start(root).await;
+    let workspace_id = daemon.workspace(root).await;
+    let mut document = daemon.workbench(workspace_id).await.document;
+    document.assignments = runner("Imported runner");
+    let imported = document.clone();
+    let replace = |revision, document| ClientMessage::ApplyWorkspaceImport {
+        workspace_id,
+        revision,
+        incoming: document,
+        linked: false,
+        resolutions: Default::default(),
+    };
+    let ResponsePayload::Workbench(initial) = daemon.call(replace(0, document)).await.unwrap()
+    else {
+        panic!("expected imported workbench");
+    };
+    let latest = runner("Saved project runner");
+    daemon
+        .call(ClientMessage::SetProjectSetup {
+            workspace_id,
+            assignments: latest.clone(),
+            expected: None,
+        })
+        .await
+        .unwrap();
+    let saved = daemon.workbench(workspace_id).await;
+    assert_eq!(saved.revision, initial.revision + 1);
+    assert_eq!(saved.document.assignments, latest);
+    assert_eq!(
+        daemon
+            .call(replace(initial.revision, imported.clone()))
+            .await
+            .unwrap(),
+        ResponsePayload::WorkbenchConflict(saved.clone())
+    );
+    daemon.finish().await;
+
+    let mut daemon = DaemonFixture::start(root).await;
+    assert_eq!(daemon.workbench(workspace_id).await, saved);
+    let ResponsePayload::Workbench(local) = daemon
+        .call(replace(saved.revision, imported.clone()))
+        .await
+        .unwrap()
+    else {
+        panic!("expected workspace-local replacement");
+    };
+    assert_eq!(local.document.assignments, imported.assignments);
+    daemon
+        .call(ClientMessage::CloseWorkspace {
+            id: workspace_id,
+            compose_down: false,
+            remove_worktree: false,
+            force_remove_worktree: false,
+        })
+        .await
+        .unwrap();
+    daemon.finish().await;
+
+    let mut daemon = DaemonFixture::start(root).await;
+    let ResponsePayload::RecentProjects(recent) = daemon
+        .call(ClientMessage::ListRecentProjects)
+        .await
+        .unwrap()
+    else {
+        panic!("expected recent projects");
+    };
+    assert!(
+        recent
+            .iter()
+            .any(|project| project.root_dir == root && project.has_setup)
+    );
+    let reopened = daemon.workspace(root).await;
+    assert_ne!(workspace_id, reopened);
+    assert_eq!(
+        daemon.workbench(reopened).await.document.assignments,
+        latest
+    );
+    daemon.finish().await;
+}
+
+#[tokio::test]
+async fn first_layout_preserves_newer_project_setup_and_is_exported_after_restart() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let mut daemon = DaemonFixture::start(root).await;
+    let workspace_id = daemon.workspace(root).await;
+    let mut initial = daemon.workbench(workspace_id).await;
+    assert_eq!(initial.revision, 0);
+    assert!(initial.document.assignments.is_empty());
+    let assignments = vec![Assignment {
+        id: "agent".into(),
+        name: "Agent setup".into(),
+        role: PaneRole::Agent,
+        argv: vec!["agent".into()],
+    }];
+    daemon
+        .call(ClientMessage::SetProjectSetup {
+            workspace_id,
+            assignments: assignments.clone(),
+            expected: None,
+        })
+        .await
+        .unwrap();
+    initial.document.layout.split_view = true;
+    let reply = daemon
+        .call(ClientMessage::UpdateWorkbench {
+            workspace_id,
+            revision: 0,
+            document: initial.document,
+            layout_only: true,
+            edit: None,
+        })
+        .await
+        .unwrap();
+    let ResponsePayload::Workbench(saved) = reply else {
+        panic!("expected the first layout save")
+    };
+    assert_eq!(saved.revision, 1);
+    assert_eq!(saved.document.assignments, assignments);
+    assert!(saved.document.layout.split_view);
+    daemon.finish().await;
+
+    let mut daemon = DaemonFixture::start(root).await;
+    assert_eq!(daemon.workbench(workspace_id).await, saved);
+    let ResponsePayload::WorkbenchToml(export) = daemon
+        .call(ClientMessage::ExportWorkspace { workspace_id })
+        .await
+        .unwrap()
+    else {
+        panic!("expected export")
+    };
+    assert!(export.contains("split_view = true"));
+    daemon.finish().await;
+}
+
 #[tokio::test]
 async fn rejected_workbench_write_preserves_the_last_confirmed_document() {
     let scratch = tempfile::tempdir().unwrap();
@@ -147,6 +660,8 @@ async fn rejected_workbench_write_preserves_the_last_confirmed_document() {
             workspace_id,
             revision: 1,
             document: WorkspaceDocument::new("Rejected".into()),
+            layout_only: false,
+            edit: None,
         })
         .await;
     assert!(matches!(rejected, Err(ProtoError::IoError(_))));
@@ -224,6 +739,8 @@ async fn shared_import_reports_repo_availability_and_rejects_both_forms_of_stale
             workspace_id,
             revision: 0,
             document: WorkspaceDocument::new("From another client".into()),
+            layout_only: false,
+            edit: None,
         })
         .await
         .unwrap();
@@ -493,6 +1010,8 @@ async fn linked_import_applies_the_explicit_choices_from_a_renewed_preview() {
             workspace_id,
             revision: linked.revision,
             document: local.clone(),
+            layout_only: false,
+            edit: None,
         })
         .await
         .unwrap()

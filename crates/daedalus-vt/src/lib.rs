@@ -594,6 +594,28 @@ mod tests {
     }
 
     #[test]
+    fn search_folds_greek_sigma_and_preserves_terminal_columns() {
+        let mut vt = BuiltinVt::new(VtConfig {
+            cols: 20,
+            rows: 2,
+            scrollback_limit: 10,
+        });
+        vt.feed("界 ΟΣ".as_bytes());
+        for query in ["ΟΣ", "ος", "οσ"] {
+            assert_eq!(
+                vt.search(query, false),
+                vec![SearchMatch {
+                    abs_row: 0,
+                    start_col: 3,
+                    end_col: 5,
+                }],
+                "{query}"
+            );
+        }
+        assert!(vt.search("ος", true).is_empty());
+    }
+
+    #[test]
     fn search_caps_results_at_max_search_matches() {
         let mut vt = BuiltinVt::new(VtConfig {
             cols: 80,
