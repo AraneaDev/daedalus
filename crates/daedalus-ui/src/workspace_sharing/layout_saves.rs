@@ -10,32 +10,44 @@ use uuid::Uuid;
 pub(crate) struct LayoutSave {
     pub(super) desired: WorkbenchLayout,
     pub(super) base: Option<WorkbenchState>,
-    in_flight: Option<Uuid>,
-    edited_view: bool,
-    edited_splits: BTreeSet<String>,
+    in_flight: Option<LayoutWrite>,
+    edits: LayoutEdits,
+}
+
+struct LayoutWrite {
+    token: Uuid,
+    layout: WorkbenchLayout,
+    edits: LayoutEdits,
+}
+
+#[derive(Clone, Default)]
+struct LayoutEdits {
+    view: bool,
+    splits: BTreeSet<String>,
 }
 
 impl LayoutSave {
     fn record(&mut self, desired: WorkbenchLayout) {
-        self.edited_splits.extend(
+        self.edits.splits.extend(
             desired
                 .splits
                 .iter()
                 .filter(|(key, value)| self.desired.splits.get(*key) != Some(*value))
                 .map(|(key, _)| key.clone()),
         );
-        self.edited_view |=
-            self.desired.split_view != desired.split_view || !self.edited_splits.is_empty();
+        self.edits.view |=
+            self.desired.split_view != desired.split_view || !self.edits.splits.is_empty();
         self.desired = desired;
     }
 
     fn project(&self, confirmed: &WorkbenchLayout) -> WorkbenchLayout {
         let mut layout = confirmed.clone();
-        if self.edited_view {
+        if self.edits.view {
             layout.split_view = self.desired.split_view;
         }
         layout.splits.extend(
-            self.edited_splits
+            self.edits
+                .splits
                 .iter()
                 .map(|key| (key.clone(), self.desired.splits[key])),
         );
@@ -46,6 +58,16 @@ impl LayoutSave {
         let layout = self.project(&state.document.layout);
         self.desired = normalize_layout(&layout);
         self.base = Some(state.clone());
+    }
+
+    fn confirm(&mut self, write: &LayoutWrite) {
+        if write.edits.view && self.desired.split_view == write.layout.split_view {
+            self.edits.view = false;
+        }
+        self.edits.splits.retain(|key| {
+            !write.edits.splits.contains(key)
+                || self.desired.splits.get(key) != write.layout.splits.get(key)
+        });
     }
 
     fn pause(&mut self) {
@@ -108,8 +130,7 @@ impl DaedalusApp {
                 ),
                 base: base.filter(|_| connected).cloned(),
                 in_flight: None,
-                edited_view: false,
-                edited_splits: BTreeSet::new(),
+                edits: LayoutEdits::default(),
             }
         });
         save.record(desired);
@@ -151,10 +172,14 @@ impl DaedalusApp {
         // Rebase the desktop intent on the newest confirmed document. Retain
         // imported split keys the desktop does not own as well as other settings.
         let mut document = base.document.clone();
-        document.layout = layout;
+        document.layout = layout.clone();
         let revision = base.revision;
         let token = Uuid::new_v4();
-        save.in_flight = Some(token);
+        save.in_flight = Some(LayoutWrite {
+            token,
+            layout,
+            edits: save.edits.clone(),
+        });
         if !self.send_command(UiCommand::Workbench {
             workspace_id: id,
             operation: WorkbenchOperation::Layout(token),
@@ -176,16 +201,28 @@ impl DaedalusApp {
         token: Uuid,
         response: Result<ResponsePayload, String>,
     ) {
-        let Some(save) = self
-            .layout_saves
-            .get_mut(&id)
-            .filter(|save| save.in_flight == Some(token))
-        else {
+        let Some(save) = self.layout_saves.get_mut(&id).filter(|save| {
+            save.in_flight
+                .as_ref()
+                .is_some_and(|write| write.token == token)
+        }) else {
             return;
         };
-        save.in_flight = None;
+        let write = save.in_flight.take().expect("matching layout write");
         match response {
-            Ok(ResponsePayload::Workbench(state) | ResponsePayload::WorkbenchConflict(state)) => {
+            Ok(ResponsePayload::Workbench(state)) => {
+                save.confirm(&write);
+                // A watched update can arrive before its matching save response.
+                // Reapply the remaining intent to the newest confirmed snapshot.
+                let latest = save
+                    .base
+                    .as_ref()
+                    .filter(|base| base.revision > state.revision)
+                    .cloned()
+                    .unwrap_or(state);
+                self.load_workbench(id, latest);
+            }
+            Ok(ResponsePayload::WorkbenchConflict(state)) => {
                 self.load_workbench(id, state);
             }
             Err(error) => self.fail_layout_save(id, error),

@@ -11,6 +11,18 @@ pub struct Assignment {
     pub argv: Vec<String>,
 }
 
+impl Assignment {
+    /// Older documents represented the manifest's Shell preset as a synthetic executable.
+    pub fn uses_default_shell(&self) -> bool {
+        self.role == PaneRole::Agent
+            && self
+                .id
+                .strip_prefix("manifest-agent")
+                .is_some_and(|suffix| suffix.chars().all(|ch| ch == '-'))
+            && matches!(self.argv.as_slice(), [preset] if crate::canonical_agent_preset(preset) == Some("shell"))
+    }
+}
+
 /// The saved pane setup the client used as its starting point. An unset setup
 /// is distinct from a saved empty list.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

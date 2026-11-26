@@ -68,12 +68,7 @@ impl RestoreBatch {
             return;
         }
 
-        match Registry::prepare_registered_workspace(
-            &entry,
-            HashMap::new(),
-            self.reserved_ports.clone(),
-        )
-        .await
+        match prepare_restored_workspace(&entry, HashMap::new(), self.reserved_ports.clone()).await
         {
             Ok(record) => {
                 self.reserved_ports
@@ -87,6 +82,27 @@ impl RestoreBatch {
             }
         }
     }
+}
+
+async fn prepare_restored_workspace(
+    entry: &PersistedWorkspace,
+    environment: HashMap<String, String>,
+    reserved_ports: HashSet<u16>,
+) -> Result<WorkspaceRecord, daedalus_proto::ProtoError> {
+    use daedalus_proto::ProtoError;
+    let mut record =
+        Registry::prepare_registered_workspace(entry, environment, reserved_ports).await?;
+    if record.pending_compose_override.is_none() {
+        return Ok(record);
+    }
+    tokio::task::spawn_blocking(move || {
+        record
+            .install_compose_override()
+            .map_err(|error| ProtoError::IoError(error.to_string()))?;
+        Ok(record)
+    })
+    .await
+    .map_err(|error| ProtoError::Internal(format!("Workspace restoration task failed: {error}")))?
 }
 
 async fn root_is_directory(root: &Path) -> io::Result<bool> {

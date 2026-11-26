@@ -1,6 +1,6 @@
 use super::rpc::{RpcConnection, RpcError};
 use super::workspace::emit_spawned_pane;
-use super::{DEFAULT_PANE_COLS, DEFAULT_PANE_ROWS, UiEvent, UiEventSink};
+use super::{AssignmentLaunch, DEFAULT_PANE_COLS, DEFAULT_PANE_ROWS, UiEvent, UiEventSink};
 use crate::assignments::{self, Assignment};
 use crate::state::AgentPreset;
 use daedalus_proto::{
@@ -82,7 +82,7 @@ pub(super) async fn launch_assignment(
     sink: &Arc<dyn UiEventSink>,
     workspace_id: WorkspaceId,
     assignment: Assignment,
-    saved_runner: bool,
+    launch: AssignmentLaunch,
     cols: u16,
     rows: u16,
 ) -> Result<(), RpcError> {
@@ -94,11 +94,17 @@ pub(super) async fn launch_assignment(
     } else {
         None
     };
-    let summary = if saved_runner && conn.runner_assignment_supported {
+    let use_saved_runner = match launch {
+        AssignmentLaunch::Direct => false,
+        AssignmentLaunch::SavedRunner => conn.runner_assignment_supported,
+        AssignmentLaunch::ReviewedRunner => conn.guarded_runner_assignment_supported,
+    };
+    let summary = if use_saved_runner {
         match conn
             .call(ClientMessage::LaunchRunnerAssignment {
                 workspace_id,
                 assignment_id: assignment.id.clone(),
+                expected: (launch == AssignmentLaunch::ReviewedRunner).then(|| assignment.clone()),
                 cols,
                 rows,
             })
@@ -112,7 +118,8 @@ pub(super) async fn launch_assignment(
             }
         }
     } else {
-        let command = (!assignment.argv.is_empty()).then(|| assignment.argv.clone());
+        let command = (!assignment.argv.is_empty() && !assignment.uses_default_shell())
+            .then(|| assignment.argv.clone());
         spawn(conn, workspace_id, assignment.role, command, cols, rows).await?
     };
     let pane_id = summary.id;
@@ -323,13 +330,17 @@ async fn launch_entries(
     let mut failures = Vec::new();
     for entry in entries {
         let name = entry.name.clone();
-        let saved_runner = conn.project_setup_supported && entry.role == PaneRole::Runner;
+        let launch = if conn.project_setup_supported && entry.role == PaneRole::Runner {
+            AssignmentLaunch::ReviewedRunner
+        } else {
+            AssignmentLaunch::Direct
+        };
         match launch_assignment(
             conn,
             sink,
             workspace_id,
             entry,
-            saved_runner,
+            launch,
             DEFAULT_PANE_COLS,
             DEFAULT_PANE_ROWS,
         )

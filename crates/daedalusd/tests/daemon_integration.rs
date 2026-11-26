@@ -2941,7 +2941,8 @@ command = "echo SVC_ACTION_OK"
                 command: Some(vec![
                     "/bin/sh".to_string(),
                     "-c".to_string(),
-                    "stty -echo; cat -v".to_string(),
+                    "stty raw -echo; printf '\\033[?2004h'; dd bs=1 count=28 of=action-wrapped 2>/dev/null; \
+                     printf '\\033[?2004l'; dd bs=1 count=16 of=action-plain 2>/dev/null".to_string(),
                 ]),
                 shell: None,
                 cols: 120,
@@ -2955,56 +2956,56 @@ command = "echo SVC_ACTION_OK"
             other => panic!("unexpected response: {other:?}"),
         };
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(
-            send_rpc(
-                &mut client,
-                8,
-                ClientMessage::RunWorkspaceAction {
-                    workspace_id: ws.id,
-                    action_id: "agent-prompt".to_string(),
-                },
-            )
-            .await,
-            ResponsePayload::Ok
-        );
-
-        let agent_text = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let snap = match send_rpc(
+        for (enabled, file, expected) in [
+            (
+                true,
+                "action-wrapped",
+                &b"\x1b[200~AGENT_ACTION_OK\x1b[201~\r"[..],
+            ),
+            (false, "action-plain", &b"AGENT_ACTION_OK\r"[..]),
+        ] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let ResponsePayload::Snapshot(snapshot) = send_rpc(
+                        &mut client,
+                        8,
+                        ClientMessage::GetSnapshot {
+                            pane_id: agent_pane.id,
+                        },
+                    )
+                    .await
+                    else {
+                        panic!("expected agent snapshot");
+                    };
+                    if snapshot.terminal_modes.bracketed_paste == enabled {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("agent did not switch paste mode");
+            assert_eq!(
+                send_rpc(
                     &mut client,
                     9,
-                    ClientMessage::GetSnapshot {
-                        pane_id: agent_pane.id,
+                    ClientMessage::RunWorkspaceAction {
+                        workspace_id: ws.id,
+                        action_id: "agent-prompt".into(),
                     },
                 )
-                .await
-                {
-                    ResponsePayload::Snapshot(s) => s,
-                    other => panic!("unexpected response: {other:?}"),
-                };
-                let text: String = snap
-                    .rows_data
-                    .iter()
-                    .map(|r| {
-                        r.cells
-                            .iter()
-                            .map(|c| c.text.as_str())
-                            .collect::<String>()
-                            .trim_end()
-                            .to_string()
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if text.contains("^[[200~AGENT_ACTION_OK^[[201~") {
-                    return text;
+                .await,
+                ResponsePayload::Ok
+            );
+            let file = ws.root_dir.join(file);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !std::fs::read(&file).is_ok_and(|data| data == expected) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("timed out waiting for bracketed paste AGENT_ACTION_OK in agent pane snapshot");
-        assert!(agent_text.contains("^[[200~AGENT_ACTION_OK^[[201~"));
+            })
+            .await
+            .unwrap_or_else(|_| panic!("unexpected action bytes: {:?}", std::fs::read(&file)));
+        }
     }
 
     send_rpc(

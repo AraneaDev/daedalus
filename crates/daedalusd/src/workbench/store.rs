@@ -106,6 +106,23 @@ impl WorkbenchStore {
             .await
     }
 
+    pub(crate) async fn discard_unpublished_workspace(
+        &self,
+        id: WorkspaceId,
+    ) -> Result<(), ProtoError> {
+        self.access(move |store, memory| {
+            memory.workspaces.remove(&id);
+            if let Some(path) = store.workspace_path(id)
+                && let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != ErrorKind::NotFound
+            {
+                return Err(io_error(error));
+            }
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn update_library(
         &self,
         revision: u64,

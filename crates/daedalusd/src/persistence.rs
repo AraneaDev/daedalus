@@ -125,6 +125,13 @@ impl StateStore {
 }
 
 pub(crate) fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|e| io::Error::other(format!("failed to serialize {}: {e}", path.display())))?;
+    bytes.push(b'\n');
+    write_bytes_atomic(path, &bytes)
+}
+
+pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         #[cfg_attr(not(unix), allow(unused_variables))]
         let created = !parent.exists();
@@ -134,10 +141,6 @@ pub(crate) fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Resu
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
     }
-
-    let mut bytes = serde_json::to_vec_pretty(value)
-        .map_err(|e| io::Error::other(format!("failed to serialize {}: {e}", path.display())))?;
-    bytes.push(b'\n');
 
     let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp_name = format!(
@@ -162,7 +165,7 @@ pub(crate) fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Resu
     let write_res = (|| -> io::Result<()> {
         #[cfg(unix)]
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         Ok(())
     })();

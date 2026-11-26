@@ -136,12 +136,25 @@ pub(crate) fn save_if_current(
     save_checked(&workspace_path(workspace_id), assignments, Some(baseline))
 }
 
-fn save_checked(
+pub(crate) fn save_checked(
     path: &Path,
     assignments: &[Assignment],
     baseline: Option<&ProjectSetupBaseline>,
 ) -> Result<bool, String> {
     validate(assignments)?;
+    let _lock = lock_for_write(path)?;
+    if let Some(baseline) = baseline
+        && load_stored(path)? != baseline.assignments
+    {
+        return Ok(false);
+    }
+    let contents = toml::to_string(&AssignmentList { assignments })
+        .map_err(|error| format!("Could not encode assignments: {error}"))?;
+    write_atomic(path, &contents)?;
+    Ok(true)
+}
+
+pub(crate) fn lock_for_write(path: &Path) -> Result<fs::File, String> {
     let directory = path.parent().ok_or("Missing assignments directory")?;
     fs::create_dir_all(directory)
         .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
@@ -156,15 +169,7 @@ fn save_checked(
         .map_err(|error| format!("Could not open {}: {error}", lock_path.display()))?;
     lock.lock()
         .map_err(|error| format!("Could not lock {}: {error}", lock_path.display()))?;
-    if let Some(baseline) = baseline
-        && load_stored(path)? != baseline.assignments
-    {
-        return Ok(false);
-    }
-    let contents = toml::to_string(&AssignmentList { assignments })
-        .map_err(|error| format!("Could not encode assignments: {error}"))?;
-    write_atomic(path, &contents)?;
-    Ok(true)
+    Ok(lock)
 }
 
 pub fn bind(workspace_id: WorkspaceId, pane_id: PaneId, assignment_id: &str) -> Result<(), String> {

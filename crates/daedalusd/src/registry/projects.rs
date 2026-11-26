@@ -125,24 +125,22 @@ impl Registry {
             .collect()
     }
 
-    /// Moves the folder to the front of the recent list and trims the list.
-    pub(super) async fn record_recent_project(
+    /// Projects the recent list for a lifecycle change before its state is committed.
+    pub(super) async fn recent_projects_after_contact(
         &self,
         name: &str,
         root_dir: &Path,
         canonical_root_dir: &Path,
-    ) {
-        let mut recent = self.recent_projects.write().await;
+    ) -> Vec<PersistedRecentProject> {
+        let mut recent = self.recent_projects.read().await.clone();
         if recent.len() >= MAX_RECENT_PROJECTS
             && !recent.iter().any(|entry| entry.root_dir == root_dir)
         {
             // Resolve the visible paths before a potential eviction. A legacy
             // mount may be back, or a previously direct path can now be a symlink.
             let candidates: Vec<_> = recent.iter().map(|entry| entry.root_dir.clone()).collect();
-            drop(recent);
             let mut resolved = resolve_project_roots(candidates.into_iter()).await;
-            recent = self.recent_projects.write().await;
-            for entry in recent.iter_mut() {
+            for entry in &mut recent {
                 if let Some(canonical) = resolved.remove(&entry.root_dir) {
                     entry.canonical_root_dir = Some(canonical);
                 }
@@ -159,6 +157,15 @@ impl Registry {
             },
         );
         deduplicate_projects(&mut recent);
+        recent
+    }
+
+    #[cfg(test)]
+    async fn record_recent_project(&self, name: &str, root_dir: &Path, canonical_root_dir: &Path) {
+        let recent = self
+            .recent_projects_after_contact(name, root_dir, canonical_root_dir)
+            .await;
+        *self.recent_projects.write().await = recent;
     }
 
     pub(super) async fn load_project_lists(&self, state: &mut PersistedState) {

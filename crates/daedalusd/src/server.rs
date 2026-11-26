@@ -317,6 +317,7 @@ async fn dispatch_request(
                 workbench_supported: true,
                 workspace_membership_supported: true,
                 runner_assignment_supported: true,
+                guarded_runner_assignment_supported: true,
                 resolved_import_preview_supported: true,
                 agent_launch_metadata_supported: true,
                 home_dir: std::env::home_dir(),
@@ -461,11 +462,18 @@ async fn dispatch_request(
         ClientMessage::LaunchRunnerAssignment {
             workspace_id,
             assignment_id,
+            expected,
             cols,
             rows,
         } => Ok(ResponsePayload::PaneSpawned(
             registry
-                .launch_runner_assignment(workspace_id, &assignment_id, cols, rows)
+                .launch_runner_assignment(
+                    workspace_id,
+                    &assignment_id,
+                    expected.as_ref(),
+                    cols,
+                    rows,
+                )
                 .await?,
         )),
         ClientMessage::ClosePane { pane_id } => {

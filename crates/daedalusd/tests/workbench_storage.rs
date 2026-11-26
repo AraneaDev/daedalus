@@ -374,6 +374,127 @@ async fn first_widget_edits_preserve_newer_project_setup() {
 }
 
 #[tokio::test]
+async fn first_workbench_write_respects_explicit_setup_and_manifest_preset() {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut daemon = DaemonFixture::start(scratch.path()).await;
+    for (name, preset, saved) in [
+        ("empty", "shell", Some(Vec::new())),
+        ("partial", "shell", Some(runner("Explicit runner"))),
+        ("inherited", "CoDeX", None),
+        ("shell-preset", "SHELL", None),
+        ("shell-command", "shell", None),
+    ] {
+        let root = scratch.path().join(name);
+        std::fs::create_dir(&root).unwrap();
+        let explicit_command = if name == "shell-command" {
+            "command = [\"shell\"]\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            root.join(".daedalus.toml"),
+            format!("[agent]\npreset = \"{preset}\"\n{explicit_command}[runner]\ncommand = [\"cargo\", \"test\"]\n"),
+        )
+        .unwrap();
+        let workspace_id = daemon.workspace(&root).await;
+        let initial = daemon.workbench(workspace_id).await;
+        if let Some(assignments) = &saved {
+            daemon
+                .call(ClientMessage::SetProjectSetup {
+                    workspace_id,
+                    assignments: assignments.clone(),
+                    expected: None,
+                })
+                .await
+                .unwrap();
+        }
+        let ResponsePayload::Workbench(written) = daemon
+            .call(ClientMessage::UpdateWorkbench {
+                workspace_id,
+                revision: initial.revision,
+                document: initial.document,
+                layout_only: true,
+                edit: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected a saved layout");
+        };
+        if let Some(assignments) = saved {
+            assert_eq!(written.document.assignments, assignments);
+        } else {
+            let agent = &written.document.assignments[0];
+            assert_eq!(
+                agent.argv,
+                [if name == "inherited" {
+                    "codex"
+                } else {
+                    "shell"
+                }]
+            );
+            assert_eq!(agent.uses_default_shell(), name == "shell-preset");
+            assert_eq!(written.document.assignments[1].role, PaneRole::Runner);
+        }
+    }
+    daemon.finish().await;
+}
+
+#[tokio::test]
+async fn reviewed_runner_launch_rejects_a_second_clients_command_edit() {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut daemon = DaemonFixture::start(scratch.path()).await;
+    let workspace_id = daemon.workspace(scratch.path()).await;
+    let reviewed = runner("Reviewed runner").remove(0);
+    daemon
+        .call(ClientMessage::SetProjectSetup {
+            workspace_id,
+            assignments: vec![reviewed.clone()],
+            expected: None,
+        })
+        .await
+        .unwrap();
+    let primary = IpcStream::connect(&scratch.path().join("control.sock"))
+        .await
+        .unwrap();
+    let second = std::mem::replace(&mut daemon.client, primary);
+    let updated = Assignment {
+        argv: vec!["updated-runner".into()],
+        ..reviewed.clone()
+    };
+    daemon
+        .call(ClientMessage::SetProjectSetup {
+            workspace_id,
+            assignments: vec![updated],
+            expected: Some(ProjectSetupBaseline {
+                assignments: Some(vec![reviewed.clone()]),
+            }),
+        })
+        .await
+        .unwrap();
+    daemon.client = second;
+    let response = daemon
+        .call(ClientMessage::LaunchRunnerAssignment {
+            workspace_id,
+            assignment_id: reviewed.id.clone(),
+            expected: Some(reviewed),
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(response, ProtoError::InvalidRequest(message)
+        if message.contains("saved runner changed")));
+    let ResponsePayload::Workspaces(workspaces) =
+        daemon.call(ClientMessage::ListWorkspaces).await.unwrap()
+    else {
+        panic!("expected open workspaces");
+    };
+    assert!(workspaces[0].panes.is_empty());
+    daemon.finish().await;
+}
+
+#[tokio::test]
 async fn saved_project_setup_survives_reopen_without_inheriting_a_workspace_import() {
     let scratch = tempfile::tempdir().unwrap();
     let root = scratch.path();

@@ -2,7 +2,7 @@ use super::super::{DaedalusApp, FALLBACK_PANE_COLS, FALLBACK_PANE_ROWS};
 use daedalus_proto::{PaneId, PaneRole, WorkspaceId, WorkspaceInfo};
 use daedalus_ui::{
     assignments::{self, Assignment},
-    bridge::UiCommand,
+    bridge::{AssignmentLaunch, UiCommand},
 };
 
 impl DaedalusApp {
@@ -35,7 +35,7 @@ impl DaedalusApp {
             self.show_toast("Test command is no longer configured", false);
             return;
         };
-        if !self.launch_assignment(workspace_id, assignment, true) {
+        if !self.launch_assignment(workspace_id, assignment, AssignmentLaunch::SavedRunner) {
             self.show_toast("Reconnect to run tests", true);
         }
     }
@@ -45,7 +45,7 @@ impl DaedalusApp {
             return;
         }
         if let Some(workspace) = self.state.active_workspace_id
-            && !self.launch_assignment(workspace, preset.assignment(), false)
+            && !self.launch_assignment(workspace, preset.assignment(), AssignmentLaunch::Direct)
         {
             self.show_toast("Reconnect to run Cargo", true);
         }
@@ -55,7 +55,7 @@ impl DaedalusApp {
         &self,
         workspace_id: WorkspaceId,
         assignment: Assignment,
-        from_saved_setup: bool,
+        launch: AssignmentLaunch,
     ) -> bool {
         let (cols, rows) = self
             .compute_current_layout()
@@ -63,7 +63,11 @@ impl DaedalusApp {
             .unwrap_or((FALLBACK_PANE_COLS, FALLBACK_PANE_ROWS));
         self.send_command(UiCommand::LaunchAssignment {
             workspace_id,
-            saved_runner: from_saved_setup && assignment.role == PaneRole::Runner,
+            launch: if assignment.role == PaneRole::Runner {
+                launch
+            } else {
+                AssignmentLaunch::Direct
+            },
             assignment,
             cols,
             rows,

@@ -1,4 +1,5 @@
 mod background_rpc;
+mod image_requests;
 mod launch;
 #[cfg(test)]
 mod negotiation_tests;
@@ -90,6 +91,13 @@ pub enum WorkbenchOperation {
     Export(PathBuf),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignmentLaunch {
+    Direct,
+    SavedRunner,
+    ReviewedRunner,
+}
+
 /// Commands sent from the UI thread to `DaemonBridge`.
 #[derive(Debug, Clone)]
 pub enum UiCommand {
@@ -102,6 +110,7 @@ pub enum UiCommand {
     PreviewImage {
         workspace_id: WorkspaceId,
         pane_id: PaneId,
+        token: uuid::Uuid,
         path: String,
     },
     InspectSetup {
@@ -163,7 +172,7 @@ pub enum UiCommand {
     LaunchAssignment {
         workspace_id: WorkspaceId,
         assignment: crate::assignments::Assignment,
-        saved_runner: bool,
+        launch: AssignmentLaunch,
         cols: u16,
         rows: u16,
     },
@@ -236,7 +245,8 @@ pub enum UiEvent {
     },
     ImagePreview {
         pane_id: PaneId,
-        image: daedalus_proto::rpc::ImagePreview,
+        token: uuid::Uuid,
+        result: Result<daedalus_proto::rpc::ImagePreview, String>,
     },
     SetupInspected {
         session: u64,
@@ -550,11 +560,18 @@ async fn session_loop(
     let membership = conn.membership_notifications();
     let mut widgets = widget_lane::WidgetLane::new(endpoint, auth_token, sink);
     let mut recents = JoinSet::new();
+    let mut images = JoinSet::new();
+    let mut next_image: Option<image_requests::ImageRequest> = None;
     let mut refresh_recents = conn.recent_projects_supported;
     loop {
         if refresh_recents && recents.is_empty() {
             recent_projects::request(&mut recents, endpoint, auth_token);
             refresh_recents = false;
+        }
+        if images.is_empty()
+            && let Some(request) = next_image.take()
+        {
+            request.start(&mut images, endpoint, auth_token);
         }
         tokio::select! {
             biased;
@@ -562,6 +579,12 @@ async fn session_loop(
                 return;
             }
             _ = widgets.join_next(), if widgets.has_jobs() => {}
+            Some(result) = images.join_next(), if !images.is_empty() => {
+                match result {
+                    Ok(event) => sink.emit(event),
+                    Err(error) => warn!(%error, "image preview task failed"),
+                }
+            }
             Some(result) = recents.join_next(), if !recents.is_empty() => {
                 match result {
                     Ok(Ok(projects)) => sink.emit(UiEvent::RecentProjectsLoaded(projects)),
@@ -584,6 +607,20 @@ async fn session_loop(
                 }
                 if matches!(cmd, UiCommand::RefreshRecentProjects) {
                     refresh_recents = conn.recent_projects_supported;
+                    continue;
+                }
+                if let UiCommand::PreviewImage { workspace_id, pane_id, token, path } = cmd {
+                    if conn.image_preview_supported {
+                        next_image = Some(image_requests::ImageRequest {
+                            workspace_id, pane_id, token, path,
+                        });
+                    } else {
+                        sink.emit(UiEvent::ImagePreview {
+                            pane_id,
+                            token,
+                            result: Err("This daemon does not support workspace image previews.".into()),
+                        });
+                    }
                     continue;
                 }
                 if conn.workbench_supported && widgets.dispatch(&cmd) {
@@ -780,20 +817,12 @@ async fn handle_command(
         UiCommand::LaunchAssignment {
             workspace_id,
             assignment,
-            saved_runner,
+            launch,
             cols,
             rows,
         } => {
-            setup::launch_assignment(
-                conn,
-                sink,
-                workspace_id,
-                assignment,
-                saved_runner,
-                cols,
-                rows,
-            )
-            .await?;
+            setup::launch_assignment(conn, sink, workspace_id, assignment, launch, cols, rows)
+                .await?;
         }
         UiCommand::AddAgent {
             workspace_id,
@@ -812,13 +841,7 @@ async fn handle_command(
         } => {
             replace_agent_preset(conn, sink, workspace_id, old_pane_id, preset, cols, rows).await?;
         }
-        UiCommand::PreviewImage {
-            workspace_id,
-            pane_id,
-            path,
-        } => {
-            terminal::preview_image(conn, sink, workspace_id, pane_id, path).await?;
-        }
+        UiCommand::PreviewImage { .. } => {}
         UiCommand::RunWorkspaceAction {
             workspace_id,
             action_id,

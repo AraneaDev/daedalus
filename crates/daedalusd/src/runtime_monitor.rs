@@ -10,6 +10,7 @@ pub use local_ports::{
     parse_windows_netstat_output,
 };
 
+use crate::process::monitor_root::MonitorRoot;
 use crate::registry::Registry;
 use crate::worktree;
 use bollard::Docker;
@@ -32,6 +33,11 @@ pub struct WorkspaceMonitorTarget {
     pub root_dir: PathBuf,
     pub compose_project_name: Option<String>,
     pub root_pids: Vec<u32>,
+}
+
+pub(crate) struct ActiveMonitorTarget {
+    pub(crate) snapshot: WorkspaceMonitorTarget,
+    pub(crate) monitor_roots: Vec<MonitorRoot>,
 }
 
 async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
@@ -67,7 +73,7 @@ pub fn spawn_runtime_monitor(
                 break;
             }
 
-            let targets = registry.monitor_targets().await;
+            let targets = registry.monitor_targets_with_roots().await;
             if targets.is_empty() {
                 continue;
             }
@@ -86,7 +92,11 @@ pub fn spawn_runtime_monitor(
                 }
             };
 
-            if targets.iter().any(|t| t.compose_project_name.is_some()) && docker_client.is_none() {
+            if targets
+                .iter()
+                .any(|t| t.snapshot.compose_project_name.is_some())
+                && docker_client.is_none()
+            {
                 match connect_docker_client() {
                     Some(client) => docker_client = Some(client),
                     None => {
@@ -98,7 +108,10 @@ pub fn spawn_runtime_monitor(
                 }
             }
 
-            for target in targets {
+            for ActiveMonitorTarget {
+                snapshot: target, ..
+            } in targets
+            {
                 if *shutdown.borrow() {
                     break;
                 }
@@ -114,10 +127,27 @@ pub fn spawn_runtime_monitor(
                     },
                     _ => Default::default(),
                 };
-                let (containers, bound_ports, git_status, git_branch) = merge_runtime_observations(
-                    observations,
-                    local_by_ws.remove(&target.workspace_id),
-                );
+                let mut local = None;
+                if let Some(((mut ports, status, branch), mut sampled)) =
+                    local_by_ws.remove(&target.workspace_id)
+                {
+                    if sampled.iter().any(|root| root.live_pid().is_none()) {
+                        // Docker polling can outlast a pane. Resample the surviving
+                        // processes so their ports stay visible when this one exits.
+                        (ports, sampled) = tokio::select! {
+                            biased;
+                            _ = wait_for_shutdown(&mut shutdown) => break,
+                            result = tokio::task::spawn_blocking(move || sample_ports(sampled)) =>
+                                result.unwrap_or_default(),
+                        };
+                    }
+                    if sampled.iter().any(|root| root.live_pid().is_none()) {
+                        ports.clear();
+                    }
+                    local = Some((ports, status, branch));
+                }
+                let (containers, bound_ports, git_status, git_branch) =
+                    merge_runtime_observations(observations, local);
 
                 registry
                     .update_workspace_runtime(
@@ -134,28 +164,48 @@ pub fn spawn_runtime_monitor(
 }
 
 type LocalObservation = (Vec<PortMapping>, Option<GitWorkspaceStatus>, Option<String>);
+type LocalSample = (LocalObservation, Vec<MonitorRoot>);
 type ComposeObservation = (Vec<ContainerHealth>, Vec<PortMapping>);
 
 fn probe_local_targets(
-    targets: &[WorkspaceMonitorTarget],
-) -> JoinHandle<HashMap<WorkspaceId, LocalObservation>> {
+    targets: &[ActiveMonitorTarget],
+) -> JoinHandle<HashMap<WorkspaceId, LocalSample>> {
     let targets: Vec<_> = targets
         .iter()
-        .map(|t| (t.workspace_id, t.root_pids.clone(), t.root_dir.clone()))
+        .map(|t| {
+            (
+                t.snapshot.workspace_id,
+                t.monitor_roots.clone(),
+                t.snapshot.root_dir.clone(),
+            )
+        })
         .collect();
     tokio::task::spawn_blocking(move || {
         targets
             .into_iter()
             .map(|(id, roots, dir)| {
-                let ports = discover_local_ports_for_roots(&roots);
                 let (status, branch) = match worktree::git_workspace_status_and_branch(&dir) {
                     Some((status, branch)) => (Some(status), branch),
                     None => (None, None),
                 };
-                (id, (ports, status, branch))
+                let (ports, sampled) = sample_ports(roots);
+                (id, ((ports, status, branch), sampled))
             })
             .collect()
     })
+}
+
+fn sample_ports(mut roots: Vec<MonitorRoot>) -> (Vec<PortMapping>, Vec<MonitorRoot>) {
+    for _ in 0..2 {
+        roots.retain(MonitorRoot::is_current);
+        let pids: Vec<_> = roots.iter().filter_map(MonitorRoot::live_pid).collect();
+        let ports = discover_local_ports_for_roots(&pids);
+        if roots.iter().all(MonitorRoot::is_current) {
+            return (ports, roots);
+        }
+    }
+    // Process churn exceeded the bounded retry budget for this poll.
+    (Vec::new(), Vec::new())
 }
 
 async fn poll_compose_observations(

@@ -113,6 +113,7 @@ impl DaedalusApp {
             match target {
                 PreviewTarget::Panel => {
                     self.state.image_preview = None;
+                    self.state.pending_image_preview = None;
                     self.request_redraw();
                 }
                 PreviewTarget::Button => self.handle_ui_action(UiAction::PreviewImage),

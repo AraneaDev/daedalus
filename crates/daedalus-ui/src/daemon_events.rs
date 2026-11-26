@@ -23,9 +23,22 @@ impl DaedalusApp {
                 operation,
                 response,
             } => self.workbench_response(workspace_id, operation, *response),
-            UiEvent::ImagePreview { pane_id, image } => {
-                if self.state.focused_pane_id() == Some(pane_id) && image.valid() {
-                    self.state.image_preview = Some((pane_id, image));
+            UiEvent::ImagePreview {
+                pane_id,
+                token,
+                result,
+            } => {
+                if self.state.pending_image_preview == Some((pane_id, token)) {
+                    self.state.pending_image_preview = None;
+                    if self.state.focused_pane_id() == Some(pane_id) {
+                        match result {
+                            Ok(image) if image.valid() => {
+                                self.state.image_preview = Some((pane_id, image));
+                            }
+                            Ok(_) => self.show_toast("Invalid preview received.", true),
+                            Err(error) => self.show_toast(error, true),
+                        }
+                    }
                 }
             }
             UiEvent::JournalCapability(supported) => self.history.connection(supported),
@@ -105,6 +118,7 @@ impl DaedalusApp {
                 self.schedule_resize_flush();
             }
             UiEvent::Disconnected => {
+                self.state.pending_image_preview = None;
                 self.pause_layout_saves();
                 self.seeding_workbench.clear();
                 self.watched_workbench = None;
@@ -134,24 +148,10 @@ impl DaedalusApp {
                     self.state.close_modal.submitting = false;
                 }
             }
-            UiEvent::WorkspaceCloseFailed(workspaces) => {
-                self.state.set_workspaces(workspaces);
-                self.prune_layout_saves();
-                self.schedule_resize_flush();
-            }
             UiEvent::WorkspacesLoaded(workspaces) => self.apply_workspace_list(workspaces, true),
-            UiEvent::WorkspaceMembershipLoaded(workspaces) => {
-                let new_panes: Vec<_> = workspaces
-                    .iter()
-                    .flat_map(|workspace| &workspace.panes)
-                    .filter_map(|pane| {
-                        (!self.state.panes.contains_key(&pane.id)).then_some(pane.id)
-                    })
-                    .collect();
+            UiEvent::WorkspaceMembershipLoaded(workspaces)
+            | UiEvent::WorkspaceCloseFailed(workspaces) => {
                 self.apply_workspace_list(workspaces, false);
-                for pane_id in new_panes {
-                    self.send_command(UiCommand::RequestSnapshot { pane_id });
-                }
             }
             UiEvent::SetupInspected { session, result } => self.setup_inspected(session, result),
             UiEvent::SetupInstallerStarted {
@@ -289,6 +289,16 @@ impl DaedalusApp {
     }
 
     fn apply_workspace_list(&mut self, workspaces: Vec<WorkspaceInfo>, initialize: bool) {
+        let previously_active = self.state.active_workspace_id;
+        let new_panes = if initialize {
+            Vec::new()
+        } else {
+            workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.panes)
+                .filter_map(|pane| (!self.state.panes.contains_key(&pane.id)).then_some(pane.id))
+                .collect()
+        };
         self.project_setups.absorb(&workspaces);
         for migration in self.project_setups.migrations(&workspaces) {
             self.send_setup_migration(migration);
@@ -300,7 +310,12 @@ impl DaedalusApp {
         if initialize {
             self.refresh_inactive_layout_saves();
             self.offer_first_workspace();
+        }
+        if initialize || self.state.active_workspace_id != previously_active {
             self.ensure_active_workspace_panes();
+        }
+        for pane_id in new_panes {
+            self.send_command(UiCommand::RequestSnapshot { pane_id });
         }
         self.schedule_resize_flush();
     }

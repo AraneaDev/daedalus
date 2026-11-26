@@ -4,7 +4,7 @@ use super::DaedalusApp;
 use daedalus_proto::{PaneRole, WorkspaceId};
 use daedalus_ui::{
     assignments::Assignment,
-    bridge::{UiCommand, WorkbenchOperation},
+    bridge::{AssignmentLaunch, UiCommand, WorkbenchOperation},
     project_setups::SetupMigration,
     settings::SettingsAction,
     state::{AgentPreset, WorkspaceView},
@@ -87,25 +87,34 @@ impl DaedalusApp {
         {
             self.send_setup_migration(migration);
         }
-        match self.project_setups.load_or(id, defaults) {
-            Ok(entries) => {
+        match self.project_setups.settings_draft(id, defaults) {
+            Ok((entries, baseline)) => {
                 self.state.close_search();
                 self.state.action_palette.close();
                 self.state.picker.close();
                 self.state.settings.begin(entries);
                 self.state.settings.widget_workspace = Some(id);
-                self.state.settings.setup_baseline = self.project_setups.baseline(id);
+                self.state.settings.setup_baseline = baseline;
                 self.prepare_workbench_settings(id);
                 self.state.settings.set_automatic_widgets(
                     self.state.has_widget_source(PaneRole::Service),
                     self.state.has_widget_source(PaneRole::Runner),
                 );
-                let widgets = self
-                    .state
-                    .workspace_widgets
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_default();
+                let widgets = if self.workbench_capable || self.state.settings.custom_supported {
+                    self.state
+                        .workspace_widgets
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    match daedalus_ui::workspace_widgets::load(&self.widget_directory, id) {
+                        Ok(widgets) => widgets.unwrap_or_default(),
+                        Err(error) => {
+                            self.state.settings.error = Some(error);
+                            Default::default()
+                        }
+                    }
+                };
                 self.state.settings.reset_pane_widget_draft(widgets);
             }
             Err(err) => self.show_toast(err, true),
@@ -168,7 +177,11 @@ impl DaedalusApp {
             return;
         };
         let launch = launch_id.and_then(|id| entries.iter().find(|entry| entry.id == id).cloned());
-        match self.project_setups.save(workspace, entries) {
+        match self.project_setups.save_settings(
+            workspace,
+            entries,
+            &self.state.settings.setup_baseline,
+        ) {
             Ok(Some(assignments)) => {
                 let request_id =
                     self.state
@@ -252,8 +265,13 @@ impl DaedalusApp {
             }
             return;
         }
-        match daedalus_ui::workspace_widgets::save(&self.widget_directory, id, &widgets) {
-            Ok(()) => {
+        match daedalus_ui::workspace_widgets::update(&self.widget_directory, id, |saved| {
+            self.state
+                .settings
+                .reconcile_pane_widget_draft(widgets, saved)
+                .map_err(str::to_owned)
+        }) {
+            Ok(widgets) => {
                 self.state.workspace_widgets.insert(id, widgets.clone());
                 self.state.settings.reset_pane_widget_draft(widgets);
                 self.state.settings.widgets_saved = true;
@@ -300,7 +318,7 @@ impl DaedalusApp {
     ) {
         self.refresh_workspace_setup(workspace);
         if let Some(assignment) = launch
-            && !self.launch_assignment(workspace, assignment, true)
+            && !self.launch_assignment(workspace, assignment, AssignmentLaunch::ReviewedRunner)
         {
             self.state.settings.error =
                 Some("Settings saved. Reconnect to launch this terminal.".into());

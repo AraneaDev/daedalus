@@ -148,6 +148,8 @@ pub enum ClientMessage {
     LaunchRunnerAssignment {
         workspace_id: WorkspaceId,
         assignment_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected: Option<Assignment>,
         cols: u16,
         rows: u16,
     },
@@ -313,6 +315,8 @@ pub enum ResponsePayload {
         workspace_membership_supported: bool,
         #[serde(default)]
         runner_assignment_supported: bool,
+        #[serde(default)]
+        guarded_runner_assignment_supported: bool,
         #[serde(default)]
         home_dir: Option<PathBuf>,
         #[serde(default)]

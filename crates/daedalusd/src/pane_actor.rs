@@ -1,4 +1,5 @@
 use crate::agent_detector::AgentStateDetector;
+use crate::process::monitor_root::MonitorRoot;
 use crate::supervisor::SpawnedPty;
 use daedalus_proto::{
     AgentState, FailureTrace, GridRow, GridSnapshot, PaneId, PaneRole, PaneSummary, ProtoError,
@@ -18,6 +19,7 @@ enum PaneCmd {
     },
     Paste {
         data: Vec<u8>,
+        submit: bool,
         reply: oneshot::Sender<Result<(), ProtoError>>,
     },
     Resize {
@@ -87,7 +89,7 @@ pub struct PaneHandle {
     id: PaneId,
     workspace_id: WorkspaceId,
     role: PaneRole,
-    root_pid: Option<u32>,
+    monitor_root: Option<MonitorRoot>,
     assignment_id: Option<std::sync::Arc<str>>,
     cmd_tx: mpsc::Sender<PaneCmd>,
 }
@@ -137,7 +139,7 @@ impl PaneHandle {
             mut writer,
             handle: proc_handle,
         } = spawned;
-        let root_pid = proc_handle.root_pid();
+        let monitor_root = proc_handle.root_pid().map(MonitorRoot::new);
 
         std::thread::Builder::new()
             .name(format!("pty-reader-{}", pane_id.short()))
@@ -181,6 +183,7 @@ impl PaneHandle {
                 write_tx,
                 launch_preset,
                 size,
+                monitor_root: monitor_root.clone(),
             },
             writer_handle,
             proc_handle,
@@ -192,7 +195,7 @@ impl PaneHandle {
             id: pane_id,
             workspace_id,
             role,
-            root_pid,
+            monitor_root,
             assignment_id: None,
             cmd_tx,
         }
@@ -220,7 +223,14 @@ impl PaneHandle {
     }
 
     pub fn root_pid(&self) -> Option<u32> {
-        self.root_pid
+        self.monitor_root.as_ref()?.live_pid()
+    }
+
+    pub(crate) fn monitor_root(&self) -> Option<MonitorRoot> {
+        self.monitor_root
+            .as_ref()
+            .filter(|root| root.live_pid().is_some())
+            .cloned()
     }
 
     pub async fn summary(&self) -> Result<PaneSummary, ProtoError> {
@@ -242,9 +252,21 @@ impl PaneHandle {
     }
 
     pub async fn paste(&self, data: Vec<u8>) -> Result<(), ProtoError> {
+        self.paste_input(data, false).await
+    }
+
+    pub(crate) async fn paste_and_submit(&self, data: Vec<u8>) -> Result<(), ProtoError> {
+        self.paste_input(data, true).await
+    }
+
+    async fn paste_input(&self, data: Vec<u8>, submit: bool) -> Result<(), ProtoError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(PaneCmd::Paste { data, reply: tx })
+            .send(PaneCmd::Paste {
+                data,
+                submit,
+                reply: tx,
+            })
             .await
             .map_err(|_| ProtoError::PaneNotFound(self.id))?;
         rx.await.map_err(|_| ProtoError::PaneNotFound(self.id))?
@@ -538,9 +560,16 @@ struct PaneCommands {
     write_tx: mpsc::Sender<WriteRequest>,
     launch_preset: Option<String>,
     size: PtySize,
+    monitor_root: Option<MonitorRoot>,
 }
 
 impl PaneCommands {
+    fn retire_monitor_root(&self) {
+        if let Some(root) = &self.monitor_root {
+            root.retire();
+        }
+    }
+
     fn queue_input(&self, data: Vec<u8>, reply: oneshot::Sender<Result<(), ProtoError>>) {
         if let Err(err) = self.write_tx.try_send(WriteRequest { data, reply }) {
             let (msg, request) = match err {
@@ -554,12 +583,19 @@ impl PaneCommands {
     fn handle(&mut self, output: &mut PaneOutput, command: PaneCmd) -> Option<oneshot::Sender<()>> {
         match command {
             PaneCmd::SendInput { data, reply } => self.queue_input(data, reply),
-            PaneCmd::Paste { data, reply } => {
-                let data = if output.tracker.engine().terminal_modes().bracketed_paste {
+            PaneCmd::Paste {
+                data,
+                submit,
+                reply,
+            } => {
+                let mut data = if output.tracker.engine().terminal_modes().bracketed_paste {
                     wrap_bracketed_paste(&data)
                 } else {
                     single_line_paste(&data)
                 };
+                if submit {
+                    data.push(b'\r');
+                }
                 self.queue_input(data, reply);
             }
             PaneCmd::Resize { cols, rows, reply } => {
@@ -693,6 +729,7 @@ async fn run_pane_actor(
                     Some(PtyOutput::Bytes(bytes)) => output.feed(&bytes, &commands.write_tx),
                     Some(PtyOutput::Closed) | None => {
                         pty_open = false;
+                        commands.retire_monitor_root();
                         finish_pty_output(&mut output, &mut proc_handle, child_exit.map(|(code, _)| code)).await;
                     }
                 }
@@ -720,6 +757,7 @@ async fn run_pane_actor(
                 }
             }, if pty_open && child_exit.is_none() => {
                 if let Some(code) = proc_handle.try_wait_exit() {
+                    commands.retire_monitor_root();
                     child_exit = Some((code, tokio::time::Instant::now() + CONPTY_EXIT_DRAIN));
                 }
             }
@@ -734,6 +772,7 @@ async fn run_pane_actor(
         }
     };
 
+    commands.retire_monitor_root();
     pty_rx.close();
     teardown_pane(
         commands.write_tx,

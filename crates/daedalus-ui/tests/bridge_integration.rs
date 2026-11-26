@@ -993,6 +993,7 @@ async fn queued_terminal_input_stays_with_its_connection() {
                     workbench_supported: false,
                     workspace_membership_supported: false,
                     runner_assignment_supported: false,
+                    guarded_runner_assignment_supported: false,
                     resolved_import_preview_supported: false,
                     agent_launch_metadata_supported: false,
                     home_dir: None,
@@ -1376,7 +1377,7 @@ command = ["sh", "-c", "touch unexpected-manifest-launch"]
                 assert!(bridge.send(UiCommand::LaunchAssignment {
                     workspace_id: ws.id,
                     assignment: assignment.clone(),
-                    saved_runner: false,
+                    launch: daedalus_ui::bridge::AssignmentLaunch::Direct,
                     cols: 80,
                     rows: 24
                 }));
@@ -1928,6 +1929,7 @@ async fn reconnect_hydrates_surviving_pane_before_ready_and_recents_do_not_delay
                     workbench_supported: false,
                     workspace_membership_supported: false,
                     runner_assignment_supported: false,
+                    guarded_runner_assignment_supported: false,
                     resolved_import_preview_supported: false,
                     agent_launch_metadata_supported: false,
                     home_dir: None,

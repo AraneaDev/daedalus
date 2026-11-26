@@ -111,7 +111,9 @@ impl Recap {
                     }
                 }
             }
-            UiEvent::WorkspacesLoaded(list) | UiEvent::WorkspaceCloseFailed(list) => {
+            UiEvent::WorkspacesLoaded(list)
+            | UiEvent::WorkspaceMembershipLoaded(list)
+            | UiEvent::WorkspaceCloseFailed(list) => {
                 self.visits
                     .retain(|id, _| list.iter().any(|ws| ws.id == *id));
             }
@@ -196,6 +198,22 @@ impl Recap {
 mod tests {
     use super::{replay::excerpt, *};
     use daedalus_proto::{AgentState, GridRow, ServerEvent};
+
+    #[test]
+    fn membership_refresh_retires_recap_for_a_removed_workspace() {
+        let (state, _) = crate::renderer::tests::make_state_with_agent_row();
+        let id = state.active_workspace_id.unwrap();
+        let mut recap = Recap::default();
+        recap.select(Some(id));
+        recap.select(None);
+        assert_eq!(recap.lines(id), ["No changes observed while away"]);
+        recap.observe(
+            &UiEvent::WorkspaceMembershipLoaded(vec![]),
+            &state.workspaces,
+            &state.panes,
+        );
+        assert_eq!(recap.lines(id), ["First visit this session"]);
+    }
 
     #[test]
     fn recognizable_prompts_and_echoed_commands_do_not_become_quotes() {

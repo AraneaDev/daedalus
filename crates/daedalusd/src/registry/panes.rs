@@ -1,6 +1,6 @@
 use super::Registry;
 use crate::pane_actor::PaneHandle;
-use daedalus_proto::{PaneId, PaneRole, PaneSummary, ProtoError, WorkspaceId};
+use daedalus_proto::{Assignment, PaneId, PaneRole, PaneSummary, ProtoError, WorkspaceId};
 use std::collections::{HashMap, HashSet};
 
 const DEFAULT_ROLES: [PaneRole; 3] = [PaneRole::Agent, PaneRole::Service, PaneRole::Runner];
@@ -76,6 +76,7 @@ impl Registry {
         &self,
         workspace_id: WorkspaceId,
         assignment_id: &str,
+        expected: Option<&Assignment>,
         cols: u16,
         rows: u16,
     ) -> Result<PaneSummary, ProtoError> {
@@ -90,6 +91,11 @@ impl Registry {
             .ok_or_else(|| {
                 ProtoError::InvalidRequest(format!("No saved runner assignment '{assignment_id}'"))
             })?;
+        if expected.is_some_and(|reviewed| reviewed != &assignment) {
+            return Err(ProtoError::InvalidRequest(
+                "The saved runner changed. Reopen Settings to review it before launching.".into(),
+            ));
+        }
         self.install_pane(
             workspace_id,
             PaneRole::Runner,
@@ -136,7 +142,7 @@ impl Registry {
                 .filter(|_| role == PaneRole::Runner)
                 .map(|entry| entry.id.clone());
             let command = if let Some(saved) = saved {
-                if role == PaneRole::Agent && saved.argv == ["shell"] {
+                if saved.uses_default_shell() {
                     None
                 } else {
                     Some(saved.argv)

@@ -73,6 +73,7 @@ async fn negotiate(
         workbench_supported,
         workspace_membership_supported,
         runner_assignment_supported,
+        guarded_runner_assignment_supported,
         resolved_import_preview_supported,
         agent_launch_metadata_supported,
         home_dir,
@@ -90,6 +91,7 @@ async fn negotiate(
     conn.paste_supported = paste_supported;
     conn.workbench_supported = workbench_supported;
     conn.runner_assignment_supported = runner_assignment_supported;
+    conn.guarded_runner_assignment_supported = guarded_runner_assignment_supported;
     conn.resolved_import_preview_supported = resolved_import_preview_supported;
     conn.agent_launch_metadata_supported = agent_launch_metadata_supported;
     let _ = conn

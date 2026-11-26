@@ -113,14 +113,12 @@ impl Registry {
                 workspace.manifest.clone(),
             )
         };
-        if let Some(assignments) = self
+        let saved = self
             .project_setups
             .read()
             .await
             .folder(&root, &canonical_root)
-        {
-            document.assignments.clone_from(assignments);
-        }
+            .cloned();
         if let Some(manifest) = manifest {
             if manifest.service_widget.is_some() || manifest.runner_widget.is_some() {
                 document.pane_widgets = Some(PaneWidgets {
@@ -129,50 +127,53 @@ impl Registry {
                     ..PaneWidgets::default()
                 });
             }
-            for (role, key, name, argv) in [
-                (
-                    PaneRole::Agent,
-                    "agent",
-                    "Agent",
-                    manifest
-                        .agent_command
-                        .or_else(|| manifest.agent_preset.map(|preset| vec![preset])),
-                ),
-                (
-                    PaneRole::Service,
-                    "service",
-                    "Service",
-                    manifest.service_command,
-                ),
-                (
-                    PaneRole::Runner,
-                    "runner",
-                    "Runner",
-                    manifest.runner_command,
-                ),
-            ] {
-                if !document
-                    .assignments
-                    .iter()
-                    .any(|assignment| assignment.role == role)
-                    && let Some(argv) = argv
-                {
-                    let mut id = format!("manifest-{key}");
-                    while document
-                        .assignments
-                        .iter()
-                        .any(|assignment| assignment.id == id)
-                    {
-                        id.push('-');
-                    }
-                    document.assignments.push(Assignment {
-                        id,
+            let agent_key = if manifest.agent_command.as_deref().is_some_and(|argv| {
+                matches!(argv, [program] if daedalus_proto::canonical_agent_preset(program) == Some("shell"))
+            }) {
+                "agent-command"
+            } else {
+                "agent"
+            };
+            if saved.is_none() {
+                document.assignments = [
+                    (
+                        PaneRole::Agent,
+                        agent_key,
+                        "Agent",
+                        manifest.agent_command.or_else(|| {
+                            let preset = daedalus_proto::canonical_agent_preset(
+                                manifest.agent_preset.as_deref()?,
+                            )?;
+                            Some(vec![preset.to_owned()])
+                        }),
+                    ),
+                    (
+                        PaneRole::Service,
+                        "service",
+                        "Service",
+                        manifest.service_command,
+                    ),
+                    (
+                        PaneRole::Runner,
+                        "runner",
+                        "Runner",
+                        manifest.runner_command,
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(role, key, name, argv)| {
+                    Some(Assignment {
+                        id: format!("manifest-{key}"),
                         name: name.into(),
                         role,
-                        argv,
-                    });
-                }
+                        argv: argv?,
+                    })
+                })
+                .collect();
             }
+        }
+        if let Some(assignments) = saved {
+            document.assignments = assignments;
         }
         Ok(document)
     }

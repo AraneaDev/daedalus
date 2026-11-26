@@ -45,6 +45,70 @@ fn snapshot_with_runner_label(revision: u64, label: &str) -> WorkbenchState {
     state
 }
 
+#[test]
+fn legacy_widget_settings_merge_other_clients_changes_and_reject_overlaps() {
+    let ws = workspace("Two local clients");
+    let id = ws.id;
+    let mut first = Workbench::new();
+    let mut second = Workbench::new();
+    second.app.widget_directory = first.app.widget_directory.clone();
+    let mut original = WorkspaceWidgets {
+        service_enabled: Some(true),
+        runner_enabled: Some(true),
+        ..Default::default()
+    };
+    original.runner.label = Some("Original".into());
+    workspace_widgets::save(&first.app.widget_directory, id, &original).unwrap();
+    for client in [&mut first, &mut second] {
+        client.app.state.set_workspaces(vec![ws.clone()]);
+        client.app.open_workspace_settings();
+        apply_control(client, Control::WidgetsPage);
+        assert_eq!(client.app.state.settings.widgets, original);
+    }
+    first
+        .app
+        .state
+        .settings
+        .set_value(Control::ServiceLabel, "Saved service");
+    second
+        .app
+        .state
+        .settings
+        .set_value(Control::RunnerLabel, "Saved runner");
+    apply_control(&mut first, Control::Save);
+    apply_control(&mut second, Control::Save);
+    let saved = workspace_widgets::load(&first.app.widget_directory, id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.service.label.as_deref(), Some("Saved service"));
+    assert_eq!(saved.runner.label.as_deref(), Some("Saved runner"));
+
+    first
+        .app
+        .state
+        .settings
+        .set_value(Control::RunnerLabel, "Stale runner");
+    apply_control(&mut first, Control::Save);
+    assert!(
+        first
+            .app
+            .state
+            .settings
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Runner widget settings changed")
+    );
+    assert_eq!(
+        first.app.state.settings.value(Control::RunnerLabel),
+        Some("Stale runner")
+    );
+    assert_eq!(
+        workspace_widgets::load(&first.app.widget_directory, id).unwrap(),
+        Some(saved)
+    );
+}
+
 fn apply_control(w: &mut Workbench, control: Control) {
     let action = w.app.state.settings.activate(control);
     w.app.handle_settings_action(action);
@@ -1641,6 +1705,74 @@ fn reversing_a_layout_before_acknowledgment_preserves_the_latest_choice() {
     assert!(w.commands.try_iter().all(|command| {
         !matches!(command, UiCommand::Workbench { request, .. } if matches!(*request, ClientMessage::UpdateWorkbench { .. }))
     }));
+}
+
+#[test]
+fn layout_conflict_preserves_remote_change_to_acknowledged_divider() {
+    use daedalus_ui::layout::Divider;
+
+    let (id, mut w, _) = layout_client(true);
+    w.app.pointer.splits.move_divider(Divider::Column, 0.64);
+    w.app.save_workbench_layout();
+    let (first, _, confirmed) = next_layout_save(&w, id);
+
+    w.app.pointer.splits.move_divider(Divider::RightRow, 0.61);
+    w.app.save_workbench_layout();
+    assert!(w.idle());
+
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        first,
+        Ok(ResponsePayload::Workbench(confirmed.clone())),
+    );
+    let (second, revision, pending) = next_layout_save(&w, id);
+    assert_eq!(revision, 2);
+    assert_eq!(pending.document.layout.splits["right_row"], 610);
+
+    let mut remote = confirmed;
+    remote.revision = 3;
+    remote.document.layout.splits.insert("column".into(), 680);
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        second,
+        Ok(ResponsePayload::WorkbenchConflict(remote)),
+    );
+    let (_, revision, rebased) = next_layout_save(&w, id);
+    assert_eq!(revision, 3);
+    assert_eq!(rebased.document.layout.splits["column"], 680);
+    assert_eq!(rebased.document.layout.splits["right_row"], 610);
+}
+
+#[test]
+fn late_layout_ack_retires_intent_against_the_newer_watched_layout() {
+    use daedalus_ui::layout::Divider;
+
+    let (id, mut w, _) = layout_client(true);
+    w.app.pointer.splits.move_divider(Divider::Column, 0.64);
+    w.app.save_workbench_layout();
+    let (first, _, confirmed) = next_layout_save(&w, id);
+    w.app.pointer.splits.move_divider(Divider::RightRow, 0.61);
+    w.app.save_workbench_layout();
+    assert!(w.idle());
+
+    let mut remote = confirmed.clone();
+    remote.revision = 3;
+    remote.document.layout.splits.insert("column".into(), 680);
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(remote)),
+    );
+    daemon_workbench_reply(&mut w, id, first, Ok(ResponsePayload::Workbench(confirmed)));
+
+    let (_, revision, rebased) = next_layout_save(&w, id);
+    assert_eq!(revision, 3);
+    assert_eq!(rebased.document.layout.splits["column"], 680);
+    assert_eq!(rebased.document.layout.splits["right_row"], 610);
+    assert_eq!(w.app.pointer.splits.portable(true), rebased.document.layout);
 }
 
 #[test]

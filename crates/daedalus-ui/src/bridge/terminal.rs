@@ -1,40 +1,9 @@
 use super::rpc::{RpcConnection, RpcError};
 use super::{UiEvent, UiEventSink};
-use daedalus_proto::{
-    ClientMessage, FailureTrace, PaneId, ResponsePayload, WorkspaceId, wrap_bracketed_paste,
-};
+use daedalus_proto::{ClientMessage, FailureTrace, PaneId, ResponsePayload, wrap_bracketed_paste};
 use std::borrow::Cow;
 use std::sync::Arc;
 use tracing::warn;
-
-pub(super) async fn preview_image(
-    conn: &RpcConnection,
-    sink: &Arc<dyn UiEventSink>,
-    workspace_id: WorkspaceId,
-    pane_id: PaneId,
-    path: String,
-) -> Result<(), RpcError> {
-    if !conn.image_preview_supported {
-        sink.emit(UiEvent::Toast {
-            message: "This daemon does not support workspace image previews".into(),
-            is_error: true,
-        });
-    } else {
-        match conn
-            .call(ClientMessage::PreviewImage { workspace_id, path })
-            .await?
-        {
-            ResponsePayload::ImagePreview(image) if image.valid() => {
-                sink.emit(UiEvent::ImagePreview { pane_id, image })
-            }
-            _ => sink.emit(UiEvent::Toast {
-                message: "Invalid preview received".into(),
-                is_error: true,
-            }),
-        }
-    }
-    Ok(())
-}
 
 pub(super) async fn snapshot(
     conn: &RpcConnection,
@@ -128,13 +97,7 @@ pub(super) async fn forward_failure(
     {
         ResponsePayload::FailureTrace(Some(trace)) => {
             let exit_code = trace.exit_code;
-            let data = format_failure_trace_prompt(&trace);
-            let _ = conn
-                .call(ClientMessage::SendInput {
-                    pane_id: agent_pane_id,
-                    data,
-                })
-                .await?;
+            paste(conn, agent_pane_id, failure_trace_text(&trace).into_bytes()).await?;
             sink.emit(UiEvent::Toast {
                 message: format!("Sent failure trace (exit {exit_code}) to Agent"),
                 is_error: false,
@@ -213,12 +176,78 @@ mod tests {
             conn.close().await;
         }
     }
+
+    #[tokio::test]
+    async fn forwarded_failure_uses_the_peer_paste_policy() {
+        let runner = PaneId::new();
+        let agent = PaneId::new();
+        let trace = FailureTrace {
+            pane_id: runner,
+            command: Some("cargo test".into()),
+            exit_code: 1,
+            cwd: None,
+            output: "assertion failed".into(),
+            captured_at_ms: 0,
+            git_branch: None,
+            git_diff_stat: None,
+        };
+        for supported in [false, true] {
+            let (client, mut peer) = ipc_pair().await;
+            let sink: Arc<dyn UiEventSink> = Arc::new(NoopSink);
+            let mut conn = RpcConnection::new(client, sink.clone());
+            conn.paste_supported = supported;
+            let (result, ()) = tokio::join!(forward_failure(&conn, &sink, runner, agent), async {
+                let request: Request = read_frame(&mut peer).await.unwrap().unwrap();
+                assert_eq!(
+                    request.payload,
+                    ClientMessage::GetFailureTrace { pane_id: runner }
+                );
+                write_frame(
+                    &mut peer,
+                    &ServerMessage::Response {
+                        id: request.id,
+                        result: Ok(ResponsePayload::FailureTrace(Some(trace.clone()))),
+                    },
+                )
+                .await
+                .unwrap();
+                let request: Request = read_frame(&mut peer).await.unwrap().unwrap();
+                let expected = if supported {
+                    ClientMessage::Paste {
+                        pane_id: agent,
+                        data: failure_trace_text(&trace).into_bytes(),
+                    }
+                } else {
+                    ClientMessage::SendInput {
+                        pane_id: agent,
+                        data: format_failure_trace_prompt(&trace),
+                    }
+                };
+                assert_eq!(request.payload, expected);
+                write_frame(
+                    &mut peer,
+                    &ServerMessage::Response {
+                        id: request.id,
+                        result: Ok(ResponsePayload::Ok),
+                    },
+                )
+                .await
+                .unwrap();
+            });
+            result.unwrap();
+            conn.close().await;
+        }
+    }
 }
 
 /// Formats a `FailureTrace` into the diagnostic prompt defined in spec §6.1 and
 /// wraps it with `daedalus_proto::wrap_bracketed_paste` (which strips embedded
 /// breakout sequences).
 pub fn format_failure_trace_prompt(trace: &FailureTrace) -> Vec<u8> {
+    wrap_bracketed_paste(failure_trace_text(trace).as_bytes())
+}
+
+fn failure_trace_text(trace: &FailureTrace) -> String {
     let command = trace
         .command
         .as_deref()
@@ -263,7 +292,7 @@ pub fn format_failure_trace_prompt(trace: &FailureTrace) -> Vec<u8> {
 
     prompt.push_str(&format!("\n\nOutput:\n{output}"));
 
-    wrap_bracketed_paste(prompt.as_bytes())
+    prompt
 }
 
 #[cfg(test)]

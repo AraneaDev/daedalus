@@ -2692,9 +2692,23 @@ fn selected_png_preview_preserves_terminal_focus_selection_and_scroll() {
         .unwrap();
     w.app.pointer.position = (button.x + 1., button.y + 1.);
     w.app.click_at(metrics);
-    assert!(
-        matches!(w.command(), UiCommand::PreviewImage {workspace_id: ws, pane_id, path} if ws == workspace_id && pane_id == pane && path == "image.png")
+    let UiCommand::PreviewImage {
+        workspace_id: ws,
+        pane_id,
+        token: older,
+        path,
+    } = w.command()
+    else {
+        panic!("expected image preview request");
+    };
+    assert_eq!(
+        (ws, pane_id, path.as_str()),
+        (workspace_id, pane, "image.png")
     );
+    w.app.handle_ui_action(UiAction::PreviewImage);
+    let UiCommand::PreviewImage { token, .. } = w.command() else {
+        panic!("expected replacement image preview request");
+    };
     let image = ImagePreview {
         width: 3,
         height: 1,
@@ -2702,12 +2716,19 @@ fn selected_png_preview_preserves_terminal_focus_selection_and_scroll() {
     };
     w.app.handle_daemon_event(UiEvent::ImagePreview {
         pane_id: PaneId::new(),
-        image: image.clone(),
+        token,
+        result: Ok(image.clone()),
+    });
+    w.app.handle_daemon_event(UiEvent::ImagePreview {
+        pane_id: pane,
+        token: older,
+        result: Ok(image.clone()),
     });
     assert!(w.app.state.image_preview.is_none());
     w.app.handle_daemon_event(UiEvent::ImagePreview {
         pane_id: pane,
-        image,
+        token,
+        result: Ok(image),
     });
     for width in [320, 1440] {
         let metrics = ViewportMetrics {

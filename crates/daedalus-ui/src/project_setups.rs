@@ -108,10 +108,18 @@ impl ProjectSetups {
         self.load_or(id, Vec::new())
     }
 
-    pub fn baseline(&self, id: WorkspaceId) -> ProjectSetupBaseline {
-        ProjectSetupBaseline {
-            assignments: self.cache.get(&id).cloned(),
-        }
+    pub fn settings_draft(
+        &self,
+        id: WorkspaceId,
+        defaults: Vec<Assignment>,
+    ) -> Result<(Vec<Assignment>, ProjectSetupBaseline), String> {
+        let assignments = if self.daemon_backed {
+            self.cache.get(&id).cloned()
+        } else {
+            assignments::load_stored(&self.local_path(id))?
+        };
+        let entries = assignments.clone().unwrap_or(defaults);
+        Ok((entries, ProjectSetupBaseline { assignments }))
     }
 
     /// Captures the setup when the guided review's workspace is acknowledged.
@@ -138,17 +146,32 @@ impl ProjectSetups {
 
     /// Daemon-backed saves return validated assignments to send without changing the cache.
     /// Older daemons use local files, which are saved synchronously.
-    pub fn save(
+    pub fn save_settings(
         &self,
         id: WorkspaceId,
         entries: Vec<Assignment>,
+        baseline: &ProjectSetupBaseline,
     ) -> Result<Option<Vec<Assignment>>, String> {
         if !self.daemon_backed {
-            assignments::save_to(&self.local_path(id), &entries)?;
+            if !assignments::save_checked(&self.local_path(id), &entries, Some(baseline))? {
+                return Err(
+                    "Pane assignments changed. Reopen Settings to review the saved values.".into(),
+                );
+            }
             return Ok(None);
         }
         validate_assignments(&entries)?;
         Ok(Some(entries))
+    }
+
+    #[cfg(test)]
+    fn save(
+        &self,
+        id: WorkspaceId,
+        entries: Vec<Assignment>,
+    ) -> Result<Option<Vec<Assignment>>, String> {
+        let (_, baseline) = self.settings_draft(id, Vec::new())?;
+        self.save_settings(id, entries, &baseline)
     }
 
     /// Offer each folder's legacy setup once, leaving failed attempts for an explicit retry.
@@ -482,5 +505,24 @@ mod tests {
                 .retry_migration(Path::new("/p"), &workspaces)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn ordinary_local_settings_keep_a_concurrent_explicit_clear() {
+        let (dir, first) = store();
+        let second = ProjectSetups::in_dir(dir.path().join("assignments"));
+        let id = WorkspaceId::new();
+        let (defaults, baseline) = first.settings_draft(id, vec![entry("default")]).unwrap();
+        assert_eq!(defaults, vec![entry("default")]);
+        assert_eq!(baseline.assignments, None);
+        second.save_settings(id, vec![], &baseline).unwrap();
+        assert!(
+            first
+                .save_settings(id, vec![entry("stale")], &baseline)
+                .is_err()
+        );
+        let (visible, current) = first.settings_draft(id, vec![entry("default")]).unwrap();
+        assert!(visible.is_empty());
+        assert_eq!(current.assignments, Some(vec![]));
     }
 }
