@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.20](https://github.com/AraneaDev/daedalus/compare/v0.0.19...v0.0.20) (2026-11-25)
+
+
+### Features
+
+* add custom widgets and portable workspaces ([#54](https://github.com/AraneaDev/daedalus/issues/54)) ([21fd1f6](https://github.com/AraneaDev/daedalus/commit/21fd1f61ee70a1cb9715bbcd31bd7c9030a8ed00))
+
 ## [0.0.19](https://github.com/AraneaDev/daedalus/compare/v0.0.18...v0.0.19) (2026-11-25)
 
 
