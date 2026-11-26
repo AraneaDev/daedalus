@@ -289,32 +289,64 @@ wait",
     }
 
     #[cfg(windows)]
+    const DESCENDANT_FIXTURE: &str = "workbench::command::tests::command_descendant_fixture";
+
+    #[cfg(windows)]
+    const DESCENDANT_ROLE: &str = "DAEDALUS_TEST_COMMAND_DESCENDANT_ROLE";
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn timed_out_command_stops_its_descendants() {
         let root = tempfile::tempdir().unwrap();
-        let workspace = test_workspace(root.path().into());
-        std::fs::write(
-            root.path().join("descendant.ps1"),
-            "New-Item ready -ItemType File
-while (!(Test-Path release)) { Start-Sleep -Milliseconds 20 }
-New-Item escaped -ItemType File",
-        )
-        .unwrap();
+        let mut workspace = test_workspace(root.path().into());
+        workspace
+            .injected_env
+            .insert(DESCENDANT_ROLE.into(), "parent".into());
         let spec = WorkspaceCommand {
-            argv: [
-                "powershell.exe",
-                "-NoProfile",
-                "-Command",
-                "$child = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File descendant.ps1' -NoNewWindow -PassThru; $child.WaitForExit()",
-            ]
-            .map(str::to_owned)
-            .to_vec(),
+            argv: vec![
+                std::env::current_exe()
+                    .unwrap()
+                    .into_os_string()
+                    .into_string()
+                    .unwrap(),
+                "--ignored".into(),
+                "--exact".into(),
+                DESCENDANT_FIXTURE.into(),
+            ],
             env: Vec::new(),
             timeout_seconds: Some(5),
         };
         let fields = run(&workspace, &spec, &CommandOutput::ExitStatus).await;
         assert_eq!(fields["error"], "Command exceeded 5 seconds");
         assert_descendant_stopped(root.path()).await;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "spawned by the Windows descendant cleanup test"]
+    fn command_descendant_fixture() {
+        match std::env::var(DESCENDANT_ROLE).as_deref() {
+            Ok("parent") => assert!(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--ignored", "--exact", DESCENDANT_FIXTURE])
+                    .env(DESCENDANT_ROLE, "child")
+                    .status()
+                    .unwrap()
+                    .success()
+            ),
+            Ok("child") => {
+                std::fs::write("ready", "").unwrap();
+                for _ in 0..500 {
+                    if std::path::Path::new("release").exists() {
+                        std::fs::write("escaped", "").unwrap();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                panic!("descendant fixture did not receive its release signal");
+            }
+            _ => {}
+        }
     }
 
     #[cfg(any(unix, windows))]
