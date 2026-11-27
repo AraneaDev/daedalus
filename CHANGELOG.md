@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.0.22](https://github.com/AraneaDev/daedalus/compare/v0.0.21...v0.0.22) (2026-11-27)
+
+
+### Features
+
+* improve workspace launch and reliability ([#58](https://github.com/AraneaDev/daedalus/issues/58)) ([95f2f61](https://github.com/AraneaDev/daedalus/commit/95f2f61f65781db7d680511092e4d261fb458b51))
+
+
+### Bug Fixes
+
+* address scorecard follow-up findings ([#60](https://github.com/AraneaDev/daedalus/issues/60)) ([549fce0](https://github.com/AraneaDev/daedalus/commit/549fce0e512d91379a6e494a74db4e1fd7c4e379))
+* separate workbench lifecycle and desktop responsibilities ([#61](https://github.com/AraneaDev/daedalus/issues/61)) ([3f36c6a](https://github.com/AraneaDev/daedalus/commit/3f36c6aed13fe3ef270544dc4eb3b00c9ac24270))
+
 ## [0.0.21](https://github.com/AraneaDev/daedalus/compare/v0.0.20...v0.0.21) (2026-11-26)
 
 
