@@ -2,6 +2,7 @@
 
 import json
 import sys
+from pathlib import Path
 
 EXPECTED = {
     ("daedalus-ctl", "daedalus-proto"),
@@ -15,16 +16,20 @@ EXPECTED = {
 def main():
     metadata = json.load(sys.stdin)
     members = set(metadata["workspace_members"])
-    names = {
-        pkg["id"]: pkg["name"] for pkg in metadata["packages"] if pkg["id"] in members
+    packages = [pkg for pkg in metadata["packages"] if pkg["id"] in members]
+    member_paths = {
+        (pkg["name"], Path(pkg["manifest_path"]).resolve().parent) for pkg in packages
     }
+    # The resolved graph omits optional dependencies behind disabled features.
+    # Cargo reports the original package name in "name" even for renamed dependencies.
     edges = {
-        (names[node["id"]], names[dep["pkg"]])
-        for node in metadata["resolve"]["nodes"]
-        if node["id"] in members
-        for dep in node["deps"]
-        if dep["pkg"] in members
-        and any(kind["kind"] != "dev" for kind in dep["dep_kinds"])
+        (pkg["name"], dep["name"])
+        for pkg in packages
+        for dep in pkg["dependencies"]
+        if dep["kind"] != "dev"
+        and dep["source"] is None
+        and dep.get("path")
+        and (dep["name"], Path(dep["path"]).resolve()) in member_paths
     }
     if edges != EXPECTED:
         sys.exit(
