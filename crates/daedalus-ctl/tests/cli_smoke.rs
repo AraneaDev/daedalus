@@ -1168,14 +1168,16 @@ shortcut = "Ctrl+R"
     .await
     .unwrap();
 
-    let server = DaemonServer::bind_with_supervisor(
+    let server = DaemonServer::bind_with_auth(
         std::path::PathBuf::from("tcp://127.0.0.1:0"),
         runtime,
+        None,
+        None,
         test_supervisor(),
+        Some("cli-secret-token".into()),
     )
     .await
-    .unwrap()
-    .with_auth_token(Some("cli-secret-token".to_string()));
+    .unwrap();
     let endpoint = server.socket_path();
     let endpoint_str = endpoint.to_string_lossy().to_string();
 
@@ -1191,6 +1193,7 @@ shortcut = "Ctrl+R"
     let bin = env!("CARGO_BIN_EXE_daedalus-ctl");
 
     let unauth_ping = Command::new(bin)
+        .env_remove("DAEDALUS_AUTH_TOKEN")
         .args(["--socket", &endpoint_str, "ping"])
         .output()
         .await

@@ -1,9 +1,9 @@
 use crate::registry::Registry;
-use daedalus_proto::transport::{IpcListener, IpcStream};
+use daedalus_proto::transport::{IpcEndpoint, IpcListener, IpcStream, parse_endpoint};
 use daedalus_proto::{AgentState, PaneId, StatusLevel, WorkspaceId};
 use serde::Deserialize;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::watch;
@@ -43,8 +43,19 @@ pub struct ExternalHookServer {
 }
 
 impl ExternalHookServer {
-    /// Binds an NDJSON IPC listener at `socket_path`, cleaning up any stale socket file first.
+    pub(crate) fn validate_endpoint(socket_path: &Path) -> std::io::Result<()> {
+        if matches!(parse_endpoint(socket_path), IpcEndpoint::Tcp(_)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the external status hook requires a Unix socket or Windows named pipe",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Binds an NDJSON listener on local IPC, cleaning up any stale socket file first.
     pub async fn bind(socket_path: PathBuf, registry: Arc<Registry>) -> std::io::Result<Self> {
+        Self::validate_endpoint(&socket_path)?;
         let listener = IpcListener::bind(&socket_path).await?;
         let bound_endpoint = listener.local_endpoint();
         info!(socket = %bound_endpoint.display(), "external status hook listening");
@@ -52,7 +63,7 @@ impl ExternalHookServer {
         Ok(Self { listener, registry })
     }
 
-    /// Returns the bound endpoint path (`tcp://host:port` for TCP listeners).
+    /// Returns the bound local IPC endpoint path.
     pub fn socket_path(&self) -> PathBuf {
         self.listener.local_endpoint()
     }

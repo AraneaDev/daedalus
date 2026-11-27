@@ -9,7 +9,7 @@ use crate::registry::Registry;
 use crate::runtime_monitor;
 use crate::shell_integration::ShellIntegration;
 use crate::supervisor::Supervisor;
-use daedalus_proto::transport::{IpcListener, IpcStream};
+use daedalus_proto::transport::{IpcEndpoint, IpcListener, IpcStream, parse_endpoint};
 use daedalus_proto::{
     ClientMessage, ProtoError, Request, ResponsePayload, ServerMessage, default_events_socket_path,
     default_state_file_path, read_frame, write_frame,
@@ -75,6 +75,41 @@ impl DaemonServer {
         state_path: Option<PathBuf>,
         supervisor: Supervisor,
     ) -> std::io::Result<Self> {
+        Self::bind_with_auth(
+            socket_path,
+            runtime_dir,
+            events_socket_path,
+            state_path,
+            supervisor,
+            None,
+        )
+        .await
+    }
+
+    /// Binds the daemon RPC listener, which requires a nonblank token for TCP endpoints.
+    pub async fn bind_with_auth(
+        socket_path: PathBuf,
+        runtime_dir: PathBuf,
+        events_socket_path: Option<PathBuf>,
+        state_path: Option<PathBuf>,
+        supervisor: Supervisor,
+        auth_token: Option<String>,
+    ) -> std::io::Result<Self> {
+        let endpoint = parse_endpoint(&socket_path);
+        if matches!(endpoint, IpcEndpoint::Tcp(_))
+            && auth_token
+                .as_deref()
+                .is_none_or(|token| token.trim().is_empty())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TCP RPC listeners require a nonblank token (--auth-token or DAEDALUS_AUTH_TOKEN)",
+            ));
+        }
+        if let Some(events_path) = &events_socket_path {
+            ExternalHookServer::validate_endpoint(events_path)?;
+        }
+        let auth_token = auth_token.filter(|token| !token.is_empty());
         std::fs::create_dir_all(&runtime_dir)?;
 
         let shell_integration = ShellIntegration::prepare(&runtime_dir)?;
@@ -85,7 +120,7 @@ impl DaemonServer {
             event_tx,
             state_path.map(StateStore::new),
         ));
-        let listener = IpcListener::bind(&socket_path).await?;
+        let listener = IpcListener::bind_endpoint(endpoint).await?;
         let external_hook = match events_socket_path {
             Some(events_path) => {
                 match ExternalHookServer::bind(events_path, Arc::clone(&registry)).await {
@@ -108,13 +143,8 @@ impl DaemonServer {
             listener,
             registry,
             external_hook,
-            auth_token: None,
+            auth_token,
         })
-    }
-
-    pub fn with_auth_token(mut self, token: Option<String>) -> Self {
-        self.auth_token = token.filter(|t| !t.is_empty());
-        self
     }
 
     pub fn socket_path(&self) -> PathBuf {

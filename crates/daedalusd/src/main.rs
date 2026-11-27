@@ -17,10 +17,12 @@ struct Args {
     socket: Option<PathBuf>,
     #[arg(long, env = "DAEDALUS_RUNTIME_DIR")]
     runtime_dir: Option<PathBuf>,
+    /// Local Unix socket or Windows named pipe for external status events.
     #[arg(long, env = "DAEDALUS_EVENTS_SOCKET")]
     events_socket: Option<PathBuf>,
     #[arg(long, env = "DAEDALUS_STATE_FILE")]
     state_file: Option<PathBuf>,
+    /// Authentication token required for TCP RPC listeners.
     #[arg(long, env = "DAEDALUS_AUTH_TOKEN", hide_env_values = true)]
     auth_token: Option<String>,
 }
@@ -53,17 +55,15 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .state_file
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(default_state_file_path);
-    let auth_token = args.auth_token.filter(|t| !t.is_empty());
-
-    let server = DaemonServer::bind_with_options(
+    let server = DaemonServer::bind_with_auth(
         socket,
         runtime_dir,
         Some(events_socket),
         Some(state_file),
         Supervisor::detect(),
+        args.auth_token,
     )
-    .await?
-    .with_auth_token(auth_token);
+    .await?;
     server
         .serve(async {
             let ctrl_c = tokio::signal::ctrl_c();

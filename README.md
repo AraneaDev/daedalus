@@ -246,6 +246,9 @@ branch name is present and the daemon is connected.
 
 ## CLI & External Status Hook (`daedalus-ctl` / `events.sock`)
 
+The NDJSON status hook uses a local Unix socket or Windows named pipe. To publish to a remote
+daemon, use `daedalus-ctl status publish` through its RPC connection.
+
 ```bash
 # Check daemon status
 daedalus-ctl ping
@@ -302,6 +305,12 @@ local daemon. Folder paths you enter belong to the daemon host, such as `/home/y
 folder the UI suggests is the home directory of the daemon host, not the working directory of the
 client. Pass `--dir` to open the UI on a project there.
 
+A daemon configured with a `tcp://host:port` RPC listener requires a nonblank token before it
+opens the socket, including on loopback. Set `DAEDALUS_AUTH_TOKEN` or pass `--auth-token` to the
+daemon and configure the same token on each client. Existing TCP deployments without a token
+must set one before starting the upgraded daemon. Unix sockets and Windows named pipes can
+still start with no token configured.
+
 The daemon keeps the recent projects and each project's setup, so every client of that daemon
 shares them. Set a project up from one machine and the other clients reopen it as it is.
 
@@ -340,17 +349,18 @@ or they start a second daemon on the default socket.
 ### Windows with projects in WSL
 
 Install the Windows `.msi` on Windows and the `.deb` inside your WSL distribution. The daemon runs
-in WSL and listens on localhost over TCP. Use a token, because any local Windows process can reach
-that port.
+in WSL and listens on localhost over TCP. A token is required because local Windows processes
+can reach that port.
 
-In WSL, create the settings file and start the service from the previous section:
+For a new WSL installation, create the settings file, then start the service from the previous
+section. For an existing installation, keep your current settings and add the token if needed,
+then run `systemctl --user restart daedalusd`.
 
 ```sh
 mkdir -p ~/.config/daedalus
 printf 'DAEDALUS_SOCKET=tcp://127.0.0.1:7777\nDAEDALUS_AUTH_TOKEN=%s\n' "$(openssl rand -hex 24)" \
   > ~/.config/daedalus/daemon.env
 chmod 600 ~/.config/daedalus/daemon.env
-cat ~/.config/daedalus/daemon.env
 ```
 
 In PowerShell on Windows, store the same two values for your account, then start **Daedalus** from
@@ -358,11 +368,11 @@ Start:
 
 ```powershell
 setx DAEDALUS_SOCKET tcp://127.0.0.1:7777
-setx DAEDALUS_AUTH_TOKEN <token from daemon.env>
-daedalus-ctl ping
+setx DAEDALUS_AUTH_TOKEN "YOUR_TOKEN"
 ```
 
-`setx` applies to programs started afterwards, so open a new terminal before `daedalus-ctl ping`.
+Replace `YOUR_TOKEN` with the token from `daemon.env`. `setx` applies to new processes. Open a
+new terminal and run `daedalus-ctl ping` to verify the connection.
 Windows reaches `127.0.0.1` inside WSL through localhost forwarding, which is on by default, and in
 mirrored networking mode. The distribution must be running. With `vmIdleTimeout=-1` in
 `.wslconfig` it stays up. Otherwise, open a WSL terminal first.
@@ -390,8 +400,9 @@ daedalus-ctl --socket ssh://devbox/run/user/1000/daedalus/daedalusd.sock ping
 The form is `ssh://[user@]host[:port][/remote/socket/path]`. If the remote daemon listens on TCP,
 use `ssh://devbox?tcp=127.0.0.1:7777` instead. Without a socket path or `tcp=`, the tunnel targets
 `127.0.0.1:7777` on the remote host. The SSH server must allow forwarding to a Unix socket
-(`AllowStreamLocalForwarding`, on by default). A token is optional over SSH. If the daemon has one,
-set the same `DAEDALUS_AUTH_TOKEN` on the client.
+(`AllowStreamLocalForwarding`, on by default). A token is optional when forwarding to a remote
+Unix socket. TCP forwarding requires a token because the remote daemon listens on TCP. Whenever
+the daemon has a token configured, set the same `DAEDALUS_AUTH_TOKEN` on the client.
 
 Agents, terminals and tests keep running on the remote host when you close the UI or lose the
 connection. Reconnect with the same command. Terminal links open web URLs only, because file paths
