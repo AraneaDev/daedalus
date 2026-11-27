@@ -58,6 +58,17 @@ fn rejected_snapshot(path: &std::path::Path) -> io::Error {
 }
 
 impl Registry {
+    pub(crate) async fn persistence_health(&self) -> daedalus_proto::PersistenceHealth {
+        use daedalus_proto::PersistenceHealth;
+        if self.state_store.is_none() {
+            return PersistenceHealth::NotConfigured;
+        }
+        match *self.persist_lock.lock().await {
+            PersistenceWriteState::Rejected => PersistenceHealth::TemporarySnapshotRejected,
+            _ => PersistenceHealth::Durable,
+        }
+    }
+
     /// Persists the proposed lifecycle change before publishing it to any client.
     pub(super) async fn commit_workspace_change(
         &self,
@@ -110,6 +121,7 @@ impl Registry {
         let store = self.state_store.clone();
         let mut workspaces = self.workspaces.clone().write_owned().await;
         let mut deferred = self.deferred_workspaces.clone().write_owned().await;
+        let workbench_store = self.workbench_store.clone();
         let project_setups = Arc::clone(&self.project_setups);
         let recent_projects = Arc::clone(&self.recent_projects);
         let event_tx = self.event_tx.clone();
@@ -144,6 +156,7 @@ impl Registry {
                 WorkspaceChange::Close(_) => {
                     if let Some(record) = workspaces.remove(&id) {
                         record.widget_commands.close();
+                        workbench_store.evict_workspace(id);
                     }
                     project_setups.blocking_write().forget_workspace(id);
                 }

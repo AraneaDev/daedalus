@@ -1,7 +1,9 @@
 mod subscription;
+mod task_exit;
 mod workbench;
 
 use subscription::{SubscriberExit, Subscription, forward_subscriber_events};
+use task_exit::{join_worker, report_task_exit};
 
 use crate::external_hook::ExternalHookServer;
 use crate::persistence::StateStore;
@@ -9,7 +11,7 @@ use crate::registry::Registry;
 use crate::runtime_monitor;
 use crate::shell_integration::ShellIntegration;
 use crate::supervisor::Supervisor;
-use daedalus_proto::transport::{IpcListener, IpcStream};
+use daedalus_proto::transport::{IpcEndpoint, IpcListener, IpcStream, parse_endpoint};
 use daedalus_proto::{
     ClientMessage, ProtoError, Request, ResponsePayload, ServerMessage, default_events_socket_path,
     default_state_file_path, read_frame, write_frame,
@@ -75,6 +77,41 @@ impl DaemonServer {
         state_path: Option<PathBuf>,
         supervisor: Supervisor,
     ) -> std::io::Result<Self> {
+        Self::bind_with_auth(
+            socket_path,
+            runtime_dir,
+            events_socket_path,
+            state_path,
+            supervisor,
+            None,
+        )
+        .await
+    }
+
+    /// Binds the daemon RPC listener, which requires a nonblank token for TCP endpoints.
+    pub async fn bind_with_auth(
+        socket_path: PathBuf,
+        runtime_dir: PathBuf,
+        events_socket_path: Option<PathBuf>,
+        state_path: Option<PathBuf>,
+        supervisor: Supervisor,
+        auth_token: Option<String>,
+    ) -> std::io::Result<Self> {
+        let endpoint = parse_endpoint(&socket_path);
+        if matches!(endpoint, IpcEndpoint::Tcp(_))
+            && auth_token
+                .as_deref()
+                .is_none_or(|token| token.trim().is_empty())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TCP RPC listeners require a nonblank token (--auth-token or DAEDALUS_AUTH_TOKEN)",
+            ));
+        }
+        if let Some(events_path) = &events_socket_path {
+            ExternalHookServer::validate_endpoint(events_path)?;
+        }
+        let auth_token = auth_token.filter(|token| !token.is_empty());
         std::fs::create_dir_all(&runtime_dir)?;
 
         let shell_integration = ShellIntegration::prepare(&runtime_dir)?;
@@ -85,7 +122,7 @@ impl DaemonServer {
             event_tx,
             state_path.map(StateStore::new),
         ));
-        let listener = IpcListener::bind(&socket_path).await?;
+        let listener = IpcListener::bind_endpoint(endpoint).await?;
         let external_hook = match events_socket_path {
             Some(events_path) => {
                 match ExternalHookServer::bind(events_path, Arc::clone(&registry)).await {
@@ -108,13 +145,8 @@ impl DaemonServer {
             listener,
             registry,
             external_hook,
-            auth_token: None,
+            auth_token,
         })
-    }
-
-    pub fn with_auth_token(mut self, token: Option<String>) -> Self {
-        self.auth_token = token.filter(|t| !t.is_empty());
-        self
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -127,11 +159,15 @@ impl DaemonServer {
 
     pub async fn serve(mut self, shutdown: impl Future<Output = ()>) -> std::io::Result<()> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let monitor_handle =
-            runtime_monitor::spawn_runtime_monitor(Arc::clone(&self.registry), shutdown_rx.clone());
-        let widgets =
-            crate::workbench::scheduler::spawn(Arc::clone(&self.registry), shutdown_rx.clone());
-        let hook_handle = self.external_hook.map(|hook| {
+        let mut monitor_handle = Some(runtime_monitor::spawn_runtime_monitor(
+            Arc::clone(&self.registry),
+            shutdown_rx.clone(),
+        ));
+        let mut widgets = Some(crate::workbench::scheduler::spawn(
+            Arc::clone(&self.registry),
+            shutdown_rx.clone(),
+        ));
+        let mut hook_handle = self.external_hook.map(|hook| {
             let mut hook_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
                 if let Err(e) = hook
@@ -164,7 +200,18 @@ impl DaemonServer {
                             error!(error = %e, "accept failed");
                         }
                     }
-                    while client_tasks.try_join_next().is_some() {}
+                }
+                Some(result) = client_tasks.join_next(), if !client_tasks.is_empty() => {
+                    report_task_exit("rpc_client", false, false, result);
+                }
+                result = join_worker(&mut monitor_handle) => {
+                    report_task_exit("runtime_monitor", true, false, result);
+                }
+                result = join_worker(&mut widgets) => {
+                    report_task_exit("widget_scheduler", true, false, result);
+                }
+                result = join_worker(&mut hook_handle) => {
+                    report_task_exit("external_status_hook", true, false, result);
                 }
                 _ = &mut shutdown => {
                     info!("shutting down daedalusd");
@@ -175,11 +222,17 @@ impl DaemonServer {
 
         let _ = shutdown_tx.send(true);
         client_tasks.abort_all();
-        while client_tasks.join_next().await.is_some() {}
-        let _ = monitor_handle.await;
-        let _ = widgets.await;
-        if let Some(handle) = hook_handle {
-            let _ = handle.await;
+        while let Some(result) = client_tasks.join_next().await {
+            report_task_exit("rpc_client", false, true, result);
+        }
+        for (name, handle) in [
+            ("runtime_monitor", monitor_handle),
+            ("widget_scheduler", widgets),
+            ("external_status_hook", hook_handle),
+        ] {
+            if let Some(handle) = handle {
+                report_task_exit(name, true, true, handle.await);
+            }
         }
         self.registry.close_all().await;
         self.listener.cleanup();
@@ -320,6 +373,7 @@ async fn dispatch_request(
                 guarded_runner_assignment_supported: true,
                 resolved_import_preview_supported: true,
                 agent_launch_metadata_supported: true,
+                persistence_health: Some(registry.persistence_health().await),
                 home_dir: std::env::home_dir(),
             })
         }

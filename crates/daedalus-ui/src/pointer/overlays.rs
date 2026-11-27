@@ -63,7 +63,7 @@ fn handle_overlay_click(
             width,
             height,
             scale,
-            state.active_actions().len(),
+            state.palette_len(),
             state.action_palette.selected_index,
         );
         if !modal.contains(x, y) {

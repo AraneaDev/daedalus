@@ -46,6 +46,13 @@ async fn workbench_configuration_survives_reconnect_and_rejects_a_stale_write() 
             let _ = done.await;
         }));
         let mut client = IpcStream::connect(&sock).await.unwrap();
+        assert!(matches!(
+            send_rpc(&mut client, 5, ClientMessage::Ping).await,
+            ResponsePayload::Pong {
+                persistence_health: Some(daedalus_proto::PersistenceHealth::Durable),
+                ..
+            }
+        ));
         let id = match workspace_id {
             Some(id) => id,
             None => match send_rpc(
@@ -2487,6 +2494,92 @@ async fn close_workspace_removes_linked_worktree_and_refuses_primary_checkout() 
 }
 
 #[tokio::test]
+async fn direct_tcp_requires_auth_before_bind() {
+    let dir = TempDir::new().unwrap();
+    let runtime = dir.path().join("runtime");
+    let endpoint = PathBuf::from("tcp://127.0.0.1:0");
+    let result =
+        DaemonServer::bind_with_supervisor(endpoint.clone(), runtime.clone(), test_supervisor())
+            .await;
+    let error = result
+        .err()
+        .expect("a TCP listener without a token must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!runtime.exists(), "validate before preparing the daemon");
+
+    for token in ["", " \t\r\n\u{2003}"] {
+        let result = DaemonServer::bind_with_auth(
+            endpoint.clone(),
+            runtime.clone(),
+            None,
+            None,
+            test_supervisor(),
+            Some(token.to_owned()),
+        )
+        .await;
+        let error = result
+            .err()
+            .expect("a TCP listener with a blank token must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!runtime.exists(), "validate before preparing the daemon");
+    }
+
+    let server = DaemonServer::bind_with_auth(
+        endpoint.clone(),
+        runtime,
+        None,
+        None,
+        test_supervisor(),
+        Some("test-token".into()),
+    )
+    .await
+    .unwrap();
+    assert_ne!(server.socket_path(), endpoint);
+}
+
+#[tokio::test]
+async fn external_status_hook_rejects_tcp_before_bind() {
+    let dir = TempDir::new().unwrap();
+    let runtime = dir.path().join("runtime");
+    let rpc_endpoint = dir.path().join("daedalusd.sock");
+    let events_endpoint = PathBuf::from("tcp://127.0.0.1:0");
+    let result = DaemonServer::bind_with_events_socket(
+        rpc_endpoint,
+        runtime.clone(),
+        Some(events_endpoint),
+        test_supervisor(),
+    )
+    .await;
+    let error = result.err().expect("the status hook requires local IPC");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!runtime.exists(), "validate before preparing the daemon");
+}
+
+#[tokio::test]
+async fn local_bind_does_not_require_auth() {
+    let dir = TempDir::new().unwrap();
+    let endpoint = dir.path().join("daedalusd.sock");
+    let server = DaemonServer::bind_with_supervisor(
+        endpoint.clone(),
+        dir.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let (shutdown, done) = oneshot::channel();
+    let task = tokio::spawn(server.serve(async {
+        let _ = done.await;
+    }));
+    let mut client = IpcStream::connect(&endpoint).await.unwrap();
+    assert!(matches!(
+        send_rpc(&mut client, 1, ClientMessage::Ping).await,
+        ResponsePayload::Pong { .. }
+    ));
+    shutdown.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn tcp_wsl2_bridge_rpc_round_trip() {
     let dir = TempDir::new().unwrap();
     let runtime = dir.path().join("runtime");
@@ -2496,10 +2589,17 @@ async fn tcp_wsl2_bridge_rpc_round_trip() {
     let supervisor = test_supervisor();
     let expected_mode = supervisor.isolation_mode().as_str().to_string();
 
-    let server =
-        DaemonServer::bind_with_supervisor(PathBuf::from("tcp://127.0.0.1:0"), runtime, supervisor)
-            .await
-            .unwrap();
+    const TOKEN: &str = "bridge-rpc-token";
+    let server = DaemonServer::bind_with_auth(
+        PathBuf::from("tcp://127.0.0.1:0"),
+        runtime,
+        None,
+        None,
+        supervisor,
+        Some(TOKEN.into()),
+    )
+    .await
+    .unwrap();
     let endpoint = server.socket_path();
     let endpoint_str = endpoint.to_string_lossy();
     assert!(
@@ -2518,6 +2618,17 @@ async fn tcp_wsl2_bridge_rpc_round_trip() {
     });
 
     let mut client = IpcStream::connect(&endpoint).await.unwrap();
+    assert_eq!(
+        send_rpc(
+            &mut client,
+            0,
+            ClientMessage::Authenticate {
+                token: TOKEN.into()
+            }
+        )
+        .await,
+        ResponsePayload::Ok
+    );
     match send_rpc(&mut client, 1, ClientMessage::Ping).await {
         ResponsePayload::Pong {
             version,
@@ -2621,14 +2732,17 @@ async fn auth_token_rejects_unauthenticated_and_allows_authenticated_clients() {
     let dir = TempDir::new().unwrap();
     let runtime = dir.path().join("runtime");
 
-    let server = DaemonServer::bind_with_supervisor(
+    const TOKEN: &str = " super-secret-token \t";
+    let server = DaemonServer::bind_with_auth(
         PathBuf::from("tcp://127.0.0.1:0"),
         runtime,
+        None,
+        None,
         test_supervisor(),
+        Some(TOKEN.into()),
     )
     .await
-    .unwrap()
-    .with_auth_token(Some("super-secret-token".to_string()));
+    .unwrap();
     let endpoint = server.socket_path();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -2654,7 +2768,7 @@ async fn auth_token_rejects_unauthenticated_and_allows_authenticated_clients() {
             &mut c1,
             3,
             ClientMessage::Authenticate {
-                token: "wrong-token".to_string(),
+                token: TOKEN.trim().into(),
             },
         )
         .await,
@@ -2669,7 +2783,7 @@ async fn auth_token_rejects_unauthenticated_and_allows_authenticated_clients() {
         &mut c1,
         5,
         ClientMessage::Authenticate {
-            token: "super-secret-token".to_string(),
+            token: TOKEN.into(),
         },
     )
     .await;
@@ -2695,7 +2809,7 @@ async fn auth_token_rejects_unauthenticated_and_allows_authenticated_clients() {
             &mut c2,
             2,
             ClientMessage::Authenticate {
-                token: "super-secret-token".to_string(),
+                token: TOKEN.into()
             },
         )
         .await,
@@ -3392,11 +3506,16 @@ async fn ping_reports_project_capabilities_and_home() {
         ResponsePayload::Pong {
             recent_projects_supported,
             project_setup_supported,
+            persistence_health,
             home_dir,
             ..
         } => {
             assert!(recent_projects_supported);
             assert!(project_setup_supported);
+            assert_eq!(
+                persistence_health,
+                Some(daedalus_proto::PersistenceHealth::NotConfigured)
+            );
             assert_eq!(home_dir, std::env::home_dir());
         }
         other => panic!("expected Pong, got {other:?}"),
@@ -4184,4 +4303,54 @@ async fn workbench_watch_tracks_only_the_selected_workspace_and_rejects_invalid_
 
     stop.send(()).unwrap();
     daemon.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn rejected_snapshot_reports_temporary_workspace_changes() {
+    for bytes in [b"bad json".as_slice(), br#"{"version":999}"#] {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("test.sock");
+        let state = dir.path().join("state.json");
+        std::fs::write(&state, bytes).unwrap();
+        let server = DaemonServer::bind_with_options(
+            sock.clone(),
+            dir.path().join("runtime"),
+            None,
+            Some(state.clone()),
+            test_supervisor(),
+        )
+        .await
+        .unwrap();
+        let (shutdown, done) = oneshot::channel();
+        let task = tokio::spawn(server.serve(async {
+            let _ = done.await;
+        }));
+        let mut client = IpcStream::connect(&sock).await.unwrap();
+        assert!(matches!(
+            send_rpc(
+                &mut client,
+                1,
+                ClientMessage::CreateManualWorkspace {
+                    name: "temporary".into(),
+                    root_dir: dir.path().to_owned()
+                }
+            )
+            .await,
+            ResponsePayload::WorkspaceCreated(_)
+        ));
+        let mut reconnect = IpcStream::connect(&sock).await.unwrap();
+        let pong = send_rpc(&mut reconnect, 1, ClientMessage::Ping).await;
+        assert_eq!(std::fs::read(state).unwrap(), bytes);
+        assert!(matches!(
+            pong,
+            ResponsePayload::Pong {
+                persistence_health: Some(
+                    daedalus_proto::PersistenceHealth::TemporarySnapshotRejected
+                ),
+                ..
+            }
+        ));
+        shutdown.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
 }

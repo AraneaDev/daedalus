@@ -365,17 +365,19 @@ pub(super) fn banner_appearance(state: &AppState, theme: &Theme) -> (Rgba, Optio
             };
             Some((label.to_owned(), theme.status_busy))
         }
+    } else if let Some((message, error, _)) = &state.toast {
+        Some((
+            message.clone(),
+            if *error {
+                theme.status_err
+            } else {
+                theme.status_ok
+            },
+        ))
     } else {
-        state.toast.as_ref().map(|(msg, error, _)| {
-            (
-                msg.clone(),
-                if *error {
-                    theme.status_err
-                } else {
-                    theme.status_ok
-                },
-            )
-        })
+        state
+            .persistence_warning()
+            .map(|message| (message.to_owned(), theme.status_busy))
     };
     (theme.bg_header, message)
 }
@@ -435,9 +437,14 @@ fn collect_prepared_quads(
         let settings = state.active_workspace_id.map(|_| {
             crate::layout::settings_button(toggle, cards.and_then(|cards| cards.list.arrows), s)
         });
-        for button in [layout.layout_button, layout.run_tests_button, settings]
-            .into_iter()
-            .flatten()
+        for button in [
+            layout.layout_button,
+            layout.run_tests_button,
+            layout.launch_button,
+            settings,
+        ]
+        .into_iter()
+        .flatten()
         {
             let surface = Rect::new(
                 button.x + 1. * s,
@@ -1256,6 +1263,19 @@ pub(crate) mod tests {
         );
         state.connection = ConnectionState::Connected;
         assert!(banner_appearance(&state, &theme).1.is_none());
+        state.persistence_health =
+            Some(daedalus_proto::PersistenceHealth::TemporarySnapshotRejected);
+        assert!(
+            banner_appearance(&state, &theme)
+                .1
+                .unwrap()
+                .0
+                .contains("Workspace changes are temporary")
+        );
+        state.show_toast("Workspace opened", false);
+        let message = banner_appearance(&state, &theme).1.unwrap().0;
+        assert_eq!(message, "Workspace opened");
+        state.toast = None;
         state.connection = ConnectionState::Reconnecting;
         assert_eq!(
             banner_appearance(&state, &theme).1.unwrap().0,

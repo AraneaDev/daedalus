@@ -891,6 +891,12 @@ label = 'Run checks'
 kind = 'command'
 command = { argv = ['cargo', 'check'] }
 "#;
+    let wrong_type = template.replace("version = 1", "version = 'one'");
+    assert!(matches!(
+        parse_template(&wrong_type),
+        Err(daedalusd::workbench::documents::DocumentError::Parse(error))
+            if error.span().is_some()
+    ));
     let document = parse_template(template).unwrap();
     assert_eq!(
         parse_template(&serialize_template(&document).unwrap()).unwrap(),
@@ -1095,5 +1101,127 @@ async fn linked_import_applies_the_explicit_choices_from_a_renewed_preview() {
     assert_eq!(saved.document.templates, local.templates);
     assert_eq!(saved.repo_baseline, Some(incoming));
     assert!(daemon.repo_preview(workspace_id).await.conflicts.is_empty());
+    daemon.finish().await;
+}
+
+#[tokio::test]
+async fn refresh_keys_are_checked_at_workspace_and_template_import_boundaries() {
+    use daedalus_proto::workbench::WidgetSource;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut daemon = DaemonFixture::start(root.path()).await;
+    let workspace_id = daemon.workspace(&project).await;
+    let initial = daemon.workbench(workspace_id).await;
+    let source = "id = 'timer'\nkind = 'command'\ncommand = { argv = ['scorecard-never-run'] }";
+    let inline = format!(
+        "version = 1\nname = 'Fixture'\n[[widgets]]\nid = 'inline'\nname = 'Inline'\npinned = true\n\
+         [[widgets.definition.sources]]\n{source}"
+    );
+    let embedded = format!(
+        "version = 1\nname = 'Fixture'\n[[templates]]\nid = 'embedded'\nname = 'Embedded'\n\
+         [[templates.definition.sources]]\n{source}"
+    );
+    let standalone = format!(
+        "version = 1\n[template]\nid = 'standalone'\nname = 'Standalone'\n\
+         [[template.definition.sources]]\n{source}"
+    );
+
+    for (base, context) in [
+        (&inline, "widget 'inline'"),
+        (&embedded, "template 'embedded'"),
+        (&standalone, "template 'standalone'"),
+    ] {
+        for (refresh, expected) in [
+            ("refresh = { interval_second = 2 }", Err("interval_second")),
+            (
+                "refresh = { interval_seconds = 0 }",
+                Err("must be positive"),
+            ),
+            ("refresh = { interval_seconds = 2 }", Ok(Some(2))),
+            ("refresh = { on_runner_completion = true }", Ok(None)),
+            ("", Ok(None)),
+        ] {
+            let text = format!("{base}\n{refresh}\n");
+            let message = if context == "template 'standalone'" {
+                ClientMessage::DecodeWidgetTemplate { text }
+            } else {
+                ClientMessage::PreviewWorkspaceImport {
+                    workspace_id,
+                    source: WorkspaceImportSource::Text(text),
+                    linked: false,
+                }
+            };
+            let result = daemon.call(message).await;
+            match expected {
+                Err(needle) => {
+                    let Err(ProtoError::InvalidRequest(message)) = result else {
+                        panic!("{context} {refresh}: expected a validation error");
+                    };
+                    assert!(message.contains(needle), "{message}");
+                    assert!(
+                        message.contains(context) && message.contains("'timer'"),
+                        "{message}"
+                    );
+                }
+                Ok(interval) => {
+                    let definition = match result.unwrap() {
+                        ResponsePayload::WorkspaceImportPreview(preview)
+                            if context == "widget 'inline'" =>
+                        {
+                            preview.incoming.widgets[0].definition.clone().unwrap()
+                        }
+                        ResponsePayload::WorkspaceImportPreview(preview) => {
+                            preview.incoming.templates[0].definition.clone()
+                        }
+                        ResponsePayload::WidgetTemplate(template) => template.definition,
+                        other => panic!("unexpected response: {other:?}"),
+                    };
+                    let WidgetSource::Command { refresh, .. } = &definition.sources[0].source
+                    else {
+                        panic!("expected command source");
+                    };
+                    assert_eq!(refresh.interval_seconds, interval);
+                }
+            }
+        }
+    }
+    assert_eq!(daemon.workbench(workspace_id).await, initial);
+    daemon.finish().await;
+}
+
+#[tokio::test]
+async fn restored_workbench_cache_refreshes_after_restart() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let mut daemon = DaemonFixture::start(root).await;
+    let id = daemon.workspace(root).await;
+    let mut state = daemon.workbench(id).await;
+    state.document.layout.split_view = true;
+    daemon
+        .call(ClientMessage::UpdateWorkbench {
+            workspace_id: id,
+            revision: state.revision,
+            document: state.document,
+            layout_only: true,
+            edit: None,
+        })
+        .await
+        .unwrap();
+    daemon.finish().await;
+
+    let mut daemon = DaemonFixture::start(root).await;
+    let warm = daemon.workbench(id).await;
+    let mut external = warm.clone();
+    external.revision += 1;
+    external.document.layout.split_view = false;
+    let path = root.join("workbench").join(format!("{id}.json"));
+    std::fs::write(path, serde_json::to_vec(&external).unwrap()).unwrap();
+    assert_eq!(daemon.workbench(id).await, warm);
+    daemon.finish().await;
+
+    let mut daemon = DaemonFixture::start(root).await;
+    assert_eq!(daemon.workbench(id).await, external);
     daemon.finish().await;
 }

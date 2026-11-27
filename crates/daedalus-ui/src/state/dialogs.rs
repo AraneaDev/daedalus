@@ -1,10 +1,28 @@
 use super::{AgentPreset, WorkspaceView, remove_last_grapheme};
-use daedalus_proto::WorkspaceId;
+use daedalus_proto::{Assignment, PaneId, WorkspaceId};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionAction {
+    Launch { assignment: Assignment, saved: bool },
+    Stop(PaneId, String),
+}
+
+impl SessionAction {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Launch { assignment, .. } => {
+                format!("Launch {} · {}", assignment.name, assignment.role)
+            }
+            Self::Stop(_, name) => format!("Stop {name}"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ActionPaletteState {
     pub open: bool,
     pub selected_index: usize,
+    pub session_actions: Option<Vec<SessionAction>>,
     session: u64,
 }
 
@@ -13,6 +31,7 @@ impl ActionPaletteState {
         self.session = self.session.wrapping_add(1);
         self.open = true;
         self.selected_index = 0;
+        self.session_actions = None;
     }
 
     pub fn session(&self) -> u64 {
@@ -21,6 +40,7 @@ impl ActionPaletteState {
 
     pub fn close(&mut self) {
         self.open = false;
+        self.session_actions = None;
     }
 
     pub fn move_up(&mut self, len: usize) {

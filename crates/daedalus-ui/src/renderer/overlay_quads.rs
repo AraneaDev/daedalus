@@ -275,7 +275,7 @@ impl OverlayQuads<'_> {
         let (modal, selected) = if overlay == ActiveOverlay::ActionPalette {
             let idx = state.action_palette.selected_index;
             let (modal, visible) =
-                action_palette_layout(screen_w, screen_h, s, state.active_actions().len(), idx);
+                action_palette_layout(screen_w, screen_h, s, state.palette_len(), idx);
             (modal, visible.contains(&idx).then(|| idx - visible.start))
         } else {
             let idx = state.picker.selected_index;

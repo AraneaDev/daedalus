@@ -713,6 +713,7 @@ impl Registry {
         } else {
             if let Some(workspace) = self.workspaces.write().await.remove(&workspace_id) {
                 workspace.widget_commands.close();
+                self.workbench_store.evict_workspace(workspace_id);
             }
             self.project_setups
                 .write()

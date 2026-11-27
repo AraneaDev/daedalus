@@ -916,14 +916,16 @@ command = "mkdir action-result"
 "#,
     )
     .unwrap();
-    let server = DaemonServer::bind_with_supervisor(
+    let server = DaemonServer::bind_with_auth(
         "tcp://127.0.0.1:0".into(),
         dir.path().join("runtime"),
+        None,
+        None,
         test_supervisor(),
+        Some("bridge-test".into()),
     )
     .await
-    .unwrap()
-    .with_auth_token(Some("bridge-test".into()));
+    .unwrap();
     let socket_path = server.socket_path();
     let (stop, stopped) = oneshot::channel::<()>();
     let daemon = tokio::spawn(server.serve(async {
@@ -996,6 +998,7 @@ async fn queued_terminal_input_stays_with_its_connection() {
                     guarded_runner_assignment_supported: false,
                     resolved_import_preview_supported: false,
                     agent_launch_metadata_supported: false,
+                    persistence_health: None,
                     home_dir: None,
                 },
                 _ => ResponsePayload::Ok,
@@ -1737,14 +1740,16 @@ async fn held_widget_preview_does_not_delay_typing_or_paste() {
     const TOKEN: &str = "widget-lane-test-token";
     let dir = TempDir::new().unwrap();
     let sock = dir.path().join("daemon.sock");
-    let server = DaemonServer::bind_with_supervisor(
+    let server = DaemonServer::bind_with_auth(
         sock.clone(),
         dir.path().join("runtime"),
+        None,
+        None,
         test_supervisor(),
+        Some(TOKEN.into()),
     )
     .await
-    .unwrap()
-    .with_auth_token(Some(TOKEN.into()));
+    .unwrap();
     let (stop, done) = oneshot::channel();
     let server = tokio::spawn(server.serve(async {
         let _ = done.await;
@@ -1932,6 +1937,7 @@ async fn reconnect_hydrates_surviving_pane_before_ready_and_recents_do_not_delay
                     guarded_runner_assignment_supported: false,
                     resolved_import_preview_supported: false,
                     agent_launch_metadata_supported: false,
+                    persistence_health: None,
                     home_dir: None,
                 },
             )

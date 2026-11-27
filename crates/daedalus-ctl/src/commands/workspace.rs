@@ -5,6 +5,25 @@ use crate::{
 };
 use daedalus_proto::ResponsePayload;
 use daedalus_proto::{ClientMessage, WorkspaceId};
+use std::io::Write;
+
+async fn persistence_warning(
+    client: &mut DaemonClient,
+) -> Result<Option<&'static str>, Box<dyn std::error::Error>> {
+    match client.request(ClientMessage::Ping).await? {
+        ResponsePayload::Pong {
+            persistence_health, ..
+        } => Ok(persistence_health.and_then(daedalus_proto::PersistenceHealth::warning)),
+        other => Err(unexpected_response(other)),
+    }
+}
+
+fn print_persistence_warning(warning: Option<&str>) {
+    if let Some(message) = warning {
+        // The daemon has already acknowledged the operation.
+        let _ = writeln!(std::io::stderr().lock(), "{message}");
+    }
+}
 
 pub(crate) async fn execute(
     client: &mut DaemonClient,
@@ -18,6 +37,7 @@ pub(crate) async fn execute(
         WorkspaceAction::Create { name, dir, env } => {
             let root_dir = resolve_dir(Some(dir))?;
             let env_map = parse_env_pairs(&env)?;
+            let warning = persistence_warning(client).await?;
             match client
                 .request(ClientMessage::CreateWorkspace {
                     name,
@@ -26,39 +46,59 @@ pub(crate) async fn execute(
                 })
                 .await?
             {
-                ResponsePayload::WorkspaceCreated(ws) => println!("{}", ws.id),
+                ResponsePayload::WorkspaceCreated(ws) => {
+                    println!("{}", ws.id);
+                    print_persistence_warning(warning);
+                }
                 other => return Err(unexpected_response(other)),
             }
         }
-        WorkspaceAction::List => match client.request(ClientMessage::ListWorkspaces).await? {
-            ResponsePayload::Workspaces(list) => {
-                for ws in list {
-                    let mut line = format!(
-                        "{}  {}  ({})  panes={}",
-                        ws.id,
-                        ws.name,
-                        ws.root_dir.display(),
-                        ws.panes.len()
-                    );
-                    if let Some(branch) = &ws.git_branch {
-                        line.push_str(&format!("  branch={branch}"));
+        WorkspaceAction::List { json } => {
+            match client.request(ClientMessage::ListWorkspaces).await? {
+                ResponsePayload::Workspaces(list) => {
+                    if json {
+                        let identities: Vec<_> = list
+                        .iter()
+                        .map(|workspace| {
+                            serde_json::json!({
+                                "id": workspace.id,
+                                "name": workspace.name,
+                                "root_dir": workspace.root_dir,
+                                "pane_ids": workspace.panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+                            })
+                        })
+                        .collect();
+                        println!("{}", serde_json::to_string(&identities)?);
+                        return Ok(());
                     }
-                    if ws.port_offset > 0 {
-                        line.push_str(&format!("  offset=+{}", ws.port_offset));
+                    for ws in list {
+                        let mut line = format!(
+                            "{}  {}  ({})  panes={}",
+                            ws.id,
+                            ws.name,
+                            ws.root_dir.display(),
+                            ws.panes.len()
+                        );
+                        if let Some(branch) = &ws.git_branch {
+                            line.push_str(&format!("  branch={branch}"));
+                        }
+                        if ws.port_offset > 0 {
+                            line.push_str(&format!("  offset=+{}", ws.port_offset));
+                        }
+                        if !ws.external_statuses.is_empty() {
+                            let badges: Vec<String> = ws
+                                .external_statuses
+                                .iter()
+                                .map(|s| format!("{}:{}", s.source, s.label))
+                                .collect();
+                            line.push_str(&format!("  status=[{}]", badges.join(", ")));
+                        }
+                        println!("{line}");
                     }
-                    if !ws.external_statuses.is_empty() {
-                        let badges: Vec<String> = ws
-                            .external_statuses
-                            .iter()
-                            .map(|s| format!("{}:{}", s.source, s.label))
-                            .collect();
-                        line.push_str(&format!("  status=[{}]", badges.join(", ")));
-                    }
-                    println!("{line}");
                 }
+                other => return Err(unexpected_response(other)),
             }
-            other => return Err(unexpected_response(other)),
-        },
+        }
         WorkspaceAction::Recent => {
             let supported = matches!(
                 client.request(ClientMessage::Ping).await?,
@@ -88,6 +128,7 @@ pub(crate) async fn execute(
             remove_worktree,
             force,
         } => {
+            let warning = persistence_warning(client).await?;
             expect_ok(
                 client
                     .request(ClientMessage::CloseWorkspace {
@@ -99,6 +140,7 @@ pub(crate) async fn execute(
                     .await?,
             )?;
             println!("closed {id}");
+            print_persistence_warning(warning);
         }
     }
     Ok(())

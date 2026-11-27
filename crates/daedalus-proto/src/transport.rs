@@ -244,7 +244,12 @@ pub struct IpcListener {
 impl IpcListener {
     /// Binds an IPC listener at `endpoint`.
     pub async fn bind(endpoint: &Path) -> std::io::Result<Self> {
-        let inner = match parse_endpoint(endpoint) {
+        Self::bind_endpoint(parse_endpoint(endpoint)).await
+    }
+
+    /// Binds an endpoint already classified by [`parse_endpoint`].
+    pub async fn bind_endpoint(endpoint: IpcEndpoint) -> std::io::Result<Self> {
+        let inner = match endpoint {
             IpcEndpoint::Tcp(addr) => {
                 let listener = tokio::net::TcpListener::bind(&addr).await?;
                 let local_addr = listener.local_addr()?;

@@ -2,8 +2,8 @@
 
 ## Baseline
 
-Reviewed against the 0.0.6 feature branch. These are proposed patch-sized milestones. Each can ship
-independently after its acceptance checks pass.
+The original review covered the 0.0.6 feature branch. Status notes below identify work shipped
+since that baseline and preserve acceptance scenarios for later release checks.
 
 | Original requirement | Implementation evidence | Assessment |
 |---|---|---|
@@ -12,27 +12,18 @@ independently after its acceptance checks pass.
 | Worktree creation, port allocation, Compose and environment isolation | `crates/daedalusd/src/{worktree,isolation,registry}.rs` | Implemented. Preserve collision and environment-remapping tests. |
 | Command lifecycle, failure badge, forward-to-agent, external status socket | `crates/daedalusd/src/{shell_integration,external_hook}.rs`, `crates/daedalus-vt/src/semantic.rs`, UI bridge and renderer | Implemented with the built-in engine. Preserve behavior when adding the native backend. |
 | Linux process-tree teardown and optional Compose cleanup | `supervisor.rs` sends TERM, waits up to three seconds, then KILL. The registry closes panes and supports Compose teardown. | Per-pane systemd scopes and a process-group fallback differ from the proposed single workspace scope. Verify descendant cleanup under both modes. |
-| Project identity, runtime discovery, and project/worktree sidebar | `manifest.rs` reads explicit project configuration, `isolation.rs` finds Compose files, sidebar cards display workspaces and runtime status. | General project discovery and grouping require work. |
-| Native Ghostty terminal state | `crates/daedalus-vt/src/ghostty/mod.rs` delegates to `BuiltinVt`. | Bindings scaffold only. |
+| Project identity, runtime discovery, and project/worktree sidebar | `manifest.rs` reads explicit project configuration, `isolation.rs` finds Compose files, sidebar cards display workspaces and runtime status. | Shipped. The daemon reports detected tools and the sidebar groups linked worktrees. |
+| Native Ghostty terminal state | [Native VT workflow](../.github/workflows/ghostty-vt.yml) builds pinned Ghostty and runs native transcript tests. | Shipped as an optional backend. Built-in VT is the default. |
 | Agent selection | Current supported presets are agy, Claude, Codex and shell. | Preserve these four. The original spec also mentioned OpenCode as an example. |
 
-## Proposed implementation order
+## Milestones and acceptance
 
-1. **Project discovery and sidebar grouping.** Resolve the primary repository and linked worktrees
-   in `worktree.rs`, identify Compose, Cargo, npm, Composer, Python and Make manifests in
-   `manifest.rs`, and expose project identity and detected runtimes through additive, defaulted
-   protocol fields. Preserve explicit manifest settings and shell fallback. Display workspaces under
-   their owning repository with existing branch, port and runner status. Test two independent
-   repositories with the same basename, linked worktrees, mixed manifests, a directory without Git,
-   and reading old persisted state. Opening a project must never execute a discovered manifest as a
-   side effect of discovery.
-2. **Native terminal backend.** Pin a tested upstream Ghostty C ABI revision and compile a minimal
-   ownership/feed/resize probe using the headers in `crates/daedalus-vt/build.rs`. Map terminal
-   grid, dirty rows, cursor, cell attributes, scrollback, resize/reflow and search to the existing
-   `VtEngine` interface. Drive OSC handling once per byte stream. Run identical transcript fixtures
-   against both backends, covering Unicode, styles, alternate screen, split OSC sequences and runner
-   failure extraction. Add native-feature CI with the pinned library before documenting native
-   support or changing the default backend.
+1. **Project discovery and sidebar grouping — shipped.** The daemon detects project tools
+   without launching their commands. The sidebar groups workspaces by repository and keeps
+   names distinct when repositories share a basename.
+2. **Native terminal backend — shipped as an option.** Native VT CI builds a pinned Ghostty
+   C ABI and tests the feature-gated backend. Keep built-in VT as the default and record the
+   backend used for each acceptance check.
 3. **Lifecycle acceptance.** Exercise closing a workspace with multiple shell children, a
    TERM-resistant grandchild, and a second workspace that must stay alive. Run the test under a real
    user systemd manager and under the process-group fallback. In a Docker-enabled job, close one

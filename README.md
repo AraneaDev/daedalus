@@ -63,8 +63,10 @@ In **Settings**, add any number of named agents or commands. For example, add a 
 “Reviewer” and a runner named “Unit tests”. For the runner, enter `cargo` as the executable
 and `test` as its first argument. Each argument has its own field, so a value containing spaces
 stays a single argument.
-**Save** records the assignments in your local Daedalus configuration. **Save & launch** also opens
-the selected assignment in its own terminal. Switching workspaces restores your selected terminal.
+**Save** records the assignments on the daemon so its clients share them. With an older daemon
+that lacks project setup support, Daedalus saves them in the client's local configuration.
+**Save & launch** also opens the selected assignment in its own terminal. Switching workspaces
+restores your selected terminal.
 
 ![Workspace assignments showing a Codex agent named Reviewer](docs/images/workspace-settings.png)
 
@@ -92,6 +94,8 @@ and Claude sessions have distinct tab marks alongside their session names.
 In Cargo workspaces, choose **Cargo Test** or **Cargo Check** in the bottom bar to run the preset
 on the workspace host while keeping your agent in view. In workspace **Settings**, use
 **+ Cargo Test** or **+ Cargo Check** to save an editable runner command.
+To hide either automatic shortcut for this workspace, open **Settings → Widgets**,
+choose **Hide Cargo Test** or **Hide Cargo Check**, then select **Save widgets**.
 
 ![Full Windows workbench with Codex and Claude tabs, terminal output, and the Cargo bottom bar](docs/images/windows-agent-tabs.png)
 
@@ -158,7 +162,9 @@ both sides. Live terminals stay open.
 
 ![Daedalus workbench previewing a shared workspace before import](docs/images/workspace-import.png)
 
-The CLI uses the same configuration as the desktop. These commands use the
+The CLI and desktop save workbench changes through the daemon. It caches open
+workspace documents and reads their saved state again when it reopens them.
+These commands use the
 workspace for the current directory unless supplied a workspace ID or directory.
 
 ```sh
@@ -203,6 +209,7 @@ or repeat the shortcut to close it. The preview supports regular PNG files up to
 | `Ctrl+Shift+B` | Toggle workspace sidebar |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Switch to the next / previous workspace |
 | `Ctrl+Shift+S` | Edit workspace assignments |
+| `Ctrl+Shift+U` | Open the Launch menu to start saved sessions or stop live terminals |
 | `Ctrl+Shift+P` | Open/close Agent preset picker (`agy`, `claude`, `codex`, `shell`) |
 | `Ctrl+Shift+X` | Close the focused terminal and stop its process. You can also click × on the selected terminal tab. |
 | `Ctrl+Shift+W` | Open/close New Git Worktree modal |
@@ -240,6 +247,9 @@ or **Cancel** with the pointer, keyboard, or an assistive tool. Create becomes a
 branch name is present and the daemon is connected.
 
 ## CLI & External Status Hook (`daedalus-ctl` / `events.sock`)
+
+The NDJSON status hook uses a local Unix socket or Windows named pipe. To publish to a remote
+daemon, use `daedalus-ctl status publish` through its RPC connection.
 
 ```bash
 # Check daemon status
@@ -297,6 +307,12 @@ local daemon. Folder paths you enter belong to the daemon host, such as `/home/y
 folder the UI suggests is the home directory of the daemon host, not the working directory of the
 client. Pass `--dir` to open the UI on a project there.
 
+A daemon configured with a `tcp://host:port` RPC listener requires a nonblank token before it
+opens the socket, including on loopback. Set `DAEDALUS_AUTH_TOKEN` or pass `--auth-token` to the
+daemon and configure the same token on each client. Existing TCP deployments without a token
+must set one before starting the upgraded daemon. Unix sockets and Windows named pipes can
+still start with no token configured.
+
 The daemon keeps the recent projects and each project's setup, so every client of that daemon
 shares them. Set a project up from one machine and the other clients reopen it as it is.
 
@@ -335,17 +351,18 @@ or they start a second daemon on the default socket.
 ### Windows with projects in WSL
 
 Install the Windows `.msi` on Windows and the `.deb` inside your WSL distribution. The daemon runs
-in WSL and listens on localhost over TCP. Use a token, because any local Windows process can reach
-that port.
+in WSL and listens on localhost over TCP. A token is required because local Windows processes
+can reach that port.
 
-In WSL, create the settings file and start the service from the previous section:
+For a new WSL installation, create the settings file, then start the service from the previous
+section. For an existing installation, keep your current settings and add the token if needed,
+then run `systemctl --user restart daedalusd`.
 
 ```sh
 mkdir -p ~/.config/daedalus
 printf 'DAEDALUS_SOCKET=tcp://127.0.0.1:7777\nDAEDALUS_AUTH_TOKEN=%s\n' "$(openssl rand -hex 24)" \
   > ~/.config/daedalus/daemon.env
 chmod 600 ~/.config/daedalus/daemon.env
-cat ~/.config/daedalus/daemon.env
 ```
 
 In PowerShell on Windows, store the same two values for your account, then start **Daedalus** from
@@ -353,11 +370,11 @@ Start:
 
 ```powershell
 setx DAEDALUS_SOCKET tcp://127.0.0.1:7777
-setx DAEDALUS_AUTH_TOKEN <token from daemon.env>
-daedalus-ctl ping
+setx DAEDALUS_AUTH_TOKEN "YOUR_TOKEN"
 ```
 
-`setx` applies to programs started afterwards, so open a new terminal before `daedalus-ctl ping`.
+Replace `YOUR_TOKEN` with the token from `daemon.env`. `setx` applies to new processes. Open a
+new terminal and run `daedalus-ctl ping` to verify the connection.
 Windows reaches `127.0.0.1` inside WSL through localhost forwarding, which is on by default, and in
 mirrored networking mode. The distribution must be running. With `vmIdleTimeout=-1` in
 `.wslconfig` it stays up. Otherwise, open a WSL terminal first.
@@ -385,8 +402,9 @@ daedalus-ctl --socket ssh://devbox/run/user/1000/daedalus/daedalusd.sock ping
 The form is `ssh://[user@]host[:port][/remote/socket/path]`. If the remote daemon listens on TCP,
 use `ssh://devbox?tcp=127.0.0.1:7777` instead. Without a socket path or `tcp=`, the tunnel targets
 `127.0.0.1:7777` on the remote host. The SSH server must allow forwarding to a Unix socket
-(`AllowStreamLocalForwarding`, on by default). A token is optional over SSH. If the daemon has one,
-set the same `DAEDALUS_AUTH_TOKEN` on the client.
+(`AllowStreamLocalForwarding`, on by default). A token is optional when forwarding to a remote
+Unix socket. TCP forwarding requires a token because the remote daemon listens on TCP. Whenever
+the daemon has a token configured, set the same `DAEDALUS_AUTH_TOKEN` on the client.
 
 Agents, terminals and tests keep running on the remote host when you close the UI or lose the
 connection. Reconnect with the same command. Terminal links open web URLs only, because file paths
@@ -463,8 +481,8 @@ The audit fails on vulnerabilities, yanked dependencies and new advisory warning
 warnings from font rendering and Linux accessibility are printed on every run. Their exact versions
 and advisory IDs are recorded in `scripts/check_audit.py` and need review at each version change.
 
-To measure workspace coverage and test whether the suite detects changes to frame encoding,
-decoding and terminal erasure, run:
+To measure workspace coverage and test whether the suite detects mutations in framing, terminal
+erasure, and workbench state, run on Linux:
 
 ```sh
 rustup toolchain install 1.94.1 --profile minimal --component llvm-tools-preview
@@ -473,11 +491,11 @@ cargo install cargo-mutants --version 27.1.0 --locked
 RUSTUP_TOOLCHAIN=1.94.1 scripts/check-test-quality.sh
 ```
 
-The workspace coverage floors are 92.9% for lines, 92.5% for functions, and 92.4% for regions.
-On Linux the gate
-also runs a native desktop test in Xvfb with Xauth, Mesa Vulkan, the system Python Xlib package, and
-AT-SPI (`at-spi2-core`) on a private D-Bus session, so the accessibility tree is covered.
-Set `DAEDALUS_TEST_PYTHON` to use a different Python interpreter with Xlib installed. The
+The workspace coverage floors are 92.9% for lines, 92.5% for functions, and 92.4% for regions. The
+named launch, pointer, and terminal interaction modules each have an 85% line floor. The Linux gate
+also runs clipboard and native desktop tests in Xvfb with Xauth, Mesa Vulkan, the system Python Xlib
+package, and AT-SPI (`at-spi2-core`) on a private D-Bus session, so the accessibility tree is
+covered. Set `DAEDALUS_TEST_PYTHON` to use a different Python interpreter with Xlib installed. The
 mutation gate fails on surviving or timed-out mutations. Mutation results are written under
 `target/quality/`. Native Ghostty checks require the external Ghostty C library and headers.
 
@@ -488,8 +506,9 @@ permissions. Set the `RELEASE_APP_ID` repository variable and the
 `RELEASE_APP_PRIVATE_KEY` repository secret. With the built-in workflow token, GitHub may ask
 a maintainer to approve workflow runs from the release PR page.
 
-The [specification follow-up](docs/spec-follow-up.md) records the remaining implementation work and
-its acceptance tests.
+The [initial specification follow-up](docs/spec-follow-up.md) records the 0.0.6 baseline.
+It marks the milestones that have shipped and the acceptance scenarios that remain open.
+See [runtime decisions](docs/runtime-decisions.md) for transport, persistence, and cache behavior.
 
 ## License
 

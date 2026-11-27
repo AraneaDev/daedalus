@@ -2,6 +2,94 @@ use crate::types::PaneRole;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Runtime meaning of a manifest role, before applying a consumer's pane policy.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ManifestTarget {
+    DefaultShell,
+    Command(Vec<String>),
+    Unconfigured,
+}
+
+impl ManifestTarget {
+    pub fn into_command(self) -> Option<Vec<String>> {
+        match self {
+            Self::Command(argv) => Some(argv),
+            Self::DefaultShell | Self::Unconfigured => None,
+        }
+    }
+
+    /// Encode the default shell using the existing portable assignment sentinel.
+    pub fn into_assignment(self, role: PaneRole, id: String, name: &str) -> Option<Assignment> {
+        let default_shell = self == Self::DefaultShell;
+        let (id, argv) = match self {
+            Self::DefaultShell => ("manifest-agent".into(), vec!["shell".into()]),
+            Self::Command(argv) => (id, argv),
+            Self::Unconfigured => return None,
+        };
+        let mut assignment = Assignment {
+            id,
+            name: name.into(),
+            role,
+            argv,
+        };
+        // A literal command named "shell" has its own portable ID.
+        if !default_shell && assignment.uses_default_shell() {
+            assignment.id.push_str("-command");
+        }
+        Some(assignment)
+    }
+}
+
+pub struct ManifestLaunchTargets {
+    pub roles: [(PaneRole, ManifestTarget); 3],
+    pub selected_preset: Option<&'static str>,
+    pub launch_preset: Option<&'static str>,
+}
+
+/// Resolve executable arguments once for provisioning, launch settings and portable export.
+/// Export has no machine-local fallback preset.
+pub fn manifest_launch_targets(
+    manifest: Option<&crate::WorkspaceManifest>,
+    fallback_agent: Option<&str>,
+) -> ManifestLaunchTargets {
+    let declared = manifest
+        .and_then(|m| m.agent_preset.as_deref())
+        .and_then(crate::canonical_agent_preset);
+    let selected_preset =
+        declared.or_else(|| fallback_agent.and_then(crate::canonical_agent_preset));
+    let command = |argv: Option<&Vec<String>>| argv.filter(|args| !args.is_empty()).cloned();
+    let (agent, launch_preset) = match command(manifest.and_then(|m| m.agent_command.as_ref())) {
+        Some(argv) => {
+            let preset = crate::agent_launch_preset(&argv[0]).or(declared);
+            (ManifestTarget::Command(argv), preset)
+        }
+        None => (
+            match selected_preset {
+                Some("shell") => ManifestTarget::DefaultShell,
+                Some(preset) => ManifestTarget::Command(vec![preset.into()]),
+                None => ManifestTarget::Unconfigured,
+            },
+            selected_preset,
+        ),
+    };
+    let target = |argv| command(argv).map_or(ManifestTarget::Unconfigured, ManifestTarget::Command);
+    ManifestLaunchTargets {
+        roles: [
+            (PaneRole::Agent, agent),
+            (
+                PaneRole::Service,
+                target(manifest.and_then(|m| m.service_command.as_ref())),
+            ),
+            (
+                PaneRole::Runner,
+                target(manifest.and_then(|m| m.runner_command.as_ref())),
+            ),
+        ],
+        selected_preset,
+        launch_preset,
+    }
+}
+
 /// A pane the user assigned to a project: what to run and in which role.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Assignment {

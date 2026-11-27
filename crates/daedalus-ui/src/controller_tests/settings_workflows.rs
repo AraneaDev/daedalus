@@ -1882,3 +1882,64 @@ fn reconnect_reloads_a_layout_base_and_workspace_removal_discards_the_pending_sa
     );
     assert!(w.idle());
 }
+
+#[test]
+fn cargo_shortcuts_can_be_hidden_independently_and_restored_for_one_workspace() {
+    use daedalus_ui::assignments::CargoPreset;
+
+    let mut w = Workbench::new();
+    let mut first = workspace("First Cargo project");
+    first.project.tools.push("Cargo".into());
+    let mut second = workspace("Other Cargo project");
+    second.project.tools.push("Cargo".into());
+    let id = first.id;
+    let other = second.id;
+    w.app.state.set_workspaces(vec![first, second]);
+    w.app.state.select_workspace(id);
+    assert!(w.app.state.cargo_preset_visible(CargoPreset::Test));
+    assert!(w.app.state.cargo_preset_visible(CargoPreset::Check));
+
+    w.app.open_workspace_settings();
+    apply_control(&mut w, Control::WidgetsPage);
+    assert_eq!(
+        w.app.state.settings.label(Control::CargoTestShortcut),
+        "Hide Cargo Test"
+    );
+    apply_control(&mut w, Control::CargoTestShortcut);
+    apply_control(&mut w, Control::Save);
+    assert!(!w.app.state.cargo_preset_visible(CargoPreset::Test));
+    assert!(w.app.state.cargo_preset_visible(CargoPreset::Check));
+    assert!(
+        workspace_widgets::load(&w.app.widget_directory, id)
+            .unwrap()
+            .unwrap()
+            .hide_cargo_test
+    );
+    w.app
+        .handle_ui_action(UiAction::RunCargo(CargoPreset::Test));
+    assert!(w.idle());
+
+    apply_control(&mut w, Control::CargoCheckShortcut);
+    apply_control(&mut w, Control::Save);
+    let viewport = ViewportMetrics {
+        size: (320, 550).into(),
+        scale_factor: 1.,
+        cell: (8., 16.),
+    };
+    assert!(w.app.layout_for(viewport).cargo_bar.is_none());
+
+    w.app.state.select_workspace(other);
+    assert_eq!(w.app.layout_for(viewport).cargo_buttons(1.).count(), 2);
+    w.app.state.select_workspace(id);
+    w.app.open_workspace_settings();
+    apply_control(&mut w, Control::WidgetsPage);
+    assert_eq!(
+        w.app.state.settings.label(Control::CargoTestShortcut),
+        "Show Cargo Test"
+    );
+    apply_control(&mut w, Control::CargoTestShortcut);
+    apply_control(&mut w, Control::Save);
+    let layout = w.app.layout_for(viewport);
+    let buttons = layout.cargo_buttons(1.).collect::<Vec<_>>();
+    assert!(matches!(buttons.as_slice(), [(CargoPreset::Test, _)]));
+}

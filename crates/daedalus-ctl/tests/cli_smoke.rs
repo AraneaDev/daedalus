@@ -80,6 +80,18 @@ async fn cli_widget_crud_and_workspace_round_trip() {
     .await;
     let base = base.trim();
     let target = target.trim();
+    let listed: serde_json::Value =
+        serde_json::from_str(&cli(&sock, &["workspace", "list", "--json"]).await).unwrap();
+    let listed = listed.as_array().unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().any(|ws| {
+        ws["id"] == base
+            && ws["name"] == "API"
+            && ws["pane_ids"] == serde_json::json!([])
+            && ws.get("injected_env").is_none()
+    }));
+    assert!(listed.iter().any(|ws| ws["id"] == target));
+
     let template = dir.path().join("git-widget.toml");
     cli(
         &sock,
@@ -1156,14 +1168,16 @@ shortcut = "Ctrl+R"
     .await
     .unwrap();
 
-    let server = DaemonServer::bind_with_supervisor(
+    let server = DaemonServer::bind_with_auth(
         std::path::PathBuf::from("tcp://127.0.0.1:0"),
         runtime,
+        None,
+        None,
         test_supervisor(),
+        Some("cli-secret-token".into()),
     )
     .await
-    .unwrap()
-    .with_auth_token(Some("cli-secret-token".to_string()));
+    .unwrap();
     let endpoint = server.socket_path();
     let endpoint_str = endpoint.to_string_lossy().to_string();
 
@@ -1179,6 +1193,7 @@ shortcut = "Ctrl+R"
     let bin = env!("CARGO_BIN_EXE_daedalus-ctl");
 
     let unauth_ping = Command::new(bin)
+        .env_remove("DAEDALUS_AUTH_TOKEN")
         .args(["--socket", &endpoint_str, "ping"])
         .output()
         .await
@@ -1537,6 +1552,7 @@ async fn workspace_recent_reports_unsupported_daemon() {
                     guarded_runner_assignment_supported: false,
                     resolved_import_preview_supported: false,
                     agent_launch_metadata_supported: false,
+                    persistence_health: None,
                     home_dir: None,
                     recent_projects_supported: false,
                 }),
@@ -1564,4 +1580,99 @@ async fn workspace_recent_reports_unsupported_daemon() {
         String::from_utf8_lossy(&output.stderr)
             .contains("This daemon does not keep recent projects. Upgrade daedalusd.")
     );
+}
+
+#[tokio::test]
+async fn temporary_persistence_warns_on_stderr() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("test.sock");
+    let state = dir.path().join("state.json");
+    std::fs::write(&state, b"bad json").unwrap();
+    let server = DaemonServer::bind_with_options(
+        sock.clone(),
+        dir.path().join("runtime"),
+        None,
+        Some(state.clone()),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let (shutdown, done) = oneshot::channel();
+    let task = tokio::spawn(server.serve(async {
+        let _ = done.await;
+    }));
+    let create = Command::new(env!("CARGO_BIN_EXE_daedalus-ctl"))
+        .arg("--socket")
+        .arg(&sock)
+        .args(["workspace", "create", "temporary", "--dir"])
+        .arg(dir.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(create.status.success());
+    let id = String::from_utf8(create.stdout).unwrap();
+    uuid::Uuid::parse_str(id.trim()).unwrap();
+    assert!(String::from_utf8_lossy(&create.stderr).contains("temporary"));
+    let close = Command::new(env!("CARGO_BIN_EXE_daedalus-ctl"))
+        .arg("--socket")
+        .arg(&sock)
+        .args(["workspace", "close", id.trim()])
+        .output()
+        .await
+        .unwrap();
+    assert!(close.status.success());
+    assert_eq!(
+        String::from_utf8(close.stdout).unwrap().trim(),
+        format!("closed {}", id.trim())
+    );
+    assert!(String::from_utf8_lossy(&close.stderr).contains("temporary"));
+    #[cfg(target_os = "linux")]
+    {
+        let cli = || {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_daedalus-ctl"));
+            cmd.arg("--socket")
+                .arg(&sock)
+                .arg("workspace")
+                .stdout(std::process::Stdio::piped())
+                .stderr(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open("/dev/full")
+                        .unwrap(),
+                );
+            cmd
+        };
+        let create = cli()
+            .args(["create", "full", "--dir"])
+            .arg(dir.path())
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .await
+            .unwrap();
+        assert!(
+            create.status.success(),
+            "failed stderr write changed create status"
+        );
+        let id = String::from_utf8(create.stdout).unwrap();
+        uuid::Uuid::parse_str(id.trim()).unwrap();
+        let close = cli()
+            .args(["close", id.trim()])
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .await
+            .unwrap();
+        assert!(
+            close.status.success(),
+            "failed stderr write changed close status"
+        );
+        assert_eq!(
+            String::from_utf8(close.stdout).unwrap().trim(),
+            format!("closed {}", id.trim())
+        );
+    }
+    assert_eq!(std::fs::read(state).unwrap(), b"bad json");
+    shutdown.send(()).unwrap();
+    task.await.unwrap().unwrap();
 }

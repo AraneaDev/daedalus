@@ -43,10 +43,12 @@ impl DaedalusApp {
             }
             UiEvent::JournalCapability(supported) => self.history.connection(supported),
             UiEvent::DaemonCapabilities {
+                persistence_health,
                 home_dir,
                 project_setups,
                 recent_projects,
             } => {
+                self.state.persistence_health = persistence_health;
                 self.daemon_home = home_dir;
                 self.project_setups.set_daemon_backed(project_setups);
                 if !recent_projects {
@@ -118,6 +120,7 @@ impl DaedalusApp {
                 self.schedule_resize_flush();
             }
             UiEvent::Disconnected => {
+                self.state.persistence_health = None;
                 self.state.pending_image_preview = None;
                 self.pause_layout_saves();
                 self.seeding_workbench.clear();

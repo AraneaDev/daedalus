@@ -1,10 +1,126 @@
 use super::DaedalusApp;
-use daedalus_ui::bridge::UiCommand;
+use daedalus_proto::{Assignment, PaneRole, PaneStatus, WorkspaceId};
+use daedalus_ui::bridge::{AssignmentLaunch, UiCommand};
 use daedalus_ui::input::UiAction;
+use daedalus_ui::state::{ConnectionState, SessionAction};
 
 impl DaedalusApp {
+    fn session_launches(&self, workspace: WorkspaceId) -> Result<(Vec<Assignment>, bool), String> {
+        let ws = self
+            .state
+            .active_workspace()
+            .filter(|ws| ws.id == workspace)
+            .ok_or("Select a workspace to manage its sessions.")?;
+        let defaults =
+            super::workspace_settings::initial_assignments(ws, self.config.default_agent);
+        let (mut assignments, baseline) =
+            self.project_setups.settings_draft(workspace, defaults)?;
+        let saved = baseline
+            .assignments
+            .as_ref()
+            .is_some_and(|entries| !entries.is_empty());
+        if assignments.is_empty() {
+            assignments.push(Assignment {
+                id: "default-agent-shell".into(),
+                name: "Shell".into(),
+                role: PaneRole::Agent,
+                argv: Vec::new(),
+            });
+        }
+        Ok((assignments, saved))
+    }
+
+    pub(super) fn open_sessions(&mut self) {
+        if self.state.connection != ConnectionState::Connected {
+            self.show_toast("Reconnect to manage sessions.", true);
+            return;
+        }
+        let Some(workspace) = self.state.active_workspace_id else {
+            return;
+        };
+        let mut actions: Vec<_> = match self.session_launches(workspace) {
+            Ok((assignments, saved)) => assignments
+                .into_iter()
+                .map(|assignment| SessionAction::Launch { assignment, saved })
+                .collect(),
+            Err(error) => {
+                self.show_toast(error, true);
+                Vec::new()
+            }
+        };
+        if let Some(ws) = self.state.active_workspace() {
+            actions.extend(
+                self.state
+                    .terminal_tabs(ws)
+                    .into_iter()
+                    .filter_map(|(id, title)| {
+                        let status = self.state.panes.get(&id)?.summary.status;
+                        (!matches!(status, PaneStatus::Exited { .. }))
+                            .then_some(SessionAction::Stop(id, title))
+                    }),
+            );
+        }
+        self.pointer.end_drag();
+        self.state.open_action_palette();
+        self.state.action_palette.session_actions = Some(actions);
+        self.request_redraw();
+    }
+
+    fn confirm_session_action(&mut self, action: SessionAction) {
+        if self.state.connection != ConnectionState::Connected {
+            self.show_toast("Reconnect to manage sessions.", true);
+            return;
+        }
+        let Some(workspace) = self.state.active_workspace_id else {
+            return;
+        };
+        let sent = match action {
+            SessionAction::Launch { assignment, saved } => {
+                let (assignments, currently_saved) = match self.session_launches(workspace) {
+                    Ok(current) => current,
+                    Err(error) => {
+                        self.show_toast(error, true);
+                        return;
+                    }
+                };
+                if saved != currently_saved || !assignments.contains(&assignment) {
+                    self.show_toast("Saved sessions changed. Open Launch again.", false);
+                    return;
+                }
+                let launch = if saved {
+                    AssignmentLaunch::ReviewedRunner
+                } else {
+                    AssignmentLaunch::Direct
+                };
+                self.launch_assignment(workspace, assignment, launch)
+            }
+            SessionAction::Stop(id, _) => {
+                let active = self.state.active_workspace().is_some_and(|ws| {
+                    self.state.workspace_panes(ws).any(|pane| {
+                        pane.id == id && !matches!(pane.status, PaneStatus::Exited { .. })
+                    })
+                });
+                if !active {
+                    return;
+                }
+                self.send_command(UiCommand::ClosePane(id))
+            }
+        };
+        if !sent {
+            self.show_toast("Reconnect to manage sessions.", true);
+        }
+    }
+
     pub(super) fn confirm_workspace_action(&mut self) {
         let selected = self.state.action_palette.selected_index;
+        if let Some(actions) = self.state.action_palette.session_actions.take() {
+            self.state.action_palette.close();
+            if let Some(action) = actions.into_iter().nth(selected) {
+                self.confirm_session_action(action);
+            }
+            self.request_redraw();
+            return;
+        }
         if let (Some(workspace_id), Some(action)) = (
             self.state.active_workspace_id,
             self.state.active_actions().get(selected),
@@ -30,7 +146,7 @@ impl DaedalusApp {
                 self.request_redraw();
             }
             UiAction::ActionPaletteUp | UiAction::ActionPaletteDown => {
-                let count = self.state.active_actions().len();
+                let count = self.state.palette_len();
                 if action == UiAction::ActionPaletteUp {
                     self.state.action_palette.move_up(count);
                 } else {

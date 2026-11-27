@@ -374,34 +374,18 @@ fn resolve_pane_launch_specs(
     requested_agent: AgentPreset,
     manifest: Option<&WorkspaceManifest>,
 ) -> [PaneLaunchSpec; 3] {
-    let manifest_preset = manifest
-        .and_then(|m| m.agent_preset.as_deref())
-        .and_then(AgentPreset::from_cli_name);
-    let base_preset = manifest_preset.unwrap_or(requested_agent);
-
-    let (agent_cmd, effective_agent) = match manifest
-        .and_then(|m| m.agent_command.as_ref())
-        .filter(|cmd| !cmd.is_empty())
-    {
-        Some(cmd) => (
-            Some(cmd.clone()),
-            AgentPreset::from_executable(&cmd[0]).or(manifest_preset),
-        ),
-        None => (base_preset.command(), Some(base_preset)),
-    };
-
-    let service_cmd = manifest
-        .and_then(|m| m.service_command.clone())
-        .filter(|c| !c.is_empty());
-    let runner_cmd = manifest
-        .and_then(|m| m.runner_command.clone())
-        .filter(|c| !c.is_empty());
-
-    [
-        (PaneRole::Agent, agent_cmd, effective_agent),
-        (PaneRole::Service, service_cmd, None),
-        (PaneRole::Runner, runner_cmd, None),
-    ]
+    let targets = daedalus_proto::project::manifest_launch_targets(
+        manifest,
+        Some(requested_agent.short_name()),
+    );
+    let agent = targets.launch_preset.and_then(AgentPreset::from_cli_name);
+    targets.roles.map(|(role, target)| {
+        (
+            role,
+            target.into_command(),
+            if role == PaneRole::Agent { agent } else { None },
+        )
+    })
 }
 
 pub(super) fn workspace_name_from_dir(dir: &Path) -> String {

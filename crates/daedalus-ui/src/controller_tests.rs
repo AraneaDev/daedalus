@@ -13,7 +13,9 @@ struct Workbench {
     root: TempDir,
 }
 
+mod coverage_paths;
 mod membership;
+mod sessions;
 mod settings_workflows;
 mod widget_library;
 mod widget_viewport;
@@ -1792,6 +1794,7 @@ fn runner_entry(name: &str) -> daedalus_ui::assignments::Assignment {
 
 fn daemon_capabilities(w: &mut Workbench, project_setups: bool) {
     w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
+        persistence_health: None,
         home_dir: None,
         project_setups,
         recent_projects: true,
@@ -2158,6 +2161,7 @@ fn startup_without_dir_never_uses_working_directory() {
         Ok(UiCommand::RefreshRecentProjects)
     ));
     w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
+        persistence_health: None,
         home_dir: Some("/home/dev".into()),
         project_setups: true,
         recent_projects: true,
@@ -2173,6 +2177,7 @@ fn startup_without_dir_never_uses_working_directory() {
     w.app.config.bootstrap_explicit_dir = true;
     w.app.config.initial_dir = "/p".into();
     w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
+        persistence_health: None,
         home_dir: Some("/home/dev".into()),
         project_setups: true,
         recent_projects: true,
@@ -2185,6 +2190,7 @@ fn startup_without_dir_never_uses_working_directory() {
 fn worktree_fallback_uses_folder_suggestion() {
     let mut w = Workbench::new();
     w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
+        persistence_health: None,
         home_dir: Some("/home/dev".into()),
         project_setups: true,
         recent_projects: true,
@@ -2221,6 +2227,7 @@ fn stored_setup() -> Vec<daedalus_ui::assignments::Assignment> {
 /// A freshly started UI: it never saw `/project` open, and the daemon lists it as recent.
 fn start_screen_with_recent(w: &mut Workbench, has_setup: bool) {
     w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
+        persistence_health: None,
         home_dir: None,
         project_setups: true,
         recent_projects: true,
@@ -2502,6 +2509,7 @@ fn recent_list_is_cleared_when_the_daemon_has_no_recent_projects() {
     start_screen_with_recent(&mut w, true);
     assert_eq!(w.app.state.workspace_form.recent().len(), 2);
     w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
+        persistence_health: None,
         home_dir: None,
         project_setups: false,
         recent_projects: false,
@@ -2980,4 +2988,29 @@ fn ime_commit_reaches_form_opened_by_native_action_with_recap_selected() {
             .contains("日本語"),
         "the active form lost committed Japanese text"
     );
+}
+
+#[test]
+fn temporary_persistence_warning_clears_on_healthy_or_legacy_reconnect() {
+    use daedalus_proto::PersistenceHealth::{Durable, TemporarySnapshotRejected};
+    let mut w = Workbench::new();
+    for health in [
+        Some(TemporarySnapshotRejected),
+        Some(Durable),
+        Some(TemporarySnapshotRejected),
+        None,
+    ] {
+        w.app.handle_daemon_event(UiEvent::Disconnected);
+        w.app.handle_daemon_event(UiEvent::DaemonCapabilities {
+            persistence_health: health,
+            home_dir: None,
+            recent_projects: false,
+            project_setups: false,
+        });
+        w.app.handle_daemon_event(UiEvent::Connected);
+        assert_eq!(
+            w.app.has_top_banner(),
+            health == Some(TemporarySnapshotRejected)
+        );
+    }
 }

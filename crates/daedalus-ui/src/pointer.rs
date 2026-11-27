@@ -195,6 +195,7 @@ impl DaedalusApp {
             HitTarget::SessionTab(role) => self.handle_ui_action(UiAction::FocusRole(role)),
             HitTarget::RunCargo(preset) => self.handle_ui_action(UiAction::RunCargo(preset)),
             HitTarget::RunTests => self.handle_ui_action(UiAction::RunTests),
+            HitTarget::OpenSessions => self.handle_ui_action(UiAction::OpenSessions),
             HitTarget::CustomWidget(index) => self.open_widget_details(index),
             HitTarget::WorkspaceSettings => self.open_workspace_settings(),
             HitTarget::SidebarNewWorkspace => self.create_new_workspace(),

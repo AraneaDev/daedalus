@@ -11,38 +11,34 @@ use daedalus_ui::{
 };
 use winit::keyboard::Key;
 
-fn initial_assignments(ws: &WorkspaceView, default_agent: AgentPreset) -> Vec<Assignment> {
-    let manifest = ws.manifest.as_ref();
-    let agent = manifest
-        .and_then(|m| m.agent_preset.as_deref())
-        .and_then(AgentPreset::from_cli_name)
-        .unwrap_or(default_agent);
-    let agent_command = manifest
-        .and_then(|m| m.agent_command.clone())
-        .or_else(|| agent.command());
-    [
-        (PaneRole::Agent, agent.short_name(), agent_command),
-        (
-            PaneRole::Service,
-            "Service",
-            manifest.and_then(|m| m.service_command.clone()),
-        ),
-        (
-            PaneRole::Runner,
-            "Runner",
-            manifest.and_then(|m| m.runner_command.clone()),
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(role, name, argv)| {
-        Some(Assignment {
-            id: format!("default-{role}"),
-            name: name.into(),
-            role,
-            argv: argv?,
+pub(super) fn initial_assignments(
+    ws: &WorkspaceView,
+    default_agent: AgentPreset,
+) -> Vec<Assignment> {
+    let targets = daedalus_proto::project::manifest_launch_targets(
+        ws.manifest.as_ref(),
+        Some(default_agent.short_name()),
+    );
+    targets
+        .roles
+        .into_iter()
+        .filter_map(|(role, target)| {
+            // Without a manifest, Launch supplies its existing ephemeral shell action.
+            if ws.manifest.is_none()
+                && target == daedalus_proto::project::ManifestTarget::DefaultShell
+            {
+                return None;
+            }
+            let name = match role {
+                PaneRole::Agent => targets
+                    .selected_preset
+                    .unwrap_or(default_agent.short_name()),
+                PaneRole::Service => "Service",
+                PaneRole::Runner => "Runner",
+            };
+            target.into_assignment(role, format!("default-{role}"), name)
         })
-    })
-    .collect()
+        .collect()
 }
 
 impl DaedalusApp {
@@ -94,6 +90,7 @@ impl DaedalusApp {
                 self.state.picker.close();
                 self.state.settings.begin(entries);
                 self.state.settings.widget_workspace = Some(id);
+                self.state.settings.cargo_shortcuts_available = self.state.has_cargo_presets();
                 self.state.settings.setup_baseline = baseline;
                 self.prepare_workbench_settings(id);
                 self.state.settings.set_automatic_widgets(

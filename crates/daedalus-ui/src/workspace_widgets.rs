@@ -12,6 +12,8 @@ pub struct WorkspaceWidgets {
     pub service_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_enabled: Option<bool>,
+    pub hide_cargo_test: bool,
+    pub hide_cargo_check: bool,
 }
 
 impl WorkspaceWidgets {
@@ -39,6 +41,8 @@ impl From<WorkspaceWidgets> for daedalus_proto::workbench::PaneWidgets {
             runner: widgets.runner,
             service_enabled: widgets.service_enabled,
             runner_enabled: widgets.runner_enabled,
+            hide_cargo_test: widgets.hide_cargo_test,
+            hide_cargo_check: widgets.hide_cargo_check,
         }
     }
 }
@@ -50,6 +54,8 @@ impl From<daedalus_proto::workbench::PaneWidgets> for WorkspaceWidgets {
             runner: widgets.runner,
             service_enabled: widgets.service_enabled,
             runner_enabled: widgets.runner_enabled,
+            hide_cargo_test: widgets.hide_cargo_test,
+            hide_cargo_check: widgets.hide_cargo_check,
         }
     }
 }

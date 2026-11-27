@@ -20,6 +20,7 @@ pub enum UiAction {
     ToggleSidebar,
     ToggleAgentPicker,
     ToggleActionPalette,
+    OpenSessions,
     ActionPaletteUp,
     ActionPaletteDown,
     ActionPaletteConfirm,
@@ -91,6 +92,7 @@ impl KeyRepeatGuard {
                 | UiAction::ToggleSidebar
                 | UiAction::ToggleAgentPicker
                 | UiAction::ToggleActionPalette
+                | UiAction::OpenSessions
                 | UiAction::ActionPaletteConfirm
                 | UiAction::ActionPaletteCancel
                 | UiAction::ToggleWorktreeModal
@@ -315,6 +317,7 @@ fn translate_primary_shift_char(ch: &str) -> UiAction {
         "i" => UiAction::PreviewImage,
         "b" => UiAction::ToggleSidebar,
         "a" => UiAction::ToggleActionPalette,
+        "u" => UiAction::OpenSessions,
         "p" => UiAction::ToggleAgentPicker,
         "w" => UiAction::ToggleWorktreeModal,
         "d" => UiAction::OpenCloseWorkspaceModal,

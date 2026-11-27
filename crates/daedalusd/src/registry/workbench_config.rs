@@ -2,14 +2,27 @@ use super::Registry;
 use crate::workbench::scheduler::WidgetCommands;
 use crate::workbench::store::{Change, RepoLink};
 use daedalus_proto::workbench::{PaneWidgets, WorkbenchState, WorkspaceDocument};
-use daedalus_proto::{Assignment, PaneRole, ProtoError, ServerEvent, WorkspaceId};
+use daedalus_proto::{PaneRole, ProtoError, ServerEvent, WorkspaceId};
 use std::sync::Arc;
 
 impl Registry {
     pub(crate) async fn workbench(&self, id: WorkspaceId) -> Result<WorkbenchState, ProtoError> {
+        let registration = self.workbench_widget_commands(id).await?;
+        self.workbench_for_registration(id, registration).await
+    }
+
+    pub(super) async fn workbench_for_registration(
+        &self,
+        id: WorkspaceId,
+        registration: Arc<WidgetCommands>,
+    ) -> Result<WorkbenchState, ProtoError> {
         let initial = self.initial_workbench(id).await?;
         let setup = self.project_setups.read().await.workspace(id).cloned();
-        self.workbench_store.workspace(id, initial, setup).await
+        // The blocking read may outlive its caller. Check membership under the
+        // store lock so that closing this registration always wins eviction.
+        self.workbench_store
+            .workspace(id, initial, setup, move || registration.is_open())
+            .await
     }
 
     pub(crate) async fn update_workbench(
@@ -120,56 +133,27 @@ impl Registry {
             .folder(&root, &canonical_root)
             .cloned();
         if let Some(manifest) = manifest {
+            if saved.is_none() {
+                document.assignments =
+                    daedalus_proto::project::manifest_launch_targets(Some(&manifest), None)
+                        .roles
+                        .into_iter()
+                        .filter_map(|(role, target)| {
+                            let (key, name) = match role {
+                                PaneRole::Agent => ("agent", "Agent"),
+                                PaneRole::Service => ("service", "Service"),
+                                PaneRole::Runner => ("runner", "Runner"),
+                            };
+                            target.into_assignment(role, format!("manifest-{key}"), name)
+                        })
+                        .collect();
+            }
             if manifest.service_widget.is_some() || manifest.runner_widget.is_some() {
                 document.pane_widgets = Some(PaneWidgets {
                     service: manifest.service_widget.unwrap_or_default(),
                     runner: manifest.runner_widget.unwrap_or_default(),
                     ..PaneWidgets::default()
                 });
-            }
-            let agent_key = if manifest.agent_command.as_deref().is_some_and(|argv| {
-                matches!(argv, [program] if daedalus_proto::canonical_agent_preset(program) == Some("shell"))
-            }) {
-                "agent-command"
-            } else {
-                "agent"
-            };
-            if saved.is_none() {
-                document.assignments = [
-                    (
-                        PaneRole::Agent,
-                        agent_key,
-                        "Agent",
-                        manifest.agent_command.or_else(|| {
-                            let preset = daedalus_proto::canonical_agent_preset(
-                                manifest.agent_preset.as_deref()?,
-                            )?;
-                            Some(vec![preset.to_owned()])
-                        }),
-                    ),
-                    (
-                        PaneRole::Service,
-                        "service",
-                        "Service",
-                        manifest.service_command,
-                    ),
-                    (
-                        PaneRole::Runner,
-                        "runner",
-                        "Runner",
-                        manifest.runner_command,
-                    ),
-                ]
-                .into_iter()
-                .filter_map(|(role, key, name, argv)| {
-                    Some(Assignment {
-                        id: format!("manifest-{key}"),
-                        name: name.into(),
-                        role,
-                        argv: argv?,
-                    })
-                })
-                .collect();
             }
         }
         if let Some(assignments) = saved {

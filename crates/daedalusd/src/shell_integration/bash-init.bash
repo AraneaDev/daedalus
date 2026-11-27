@@ -1,8 +1,11 @@
+# shellcheck shell=bash
 # Daedalus non-destructive bash shell integration (OSC 7 + OSC 133)
 if [ -r /etc/profile ]; then
+    # shellcheck source=/dev/null
     . /etc/profile
 fi
 if [ -r "$HOME/.bashrc" ]; then
+    # shellcheck source=/dev/null
     . "$HOME/.bashrc"
 fi
 
@@ -64,6 +67,8 @@ if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
         done
         __daedalus_joined_pc+=$'\n__daedalus_precmd_end'
         unset PROMPT_COMMAND
+        # Bash before 5.1 needs a scalar PROMPT_COMMAND after unset.
+        # shellcheck disable=SC2178
         PROMPT_COMMAND="${__daedalus_joined_pc}"
         unset __daedalus_joined_pc __daedalus_pc_item
     fi

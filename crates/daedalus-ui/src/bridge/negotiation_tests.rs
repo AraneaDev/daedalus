@@ -44,6 +44,7 @@ fn pong(supported: bool) -> ResponsePayload {
         guarded_runner_assignment_supported: false,
         resolved_import_preview_supported: false,
         agent_launch_metadata_supported: false,
+        persistence_health: supported.then_some(daedalus_proto::PersistenceHealth::Durable),
         home_dir: supported.then(|| PathBuf::from("/home/test")),
     }
 }
@@ -275,6 +276,7 @@ async fn old_daemon_gets_no_new_requests() {
     assert!(emitted.iter().any(|event| matches!(
         event,
         UiEvent::DaemonCapabilities {
+            persistence_health: None,
             home_dir: None,
             project_setups: false,
             recent_projects: false
@@ -350,6 +352,7 @@ async fn handshake_publishes_capabilities_before_terminal_readiness() {
         .iter()
         .filter_map(|event| match event {
             UiEvent::DaemonCapabilities {
+                persistence_health,
                 home_dir,
                 project_setups,
                 recent_projects,
@@ -357,6 +360,10 @@ async fn handshake_publishes_capabilities_before_terminal_readiness() {
                 assert_eq!(
                     home_dir.as_deref(),
                     Some(std::path::Path::new("/home/test"))
+                );
+                assert_eq!(
+                    *persistence_health,
+                    Some(daedalus_proto::PersistenceHealth::Durable)
                 );
                 assert!(*project_setups);
                 assert!(*recent_projects);

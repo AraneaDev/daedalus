@@ -135,7 +135,11 @@ enum WorkspaceAction {
         #[arg(long = "env")]
         env: Vec<String>,
     },
-    List,
+    List {
+        /// Print workspace identity and pane IDs as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// List recently used projects, newest first
     Recent,
     /// Inspect the current workbench configuration.

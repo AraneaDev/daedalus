@@ -18,6 +18,7 @@ use crate::theme;
 enum PickerKind {
     Preset,
     Action,
+    Sessions,
     Recipient,
 }
 
@@ -26,6 +27,7 @@ impl PickerKind {
         let (title, hint) = match self {
             Self::Preset => ("Agent preset", "Enter switches · Shift+Enter adds"),
             Self::Action => ("Workspace actions", "↑↓ choose · Enter runs · Esc"),
+            Self::Sessions => ("Workspace sessions", "↑↓ choose · Enter confirms · Esc"),
             Self::Recipient => ("Send failure to agent", "↑↓ choose · Enter sends · Esc"),
         };
         [
@@ -122,13 +124,14 @@ impl TextRenderer {
     ) {
         let s = self.scale_factor;
         let palette = state.action_palette.open;
+        let sessions = state.action_palette.session_actions.as_deref();
         let actions = state.active_actions();
         let (modal, visible) = if palette {
             action_palette_layout(
                 screen_w,
                 screen_h,
                 s,
-                actions.len(),
+                state.palette_len(),
                 state.action_palette.selected_index,
             )
         } else {
@@ -138,7 +141,9 @@ impl TextRenderer {
         self.build_picker_header(
             modal,
             theme,
-            if palette {
+            if sessions.is_some() {
+                PickerKind::Sessions
+            } else if palette {
                 PickerKind::Action
             } else {
                 PickerKind::Preset
@@ -148,7 +153,11 @@ impl TextRenderer {
         if visible.is_empty() {
             let row = picker_item_rect(modal, 0, s);
             self.push_modal_line(ChromeLineSpec {
-                text: "Add actions in .daedalus.toml",
+                text: if sessions.is_some() {
+                    "No sessions available. Check workspace setup."
+                } else {
+                    "Add actions in .daedalus.toml"
+                },
                 left: row.x + 10.0 * s,
                 top: row.y + 6.0 * s,
                 max_w: (row.width - 20.0 * s).max(1.0),
@@ -161,7 +170,12 @@ impl TextRenderer {
         }
         for (row, idx) in visible.enumerate() {
             let item_rect = picker_item_rect(modal, row, s);
-            let (selected, label) = if palette {
+            let (selected, label) = if let Some(sessions) = sessions {
+                (
+                    idx == state.action_palette.selected_index,
+                    sessions[idx].label(),
+                )
+            } else if palette {
                 let action = &actions[idx];
                 let shortcut = action.shortcut.as_deref().unwrap_or("");
                 (

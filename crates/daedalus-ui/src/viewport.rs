@@ -26,7 +26,9 @@ impl DaedalusApp {
     }
 
     pub(super) fn has_top_banner(&self) -> bool {
-        self.state.connection != ConnectionState::Connected || self.state.toast.is_some()
+        self.state.connection != ConnectionState::Connected
+            || self.state.toast.is_some()
+            || self.state.persistence_warning().is_some()
     }
 
     pub(super) fn viewport_metrics(&self) -> Option<ViewportMetrics> {
@@ -69,7 +71,9 @@ impl DaedalusApp {
                     .collect()
             })
             .unwrap_or_default();
-        let cargo = self.state.show_cargo_bar();
+        let cargo_presets = daedalus_ui::assignments::CargoPreset::ALL
+            .map(|preset| self.state.cargo_preset_visible(preset));
+        let cargo = cargo_presets.contains(&true);
         let show_footer =
             (cargo || !widgets.is_empty()) && size.height as f32 >= footer_height * 5.;
         let height = size.height as f32 - if show_footer { footer_height } else { 0. };
@@ -92,6 +96,7 @@ impl DaedalusApp {
             let bar = daedalus_ui::layout::Rect::new(0., height, size.width as f32, footer_height);
             if cargo {
                 layout.cargo_bar = Some(bar);
+                layout.cargo_presets = cargo_presets;
             }
             if !widgets.is_empty() {
                 layout.widget_bar = Some(bar);
@@ -177,6 +182,11 @@ impl DaedalusApp {
                 }
             }
             layout.sidebar_content = Some(Arc::new(list));
+        }
+        if self.state.connection == ConnectionState::Connected
+            && self.state.active_workspace_id.is_some()
+        {
+            layout.enable_launch_button(scale_factor);
         }
         if self.state.active_test_workspace().is_some() {
             layout.enable_run_tests(scale_factor);
