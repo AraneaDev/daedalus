@@ -386,7 +386,7 @@ mod tests {
         write_json_atomic(&path, &raw).unwrap();
         {
             let mut memory = store.memory.lock().unwrap();
-            for revision in [3, 4] {
+            for revision in [3, 4, 2, 1] {
                 let setup = PersistedWorkspaceSetup {
                     workspace_id: id,
                     revision,
@@ -401,8 +401,12 @@ mod tests {
                     .read_workspace(&mut memory, id, Some(setup.clone()))
                     .unwrap()
                     .unwrap();
-                assert_eq!(observed.revision, revision);
-                assert_eq!(observed.document.assignments, setup.assignments);
+                if revision > raw.revision {
+                    assert_eq!(observed.revision, revision);
+                    assert_eq!(observed.document.assignments, setup.assignments);
+                } else {
+                    assert_eq!(observed, raw);
+                }
             }
             assert_eq!(
                 store.read_workspace(&mut memory, id, None).unwrap(),
