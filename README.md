@@ -481,8 +481,8 @@ The audit fails on vulnerabilities, yanked dependencies and new advisory warning
 warnings from font rendering and Linux accessibility are printed on every run. Their exact versions
 and advisory IDs are recorded in `scripts/check_audit.py` and need review at each version change.
 
-To measure workspace coverage and test whether the suite detects changes to frame encoding,
-decoding and terminal erasure, run:
+To measure workspace coverage and test whether the suite detects mutations in framing, terminal
+erasure, and workbench state, run on Linux:
 
 ```sh
 rustup toolchain install 1.94.1 --profile minimal --component llvm-tools-preview
@@ -491,11 +491,11 @@ cargo install cargo-mutants --version 27.1.0 --locked
 RUSTUP_TOOLCHAIN=1.94.1 scripts/check-test-quality.sh
 ```
 
-The workspace coverage floors are 92.9% for lines, 92.5% for functions, and 92.4% for regions.
-On Linux the gate
-also runs a native desktop test in Xvfb with Xauth, Mesa Vulkan, the system Python Xlib package, and
-AT-SPI (`at-spi2-core`) on a private D-Bus session, so the accessibility tree is covered.
-Set `DAEDALUS_TEST_PYTHON` to use a different Python interpreter with Xlib installed. The
+The workspace coverage floors are 92.9% for lines, 92.5% for functions, and 92.4% for regions. The
+named launch, pointer, and terminal interaction modules each have an 85% line floor. The Linux gate
+also runs clipboard and native desktop tests in Xvfb with Xauth, Mesa Vulkan, the system Python Xlib
+package, and AT-SPI (`at-spi2-core`) on a private D-Bus session, so the accessibility tree is
+covered. Set `DAEDALUS_TEST_PYTHON` to use a different Python interpreter with Xlib installed. The
 mutation gate fails on surviving or timed-out mutations. Mutation results are written under
 `target/quality/`. Native Ghostty checks require the external Ghostty C library and headers.
 
@@ -508,6 +508,7 @@ a maintainer to approve workflow runs from the release PR page.
 
 The [initial specification follow-up](docs/spec-follow-up.md) records the 0.0.6 baseline.
 It marks the milestones that have shipped and the acceptance scenarios that remain open.
+See [runtime decisions](docs/runtime-decisions.md) for transport, persistence, and cache behavior.
 
 ## License
 

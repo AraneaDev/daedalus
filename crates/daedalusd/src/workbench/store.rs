@@ -293,6 +293,16 @@ fn io_error(error: std::io::Error) -> ProtoError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn revision_increments_and_refuses_overflow() {
+        assert_eq!(next_revision(0).unwrap(), 1);
+        assert_eq!(next_revision(7).unwrap(), 8);
+        assert!(matches!(
+            next_revision(u64::MAX),
+            Err(ProtoError::Internal(_))
+        ));
+    }
+
     #[tokio::test]
     async fn restored_workbench_cache_discards_stale_scheduler_reads_on_close() {
         use crate::workbench::scheduler::WidgetCommands;
