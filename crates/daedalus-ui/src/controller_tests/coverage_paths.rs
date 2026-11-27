@@ -1,5 +1,5 @@
 use super::*;
-use daedalus_ui::layout::{Rect, overlays, sidebar_workspace_close_rect};
+use daedalus_ui::layout::{Rect, overlays, settings_button, sidebar_workspace_close_rect};
 use daedalus_ui::sidebar_content::SidebarRow;
 
 fn metrics() -> ViewportMetrics {
@@ -100,6 +100,97 @@ fn pointer_routes_search_and_preview_controls_to_the_active_pane() {
         .new_workspace;
     click(app, new_workspace);
     assert!(app.state.workspace_form.open);
+}
+
+#[test]
+fn pointer_opens_workspace_settings_from_the_sidebar_heading() {
+    let mut workbench = Workbench::new();
+    let app = &mut workbench.app;
+    app.state
+        .set_workspaces(vec![workspace("Sidebar controls")]);
+    app.state.sidebar_override = Some(true);
+
+    let layout = app.layout_for(metrics());
+    let header = layout.sidebar_toggle.unwrap();
+    let arrows = layout.sidebar_content.unwrap().arrows;
+    click(app, settings_button(header, arrows, 1.));
+    assert!(app.state.settings.open);
+}
+
+#[test]
+fn pointer_switches_layout_and_focus_and_releases_resized_divider() {
+    let mut workbench = Workbench::new();
+    let app = &mut workbench.app;
+    app.state.set_workspaces(vec![workspace("Split controls")]);
+
+    let layout = app.layout_for(metrics());
+    assert!(app.state.zoomed);
+    click(app, layout.layout_button.unwrap());
+    assert!(!app.state.zoomed);
+
+    let layout = app.layout_for(metrics());
+    assert!(!layout.stacked);
+    let agent = layout.pane(PaneRole::Agent).unwrap().outer;
+    let service = layout.pane(PaneRole::Service).unwrap();
+    let divider_x = (agent.right() + service.outer.x) / 2.;
+    let divider_y = agent.y + agent.height / 2.;
+    let split = app.pointer.splits.portable(true).splits["column"];
+    app.move_pointer(divider_x, divider_y, Some(metrics()));
+    app.click_at(metrics());
+    assert!(app.pointer.dragging_divider());
+    app.move_pointer(divider_x + 80., divider_y, Some(metrics()));
+    app.handle_left_mouse_up();
+    assert!(!app.pointer.dragging_divider());
+    let resized = app.pointer.splits.portable(true).splits["column"];
+    assert!(resized > split);
+    app.move_pointer(divider_x, divider_y, Some(metrics()));
+    assert_eq!(app.pointer.splits.portable(true).splits["column"], resized);
+
+    let header = app
+        .layout_for(metrics())
+        .pane(PaneRole::Service)
+        .unwrap()
+        .header;
+    click(app, header);
+    assert_eq!(app.state.focused_role, PaneRole::Service);
+}
+
+#[test]
+fn pointer_drag_selects_cells_from_a_visible_terminal_row() {
+    use daedalus_proto::{Cell, GridRow};
+    use daedalus_ui::selection::{CellPos, Selection};
+
+    let mut workbench = Workbench::new();
+    let ws = workspace("Select cells");
+    let agent = ws.panes[0].id;
+    let app = &mut workbench.app;
+    app.state.set_workspaces(vec![ws]);
+    app.state.panes.get_mut(&agent).unwrap().viewport_rows = vec![GridRow {
+        row_index: 0,
+        abs_row: 42,
+        wraps: false,
+        links: vec![],
+        cells: "selected"
+            .chars()
+            .map(|c| Cell {
+                text: c.to_string(),
+                ..Default::default()
+            })
+            .collect(),
+    }];
+    let pane = app
+        .layout_for(metrics())
+        .pane(PaneRole::Agent)
+        .unwrap()
+        .viewport;
+    app.move_pointer(pane.x + 9., pane.y + 2., Some(metrics()));
+    app.click_at(metrics());
+    app.move_pointer(pane.x + 41., pane.y + 2., Some(metrics()));
+    app.handle_left_mouse_up();
+    assert_eq!(
+        app.state.panes[&agent].selection,
+        Some(Selection::new(CellPos::new(1, 42), CellPos::new(5, 42)))
+    );
 }
 
 #[cfg(target_os = "linux")]
