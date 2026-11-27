@@ -1,7 +1,9 @@
 mod subscription;
+mod task_exit;
 mod workbench;
 
 use subscription::{SubscriberExit, Subscription, forward_subscriber_events};
+use task_exit::{join_worker, report_task_exit};
 
 use crate::external_hook::ExternalHookServer;
 use crate::persistence::StateStore;
@@ -157,11 +159,15 @@ impl DaemonServer {
 
     pub async fn serve(mut self, shutdown: impl Future<Output = ()>) -> std::io::Result<()> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let monitor_handle =
-            runtime_monitor::spawn_runtime_monitor(Arc::clone(&self.registry), shutdown_rx.clone());
-        let widgets =
-            crate::workbench::scheduler::spawn(Arc::clone(&self.registry), shutdown_rx.clone());
-        let hook_handle = self.external_hook.map(|hook| {
+        let mut monitor_handle = Some(runtime_monitor::spawn_runtime_monitor(
+            Arc::clone(&self.registry),
+            shutdown_rx.clone(),
+        ));
+        let mut widgets = Some(crate::workbench::scheduler::spawn(
+            Arc::clone(&self.registry),
+            shutdown_rx.clone(),
+        ));
+        let mut hook_handle = self.external_hook.map(|hook| {
             let mut hook_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
                 if let Err(e) = hook
@@ -194,7 +200,18 @@ impl DaemonServer {
                             error!(error = %e, "accept failed");
                         }
                     }
-                    while client_tasks.try_join_next().is_some() {}
+                }
+                Some(result) = client_tasks.join_next(), if !client_tasks.is_empty() => {
+                    report_task_exit("rpc_client", false, false, result);
+                }
+                result = join_worker(&mut monitor_handle) => {
+                    report_task_exit("runtime_monitor", true, false, result);
+                }
+                result = join_worker(&mut widgets) => {
+                    report_task_exit("widget_scheduler", true, false, result);
+                }
+                result = join_worker(&mut hook_handle) => {
+                    report_task_exit("external_status_hook", true, false, result);
                 }
                 _ = &mut shutdown => {
                     info!("shutting down daedalusd");
@@ -205,11 +222,17 @@ impl DaemonServer {
 
         let _ = shutdown_tx.send(true);
         client_tasks.abort_all();
-        while client_tasks.join_next().await.is_some() {}
-        let _ = monitor_handle.await;
-        let _ = widgets.await;
-        if let Some(handle) = hook_handle {
-            let _ = handle.await;
+        while let Some(result) = client_tasks.join_next().await {
+            report_task_exit("rpc_client", false, true, result);
+        }
+        for (name, handle) in [
+            ("runtime_monitor", monitor_handle),
+            ("widget_scheduler", widgets),
+            ("external_status_hook", hook_handle),
+        ] {
+            if let Some(handle) = handle {
+                report_task_exit(name, true, true, handle.await);
+            }
         }
         self.registry.close_all().await;
         self.listener.cleanup();
