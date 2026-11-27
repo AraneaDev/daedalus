@@ -68,36 +68,9 @@ jobs:
           /Applications/Daedalus.app/Contents/MacOS/daedalus-ui --help >/dev/null
           /usr/local/bin/daedalus-ctl --help >/dev/null
           /usr/local/bin/daedalusd --help >/dev/null
-          DAEDALUS_RUNTIME_DIR=$(mktemp -d /tmp/daedalus-pkg.XXXXXX)
-          export DAEDALUS_RUNTIME_DIR
-          export DAEDALUS_SOCKET="$DAEDALUS_RUNTIME_DIR/daemon.sock"
-          export DAEDALUS_EVENTS_SOCKET="$DAEDALUS_RUNTIME_DIR/events.sock"
-          export DAEDALUS_STATE_FILE="$DAEDALUS_RUNTIME_DIR/state.json"
-          daedalusd >"$DAEDALUS_RUNTIME_DIR/daemon.log" 2>&1 &
-          daemon_pid=$!
-          trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
-          for _ in {1..50}; do
-            if daedalus-ctl ping >/dev/null 2>&1; then break; fi
-            sleep 0.2
-          done
-          project="$DAEDALUS_RUNTIME_DIR/installer-smoke"
-          mkdir "$project"
-          daedalus-ui --dir "$project" --agent shell --no-auto-spawn >"$DAEDALUS_RUNTIME_DIR/ui.log" 2>&1 &
-          ui_pid=$!
-          trap 'kill "$ui_pid" "$daemon_pid" 2>/dev/null || true' EXIT
-          for _ in {1..100}; do
-            kill -0 "$ui_pid"
-            if daedalus-ctl workspace list | grep -F installer-smoke | grep -q 'panes=3'; then break; fi
-            sleep 0.2
-          done
-          workspace=$(daedalus-ctl workspace list | grep -F installer-smoke | grep 'panes=3')
-          kill "$ui_pid"
-          wait "$ui_pid" || true
-          daedalus-ui --dir "$project" --agent shell --no-auto-spawn >>"$DAEDALUS_RUNTIME_DIR/ui.log" 2>&1 &
-          ui_pid=$!
-          sleep 2
-          kill -0 "$ui_pid"
-          test "$(daedalus-ctl workspace list)" = "$workspace"
+          bash packaging/test-macos-installed.sh \
+            /Applications/Daedalus.app/Contents/MacOS/daedalus-ui \
+            /usr/local/bin/daedalusd /usr/local/bin/daedalus-ctl
       - name: Build and test Windows installer
         if: runner.os == 'Windows'
         shell: pwsh

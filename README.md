@@ -313,6 +313,9 @@ daemon and configure the same token on each client. Existing TCP deployments wit
 must set one before starting the upgraded daemon. Unix sockets and Windows named pipes can
 still start with no token configured.
 
+Direct TCP uses token authentication without encrypting the connection. Use
+[SSH forwarding](#a-remote-host-over-ssh) when connecting over an untrusted network.
+
 The daemon keeps the recent projects and each project's setup, so every client of that daemon
 shares them. Set a project up from one machine and the other clients reopen it as it is.
 
