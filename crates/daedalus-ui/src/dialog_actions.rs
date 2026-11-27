@@ -1,10 +1,114 @@
-use super::DaedalusApp;
+use super::{DaedalusApp, FALLBACK_PANE_COLS, FALLBACK_PANE_ROWS};
 use daedalus_proto::{Assignment, PaneRole, PaneStatus, WorkspaceId};
 use daedalus_ui::bridge::{AssignmentLaunch, UiCommand};
 use daedalus_ui::input::UiAction;
-use daedalus_ui::state::{ConnectionState, SessionAction};
+use daedalus_ui::state::{AgentPreset, ConnectionState, SessionAction};
 
 impl DaedalusApp {
+    pub(super) fn open_agent_picker(&mut self) {
+        let current = self
+            .state
+            .pane_for_role(PaneRole::Agent)
+            .and_then(|p| p.agent_preset)
+            .unwrap_or(self.config.default_agent);
+        self.state.open_picker_with(current);
+        self.request_redraw();
+    }
+
+    pub(super) fn open_worktree_modal(&mut self) {
+        self.state.open_worktree_modal();
+        self.request_redraw();
+    }
+
+    pub(super) fn open_close_modal_for_workspace(&mut self, workspace_id: WorkspaceId) {
+        if self.state.open_close_modal_for_workspace(workspace_id) {
+            self.request_redraw();
+        }
+    }
+
+    pub(super) fn confirm_close_workspace(&mut self) {
+        let Some(id) = self.state.close_modal.workspace_id else {
+            self.state.close_modal.close();
+            self.request_redraw();
+            return;
+        };
+        if self.state.close_modal.submitting {
+            return;
+        }
+        if self.state.connection != ConnectionState::Connected {
+            self.show_toast(
+                "Reconnect to the daemon before closing this workspace.",
+                true,
+            );
+            return;
+        }
+        let compose_down = self.state.close_modal.compose_down;
+        let remove_worktree = self.state.close_modal.remove_worktree;
+        let force_remove_worktree = self.state.close_modal.force_remove_worktree;
+        self.state.close_modal.submitting = self.send_command(UiCommand::CloseWorkspace {
+            id,
+            compose_down,
+            remove_worktree,
+            force_remove_worktree,
+        });
+        self.request_redraw();
+    }
+
+    pub(super) fn submit_worktree_modal(&mut self) {
+        if self.state.connection != ConnectionState::Connected {
+            return;
+        }
+        let Some(branch) = self.state.worktree_modal.branch_for_submit() else {
+            self.request_redraw();
+            return;
+        };
+        let repo_dir = self
+            .state
+            .active_workspace()
+            .map(|ws| ws.root_dir.clone())
+            .unwrap_or_else(|| self.folder_suggestion());
+        if self.send_command(UiCommand::CreateWorktreeWorkspace {
+            repo_dir,
+            branch,
+            default_agent: self.config.default_agent,
+        }) {
+            self.state.worktree_modal.close();
+        }
+        self.request_redraw();
+    }
+
+    pub(super) fn apply_agent_preset(&mut self, preset: AgentPreset, add: bool) {
+        self.state.picker.close();
+        let Some(workspace_id) = self.state.active_workspace_id else {
+            self.show_toast("No active workspace for Agent preset switch", true);
+            return;
+        };
+        let old_pane_id = self.state.pane_id_for_role(PaneRole::Agent);
+        let (cols, rows) = self
+            .compute_current_layout()
+            .and_then(|layout| layout.pane(PaneRole::Agent).map(|p| (p.cols, p.rows)))
+            .unwrap_or((FALLBACK_PANE_COLS, FALLBACK_PANE_ROWS));
+
+        self.send_command(if add {
+            UiCommand::AddAgent {
+                workspace_id,
+                preset,
+                cols,
+                rows,
+            }
+        } else {
+            UiCommand::ReplaceAgentPreset {
+                workspace_id,
+                old_pane_id,
+                preset,
+                cols,
+                rows,
+            }
+        });
+        self.state.focused_role = PaneRole::Agent;
+        self.request_redraw();
+    }
+
     fn session_launches(&self, workspace: WorkspaceId) -> Result<(Vec<Assignment>, bool), String> {
         let ws = self
             .state

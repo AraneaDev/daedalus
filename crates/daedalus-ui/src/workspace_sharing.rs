@@ -108,6 +108,11 @@ impl DaedalusApp {
             WorkbenchOperation::WidgetPreview(token) => {
                 settings && self.state.settings.custom.finish_widget_test(token)
             }
+            WorkbenchOperation::WidgetRefresh(revision) => {
+                self.state.active_workspace_id == Some(id)
+                    && !self.workbench_snapshot_is_stale(id, revision, false)
+                    && (!settings || !self.workbench_snapshot_is_stale(id, revision, true))
+            }
             WorkbenchOperation::ImportPreview(token) => {
                 settings && self.state.settings.custom.finish_import_review(token)
             }

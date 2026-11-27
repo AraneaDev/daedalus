@@ -53,6 +53,115 @@ fn snapshot_text(snapshot: &GridSnapshot) -> String {
         .join("\n")
 }
 
+#[tokio::test]
+async fn imported_default_pane_reports_actual_shell_fallback_and_finishes_provisioning() {
+    use daedalus_proto::workbench::WorkspaceImportSource;
+
+    async fn request(stream: &mut IpcStream, payload: ClientMessage) -> ResponsePayload {
+        write_frame(stream, &Request { id: 1, payload })
+            .await
+            .unwrap();
+        let Some(ServerMessage::Response { result, .. }) = read_frame(stream).await.unwrap() else {
+            panic!("expected daemon response");
+        };
+        result.unwrap()
+    }
+
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let server = DaemonServer::bind_with_supervisor(
+        socket.clone(),
+        dir.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let (stop, done) = oneshot::channel();
+    let server = tokio::spawn(server.serve(async {
+        let _ = done.await;
+    }));
+    let mut peer = IpcStream::connect(&socket).await.unwrap();
+    let ResponsePayload::WorkspaceCreationPreview(preview) = request(
+        &mut peer,
+        ClientMessage::PreviewWorkspaceCreation {
+            root_dir: dir.path().into(),
+            source: WorkspaceImportSource::Text(
+                "version = 1\nname = 'Broken setup'\n[[assignments]]\nid = 'broken'\n\
+                 name = 'Agent'\nrole = 'agent'\nargv = ['absent-agent-82f52']\n"
+                    .into(),
+            ),
+            linked: false,
+        },
+    )
+    .await
+    else {
+        panic!("expected import preview");
+    };
+    let ResponsePayload::WorkbenchCreated(workspace) =
+        request(&mut peer, ClientMessage::ApplyWorkspaceCreation { preview }).await
+    else {
+        panic!("expected imported workspace");
+    };
+    drop(peer);
+
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let bridge = DaemonBridge::start(
+        BridgeConfig {
+            bootstrap_explicit_dir: false,
+            socket_path: socket,
+            initial_dir: dir.path().into(),
+            default_agent: AgentPreset::Shell,
+            auth_token: None,
+            auto_spawn_daemon: false,
+        },
+        Arc::new(ChannelSink { tx }),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(events.recv().await.unwrap(), UiEvent::WorkspacesLoaded(_)) {}
+        assert!(bridge.send(UiCommand::EnsureWorkspacePanes {
+            workspace_id: workspace.id,
+            default_agent: AgentPreset::Shell,
+            manifest: None,
+        }));
+        let mut roles = std::collections::HashSet::new();
+        let mut notices = 0;
+        loop {
+            match events.recv().await.unwrap() {
+                UiEvent::Toast { message, .. }
+                    if message.starts_with("Failed to start agent command (") =>
+                {
+                    assert!(message.ends_with("started a shell"), "{message}");
+                    notices += 1;
+                }
+                UiEvent::PaneSpawned { summary, .. } => {
+                    assert!(roles.insert(summary.role));
+                    if summary.role == PaneRole::Agent {
+                        assert_eq!(summary.launch_preset.as_deref(), Some("shell"));
+                    }
+                }
+                UiEvent::WorkspacePanesEnsured {
+                    workspace_id,
+                    complete,
+                } if workspace_id == workspace.id => {
+                    assert!(complete);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(roles.len(), 3);
+        assert_eq!(notices, 1);
+    })
+    .await
+    .expect("timed out waiting for imported workspace provisioning");
+
+    tokio::task::spawn_blocking(move || bridge.shutdown())
+        .await
+        .unwrap();
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn daemon_bridge_bootstraps_three_panes_and_forwards_runner_failure_to_agent() {
@@ -998,6 +1107,7 @@ async fn queued_terminal_input_stays_with_its_connection() {
                     guarded_runner_assignment_supported: false,
                     resolved_import_preview_supported: false,
                     agent_launch_metadata_supported: false,
+                    default_pane_fallback_supported: false,
                     persistence_health: None,
                     home_dir: None,
                 },
@@ -1937,6 +2047,7 @@ async fn reconnect_hydrates_surviving_pane_before_ready_and_recents_do_not_delay
                     guarded_runner_assignment_supported: false,
                     resolved_import_preview_supported: false,
                     agent_launch_metadata_supported: false,
+                    default_pane_fallback_supported: false,
                     persistence_health: None,
                     home_dir: None,
                 },

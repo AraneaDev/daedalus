@@ -6,6 +6,46 @@ use daedalus_ui::{
 };
 
 impl DaedalusApp {
+    fn on_daemon_connected(&mut self) {
+        if self.state.connection == ConnectionState::Reconnecting {
+            self.state.workbench = None;
+        }
+        self.state.connection = ConnectionState::Connected;
+        if self.state.workspace_list_loaded {
+            self.refresh_inactive_layout_saves();
+            self.ensure_active_workspace_panes();
+        }
+        self.schedule_resize_flush();
+    }
+
+    fn on_daemon_disconnected(&mut self) {
+        self.state.persistence_health = None;
+        self.state.pending_image_preview = None;
+        self.pause_layout_saves();
+        self.seeding_workbench.clear();
+        self.watched_workbench = None;
+        self.widget_refresh_at = None;
+        self.setup_disconnected();
+        self.workspace_settings_disconnected();
+        self.pane_widget_save_disconnected();
+        if self.state.settings.custom.interrupt_previews() && self.state.settings.open {
+            self.state.settings.error =
+                Some("Connection lost. Run the preview again when reconnected.".into());
+        }
+        self.history.connection(false);
+        self.state.connection = ConnectionState::Reconnecting;
+        self.state.workspace_list_loaded = false;
+        let form = &mut self.state.workspace_form;
+        form.finish_submission(
+            form.session(),
+            Some("Connection lost. Check the workspace list before retrying.".into()),
+        );
+        self.state.close_modal.submitting = false;
+        self.state.last_sent_sizes.clear();
+        self.state.spawning_workspaces.clear();
+        self.schedule_resize_flush();
+    }
+
     pub(super) fn handle_daemon_event(&mut self, event: UiEvent) {
         let previous_workspace = self.state.active_workspace_id;
         let search_generation = self.state.search.as_ref().map(|search| search.generation);
@@ -108,44 +148,8 @@ impl DaedalusApp {
                 }
             }
             UiEvent::ActivityReadFailed(token) => self.history.failed(token),
-            UiEvent::Connected => {
-                if self.state.connection == ConnectionState::Reconnecting {
-                    self.state.workbench = None;
-                }
-                self.state.connection = ConnectionState::Connected;
-                if self.state.workspace_list_loaded {
-                    self.refresh_inactive_layout_saves();
-                    self.ensure_active_workspace_panes();
-                }
-                self.schedule_resize_flush();
-            }
-            UiEvent::Disconnected => {
-                self.state.persistence_health = None;
-                self.state.pending_image_preview = None;
-                self.pause_layout_saves();
-                self.seeding_workbench.clear();
-                self.watched_workbench = None;
-                self.widget_refresh_at = None;
-                self.setup_disconnected();
-                self.workspace_settings_disconnected();
-                self.pane_widget_save_disconnected();
-                if self.state.settings.custom.interrupt_previews() && self.state.settings.open {
-                    self.state.settings.error =
-                        Some("Connection lost. Run the preview again when reconnected.".into());
-                }
-                self.history.connection(false);
-                self.state.connection = ConnectionState::Reconnecting;
-                self.state.workspace_list_loaded = false;
-                let form = &mut self.state.workspace_form;
-                form.finish_submission(
-                    form.session(),
-                    Some("Connection lost. Check the workspace list before retrying.".into()),
-                );
-                self.state.close_modal.submitting = false;
-                self.state.last_sent_sizes.clear();
-                self.state.spawning_workspaces.clear();
-                self.schedule_resize_flush();
-            }
+            UiEvent::Connected => self.on_daemon_connected(),
+            UiEvent::Disconnected => self.on_daemon_disconnected(),
             UiEvent::WorkspaceCloseFinished(id) => {
                 if self.state.close_modal.workspace_id == Some(id) {
                     self.state.close_modal.submitting = false;

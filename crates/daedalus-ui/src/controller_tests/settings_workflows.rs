@@ -1085,10 +1085,19 @@ fn widget_detail_pages_hold_action_output_until_explicit_refresh() {
     daemon_workbench_reply(&mut w, id, WorkbenchOperation::Read, Ok(results.clone()));
     assert_eq!(w.app.state.settings.custom.preview, Some(action_output));
     apply_control(&mut w, Control::CustomRefresh);
-    assert!(matches!(w.command(), UiCommand::Workbench { request, .. }
-        if matches!(request.as_ref(), ClientMessage::GetWidgetResults { refresh: Some(widget), .. }
-            if widget == "runner")));
-    daemon_workbench_reply(&mut w, id, WorkbenchOperation::Read, Ok(results));
+    let UiCommand::Workbench {
+        operation: refresh,
+        request,
+        ..
+    } = w.command()
+    else {
+        panic!("expected a widget refresh");
+    };
+    assert!(
+        matches!(request.as_ref(), ClientMessage::GetWidgetResults { refresh: Some(widget), .. }
+        if widget == "runner")
+    );
+    daemon_workbench_reply(&mut w, id, refresh, Ok(results));
     assert_eq!(w.app.state.settings.custom.preview, Some(result));
     daemon_workbench_reply(
         &mut w,
@@ -1100,6 +1109,80 @@ fn widget_detail_pages_hold_action_output_until_explicit_refresh() {
     );
     assert!(!w.app.state.settings.open);
     assert_eq!(w.app.state.focused_pane_id(), Some(agent));
+}
+
+#[test]
+fn manual_widget_refresh_ignores_results_for_an_older_workbench_snapshot() {
+    use daedalus_proto::StatusLevel;
+    use daedalus_proto::workbench::{
+        WidgetDefinition, WidgetInstance, WidgetResult, WidgetSnapshot,
+    };
+
+    let workspace = workspace("Manual refresh");
+    let id = workspace.id;
+    let mut w = modern_client(workspace);
+    let mut original = workbench_snapshot(1);
+    original.document.widgets.push(WidgetInstance {
+        id: "manual".into(),
+        name: "Manual".into(),
+        pinned: true,
+        template: None,
+        definition: Some(WidgetDefinition::default()),
+    });
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(original.clone())),
+    );
+    w.app.open_widget_details(Some(0));
+    w.commands.try_iter().for_each(drop);
+
+    apply_control(&mut w, Control::CustomRefresh);
+    let UiCommand::Workbench {
+        operation, request, ..
+    } = w.command()
+    else {
+        panic!("expected a widget refresh");
+    };
+    assert!(
+        matches!(request.as_ref(), ClientMessage::GetWidgetResults { refresh: Some(widget), .. }
+        if widget == "manual")
+    );
+
+    let mut edited = original;
+    edited.revision = 2;
+    edited.document.widgets[0].name = "Edited".into();
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::Workbench(edited)),
+    );
+    let snapshot = |label: &str| WidgetSnapshot {
+        id: "manual".into(),
+        result: WidgetResult {
+            label: label.into(),
+            level: StatusLevel::Ok,
+            details: vec![],
+        },
+    };
+    let current = snapshot("new-output");
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        WorkbenchOperation::Read,
+        Ok(ResponsePayload::WidgetResults(vec![current.clone()])),
+    );
+    daemon_workbench_reply(
+        &mut w,
+        id,
+        operation,
+        Ok(ResponsePayload::WidgetResults(vec![snapshot("old-output")])),
+    );
+
+    assert_eq!(w.app.state.widget_results, vec![current.clone()]);
+    assert_eq!(w.app.state.settings.custom.preview, Some(current.result));
 }
 
 #[test]

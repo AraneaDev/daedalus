@@ -657,6 +657,7 @@ impl PaneCommands {
                     last_exit_code: output.tracker.last_exit_code(),
                     has_failure_trace: output.tracker.last_failure_trace().is_some(),
                     launch_preset: self.launch_preset.clone(),
+                    default_shell_fallback: None,
                     agent_state: output.detector.as_ref().map(AgentStateDetector::state),
                 });
             }

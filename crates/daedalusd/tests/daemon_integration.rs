@@ -203,6 +203,95 @@ async fn send_rpc(stream: &mut IpcStream, id: u64, payload: ClientMessage) -> Re
 }
 
 #[tokio::test]
+async fn imported_broken_default_command_falls_back_to_shell_once() {
+    use daedalus_proto::workbench::WorkspaceImportSource;
+
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let server = DaemonServer::bind_with_supervisor(
+        socket.clone(),
+        dir.path().join("runtime"),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let (shutdown, shutdown_rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.serve(async {
+        let _ = shutdown_rx.await;
+    }));
+    let mut first = IpcStream::connect(&socket).await.unwrap();
+    let mut second = IpcStream::connect(&socket).await.unwrap();
+    let ResponsePayload::WorkspaceCreationPreview(preview) = send_rpc(
+        &mut first,
+        1,
+        ClientMessage::PreviewWorkspaceCreation {
+            root_dir: dir.path().into(),
+            source: WorkspaceImportSource::Text(
+                "version = 1\nname = 'Broken setup'\n[[assignments]]\nid = 'broken-agent'\n\
+                 name = 'Agent'\nrole = 'agent'\nargv = ['absent-agent-82f52']\n"
+                    .into(),
+            ),
+            linked: false,
+        },
+    )
+    .await
+    else {
+        panic!("expected a workspace preview");
+    };
+    let ResponsePayload::WorkbenchCreated(workspace) = send_rpc(
+        &mut first,
+        2,
+        ClientMessage::ApplyWorkspaceCreation { preview },
+    )
+    .await
+    else {
+        panic!("expected an imported workspace");
+    };
+    let ensure = |role| ClientMessage::EnsureDefaultPane {
+        workspace_id: workspace.id,
+        role,
+        command: None,
+        cols: 80,
+        rows: 24,
+    };
+    let (left, right) = tokio::join!(
+        send_rpc_result(&mut first, 3, ensure(PaneRole::Agent)),
+        send_rpc_result(&mut second, 1, ensure(PaneRole::Agent)),
+    );
+    match (left, right) {
+        (
+            Ok(ResponsePayload::PaneSpawned(spawned)),
+            Ok(ResponsePayload::DefaultPaneExisting(Some(existing))),
+        )
+        | (
+            Ok(ResponsePayload::DefaultPaneExisting(Some(existing))),
+            Ok(ResponsePayload::PaneSpawned(spawned)),
+        ) => {
+            assert_eq!(spawned.id, existing.id);
+            assert_eq!(spawned.launch_preset.as_deref(), Some("shell"));
+            assert!(
+                spawned
+                    .default_shell_fallback
+                    .as_deref()
+                    .is_some_and(|error| !error.is_empty())
+            );
+            assert!(existing.default_shell_fallback.is_none());
+        }
+        replies => panic!("expected one shell spawn and one existing pane: {replies:?}"),
+    }
+    for (id, role) in [(4, PaneRole::Service), (5, PaneRole::Runner)] {
+        assert!(matches!(
+            send_rpc(&mut first, id, ensure(role)).await,
+            ResponsePayload::PaneSpawned(_)
+        ));
+    }
+    drop(first);
+    drop(second);
+    shutdown.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn interrupted_default_initialization_resumes_from_another_client() {
     use ResponsePayload::{DefaultPaneExisting, PaneSpawned, WorkspaceCreated, Workspaces};
     let dir = TempDir::new().unwrap();
@@ -255,19 +344,24 @@ async fn interrupted_default_initialization_resumes_from_another_client() {
     assert!(
         matches!(send_rpc(&mut second, 2, ensure(PaneRole::Agent, sleep_command())).await, DefaultPaneExisting(Some(p)) if p.id == agent.id)
     );
-    let failed = send_rpc_result(
+    let PaneSpawned(service) = send_rpc(
         &mut second,
         3,
         ensure(PaneRole::Service, vec!["absent-service-82f52".into()]),
     )
-    .await;
-    assert!(matches!(failed, Err(ProtoError::SpawnFailed(_))));
-    for (id, role) in [(4, PaneRole::Service), (5, PaneRole::Runner)] {
-        assert!(matches!(
-            send_rpc(&mut second, id, ensure(role, sleep_command())).await,
-            PaneSpawned(_)
-        ));
-    }
+    .await
+    else {
+        panic!("expected a fallback service pane");
+    };
+    assert!(service.default_shell_fallback.is_some());
+    assert!(matches!(
+        send_rpc(&mut second, 4, ensure(PaneRole::Service, sleep_command())).await,
+        DefaultPaneExisting(Some(pane)) if pane.id == service.id
+    ));
+    assert!(matches!(
+        send_rpc(&mut second, 5, ensure(PaneRole::Runner, sleep_command())).await,
+        PaneSpawned(_)
+    ));
     let Workspaces(done) = send_rpc(&mut second, 6, ClientMessage::ListWorkspaces).await else {
         panic!("expected workspace list")
     };

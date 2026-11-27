@@ -131,6 +131,9 @@ pub struct PaneSummary {
     pub agent_state: Option<AgentState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_preset: Option<String>,
+    /// The failed command's error, returned only when default provisioning started a shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_shell_fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

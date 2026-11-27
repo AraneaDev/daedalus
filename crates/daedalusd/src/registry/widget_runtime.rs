@@ -129,6 +129,17 @@ impl Registry {
                 result,
             });
         }
+        if refresh.is_some() {
+            // Commands can take time; only serialize the final snapshot check
+            // with updates to the workbench.
+            let _lifecycle = self.lock_workspace_lifecycle(id).await?;
+            if self.workbench(id).await?.revision != state.revision {
+                return Err(ProtoError::InvalidRequest(
+                    "The workbench changed during the widget refresh. Review it and refresh again."
+                        .into(),
+                ));
+            }
+        }
         Ok(results)
     }
 
@@ -428,6 +439,97 @@ mod tests {
             finish_held_refresh(dir.path(), jobs).await,
             "run\nreplacement\n"
         );
+    }
+
+    #[tokio::test]
+    async fn manual_refresh_rejects_output_from_an_edited_workbench() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = test_registry(dir.path());
+        let workspace = registry
+            .create_workspace(
+                "Manual refresh".into(),
+                dir.path().into(),
+                Default::default(),
+            )
+            .await
+            .unwrap()
+            .id;
+        let mut document = registry.workbench(workspace).await.unwrap().document;
+        document.widgets.push(WidgetInstance {
+            id: "manual".into(),
+            name: "Manual".into(),
+            pinned: true,
+            template: None,
+            definition: Some(WidgetDefinition {
+                sources: vec![NamedSource {
+                    id: "command".into(),
+                    source: WidgetSource::Command {
+                        command: WorkspaceCommand {
+                            argv: vec![
+                                "/bin/sh".into(),
+                                "-c".into(),
+                                "touch started; while [ ! -f release ]; do sleep 0.01; done; printf old-output"
+                                    .into(),
+                            ],
+                            env: Vec::new(),
+                            timeout_seconds: Some(10),
+                        },
+                        refresh: RefreshPolicy::default(),
+                        output: CommandOutput::Text { contains: None },
+                    },
+                }],
+                display: WidgetDisplay {
+                    summary: vec![WidgetField {
+                        source: "command".into(),
+                        field: "text".into(),
+                        label: None,
+                    }],
+                    ..WidgetDisplay::default()
+                },
+                ..WidgetDefinition::default()
+            }),
+        });
+        registry
+            .update_workbench(workspace, Some(0), document.clone())
+            .await
+            .unwrap();
+
+        let (reply, ()) = tokio::join!(
+            registry.widget_results(workspace, Some("manual".into())),
+            async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !dir.path().join("started").exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+
+                let source = &mut document.widgets[0].definition.as_mut().unwrap().sources[0];
+                let WidgetSource::Command { command, .. } = &mut source.source else {
+                    unreachable!("the fixture installs a command source");
+                };
+                command.argv[2] = "printf new-output".into();
+                registry
+                    .update_workbench(workspace, Some(1), document)
+                    .await
+                    .unwrap();
+                assert_eq!(registry.workbench(workspace).await.unwrap().revision, 2);
+                std::fs::write(dir.path().join("release"), "").unwrap();
+            }
+        );
+
+        assert!(
+            matches!(&reply, Err(ProtoError::InvalidRequest(message)) if message.contains("refresh again")),
+            "the in-flight refresh must ask for a retry, got {reply:?}"
+        );
+        let view = registry.widget_results(workspace, None).await.unwrap();
+        assert_eq!(view[0].result.label, "Manual");
+        let fresh = registry
+            .widget_results(workspace, Some("manual".into()))
+            .await
+            .unwrap();
+        assert_eq!(fresh[0].result.label, "new-output");
     }
 
     #[tokio::test]

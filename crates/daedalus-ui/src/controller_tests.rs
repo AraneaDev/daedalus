@@ -372,6 +372,7 @@ fn workspace(name: &str) -> WorkspaceInfo {
             last_exit_code: None,
             has_failure_trace: false,
             launch_preset: None,
+            default_shell_fallback: None,
             agent_state: None,
         })
         .collect();

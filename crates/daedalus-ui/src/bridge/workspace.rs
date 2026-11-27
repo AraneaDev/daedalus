@@ -309,11 +309,13 @@ async fn spawn_workspace_panes(
         }
         return Ok(());
     }
+    let uses_ensure = ws.default_panes_pending.is_some();
+    let client_retries_fallback = !uses_ensure || !conn.default_pane_fallback_supported;
     for (role, command, mut agent_preset) in
         resolve_pane_launch_specs(requested_agent, ws.manifest.as_ref())
     {
         let ensure = |command| {
-            conn.call(if ws.default_panes_pending.is_some() {
+            conn.call(if uses_ensure {
                 ClientMessage::EnsureDefaultPane {
                     workspace_id: ws.id,
                     role,
@@ -333,23 +335,39 @@ async fn spawn_workspace_panes(
                 }
             })
         };
+        let mut retried_error = None;
         let response = match ensure(command.clone()).await {
-            Err(RpcError::Proto(ProtoError::SpawnFailed(err))) if command.is_some() => {
-                sink.emit(UiEvent::Toast {
-                    message: format!(
-                        "Failed to start {role} command ({err}); falling back to shell"
-                    ),
-                    is_error: true,
-                });
-                if role == PaneRole::Agent {
-                    agent_preset = Some(AgentPreset::Shell);
-                }
+            Err(RpcError::Proto(ProtoError::SpawnFailed(err)))
+                if client_retries_fallback && command.is_some() =>
+            {
+                // Older daemons still rely on the client to retry without a requested command.
+                retried_error = Some(err);
                 ensure(None).await?
             }
             other => other?,
         };
         let (summary, select_tab) = match response {
-            ResponsePayload::PaneSpawned(summary) => (summary, role == PaneRole::Agent),
+            ResponsePayload::PaneSpawned(mut summary) => {
+                let daemon_fallback = summary.default_shell_fallback.take();
+                if let Some(err) = daemon_fallback.as_ref().or(retried_error.as_ref()) {
+                    let started_shell = daemon_fallback.is_some()
+                        || !uses_ensure
+                        || summary.launch_preset.as_deref() == Some("shell");
+                    let outcome = if started_shell {
+                        "started a shell"
+                    } else {
+                        "started the pane after retry"
+                    };
+                    sink.emit(UiEvent::Toast {
+                        message: format!("Failed to start {role} command ({err}); {outcome}"),
+                        is_error: true,
+                    });
+                    if role == PaneRole::Agent {
+                        agent_preset = started_shell.then_some(AgentPreset::Shell);
+                    }
+                }
+                (summary, role == PaneRole::Agent)
+            }
             ResponsePayload::DefaultPaneExisting(Some(summary)) => {
                 // Another client may have chosen a different preset.
                 agent_preset = None;
@@ -415,16 +433,8 @@ mod tests {
         assert_eq!(workspace_name_from_dir(Path::new("")), "workspace");
     }
 
-    async fn check_provisioning_request(default_panes_pending: Option<bool>) {
-        let (client, mut server) = ipc_pair().await;
-        let sink: Arc<dyn UiEventSink> = Arc::new(NoopSink);
-        let conn = RpcConnection::new(client, sink.clone());
-        let command = vec!["agent-only-installed-on-daemon-82f52".to_owned()];
-        let manifest = WorkspaceManifest {
-            agent_command: Some(command.clone()),
-            ..Default::default()
-        };
-        let ws = WorkspaceInfo {
+    fn pending_workspace(default_panes_pending: Option<bool>, argv: Vec<String>) -> WorkspaceInfo {
+        WorkspaceInfo {
             id: WorkspaceId::new(),
             name: "test".into(),
             root_dir: PathBuf::new(),
@@ -438,11 +448,22 @@ mod tests {
             bound_ports: vec![],
             containers: vec![],
             external_statuses: vec![],
-            manifest: Some(manifest),
+            manifest: Some(WorkspaceManifest {
+                agent_command: Some(argv),
+                ..Default::default()
+            }),
             project: Default::default(),
             setup: None,
             default_panes_pending,
-        };
+        }
+    }
+
+    async fn check_provisioning_request(default_panes_pending: Option<bool>) {
+        let (client, mut server) = ipc_pair().await;
+        let sink: Arc<dyn UiEventSink> = Arc::new(NoopSink);
+        let conn = RpcConnection::new(client, sink.clone());
+        let command = vec!["agent-only-installed-on-daemon-82f52".to_owned()];
+        let ws = pending_workspace(default_panes_pending, command.clone());
         let request = async {
             let req = read_frame::<_, Request>(&mut server)
                 .await
@@ -477,6 +498,70 @@ mod tests {
     #[tokio::test]
     async fn provisioning_uses_spawn_with_a_legacy_daemon() {
         check_provisioning_request(None).await;
+    }
+
+    #[tokio::test]
+    async fn provisioning_retries_in_client_only_when_daemon_does_not_own_fallback() {
+        for (pending, supported) in [(Some(true), true), (Some(true), false), (None, false)] {
+            let (client, mut server) = ipc_pair().await;
+            let sink: Arc<dyn UiEventSink> = Arc::new(NoopSink);
+            let mut conn = RpcConnection::new(client, sink.clone());
+            conn.default_pane_fallback_supported = supported;
+            let ws = pending_workspace(pending, vec!["missing-agent".to_owned()]);
+            let spawn = async {
+                let result =
+                    spawn_workspace_panes(&conn, &sink, &ws, AgentPreset::Shell, 80, 24).await;
+                assert!(matches!(
+                    result,
+                    Err(RpcError::Proto(ProtoError::SpawnFailed(_)))
+                ));
+                conn.close().await;
+            };
+            let peer = async {
+                let expected_commands = if supported {
+                    &[Some("missing-agent")][..]
+                } else {
+                    &[Some("missing-agent"), None]
+                };
+                for expected_command in expected_commands {
+                    let req = read_frame::<_, Request>(&mut server)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let command = match req.payload {
+                        ClientMessage::EnsureDefaultPane { command, .. } if pending.is_some() => {
+                            command
+                        }
+                        ClientMessage::SpawnPane { command, .. } if pending.is_none() => command,
+                        other => panic!("unexpected request {other:?}"),
+                    };
+                    match expected_command {
+                        Some(program) => assert_eq!(command.unwrap(), [*program]),
+                        None => assert!(command.is_none()),
+                    }
+                    write_frame(
+                        &mut server,
+                        &ServerMessage::Response {
+                            id: req.id,
+                            result: Err(ProtoError::SpawnFailed("missing command or shell".into())),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                assert!(
+                    read_frame::<_, Request>(&mut server)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(spawn, peer);
+            })
+            .await
+            .expect("waiting for default provisioning requests");
+        }
     }
 
     #[tokio::test]

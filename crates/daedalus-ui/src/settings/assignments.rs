@@ -36,6 +36,32 @@ struct Draft {
     args: Vec<String>,
 }
 
+impl Draft {
+    fn validated_assignment(&self) -> Result<Assignment, (Control, &'static str)> {
+        if self.name.trim().is_empty() {
+            return Err((Name, "Enter an assignment name."));
+        }
+        if self.executable.trim().is_empty() || self.executable.contains('\0') {
+            return Err((Executable, "Enter an executable without a null character."));
+        }
+        if let Some(index) = self.args.iter().position(|arg| arg.contains('\0')) {
+            return Err((
+                Argument(index),
+                "Remove the null character from this argument.",
+            ));
+        }
+        Ok(Assignment {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            role: self.role,
+            argv: std::iter::once(&self.executable)
+                .chain(&self.args)
+                .cloned()
+                .collect(),
+        })
+    }
+}
+
 impl From<Assignment> for Draft {
     fn from(assignment: Assignment) -> Self {
         let mut argv = assignment.argv.into_iter();
@@ -238,36 +264,21 @@ impl SettingsDialog {
             Save | Launch => {
                 let mut values = Vec::new();
                 for (i, d) in self.assignments.drafts.iter().enumerate() {
-                    let invalid = if d.name.trim().is_empty() {
-                        Some((Name, "Enter an assignment name."))
-                    } else if d.executable.trim().is_empty() || d.executable.contains('\0') {
-                        Some((Executable, "Enter an executable without a null character."))
-                    } else {
-                        d.args
-                            .iter()
-                            .position(|arg| arg.contains('\0'))
-                            .map(|i| (Argument(i), "Remove the null character from this argument."))
-                    };
-                    if let Some((control, message)) = invalid {
-                        self.assignments.selected = i;
-                        if let Argument(index) = control {
-                            self.assignments.argument_page = index / PAGE_SIZE;
+                    let assignment = match d.validated_assignment() {
+                        Ok(assignment) => assignment,
+                        Err((control, message)) => {
+                            self.assignments.selected = i;
+                            if let Argument(index) = control {
+                                self.assignments.argument_page = index / PAGE_SIZE;
+                            }
+                            self.focus = control;
+                            self.select_all = true;
+                            self.invalid_field = Some(control);
+                            self.error = Some(message.into());
+                            return SettingsAction::None;
                         }
-                        self.focus = control;
-                        self.select_all = true;
-                        self.invalid_field = Some(control);
-                        self.error = Some(message.into());
-                        return SettingsAction::None;
-                    }
-                    values.push(Assignment {
-                        id: d.id.clone(),
-                        name: d.name.clone(),
-                        role: d.role,
-                        argv: std::iter::once(&d.executable)
-                            .chain(&d.args)
-                            .cloned()
-                            .collect(),
-                    });
+                    };
+                    values.push(assignment);
                 }
                 return if c == Launch {
                     SettingsAction::Launch(

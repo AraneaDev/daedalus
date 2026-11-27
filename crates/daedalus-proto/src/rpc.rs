@@ -341,6 +341,8 @@ pub enum ResponsePayload {
         resolved_import_preview_supported: bool,
         #[serde(default)]
         agent_launch_metadata_supported: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        default_pane_fallback_supported: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         persistence_health: Option<PersistenceHealth>,
     },
@@ -482,6 +484,7 @@ mod tests {
                 runner_assignment_supported,
                 resolved_import_preview_supported,
                 agent_launch_metadata_supported,
+                default_pane_fallback_supported,
                 persistence_health,
                 home_dir,
                 ..
@@ -493,6 +496,7 @@ mod tests {
                 assert!(!runner_assignment_supported);
                 assert!(!resolved_import_preview_supported);
                 assert!(!agent_launch_metadata_supported);
+                assert!(!default_pane_fallback_supported);
                 assert_eq!(home_dir, None);
                 assert_eq!(persistence_health, None);
             }
