@@ -179,6 +179,10 @@ impl WidgetCommands {
         });
     }
 
+    pub(crate) fn is_open(&self) -> bool {
+        self.0.lock().unwrap().is_some()
+    }
+
     pub(crate) fn close(&self) {
         if let Some(commands) = self.0.lock().unwrap().take() {
             for entry in commands.entries.values() {

@@ -7,9 +7,22 @@ use std::sync::Arc;
 
 impl Registry {
     pub(crate) async fn workbench(&self, id: WorkspaceId) -> Result<WorkbenchState, ProtoError> {
+        let registration = self.workbench_widget_commands(id).await?;
+        self.workbench_for_registration(id, registration).await
+    }
+
+    pub(super) async fn workbench_for_registration(
+        &self,
+        id: WorkspaceId,
+        registration: Arc<WidgetCommands>,
+    ) -> Result<WorkbenchState, ProtoError> {
         let initial = self.initial_workbench(id).await?;
         let setup = self.project_setups.read().await.workspace(id).cloned();
-        self.workbench_store.workspace(id, initial, setup).await
+        // The blocking read may outlive its caller. Check membership under the
+        // store lock so that closing this registration always wins eviction.
+        self.workbench_store
+            .workspace(id, initial, setup, move || registration.is_open())
+            .await
     }
 
     pub(crate) async fn update_workbench(

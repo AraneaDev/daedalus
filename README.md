@@ -162,7 +162,9 @@ both sides. Live terminals stay open.
 
 ![Daedalus workbench previewing a shared workspace before import](docs/images/workspace-import.png)
 
-The CLI uses the same configuration as the desktop. These commands use the
+The CLI and desktop save workbench changes through the daemon. It caches open
+workspace documents and reads their saved state again when it reopens them.
+These commands use the
 workspace for the current directory unless supplied a workspace ID or directory.
 
 ```sh

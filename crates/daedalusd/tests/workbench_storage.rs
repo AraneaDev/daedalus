@@ -1184,3 +1184,38 @@ async fn refresh_keys_are_checked_at_workspace_and_template_import_boundaries() 
     assert_eq!(daemon.workbench(workspace_id).await, initial);
     daemon.finish().await;
 }
+
+#[tokio::test]
+async fn restored_workbench_cache_refreshes_after_restart() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let mut daemon = DaemonFixture::start(root).await;
+    let id = daemon.workspace(root).await;
+    let mut state = daemon.workbench(id).await;
+    state.document.layout.split_view = true;
+    daemon
+        .call(ClientMessage::UpdateWorkbench {
+            workspace_id: id,
+            revision: state.revision,
+            document: state.document,
+            layout_only: true,
+            edit: None,
+        })
+        .await
+        .unwrap();
+    daemon.finish().await;
+
+    let mut daemon = DaemonFixture::start(root).await;
+    let warm = daemon.workbench(id).await;
+    let mut external = warm.clone();
+    external.revision += 1;
+    external.document.layout.split_view = false;
+    let path = root.join("workbench").join(format!("{id}.json"));
+    std::fs::write(path, serde_json::to_vec(&external).unwrap()).unwrap();
+    assert_eq!(daemon.workbench(id).await, warm);
+    daemon.finish().await;
+
+    let mut daemon = DaemonFixture::start(root).await;
+    assert_eq!(daemon.workbench(id).await, external);
+    daemon.finish().await;
+}

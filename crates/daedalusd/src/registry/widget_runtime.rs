@@ -156,7 +156,10 @@ impl Registry {
             })
             .collect::<Vec<_>>();
         for (workspace, commands) in workspaces {
-            let Ok(state) = self.workbench(workspace.id).await else {
+            let Ok(state) = self
+                .workbench_for_registration(workspace.id, commands.clone())
+                .await
+            else {
                 continue;
             };
             if state.revision == 0 {
