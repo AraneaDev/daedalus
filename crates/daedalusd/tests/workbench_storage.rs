@@ -891,6 +891,12 @@ label = 'Run checks'
 kind = 'command'
 command = { argv = ['cargo', 'check'] }
 "#;
+    let wrong_type = template.replace("version = 1", "version = 'one'");
+    assert!(matches!(
+        parse_template(&wrong_type),
+        Err(daedalusd::workbench::documents::DocumentError::Parse(error))
+            if error.span().is_some()
+    ));
     let document = parse_template(template).unwrap();
     assert_eq!(
         parse_template(&serialize_template(&document).unwrap()).unwrap(),

@@ -187,6 +187,11 @@ async fn hydrate_panes(
             .await
         {
             Ok(ResponsePayload::Snapshot(snapshot)) => {
+                tracing::debug!(
+                    workspace_id = %pane.workspace_id,
+                    pane_id = %snapshot.pane_id,
+                    "terminal snapshot hydrated"
+                );
                 hydrated.insert(pane.id);
                 sink.emit(UiEvent::Snapshot(snapshot));
             }

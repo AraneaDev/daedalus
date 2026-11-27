@@ -25,7 +25,7 @@ pub fn parse_workspace(input: &str) -> Result<WorkspaceDocument, DocumentError> 
             }
         }
     }
-    let document = value.try_into()?;
+    let document = toml::from_str(input)?;
     validate_workspace(&document)?;
     Ok(document)
 }
@@ -35,7 +35,7 @@ pub fn parse_template(input: &str) -> Result<TemplateDocument, DocumentError> {
     if let Some(template) = value.get("template") {
         validate_refresh_keys(template, "template")?;
     }
-    let document: TemplateDocument = value.try_into()?;
+    let document: TemplateDocument = toml::from_str(input)?;
     validate_version(document.version)?;
     validate_template(&document.template)?;
     Ok(document)

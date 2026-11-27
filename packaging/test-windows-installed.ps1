@@ -91,7 +91,7 @@ try {
     $env:DAEDALUS_SOCKET = 'tcp://127.0.0.1:0'
     $env:DAEDALUS_AUTH_TOKEN = $token
     $env:NO_COLOR = '1'
-    $env:RUST_LOG = 'info'
+    $env:RUST_LOG = 'info,daedalus_ui::bridge::session_init=debug'
     $daemon = Start-Process -FilePath $daemonExe -PassThru -NoNewWindow `
         -RedirectStandardOutput $daemonLog -RedirectStandardError $daemonErrors
     $env:DAEDALUS_SOCKET = Wait-Smoke 'the installed daemon endpoint' {
@@ -126,10 +126,19 @@ try {
     $panes = @($workspace.pane_ids | Sort-Object)
     Stop-FixtureProcess $ui
     $ui = Start-SmokeUi
-    [void](Wait-Smoke 'reconnected UI window' {
+    [void](Wait-Smoke 'the reopened UI to hydrate the original panes' {
         if ($ui.HasExited) { throw 'The installed UI exited on reconnect.' }
         $ui.Refresh()
-        $ui.MainWindowHandle -ne [IntPtr]::Zero
+        if ($ui.MainWindowHandle -eq [IntPtr]::Zero) { return $false }
+        $log = Get-Content -LiteralPath $uiLog -Raw -ErrorAction SilentlyContinue
+        foreach ($paneId in $panes) {
+            $workspacePattern = [regex]::Escape($workspaceId)
+            $pane = [regex]::Escape($paneId)
+            if ($log -notmatch "terminal snapshot hydrated[^\r\n]*workspace_id=$workspacePattern[^\r\n]*pane_id=$pane") {
+                return $false
+            }
+        }
+        return $true
     })
     $list = Invoke-SmokeCli -Arguments @('workspace', 'list', '--json')
     $after = @($list.Output | ConvertFrom-Json)
