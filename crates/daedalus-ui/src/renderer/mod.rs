@@ -366,12 +366,8 @@ pub(super) fn banner_appearance(state: &AppState, theme: &Theme) -> (Rgba, Optio
             Some((label.to_owned(), theme.status_busy))
         }
     } else if let Some((message, error, _)) = &state.toast {
-        let text = match state.persistence_warning() {
-            Some(warning) => format!("{warning} {message}"),
-            None => message.clone(),
-        };
         Some((
-            text,
+            message.clone(),
             if *error {
                 theme.status_err
             } else {
@@ -1278,8 +1274,7 @@ pub(crate) mod tests {
         );
         state.show_toast("Workspace opened", false);
         let message = banner_appearance(&state, &theme).1.unwrap().0;
-        assert!(message.contains("Workspace changes are temporary"));
-        assert!(message.contains("Workspace opened"));
+        assert_eq!(message, "Workspace opened");
         state.toast = None;
         state.connection = ConnectionState::Reconnecting;
         assert_eq!(

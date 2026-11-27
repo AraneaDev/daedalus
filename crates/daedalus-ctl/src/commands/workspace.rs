@@ -5,6 +5,7 @@ use crate::{
 };
 use daedalus_proto::ResponsePayload;
 use daedalus_proto::{ClientMessage, WorkspaceId};
+use std::io::Write;
 
 async fn persistence_warning(
     client: &mut DaemonClient,
@@ -14,6 +15,13 @@ async fn persistence_warning(
             persistence_health, ..
         } => Ok(persistence_health.and_then(daedalus_proto::PersistenceHealth::warning)),
         other => Err(unexpected_response(other)),
+    }
+}
+
+fn print_persistence_warning(warning: Option<&str>) {
+    if let Some(message) = warning {
+        // The daemon has already acknowledged the operation.
+        let _ = writeln!(std::io::stderr().lock(), "{message}");
     }
 }
 
@@ -40,9 +48,7 @@ pub(crate) async fn execute(
             {
                 ResponsePayload::WorkspaceCreated(ws) => {
                     println!("{}", ws.id);
-                    if let Some(message) = warning {
-                        eprintln!("{message}");
-                    }
+                    print_persistence_warning(warning);
                 }
                 other => return Err(unexpected_response(other)),
             }
@@ -134,9 +140,7 @@ pub(crate) async fn execute(
                     .await?,
             )?;
             println!("closed {id}");
-            if let Some(message) = warning {
-                eprintln!("{message}");
-            }
+            print_persistence_warning(warning);
         }
     }
     Ok(())

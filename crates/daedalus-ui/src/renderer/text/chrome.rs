@@ -586,7 +586,7 @@ impl TextRenderer {
             && let (_, Some((msg, color))) = banner_appearance(state, theme)
             && !msg.is_empty()
         {
-            self.push_chrome_line(ChromeLineSpec {
+            let mut line = ChromeLineSpec {
                 text: &msg,
                 left: banner.x + 10.0 * s,
                 top: banner.y + (banner.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
@@ -596,7 +596,23 @@ impl TextRenderer {
                 line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
                 color,
                 bold: true,
-            });
+            };
+            if state.connection == crate::state::ConnectionState::Connected
+                && state.toast.is_some()
+                && state.persistence_warning().is_some()
+            {
+                let indicator_width = (84.0 * s).min(line.max_w * 0.4);
+                self.push_chrome_line(ChromeLineSpec {
+                    text: "Temporary",
+                    max_w: indicator_width,
+                    color: theme.status_busy,
+                    ..line
+                });
+                let offset = indicator_width + 8.0 * s;
+                line.left += offset;
+                line.max_w -= offset;
+            }
+            self.push_chrome_line(line);
         }
     }
 
@@ -864,6 +880,57 @@ mod tests {
             assert!(index("Workspace refreshed") < index("No runner terminal open"));
             assert!(renderer.recap_drawn);
         }
+    }
+
+    #[test]
+    fn narrow_banner_renders_temporary_indicator_and_error_in_separate_colors() {
+        let (device, queue) = wgpu::Device::noop(&Default::default());
+        let mut renderer = TextRenderer::new(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            280,
+            600,
+            1.,
+            14.,
+            None,
+        );
+        let (mut state, _) = make_state_with_agent_row();
+        state.persistence_health =
+            Some(daedalus_proto::PersistenceHealth::TemporarySnapshotRejected);
+        state.show_toast("Save failed", true);
+        let theme = Theme::dark();
+        let layout = crate::layout::compute_layout(&crate::layout::LayoutInput {
+            window_w: 280.,
+            window_h: 600.,
+            scale_factor: 1.,
+            cell_w: 8.,
+            cell_h: 19.,
+            sidebar_override: None,
+            has_top_banner: true,
+            zoomed: true,
+            focused_role: state.focused_role,
+            runner_has_failure: false,
+        });
+        renderer.build_banner_text(&state, &layout, &theme);
+        let items = &renderer.chrome_items;
+        assert_eq!(items.len(), 2);
+        for (item, label, color) in [
+            (&items[0], "Temporary", theme.status_busy),
+            (&items[1], "Save failed", theme.status_err),
+        ] {
+            assert_eq!(item.buffer.lines[0].text(), label);
+            assert_eq!(item.default_color, color.to_glyphon_color());
+            let run = item.buffer.layout_runs().next().unwrap();
+            assert_eq!(run.glyphs.len(), label.len(), "clipped {label}");
+            assert!(item.left + run.line_w <= 280.);
+        }
+        assert!(
+            items[0]
+                .buffer
+                .layout_runs()
+                .all(|run| items[0].left + run.line_w <= items[1].left)
+        );
     }
 
     #[test]

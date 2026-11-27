@@ -1626,6 +1626,52 @@ async fn temporary_persistence_warns_on_stderr() {
         format!("closed {}", id.trim())
     );
     assert!(String::from_utf8_lossy(&close.stderr).contains("temporary"));
+    #[cfg(target_os = "linux")]
+    {
+        let cli = || {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_daedalus-ctl"));
+            cmd.arg("--socket")
+                .arg(&sock)
+                .arg("workspace")
+                .stdout(std::process::Stdio::piped())
+                .stderr(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open("/dev/full")
+                        .unwrap(),
+                );
+            cmd
+        };
+        let create = cli()
+            .args(["create", "full", "--dir"])
+            .arg(dir.path())
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .await
+            .unwrap();
+        assert!(
+            create.status.success(),
+            "failed stderr write changed create status"
+        );
+        let id = String::from_utf8(create.stdout).unwrap();
+        uuid::Uuid::parse_str(id.trim()).unwrap();
+        let close = cli()
+            .args(["close", id.trim()])
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .await
+            .unwrap();
+        assert!(
+            close.status.success(),
+            "failed stderr write changed close status"
+        );
+        assert_eq!(
+            String::from_utf8(close.stdout).unwrap().trim(),
+            format!("closed {}", id.trim())
+        );
+    }
     assert_eq!(std::fs::read(state).unwrap(), b"bad json");
     shutdown.send(()).unwrap();
     task.await.unwrap().unwrap();
