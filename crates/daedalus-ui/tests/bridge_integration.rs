@@ -998,6 +998,7 @@ async fn queued_terminal_input_stays_with_its_connection() {
                     guarded_runner_assignment_supported: false,
                     resolved_import_preview_supported: false,
                     agent_launch_metadata_supported: false,
+                    persistence_health: None,
                     home_dir: None,
                 },
                 _ => ResponsePayload::Ok,
@@ -1936,6 +1937,7 @@ async fn reconnect_hydrates_surviving_pane_before_ready_and_recents_do_not_delay
                     guarded_runner_assignment_supported: false,
                     resolved_import_preview_supported: false,
                     agent_launch_metadata_supported: false,
+                    persistence_health: None,
                     home_dir: None,
                 },
             )

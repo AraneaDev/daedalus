@@ -373,6 +373,7 @@ async fn dispatch_request(
                 guarded_runner_assignment_supported: true,
                 resolved_import_preview_supported: true,
                 agent_launch_metadata_supported: true,
+                persistence_health: Some(registry.persistence_health().await),
                 home_dir: std::env::home_dir(),
             })
         }

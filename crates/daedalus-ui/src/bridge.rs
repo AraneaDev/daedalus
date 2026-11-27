@@ -267,6 +267,7 @@ pub enum UiEvent {
     },
     JournalCapability(bool),
     DaemonCapabilities {
+        persistence_health: Option<daedalus_proto::PersistenceHealth>,
         home_dir: Option<PathBuf>,
         project_setups: bool,
         recent_projects: bool,

@@ -141,6 +141,7 @@ pub enum ActiveOverlay {
 /// Top-level UI application state shared between input handling, daemon bridge events, and rendering.
 #[derive(Debug)]
 pub struct AppState {
+    pub persistence_health: Option<daedalus_proto::PersistenceHealth>,
     pub connection: ConnectionState,
     pub workspace_list_loaded: bool,
     pub workspaces: Vec<WorkspaceView>,
@@ -184,6 +185,11 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn persistence_warning(&self) -> Option<&'static str> {
+        self.persistence_health
+            .and_then(daedalus_proto::PersistenceHealth::warning)
+    }
+
     pub fn selected_png_path(&self) -> Option<String> {
         let pane = self.panes.get(&self.focused_pane_id()?)?;
         let selection = pane.selection?;
@@ -231,6 +237,7 @@ impl AppState {
 
     pub fn new() -> Self {
         Self {
+            persistence_health: None,
             connection: ConnectionState::Connecting,
             workspace_list_loaded: false,
             workspaces: Vec::new(),

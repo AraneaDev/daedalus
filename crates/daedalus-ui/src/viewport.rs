@@ -26,7 +26,9 @@ impl DaedalusApp {
     }
 
     pub(super) fn has_top_banner(&self) -> bool {
-        self.state.connection != ConnectionState::Connected || self.state.toast.is_some()
+        self.state.connection != ConnectionState::Connected
+            || self.state.toast.is_some()
+            || self.state.persistence_warning().is_some()
     }
 
     pub(super) fn viewport_metrics(&self) -> Option<ViewportMetrics> {

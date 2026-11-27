@@ -6,6 +6,17 @@ use crate::{
 use daedalus_proto::ResponsePayload;
 use daedalus_proto::{ClientMessage, WorkspaceId};
 
+async fn persistence_warning(
+    client: &mut DaemonClient,
+) -> Result<Option<&'static str>, Box<dyn std::error::Error>> {
+    match client.request(ClientMessage::Ping).await? {
+        ResponsePayload::Pong {
+            persistence_health, ..
+        } => Ok(persistence_health.and_then(daedalus_proto::PersistenceHealth::warning)),
+        other => Err(unexpected_response(other)),
+    }
+}
+
 pub(crate) async fn execute(
     client: &mut DaemonClient,
     action: WorkspaceAction,
@@ -18,6 +29,7 @@ pub(crate) async fn execute(
         WorkspaceAction::Create { name, dir, env } => {
             let root_dir = resolve_dir(Some(dir))?;
             let env_map = parse_env_pairs(&env)?;
+            let warning = persistence_warning(client).await?;
             match client
                 .request(ClientMessage::CreateWorkspace {
                     name,
@@ -26,7 +38,12 @@ pub(crate) async fn execute(
                 })
                 .await?
             {
-                ResponsePayload::WorkspaceCreated(ws) => println!("{}", ws.id),
+                ResponsePayload::WorkspaceCreated(ws) => {
+                    println!("{}", ws.id);
+                    if let Some(message) = warning {
+                        eprintln!("{message}");
+                    }
+                }
                 other => return Err(unexpected_response(other)),
             }
         }
@@ -105,6 +122,7 @@ pub(crate) async fn execute(
             remove_worktree,
             force,
         } => {
+            let warning = persistence_warning(client).await?;
             expect_ok(
                 client
                     .request(ClientMessage::CloseWorkspace {
@@ -116,6 +134,9 @@ pub(crate) async fn execute(
                     .await?,
             )?;
             println!("closed {id}");
+            if let Some(message) = warning {
+                eprintln!("{message}");
+            }
         }
     }
     Ok(())

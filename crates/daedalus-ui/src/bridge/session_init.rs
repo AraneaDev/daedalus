@@ -28,6 +28,7 @@ pub(super) async fn initialize_session(
 }
 
 struct Capabilities {
+    persistence_health: Option<daedalus_proto::PersistenceHealth>,
     workbench: bool,
     journal: bool,
     project_setups: bool,
@@ -40,6 +41,7 @@ impl Capabilities {
         sink.emit(UiEvent::WorkbenchCapability(self.workbench));
         sink.emit(UiEvent::JournalCapability(self.journal));
         sink.emit(UiEvent::DaemonCapabilities {
+            persistence_health: self.persistence_health,
             home_dir: self.home_dir,
             project_setups: self.project_setups,
             recent_projects: self.recent_projects,
@@ -64,6 +66,7 @@ async fn negotiate(
         }
     }
     let ResponsePayload::Pong {
+        persistence_health,
         journal_supported,
         inspect_setup_supported,
         recent_projects_supported,
@@ -104,6 +107,7 @@ async fn negotiate(
         conn.call(ClientMessage::WatchWorkspaceMembership).await?;
     }
     Ok(Capabilities {
+        persistence_health,
         workbench: workbench_supported,
         journal: journal_supported,
         project_setups: project_setup_supported,

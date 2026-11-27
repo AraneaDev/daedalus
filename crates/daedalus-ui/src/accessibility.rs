@@ -339,6 +339,10 @@ pub(super) fn workbench_tree_with_search_bar(
     if let Some(host) = &state.remote_host {
         status_text.push_str(&format!(" ({host})"));
     }
+    if let Some(message) = state.persistence_warning() {
+        status_text.push_str(". ");
+        status_text.push_str(message);
+    }
     if let Some((message, _, _)) = &state.toast {
         status_text.push_str(". ");
         status_text.push_str(message);
@@ -494,6 +498,23 @@ mod tests {
         assert_eq!(t.focus, WINDOW);
         let status = &t.nodes.iter().find(|n| n.0 == STATUS).unwrap().1;
         assert_eq!(status.label(), Some("Connecting to daemon"));
+        assert_eq!(status.live(), Some(Live::Polite));
+    }
+
+    #[test]
+    fn rejected_snapshot_warning_is_announced_in_the_live_status() {
+        let mut state = AppState::new();
+        state.connection = ConnectionState::Connected;
+        state.persistence_health =
+            Some(daedalus_proto::PersistenceHealth::TemporarySnapshotRejected);
+        let update = tree(&state);
+        let status = &update.nodes.iter().find(|node| node.0 == STATUS).unwrap().1;
+        assert!(
+            status
+                .label()
+                .unwrap()
+                .contains("Workspace changes are temporary")
+        );
         assert_eq!(status.live(), Some(Live::Polite));
     }
 

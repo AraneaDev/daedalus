@@ -290,6 +290,24 @@ pub enum ServerMessage {
     Event(ServerEvent),
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistenceHealth {
+    Durable,
+    TemporarySnapshotRejected,
+    NotConfigured,
+}
+
+impl PersistenceHealth {
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            Self::TemporarySnapshotRejected => Some(
+                "Workspace changes are temporary. Repair the rejected snapshot and restart the daemon.",
+            ),
+            Self::Durable | Self::NotConfigured => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum ResponsePayload {
@@ -323,6 +341,8 @@ pub enum ResponsePayload {
         resolved_import_preview_supported: bool,
         #[serde(default)]
         agent_launch_metadata_supported: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persistence_health: Option<PersistenceHealth>,
     },
     ImagePreview(ImagePreview),
     RecentProjects(Vec<RecentProject>),
@@ -462,6 +482,7 @@ mod tests {
                 runner_assignment_supported,
                 resolved_import_preview_supported,
                 agent_launch_metadata_supported,
+                persistence_health,
                 home_dir,
                 ..
             } => {
@@ -473,6 +494,7 @@ mod tests {
                 assert!(!resolved_import_preview_supported);
                 assert!(!agent_launch_metadata_supported);
                 assert_eq!(home_dir, None);
+                assert_eq!(persistence_health, None);
             }
             other => panic!("unexpected payload: {other:?}"),
         }

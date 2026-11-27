@@ -365,17 +365,23 @@ pub(super) fn banner_appearance(state: &AppState, theme: &Theme) -> (Rgba, Optio
             };
             Some((label.to_owned(), theme.status_busy))
         }
+    } else if let Some((message, error, _)) = &state.toast {
+        let text = match state.persistence_warning() {
+            Some(warning) => format!("{warning} {message}"),
+            None => message.clone(),
+        };
+        Some((
+            text,
+            if *error {
+                theme.status_err
+            } else {
+                theme.status_ok
+            },
+        ))
     } else {
-        state.toast.as_ref().map(|(msg, error, _)| {
-            (
-                msg.clone(),
-                if *error {
-                    theme.status_err
-                } else {
-                    theme.status_ok
-                },
-            )
-        })
+        state
+            .persistence_warning()
+            .map(|message| (message.to_owned(), theme.status_busy))
     };
     (theme.bg_header, message)
 }
@@ -1261,6 +1267,20 @@ pub(crate) mod tests {
         );
         state.connection = ConnectionState::Connected;
         assert!(banner_appearance(&state, &theme).1.is_none());
+        state.persistence_health =
+            Some(daedalus_proto::PersistenceHealth::TemporarySnapshotRejected);
+        assert!(
+            banner_appearance(&state, &theme)
+                .1
+                .unwrap()
+                .0
+                .contains("Workspace changes are temporary")
+        );
+        state.show_toast("Workspace opened", false);
+        let message = banner_appearance(&state, &theme).1.unwrap().0;
+        assert!(message.contains("Workspace changes are temporary"));
+        assert!(message.contains("Workspace opened"));
+        state.toast = None;
         state.connection = ConnectionState::Reconnecting;
         assert_eq!(
             banner_appearance(&state, &theme).1.unwrap().0,

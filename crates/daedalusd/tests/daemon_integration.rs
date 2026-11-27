@@ -46,6 +46,13 @@ async fn workbench_configuration_survives_reconnect_and_rejects_a_stale_write() 
             let _ = done.await;
         }));
         let mut client = IpcStream::connect(&sock).await.unwrap();
+        assert!(matches!(
+            send_rpc(&mut client, 5, ClientMessage::Ping).await,
+            ResponsePayload::Pong {
+                persistence_health: Some(daedalus_proto::PersistenceHealth::Durable),
+                ..
+            }
+        ));
         let id = match workspace_id {
             Some(id) => id,
             None => match send_rpc(
@@ -3499,11 +3506,16 @@ async fn ping_reports_project_capabilities_and_home() {
         ResponsePayload::Pong {
             recent_projects_supported,
             project_setup_supported,
+            persistence_health,
             home_dir,
             ..
         } => {
             assert!(recent_projects_supported);
             assert!(project_setup_supported);
+            assert_eq!(
+                persistence_health,
+                Some(daedalus_proto::PersistenceHealth::NotConfigured)
+            );
             assert_eq!(home_dir, std::env::home_dir());
         }
         other => panic!("expected Pong, got {other:?}"),
@@ -4291,4 +4303,54 @@ async fn workbench_watch_tracks_only_the_selected_workspace_and_rejects_invalid_
 
     stop.send(()).unwrap();
     daemon.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn rejected_snapshot_reports_temporary_workspace_changes() {
+    for bytes in [b"bad json".as_slice(), br#"{"version":999}"#] {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("test.sock");
+        let state = dir.path().join("state.json");
+        std::fs::write(&state, bytes).unwrap();
+        let server = DaemonServer::bind_with_options(
+            sock.clone(),
+            dir.path().join("runtime"),
+            None,
+            Some(state.clone()),
+            test_supervisor(),
+        )
+        .await
+        .unwrap();
+        let (shutdown, done) = oneshot::channel();
+        let task = tokio::spawn(server.serve(async {
+            let _ = done.await;
+        }));
+        let mut client = IpcStream::connect(&sock).await.unwrap();
+        assert!(matches!(
+            send_rpc(
+                &mut client,
+                1,
+                ClientMessage::CreateManualWorkspace {
+                    name: "temporary".into(),
+                    root_dir: dir.path().to_owned()
+                }
+            )
+            .await,
+            ResponsePayload::WorkspaceCreated(_)
+        ));
+        let mut reconnect = IpcStream::connect(&sock).await.unwrap();
+        let pong = send_rpc(&mut reconnect, 1, ClientMessage::Ping).await;
+        assert_eq!(std::fs::read(state).unwrap(), bytes);
+        assert!(matches!(
+            pong,
+            ResponsePayload::Pong {
+                persistence_health: Some(
+                    daedalus_proto::PersistenceHealth::TemporarySnapshotRejected
+                ),
+                ..
+            }
+        ));
+        shutdown.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
 }

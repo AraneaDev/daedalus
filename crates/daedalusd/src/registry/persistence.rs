@@ -58,6 +58,17 @@ fn rejected_snapshot(path: &std::path::Path) -> io::Error {
 }
 
 impl Registry {
+    pub(crate) async fn persistence_health(&self) -> daedalus_proto::PersistenceHealth {
+        use daedalus_proto::PersistenceHealth;
+        if self.state_store.is_none() {
+            return PersistenceHealth::NotConfigured;
+        }
+        match *self.persist_lock.lock().await {
+            PersistenceWriteState::Rejected => PersistenceHealth::TemporarySnapshotRejected,
+            _ => PersistenceHealth::Durable,
+        }
+    }
+
     /// Persists the proposed lifecycle change before publishing it to any client.
     pub(super) async fn commit_workspace_change(
         &self,
