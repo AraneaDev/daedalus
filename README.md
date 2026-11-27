@@ -63,8 +63,10 @@ In **Settings**, add any number of named agents or commands. For example, add a 
 “Reviewer” and a runner named “Unit tests”. For the runner, enter `cargo` as the executable
 and `test` as its first argument. Each argument has its own field, so a value containing spaces
 stays a single argument.
-**Save** records the assignments in your local Daedalus configuration. **Save & launch** also opens
-the selected assignment in its own terminal. Switching workspaces restores your selected terminal.
+**Save** records the assignments on the daemon so its clients share them. With an older daemon
+that lacks project setup support, Daedalus saves them in the client's local configuration.
+**Save & launch** also opens the selected assignment in its own terminal. Switching workspaces
+restores your selected terminal.
 
 ![Workspace assignments showing a Codex agent named Reviewer](docs/images/workspace-settings.png)
 
@@ -491,8 +493,8 @@ permissions. Set the `RELEASE_APP_ID` repository variable and the
 `RELEASE_APP_PRIVATE_KEY` repository secret. With the built-in workflow token, GitHub may ask
 a maintainer to approve workflow runs from the release PR page.
 
-The [specification follow-up](docs/spec-follow-up.md) records the remaining implementation work and
-its acceptance tests.
+The [initial specification follow-up](docs/spec-follow-up.md) records the 0.0.6 baseline.
+It marks the milestones that have shipped and the acceptance scenarios that remain open.
 
 ## License
 
