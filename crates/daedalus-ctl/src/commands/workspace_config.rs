@@ -1,3 +1,4 @@
+use super::workspace::{persistence_warning, print_persistence_warning};
 use crate::client::{ClientError, DaemonClient};
 use crate::{resolve_dir, unexpected_response};
 use clap::Args;
@@ -127,6 +128,7 @@ impl Import {
                 }
                 return Ok(());
             }
+            let warning = persistence_warning(client).await?;
             return match client
                 .request(ClientMessage::ApplyWorkspaceCreation { preview })
                 .await?
@@ -137,6 +139,7 @@ impl Import {
                     } else {
                         println!("{}", workspace.id);
                     }
+                    print_persistence_warning(warning);
                     Ok(())
                 }
                 response => Err(unexpected_response(response)),

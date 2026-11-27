@@ -7,7 +7,7 @@ use daedalus_proto::ResponsePayload;
 use daedalus_proto::{ClientMessage, WorkspaceId};
 use std::io::Write;
 
-async fn persistence_warning(
+pub(super) async fn persistence_warning(
     client: &mut DaemonClient,
 ) -> Result<Option<&'static str>, Box<dyn std::error::Error>> {
     match client.request(ClientMessage::Ping).await? {
@@ -18,7 +18,7 @@ async fn persistence_warning(
     }
 }
 
-fn print_persistence_warning(warning: Option<&str>) {
+pub(super) fn print_persistence_warning(warning: Option<&str>) {
     if let Some(message) = warning {
         // The daemon has already acknowledged the operation.
         let _ = writeln!(std::io::stderr().lock(), "{message}");

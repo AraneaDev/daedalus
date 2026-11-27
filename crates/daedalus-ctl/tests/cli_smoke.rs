@@ -1676,3 +1676,343 @@ async fn temporary_persistence_warns_on_stderr() {
     shutdown.send(()).unwrap();
     task.await.unwrap().unwrap();
 }
+
+const TEMPORARY_PERSISTENCE_WARNING: &str =
+    "Workspace changes are temporary. Repair the rejected snapshot and restart the daemon.";
+const PORTABLE_WORKSPACE: &str = "version = 1\nname = 'Portable fixture'\n";
+
+#[tokio::test]
+async fn new_workspace_import_warns_when_persistence_is_temporary() {
+    check_new_workspace_import_persistence(Some(b"{ invalid JSON")).await;
+}
+
+#[tokio::test]
+async fn new_workspace_import_is_quiet_when_persistence_is_durable() {
+    check_new_workspace_import_persistence(None).await;
+}
+
+async fn check_new_workspace_import_persistence(rejected_snapshot: Option<&[u8]>) {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("test.sock");
+    let state = dir.path().join("state.json");
+    if let Some(bytes) = rejected_snapshot {
+        std::fs::write(&state, bytes).unwrap();
+    }
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let portable = dir.path().join("workspace.toml");
+    std::fs::write(&portable, PORTABLE_WORKSPACE).unwrap();
+
+    let server = DaemonServer::bind_with_options(
+        sock.clone(),
+        dir.path().join("runtime"),
+        None,
+        Some(state.clone()),
+        test_supervisor(),
+    )
+    .await
+    .unwrap();
+    let (shutdown, done) = oneshot::channel();
+    let task = tokio::spawn(server.serve(async {
+        let _ = done.await;
+    }));
+    let workspace = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_daedalus-ctl"));
+        cmd.kill_on_drop(true)
+            .arg("--socket")
+            .arg(&sock)
+            .arg("workspace");
+        cmd
+    };
+    let import = || {
+        let mut cmd = workspace();
+        cmd.args(["import", "--new"])
+            .arg(&project)
+            .arg("--file")
+            .arg(&portable)
+            .arg("--json");
+        cmd
+    };
+
+    let preview = import().arg("--dry-run").output().await.unwrap();
+    let before = workspace().args(["list", "--json"]).output().await.unwrap();
+    let applied = import().output().await.unwrap();
+    let after = workspace().args(["list", "--json"]).output().await.unwrap();
+    shutdown.send(()).unwrap();
+    task.await.unwrap().unwrap();
+
+    assert!(preview.status.success(), "{preview:?}");
+    let preview_json: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview_json["incoming"]["name"], "Portable fixture");
+    assert!(preview.stderr.is_empty(), "{preview:?}");
+    assert!(before.status.success(), "{before:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&before.stdout).unwrap(),
+        serde_json::json!([])
+    );
+    assert_eq!(applied.status.code(), Some(0), "{applied:?}");
+    let id: uuid::Uuid = serde_json::from_slice(&applied.stdout).unwrap();
+    assert!(after.status.success(), "{after:?}");
+    let listed: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    assert_eq!(listed[0]["id"], id.to_string());
+    let snapshot = std::fs::read(state).unwrap();
+    if let Some(bytes) = rejected_snapshot {
+        assert_eq!(snapshot, bytes);
+        assert_eq!(
+            String::from_utf8_lossy(&applied.stderr).trim_end(),
+            TEMPORARY_PERSISTENCE_WARNING,
+            "successful new-workspace import should warn when persistence is temporary"
+        );
+    } else {
+        let persisted: serde_json::Value = serde_json::from_slice(&snapshot).unwrap();
+        assert_eq!(persisted["workspaces"][0]["id"], id.to_string());
+        assert!(applied.stderr.is_empty(), "{applied:?}");
+    }
+}
+
+mod workspace_import_peer {
+    use super::{Command, PORTABLE_WORKSPACE, TempDir};
+    use daedalus_proto::transport::IpcListener;
+    use daedalus_proto::workbench::{
+        WorkbenchState, WorkspaceCreationPreview, WorkspaceDocument, WorkspaceImportPreview,
+        WorkspaceImportSource,
+    };
+    use daedalus_proto::{
+        ClientMessage, PersistenceHealth, ProtoError, Request, ResponsePayload, ServerMessage,
+        WorkspaceId, WorkspaceInfo, read_frame, write_frame,
+    };
+    use std::path::Path;
+    use std::process::Output;
+    use std::time::Duration;
+
+    fn pong(persistence_health: Option<PersistenceHealth>) -> ResponsePayload {
+        ResponsePayload::Pong {
+            version: "0.0.1".into(),
+            vt_backend: "test".into(),
+            isolation_mode: "test".into(),
+            journal_supported: false,
+            inspect_setup_supported: false,
+            project_setup_supported: false,
+            image_preview_supported: false,
+            paste_supported: false,
+            workbench_supported: true,
+            workspace_membership_supported: false,
+            runner_assignment_supported: false,
+            guarded_runner_assignment_supported: false,
+            resolved_import_preview_supported: false,
+            agent_launch_metadata_supported: false,
+            persistence_health,
+            home_dir: None,
+            recent_projects_supported: false,
+        }
+    }
+
+    async fn import(
+        target: [&str; 2],
+        exchanges: Vec<(ClientMessage, Result<ResponsePayload, ProtoError>)>,
+    ) -> Output {
+        let dir = TempDir::new().unwrap();
+        let portable = dir.path().join("workspace.toml");
+        std::fs::write(&portable, PORTABLE_WORKSPACE).unwrap();
+        let mut listener = IpcListener::bind(Path::new("tcp://127.0.0.1:0"))
+            .await
+            .unwrap();
+        let endpoint = listener.local_endpoint();
+        let peer = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            for (expected, result) in exchanges {
+                let request: Request = read_frame(&mut stream).await.unwrap().unwrap();
+                assert_eq!(request.payload, expected);
+                write_frame(
+                    &mut stream,
+                    &ServerMessage::Response {
+                        id: request.id,
+                        result,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(read_frame::<_, Request>(&mut stream).await.unwrap(), None);
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let output = Command::new(env!("CARGO_BIN_EXE_daedalus-ctl"))
+                .kill_on_drop(true)
+                .arg("--socket")
+                .arg(endpoint)
+                .args(["workspace", "import"])
+                .args(target)
+                .arg("--file")
+                .arg(portable)
+                .arg("--json")
+                .output()
+                .await
+                .unwrap();
+            peer.await.unwrap();
+            output
+        })
+        .await
+        .expect("CLI or mock daemon timed out")
+    }
+
+    fn creation_preview(root_dir: &Path) -> WorkspaceCreationPreview {
+        WorkspaceCreationPreview {
+            root_dir: root_dir.into(),
+            incoming: WorkspaceDocument::new("Portable fixture".into()),
+            linked: false,
+        }
+    }
+
+    fn preview_exchange(
+        preview: &WorkspaceCreationPreview,
+    ) -> (ClientMessage, Result<ResponsePayload, ProtoError>) {
+        (
+            ClientMessage::PreviewWorkspaceCreation {
+                root_dir: preview.root_dir.clone(),
+                source: WorkspaceImportSource::Text(PORTABLE_WORKSPACE.into()),
+                linked: false,
+            },
+            Ok(ResponsePayload::WorkspaceCreationPreview(preview.clone())),
+        )
+    }
+
+    #[tokio::test]
+    async fn new_workspace_import_accepts_legacy_pong_without_health() {
+        let dir = TempDir::new().unwrap();
+        let preview = creation_preview(dir.path());
+        let id = WorkspaceId(uuid::Uuid::new_v4());
+        let workspace = WorkspaceInfo {
+            id,
+            name: preview.incoming.name.clone(),
+            root_dir: preview.root_dir.clone(),
+            project: Default::default(),
+            setup: None,
+            default_panes_pending: None,
+            slot_index: 0,
+            injected_env: Default::default(),
+            panes: Vec::new(),
+            port_offset: 0,
+            compose_project_name: None,
+            git_branch: None,
+            git_status: None,
+            bound_ports: Vec::new(),
+            containers: Vec::new(),
+            external_statuses: Vec::new(),
+            manifest: None,
+        };
+        let output = import(
+            ["--new", dir.path().to_str().unwrap()],
+            vec![
+                preview_exchange(&preview),
+                (ClientMessage::Ping, Ok(pong(None))),
+                (
+                    ClientMessage::ApplyWorkspaceCreation { preview },
+                    Ok(ResponsePayload::WorkbenchCreated(workspace)),
+                ),
+            ],
+        )
+        .await;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            serde_json::from_slice::<WorkspaceId>(&output.stdout).unwrap(),
+            id
+        );
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+
+    #[tokio::test]
+    async fn rejected_new_workspace_import_reports_only_the_apply_error() {
+        let dir = TempDir::new().unwrap();
+        let preview = creation_preview(dir.path());
+        let output = import(
+            ["--new", dir.path().to_str().unwrap()],
+            vec![
+                preview_exchange(&preview),
+                (
+                    ClientMessage::Ping,
+                    Ok(pong(Some(PersistenceHealth::TemporarySnapshotRejected))),
+                ),
+                (
+                    ClientMessage::ApplyWorkspaceCreation { preview },
+                    Err(ProtoError::InvalidRequest("creation rejected".into())),
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(
+            output.stderr,
+            b"Error: InvalidRequest(\"creation rejected\")\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_workspace_import_stops_before_apply_if_persistence_preflight_fails() {
+        let dir = TempDir::new().unwrap();
+        let preview = creation_preview(dir.path());
+        let output = import(
+            ["--new", dir.path().to_str().unwrap()],
+            vec![
+                preview_exchange(&preview),
+                (
+                    ClientMessage::Ping,
+                    Err(ProtoError::Internal("health unavailable".into())),
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(output.stderr, b"Error: Internal(\"health unavailable\")\n");
+    }
+
+    #[tokio::test]
+    async fn existing_workspace_import_skips_persistence_preflight() {
+        let workspace_id = WorkspaceId(uuid::Uuid::new_v4());
+        let document = WorkspaceDocument::new("Portable fixture".into());
+        let output = import(
+            ["--workspace", &workspace_id.to_string()],
+            vec![
+                (
+                    ClientMessage::PreviewWorkspaceImport {
+                        workspace_id,
+                        source: WorkspaceImportSource::Text(PORTABLE_WORKSPACE.into()),
+                        linked: false,
+                    },
+                    Ok(ResponsePayload::WorkspaceImportPreview(
+                        WorkspaceImportPreview {
+                            workspace_id,
+                            revision: 1,
+                            incoming: document.clone(),
+                            current: WorkspaceDocument::new("Original workspace".into()),
+                            proposed: document.clone(),
+                            linked: false,
+                            conflicts: Vec::new(),
+                        },
+                    )),
+                ),
+                (
+                    ClientMessage::ApplyWorkspaceImport {
+                        workspace_id,
+                        revision: 1,
+                        incoming: document.clone(),
+                        linked: false,
+                        resolutions: Default::default(),
+                    },
+                    Ok(ResponsePayload::Workbench(WorkbenchState {
+                        revision: 2,
+                        document: document.clone(),
+                        repo_baseline: None,
+                    })),
+                ),
+            ],
+        )
+        .await;
+        assert!(output.status.success(), "{output:?}");
+        let state: WorkbenchState = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(state.revision, 2);
+        assert_eq!(state.document, document);
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+}
