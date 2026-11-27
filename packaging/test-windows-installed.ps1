@@ -11,8 +11,6 @@ $daemonLog = Join-Path $root 'daemon.log'
 $daemonErrors = Join-Path $root 'daemon-errors.log'
 $uiLog = Join-Path $root 'ui.log'
 $uiErrors = Join-Path $root 'ui-errors.log'
-$cliLog = Join-Path $root 'cli.log'
-$cliErrors = Join-Path $root 'cli-errors.log'
 $state = Join-Path $root 'state.json'
 $token = [Guid]::NewGuid().ToString('N')
 $daemon = $null
@@ -30,16 +28,29 @@ $cliExe = Join-Path $InstallDirectory 'daedalus-ctl.exe'
 
 function Invoke-SmokeCli {
     param([string[]]$Arguments)
-    $process = Start-Process -FilePath $cliExe -ArgumentList $Arguments -PassThru -NoNewWindow `
-        -RedirectStandardOutput $cliLog -RedirectStandardError $cliErrors
-    if (!$process.WaitForExit(3000)) {
-        Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
-        throw 'The installed CLI did not reply within three seconds.'
-    }
-    [pscustomobject]@{
-        Code = $process.ExitCode
-        Output = (Get-Content -LiteralPath $cliLog -Raw)
-        ErrorOutput = (Get-Content -LiteralPath $cliErrors -Raw)
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $cliExe
+    $info.Arguments = $Arguments -join ' '
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::Start($info)
+    try {
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (!$process.WaitForExit(3000)) {
+            $process.Kill()
+            [void]$process.WaitForExit(3000)
+            throw 'The installed CLI did not reply within three seconds.'
+        }
+        [pscustomobject]@{
+            Code = $process.ExitCode
+            Output = $stdout.GetAwaiter().GetResult()
+            ErrorOutput = $stderr.GetAwaiter().GetResult()
+        }
+    } finally {
+        $process.Dispose()
     }
 }
 
@@ -99,7 +110,8 @@ try {
     $env:DAEDALUS_AUTH_TOKEN = $token
     $ready = Invoke-SmokeCli -Arguments @('ping')
     if ($ready.Code -ne 0 -or $ready.Output -notlike "daedalusd v$Version (*") {
-        throw 'The installed authenticated handshake failed or reported the wrong version.'
+        throw ("The authenticated handshake failed (exit {0}). Expected v{1}. Output: {2} {3}" -f
+            $ready.Code, $Version, $ready.Output, $ready.ErrorOutput)
     }
 
     $ui = Start-SmokeUi
@@ -127,7 +139,7 @@ try {
     }
     Write-Output "Installed Windows workbench v$Version created and reconnected to the same workspace and panes."
 } catch {
-    foreach ($path in @($daemonLog, $daemonErrors, $uiLog, $uiErrors, $cliErrors)) {
+    foreach ($path in @($daemonLog, $daemonErrors, $uiLog, $uiErrors)) {
         if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path -Tail 25 }
     }
     throw
