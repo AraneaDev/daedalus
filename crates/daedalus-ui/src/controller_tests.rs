@@ -13,6 +13,7 @@ struct Workbench {
     root: TempDir,
 }
 
+mod coverage_paths;
 mod membership;
 mod sessions;
 mod settings_workflows;

@@ -71,8 +71,16 @@ pub(super) fn spawn_daemon_detached(
 ) -> std::io::Result<PathBuf> {
     let exe = std::env::current_exe().ok();
     let bin = resolve_daemon_binary(exe.as_deref());
+    let _child = spawn_daemon_at(&bin, socket_path, auth_token)?;
+    Ok(bin)
+}
 
-    let mut cmd = Command::new(&bin);
+fn spawn_daemon_at(
+    bin: &Path,
+    socket_path: &Path,
+    auth_token: Option<&str>,
+) -> std::io::Result<std::process::Child> {
+    let mut cmd = Command::new(bin);
     if let Some(token) = auth_token {
         cmd.env("DAEDALUS_AUTH_TOKEN", token);
     }
@@ -102,8 +110,7 @@ pub(super) fn spawn_daemon_detached(
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
 
-    let _child = cmd.spawn()?;
-    Ok(bin)
+    cmd.spawn()
 }
 
 #[cfg(unix)]
@@ -180,5 +187,39 @@ mod tests {
             false,
             Path::new(r"\\.\pipe\daedalus-alice-daedalusd")
         ));
+    }
+    #[tokio::test]
+    async fn invalid_ssh_target_fails_before_launching_a_tunnel() {
+        let error = match connect_endpoint(Path::new("ssh://")).await {
+            Ok(_) => panic!("empty SSH target was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_daemon_spawn_preserves_the_socket_and_token() {
+        let temp = TempDir::new().unwrap();
+        let binary = temp.path().join("daemon-fixture");
+        let marker = temp.path().join("started");
+        fs::write(
+            &binary,
+            "#!/bin/sh
+[ \"$1\" = --socket ] && [ \"$DAEDALUS_AUTH_TOKEN\" = fixture-auth ] || exit 3
+printf started > \"$2\"
+",
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = spawn_daemon_at(&binary, &marker, Some("fixture-auth")).unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "started");
+        assert_eq!(
+            spawn_daemon_at(&temp.path().join("missing"), &marker, None)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 }

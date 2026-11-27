@@ -397,6 +397,28 @@ def exercise(binaries, scratch, screen):
             ui.close(client)
 
 
+def exercise_auto_spawn(binaries, scratch, screen):
+    scratch.mkdir()
+    project, env = fixture(scratch)
+    location = scratch / "installed"
+    location.mkdir()
+    ui_bin = location / "daedalus-ui"
+    shutil.copy2(binaries / "daedalus-ui", ui_bin)
+    daemon = location / "daedalusd"
+    daemon.write_text(
+        '#!/bin/sh\n[ "$1" = --socket ] && [ "$2" = "$DAEDALUS_SOCKET" ] || exit 3\n'
+        "touch daemon-spawned\n"
+    )
+    daemon.chmod(0o700)
+    with running(ui_bin, [], project, env) as process:
+        ui = Workbench(screen, process)
+        until(
+            "automatic launch of the sibling daemon",
+            lambda: (project / "daemon-spawned").exists(),
+        )
+        ui.close(process)
+
+
 def enable_accessibility():
     """Turn AT-SPI on so accesskit requests the tree, as a screen reader would."""
 
@@ -431,6 +453,8 @@ if __name__ == "__main__":
     screen = display.Display()
     try:
         with TemporaryDirectory(prefix="daedalus-ui-") as folder:
-            exercise(Path(sys.argv[1]).resolve(), Path(folder), screen)
+            bins = Path(sys.argv[1]).resolve()
+            exercise(bins, Path(folder), screen)
+            exercise_auto_spawn(bins, Path(folder) / "auto-spawn", screen)
     finally:
         screen.close()
