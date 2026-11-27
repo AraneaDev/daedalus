@@ -608,6 +608,7 @@ impl DaedalusApp {
                 self.request_redraw();
             }
             UiAction::RunTests => self.run_saved_tests(),
+            UiAction::OpenSessions => self.open_sessions(),
             UiAction::RunCargo(preset) => self.run_cargo_preset(preset),
             UiAction::WorkspaceSettings => self.open_workspace_settings(),
             UiAction::NewWorkspace => self.create_new_workspace(),
@@ -917,7 +918,7 @@ impl DaedalusApp {
                 } else {
                     (
                         ScrollTarget::Actions,
-                        self.state.active_actions().len(),
+                        self.state.palette_len(),
                         &mut self.state.action_palette.selected_index,
                     )
                 };

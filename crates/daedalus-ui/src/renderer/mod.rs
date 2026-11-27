@@ -435,9 +435,14 @@ fn collect_prepared_quads(
         let settings = state.active_workspace_id.map(|_| {
             crate::layout::settings_button(toggle, cards.and_then(|cards| cards.list.arrows), s)
         });
-        for button in [layout.layout_button, layout.run_tests_button, settings]
-            .into_iter()
-            .flatten()
+        for button in [
+            layout.layout_button,
+            layout.run_tests_button,
+            layout.launch_button,
+            settings,
+        ]
+        .into_iter()
+        .flatten()
         {
             let surface = Rect::new(
                 button.x + 1. * s,

@@ -39,6 +39,7 @@ const SETUP_REVIEW: NodeId = NodeId(19);
 const SETTINGS: NodeId = NodeId(14);
 const OPEN_SETTINGS: NodeId = NodeId(17);
 const TOGGLE_LAYOUT: NodeId = NodeId(20);
+const OPEN_SESSIONS: NodeId = NodeId(21);
 const NEW_WORKSPACE: NodeId = NodeId(15);
 const VALIDATION: NodeId = NodeId(12);
 const BRANCH_TEXT: NodeId = NodeId(13);
@@ -61,6 +62,12 @@ pub(super) fn action(
         match request.target_node {
             TOGGLE_LAYOUT if state.active_workspace().is_some() => {
                 return Some(UiAction::ToggleZoom);
+            }
+            OPEN_SESSIONS
+                if state.connection == ConnectionState::Connected
+                    && state.active_workspace().is_some() =>
+            {
+                return Some(UiAction::OpenSessions);
             }
             OPEN_SETTINGS if state.active_workspace().is_some() => {
                 return Some(UiAction::WorkspaceSettings);
@@ -179,7 +186,15 @@ fn overlay(state: &AppState) -> Option<(NodeId, Node)> {
             || "No actions configured for this workspace.".to_string(),
             |action| format!("Selected {}. Use Up and Down to choose, Enter to run, or Escape to cancel.", action.label),
         );
-        (ACTIONS, "Action palette", selection)
+        if state.action_palette.session_actions.is_some() {
+            (
+                ACTIONS,
+                "Workspace sessions",
+                "Choose a session to launch or stop.".into(),
+            )
+        } else {
+            (ACTIONS, "Action palette", selection)
+        }
     } else if overlay == Some(ActiveOverlay::Worktree) {
         (
             WORKTREE,
@@ -393,6 +408,12 @@ pub(super) fn workbench_tree_with_search_bar(
         workspace.push_child(TOGGLE_LAYOUT);
         nodes.push((TOGGLE_LAYOUT, toggle_layout));
         controls.append_cargo(state, &mut workspace, &mut nodes);
+        if state.connection == ConnectionState::Connected {
+            let mut launch = named(Role::Button, "Launch or stop a session");
+            launch.add_action(Action::Click);
+            workspace.push_child(OPEN_SESSIONS);
+            nodes.push((OPEN_SESSIONS, launch));
+        }
         workspace.push_child(OPEN_SETTINGS);
         nodes.push((OPEN_SETTINGS, open_settings));
         root.push_child(WORKSPACE);

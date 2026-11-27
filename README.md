@@ -92,6 +92,8 @@ and Claude sessions have distinct tab marks alongside their session names.
 In Cargo workspaces, choose **Cargo Test** or **Cargo Check** in the bottom bar to run the preset
 on the workspace host while keeping your agent in view. In workspace **Settings**, use
 **+ Cargo Test** or **+ Cargo Check** to save an editable runner command.
+To hide either automatic shortcut for this workspace, open **Settings → Widgets**,
+choose **Hide Cargo Test** or **Hide Cargo Check**, then select **Save widgets**.
 
 ![Full Windows workbench with Codex and Claude tabs, terminal output, and the Cargo bottom bar](docs/images/windows-agent-tabs.png)
 
@@ -203,6 +205,7 @@ or repeat the shortcut to close it. The preview supports regular PNG files up to
 | `Ctrl+Shift+B` | Toggle workspace sidebar |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Switch to the next / previous workspace |
 | `Ctrl+Shift+S` | Edit workspace assignments |
+| `Ctrl+Shift+U` | Open the Launch menu to start saved sessions or stop live terminals |
 | `Ctrl+Shift+P` | Open/close Agent preset picker (`agy`, `claude`, `codex`, `shell`) |
 | `Ctrl+Shift+X` | Close the focused terminal and stop its process. You can also click × on the selected terminal tab. |
 | `Ctrl+Shift+W` | Open/close New Git Worktree modal |

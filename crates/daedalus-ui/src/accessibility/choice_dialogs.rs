@@ -5,7 +5,7 @@ use daedalus_ui::input::UiAction;
 use daedalus_ui::layout::overlays::{
     action_palette_layout, picker_item_rect, preset_picker_layout,
 };
-use daedalus_ui::state::{ActiveOverlay, AgentPreset, AppState};
+use daedalus_ui::state::{ActiveOverlay, AgentPreset, AppState, SessionAction};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {
@@ -33,6 +33,7 @@ impl Scope {
 enum Choice {
     Preset(AgentPreset),
     Action(CustomAction),
+    Session(SessionAction),
 }
 
 #[derive(Default)]
@@ -54,13 +55,19 @@ impl ChoiceControls {
     ) -> NodeId {
         let scope = Scope::current(state);
         let actions = state.active_actions();
+        let sessions = state.action_palette.session_actions.as_deref();
         let is_picker = id == PICKER;
         let changed = self.scope != scope
             || (!is_picker
-                && (self.rows.len() != actions.len()
-                    || self.rows.iter().zip(actions).any(|((_, choice), action)| {
-                        !matches!(choice, Choice::Action(stored) if stored == action)
-                    })));
+                && (self.rows.len() != state.palette_len()
+                    || match sessions {
+                        Some(sessions) => self.rows.iter().zip(sessions).any(|((_, choice), action)| {
+                            !matches!(choice, Choice::Session(stored) if stored == action)
+                        }),
+                        None => self.rows.iter().zip(actions).any(|((_, choice), action)| {
+                            !matches!(choice, Choice::Action(stored) if stored == action)
+                        }),
+                    }));
         if self.list.is_none() || changed {
             self.scope = scope;
             self.rows.clear();
@@ -70,6 +77,12 @@ impl ChoiceControls {
                     AgentPreset::ALL
                         .into_iter()
                         .map(|preset| (next_control_group(serial), Choice::Preset(preset))),
+                );
+            } else if let Some(sessions) = sessions {
+                self.rows.extend(
+                    sessions.iter().map(|action| {
+                        (next_control_group(serial), Choice::Session(action.clone()))
+                    }),
                 );
             } else {
                 self.rows.extend(
@@ -87,7 +100,7 @@ impl ChoiceControls {
         let (modal, visible) = if is_picker {
             preset_picker_layout(width, height, scale, selected)
         } else {
-            action_palette_layout(width, height, scale, actions.len(), selected)
+            action_palette_layout(width, height, scale, state.palette_len(), selected)
         };
         dialog.set_bounds(bounds(modal));
         if self.rows.is_empty() {
@@ -100,14 +113,17 @@ impl ChoiceControls {
             Role::Group,
             if is_picker {
                 "Agent presets"
+            } else if sessions.is_some() {
+                "Workspace sessions"
             } else {
                 "Workspace actions"
             },
         );
         for (index, (node_id, choice)) in self.rows.iter().enumerate() {
             let label = match choice {
-                Choice::Preset(preset) => preset.label(),
-                Choice::Action(action) => &action.label,
+                Choice::Preset(preset) => preset.label().to_owned(),
+                Choice::Action(action) => action.label.clone(),
+                Choice::Session(action) => action.label(),
             };
             // A row executes an action when activated. An item-selection role would also
             // invoke its Click handler when a platform selection API just selects it.
@@ -152,7 +168,17 @@ impl ChoiceControls {
                 state.picker.selected_index = index;
                 UiAction::PickerConfirm
             }
-            Choice::Action(cached) => {
+            Choice::Session(cached) => {
+                let index = state
+                    .action_palette
+                    .session_actions
+                    .as_ref()?
+                    .iter()
+                    .position(|action| action == cached)?;
+                state.action_palette.selected_index = index;
+                UiAction::ActionPaletteConfirm
+            }
+            Choice::Action(cached) if state.action_palette.session_actions.is_none() => {
                 // Actions can move when a daemon refresh replaces the workspace manifest.
                 let index = state
                     .active_actions()

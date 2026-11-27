@@ -14,7 +14,9 @@ mod pane;
 mod search;
 mod widgets;
 
-pub use dialogs::{ActionPaletteState, CloseWorkspaceModalState, PickerState, WorktreeModalState};
+pub use dialogs::{
+    ActionPaletteState, CloseWorkspaceModalState, PickerState, SessionAction, WorktreeModalState,
+};
 pub use pane::PaneViewState;
 pub use search::SearchState;
 
@@ -367,7 +369,7 @@ impl AppState {
                 PaneRole::Runner => "No runner terminal open",
             }
         };
-        Some((title, Some("Open Settings to launch a terminal.")))
+        Some((title, Some("Choose Launch to start a session.")))
     }
 
     /// Opens the Agent preset picker modal while ensuring other modals are closed.
@@ -575,6 +577,13 @@ impl AppState {
             .and_then(|ws| ws.manifest.as_ref())
             .map(|m| m.actions.as_slice())
             .unwrap_or_default()
+    }
+
+    pub fn palette_len(&self) -> usize {
+        self.action_palette
+            .session_actions
+            .as_ref()
+            .map_or_else(|| self.active_actions().len(), Vec::len)
     }
 
     pub fn open_action_palette(&mut self) {

@@ -50,6 +50,16 @@ impl SettingsDialog {
             runner: runner.clone(),
             service_enabled,
             runner_enabled,
+            hide_cargo_test: if requested.hide_cargo_test == baseline.hide_cargo_test {
+                saved.hide_cargo_test
+            } else {
+                requested.hide_cargo_test
+            },
+            hide_cargo_check: if requested.hide_cargo_check == baseline.hide_cargo_check {
+                saved.hide_cargo_check
+            } else {
+                requested.hide_cargo_check
+            },
         })
     }
 
@@ -77,6 +87,9 @@ impl SettingsDialog {
             ]);
         } else {
             rows.push(vec![RunnerWidget]);
+        }
+        if self.cargo_shortcuts_available {
+            rows.push(vec![CargoTestShortcut, CargoCheckShortcut]);
         }
         rows.push(vec![Cancel, Save]);
         rows
@@ -118,6 +131,8 @@ impl SettingsDialog {
                 "Warnings · {}",
                 detail_label(self.widgets.runner.show_warnings)
             ),
+            CargoTestShortcut => shortcut_label("Cargo Test", self.widgets.hide_cargo_test),
+            CargoCheckShortcut => shortcut_label("Cargo Check", self.widgets.hide_cargo_check),
             Cancel if self.is_pane_widgets_page() && self.widgets_saved => "Done".into(),
             Save if self.is_pane_widgets_page() => "Save widgets".into(),
             _ => return None,
@@ -161,6 +176,8 @@ impl SettingsDialog {
                 | RunnerPreset
                 | RunnerDuration
                 | RunnerWarnings
+                | CargoTestShortcut
+                | CargoCheckShortcut
         ) {
             self.widgets_saved = false;
         }
@@ -188,6 +205,8 @@ impl SettingsDialog {
             ),
             RunnerDuration => cycle_detail(&mut self.widgets.runner.show_duration),
             RunnerWarnings => cycle_detail(&mut self.widgets.runner.show_warnings),
+            CargoTestShortcut => self.widgets.hide_cargo_test = !self.widgets.hide_cargo_test,
+            CargoCheckShortcut => self.widgets.hide_cargo_check = !self.widgets.hide_cargo_check,
             ServiceLabel | RunnerLabel => self.select_all = true,
             Save => {
                 let mut widgets = self.widgets.clone();
@@ -215,6 +234,11 @@ fn merge_role<T: Eq>(baseline: T, draft: T, requested: T, saved: T) -> Option<T>
     } else {
         None
     }
+}
+
+fn shortcut_label(name: &str, hidden: bool) -> String {
+    let verb = if hidden { "Show" } else { "Hide" };
+    format!("{verb} {name}")
 }
 
 fn preset_label(preset: Option<&str>) -> &'static str {

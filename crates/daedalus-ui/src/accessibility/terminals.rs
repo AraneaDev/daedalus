@@ -73,7 +73,7 @@ impl TerminalControls {
         workspace: &mut Node,
         nodes: &mut Vec<(NodeId, Node)>,
     ) {
-        let Some(id) = state.active_workspace_id.filter(|_| state.show_cargo_bar()) else {
+        let Some(id) = state.active_workspace_id else {
             self.cargo = None;
             return;
         };
@@ -82,6 +82,9 @@ impl TerminalControls {
         }
         if let Some((_, base)) = self.cargo {
             for (index, preset) in CargoPreset::ALL.into_iter().enumerate() {
+                if !state.cargo_preset_visible(preset) {
+                    continue;
+                }
                 let node = NodeId(base.0 + index as u64);
                 let mut button = named(Role::Button, preset.label());
                 button.add_action(Action::Click);
@@ -93,13 +96,16 @@ impl TerminalControls {
 
     pub(super) fn cargo_preset(&self, state: &AppState, target: NodeId) -> Option<CargoPreset> {
         let (id, base) = self.cargo?;
-        if state.active_workspace_id != Some(id) || !state.show_cargo_bar() {
+        if state.active_workspace_id != Some(id) {
             return None;
         }
         CargoPreset::ALL
             .into_iter()
             .enumerate()
-            .find_map(|(index, preset)| (target == NodeId(base.0 + index as u64)).then_some(preset))
+            .find_map(|(index, preset)| {
+                (target == NodeId(base.0 + index as u64) && state.cargo_preset_visible(preset))
+                    .then_some(preset)
+            })
     }
 
     pub(super) fn register_close_modal(&mut self, session: u64) -> NodeId {

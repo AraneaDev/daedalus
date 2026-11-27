@@ -266,38 +266,29 @@ impl TextRenderer {
                     color: theme.border_focused,
                     bold: true,
                 });
-                let left = if let Some(run) = layout.run_tests_button {
+                let mut left = button.x;
+                for (target, label) in [
+                    (layout.launch_button, "Launch"),
+                    (layout.run_tests_button, "Run tests"),
+                    (
+                        layout.layout_button,
+                        if state.zoomed { "Split" } else { "Focus" },
+                    ),
+                ] {
+                    let Some(target) = target else { continue };
                     self.push_chrome_button(ChromeLineSpec {
-                        text: "Run tests",
-                        bounds: run,
-                        left: run.x + 3. * s,
-                        top: run.y + (run.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                        max_w: run.width - 6. * s,
+                        text: label,
+                        bounds: target,
+                        left: target.x + 3. * s,
+                        top: target.y + (target.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
+                        max_w: target.width - 6. * s,
                         font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
                         line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
                         color: theme.border_focused,
                         bold: true,
                     });
-                    run.x
-                } else {
-                    button.x
-                };
-                let left = if let Some(view) = layout.layout_button {
-                    self.push_chrome_button(ChromeLineSpec {
-                        text: if state.zoomed { "Split" } else { "Focus" },
-                        bounds: view,
-                        left: view.x + 3. * s,
-                        top: view.y + (view.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                        max_w: view.width - 6. * s,
-                        font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
-                        line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
-                        color: theme.border_focused,
-                        bold: true,
-                    });
-                    view.x
-                } else {
-                    left
-                };
+                    left = target.x;
+                }
                 toggle.width = (left - toggle.x).max(0.);
             } else if let Some((up, _)) = arrows {
                 toggle.width = (up.x - toggle.x).max(0.0);
@@ -915,7 +906,7 @@ mod tests {
             state.terminal_guidance(PaneRole::Runner),
             Some((
                 "No terminals open",
-                Some("Open Settings to launch a terminal.")
+                Some("Choose Launch to start a session.")
             )),
         );
     }

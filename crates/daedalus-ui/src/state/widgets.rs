@@ -1,4 +1,5 @@
 use super::AppState;
+use crate::assignments::CargoPreset;
 use daedalus_proto::{PaneRole, PaneStatus, WidgetConfig};
 
 impl AppState {
@@ -35,9 +36,20 @@ impl AppState {
         [overrides, defaults].into_iter().flatten()
     }
 
-    pub fn show_cargo_bar(&self) -> bool {
+    pub fn has_cargo_presets(&self) -> bool {
         self.active_workspace()
             .is_some_and(|ws| ws.project.tools.iter().any(|tool| tool == "Cargo"))
+    }
+
+    pub fn cargo_preset_visible(&self, preset: CargoPreset) -> bool {
+        self.has_cargo_presets()
+            && !self
+                .active_workspace_id
+                .and_then(|id| self.workspace_widgets.get(&id))
+                .is_some_and(|widgets| match preset {
+                    CargoPreset::Test => widgets.hide_cargo_test,
+                    CargoPreset::Check => widgets.hide_cargo_check,
+                })
     }
 
     /// Single-line summary shared by terminal headers, the focused view and accessibility.

@@ -14,6 +14,7 @@ struct Workbench {
 }
 
 mod membership;
+mod sessions;
 mod settings_workflows;
 mod widget_library;
 mod widget_viewport;

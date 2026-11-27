@@ -11,7 +11,10 @@ use daedalus_ui::{
 };
 use winit::keyboard::Key;
 
-fn initial_assignments(ws: &WorkspaceView, default_agent: AgentPreset) -> Vec<Assignment> {
+pub(super) fn initial_assignments(
+    ws: &WorkspaceView,
+    default_agent: AgentPreset,
+) -> Vec<Assignment> {
     let manifest = ws.manifest.as_ref();
     let agent = manifest
         .and_then(|m| m.agent_preset.as_deref())
@@ -94,6 +97,7 @@ impl DaedalusApp {
                 self.state.picker.close();
                 self.state.settings.begin(entries);
                 self.state.settings.widget_workspace = Some(id);
+                self.state.settings.cargo_shortcuts_available = self.state.has_cargo_presets();
                 self.state.settings.setup_baseline = baseline;
                 self.prepare_workbench_settings(id);
                 self.state.settings.set_automatic_widgets(

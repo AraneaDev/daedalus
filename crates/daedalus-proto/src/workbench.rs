@@ -103,6 +103,8 @@ pub struct PaneWidgets {
     pub runner: WidgetConfig,
     pub service_enabled: Option<bool>,
     pub runner_enabled: Option<bool>,
+    pub hide_cargo_test: bool,
+    pub hide_cargo_check: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

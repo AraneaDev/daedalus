@@ -209,8 +209,10 @@ pub struct WorkspaceLayout {
     pub named_tabs: Vec<NamedTab>,
     pub stacked: bool,
     pub run_tests_button: Option<Rect>,
+    pub launch_button: Option<Rect>,
     pub layout_button: Option<Rect>,
     pub cargo_bar: Option<Rect>,
+    pub cargo_presets: [bool; 2],
     pub widget_bar: Option<Rect>,
     pub widget_buttons: Vec<(Option<usize>, Rect)>,
     pub failed_run_buttons: Vec<(WorkspaceId, Rect)>,
@@ -297,34 +299,59 @@ impl WorkspaceLayout {
         &self,
         scale: f32,
     ) -> impl Iterator<Item = (crate::assignments::CargoPreset, Rect)> {
-        self.cargo_bar.into_iter().flat_map(move |bar| {
-            let gap = 8. * scale;
-            let button_budget = (bar.width - 3. * gap).max(0.);
-            // Leave space for one readable widget or the overflow button before
-            // widening the Cargo actions to their normal desktop size.
-            let widget_room = if self.widget_bar.is_some() {
-                let slot =
-                    (WIDGET_BUTTON_MIN_LOGICAL_WIDTH + 2. * WIDGET_BUTTON_GAP_LOGICAL) * scale;
-                (button_budget - 2. * 72. * scale).clamp(0., slot)
-            } else {
-                0.
-            };
-            let width = ((button_budget - widget_room) / 2.).min(112. * scale);
-            crate::assignments::CargoPreset::ALL
-                .into_iter()
-                .enumerate()
-                .map(move |(index, preset)| {
-                    (
-                        preset,
-                        Rect::new(
-                            bar.x + gap + index as f32 * (width + gap),
-                            bar.y + 4. * scale,
-                            width,
-                            (bar.height - 8. * scale).max(0.),
-                        ),
-                    )
-                })
-        })
+        let presets = self.cargo_presets;
+        let count = presets.into_iter().filter(|shown| *shown).count() as f32;
+        self.cargo_bar
+            .filter(|_| count > 0.)
+            .into_iter()
+            .flat_map(move |bar| {
+                let gap = 8. * scale;
+                let button_budget = (bar.width - (count + 1.) * gap).max(0.);
+                // Leave space for one readable widget or the overflow button before
+                // widening the Cargo actions to their normal desktop size.
+                let widget_room = if self.widget_bar.is_some() {
+                    let slot =
+                        (WIDGET_BUTTON_MIN_LOGICAL_WIDTH + 2. * WIDGET_BUTTON_GAP_LOGICAL) * scale;
+                    (button_budget - count * 72. * scale).clamp(0., slot)
+                } else {
+                    0.
+                };
+                let width = ((button_budget - widget_room) / count).min(112. * scale);
+                crate::assignments::CargoPreset::ALL
+                    .into_iter()
+                    .zip(presets)
+                    .filter_map(|(preset, shown)| shown.then_some(preset))
+                    .enumerate()
+                    .map(move |(index, preset)| {
+                        (
+                            preset,
+                            Rect::new(
+                                bar.x + gap + index as f32 * (width + gap),
+                                bar.y + 4. * scale,
+                                width,
+                                (bar.height - 8. * scale).max(0.),
+                            ),
+                        )
+                    })
+            })
+    }
+
+    pub fn enable_launch_button(&mut self, scale: f32) {
+        let Some(header) = self.sidebar_toggle else {
+            return;
+        };
+        let settings = settings_button(
+            header,
+            self.sidebar_content.as_ref().and_then(|list| list.arrows),
+            scale,
+        );
+        let width = (52. * scale).min((settings.x - header.x) * 0.7);
+        self.launch_button = Some(Rect::new(
+            settings.x - width,
+            header.y,
+            width,
+            header.height,
+        ));
     }
 
     pub fn enable_layout_button(&mut self, scale: f32) {
@@ -336,7 +363,11 @@ impl WorkspaceLayout {
             self.sidebar_content.as_ref().and_then(|list| list.arrows),
             scale,
         );
-        let right = self.run_tests_button.unwrap_or(settings).x;
+        let right = self
+            .run_tests_button
+            .or(self.launch_button)
+            .unwrap_or(settings)
+            .x;
         let width = 52. * scale;
         if right - header.x >= width + 32. * scale {
             self.layout_button = Some(Rect::new(right - width, header.y, width, header.height));
@@ -353,13 +384,14 @@ impl WorkspaceLayout {
             scale,
         );
         let width = 68. * scale;
-        if settings.x - header.x >= width + 42. * scale {
-            self.run_tests_button = Some(Rect::new(
-                settings.x - width,
-                header.y,
-                width,
-                header.height,
-            ));
+        let right = self.launch_button.unwrap_or(settings).x;
+        let reserve = if self.launch_button.is_some() {
+            84.
+        } else {
+            42.
+        };
+        if right - header.x >= width + reserve * scale {
+            self.run_tests_button = Some(Rect::new(right - width, header.y, width, header.height));
         }
     }
 
@@ -485,6 +517,7 @@ pub enum HitTarget {
     SidebarNewWorkspace,
     SidebarNewWorktree,
     RunTests,
+    OpenSessions,
     Widget(PaneRole),
     CustomWidget(Option<usize>),
     SessionTab(PaneRole),
@@ -846,8 +879,10 @@ pub fn compute_split_layout(input: &LayoutInput, splits: &PaneSplits) -> Workspa
         named_tabs: Vec::new(),
         sidebar_toggle: canvas.sidebar_toggle,
         run_tests_button: None,
+        launch_button: None,
         layout_button: None,
         cargo_bar: None,
+        cargo_presets: [true; 2],
         failed_run_buttons: Vec::new(),
         sidebar_first: 0,
         sidebar_content: None,
@@ -1098,6 +1133,12 @@ fn workbench_controls_target(
         .is_some_and(|button| button.contains(x, y))
     {
         return Some(HitTarget::ToggleLayout);
+    }
+    if layout
+        .launch_button
+        .is_some_and(|button| button.contains(x, y))
+    {
+        return Some(HitTarget::OpenSessions);
     }
     if layout
         .run_tests_button

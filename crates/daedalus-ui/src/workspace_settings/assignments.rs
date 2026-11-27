@@ -41,7 +41,7 @@ impl DaedalusApp {
     }
 
     pub(crate) fn run_cargo_preset(&mut self, preset: assignments::CargoPreset) {
-        if !self.state.show_cargo_bar() {
+        if !self.state.cargo_preset_visible(preset) {
             return;
         }
         if let Some(workspace) = self.state.active_workspace_id
@@ -51,7 +51,7 @@ impl DaedalusApp {
         }
     }
 
-    pub(in crate::workspace_settings) fn launch_assignment(
+    pub(crate) fn launch_assignment(
         &self,
         workspace_id: WorkspaceId,
         assignment: Assignment,
