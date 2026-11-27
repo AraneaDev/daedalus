@@ -30,35 +30,52 @@ pub(crate) async fn execute(
                 other => return Err(unexpected_response(other)),
             }
         }
-        WorkspaceAction::List => match client.request(ClientMessage::ListWorkspaces).await? {
-            ResponsePayload::Workspaces(list) => {
-                for ws in list {
-                    let mut line = format!(
-                        "{}  {}  ({})  panes={}",
-                        ws.id,
-                        ws.name,
-                        ws.root_dir.display(),
-                        ws.panes.len()
-                    );
-                    if let Some(branch) = &ws.git_branch {
-                        line.push_str(&format!("  branch={branch}"));
+        WorkspaceAction::List { json } => {
+            match client.request(ClientMessage::ListWorkspaces).await? {
+                ResponsePayload::Workspaces(list) => {
+                    if json {
+                        let identities: Vec<_> = list
+                        .iter()
+                        .map(|workspace| {
+                            serde_json::json!({
+                                "id": workspace.id,
+                                "name": workspace.name,
+                                "root_dir": workspace.root_dir,
+                                "pane_ids": workspace.panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+                            })
+                        })
+                        .collect();
+                        println!("{}", serde_json::to_string(&identities)?);
+                        return Ok(());
                     }
-                    if ws.port_offset > 0 {
-                        line.push_str(&format!("  offset=+{}", ws.port_offset));
+                    for ws in list {
+                        let mut line = format!(
+                            "{}  {}  ({})  panes={}",
+                            ws.id,
+                            ws.name,
+                            ws.root_dir.display(),
+                            ws.panes.len()
+                        );
+                        if let Some(branch) = &ws.git_branch {
+                            line.push_str(&format!("  branch={branch}"));
+                        }
+                        if ws.port_offset > 0 {
+                            line.push_str(&format!("  offset=+{}", ws.port_offset));
+                        }
+                        if !ws.external_statuses.is_empty() {
+                            let badges: Vec<String> = ws
+                                .external_statuses
+                                .iter()
+                                .map(|s| format!("{}:{}", s.source, s.label))
+                                .collect();
+                            line.push_str(&format!("  status=[{}]", badges.join(", ")));
+                        }
+                        println!("{line}");
                     }
-                    if !ws.external_statuses.is_empty() {
-                        let badges: Vec<String> = ws
-                            .external_statuses
-                            .iter()
-                            .map(|s| format!("{}:{}", s.source, s.label))
-                            .collect();
-                        line.push_str(&format!("  status=[{}]", badges.join(", ")));
-                    }
-                    println!("{line}");
                 }
+                other => return Err(unexpected_response(other)),
             }
-            other => return Err(unexpected_response(other)),
-        },
+        }
         WorkspaceAction::Recent => {
             let supported = matches!(
                 client.request(ClientMessage::Ping).await?,

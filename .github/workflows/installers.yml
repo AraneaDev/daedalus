@@ -4,6 +4,9 @@ on:
   pull_request:
     paths:
       - 'packaging/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/installers.yml'
       - '.github/workflows/release-please.yml'
   workflow_call:
@@ -150,6 +153,7 @@ jobs:
                 & "$env:ProgramFiles/Daedalus/$bin.exe" --help
                 if ($LASTEXITCODE) { exit $LASTEXITCODE }
               }
+              & ./packaging/test-windows-installed.ps1 -InstallDirectory (Split-Path $gui) -Version $env:VERSION
             }
           }
       - name: Checksum installer

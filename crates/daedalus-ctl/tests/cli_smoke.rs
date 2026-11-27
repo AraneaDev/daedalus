@@ -80,6 +80,18 @@ async fn cli_widget_crud_and_workspace_round_trip() {
     .await;
     let base = base.trim();
     let target = target.trim();
+    let listed: serde_json::Value =
+        serde_json::from_str(&cli(&sock, &["workspace", "list", "--json"]).await).unwrap();
+    let listed = listed.as_array().unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().any(|ws| {
+        ws["id"] == base
+            && ws["name"] == "API"
+            && ws["pane_ids"] == serde_json::json!([])
+            && ws.get("injected_env").is_none()
+    }));
+    assert!(listed.iter().any(|ws| ws["id"] == target));
+
     let template = dir.path().join("git-widget.toml");
     cli(
         &sock,
