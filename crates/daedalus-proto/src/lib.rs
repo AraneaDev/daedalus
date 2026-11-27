@@ -1101,6 +1101,7 @@ mod tests {
             last_exit_code: None,
             has_failure_trace: false,
             launch_preset: None,
+            default_shell_fallback: None,
             agent_state: Some(AgentState::Thinking),
         };
 
@@ -1160,7 +1161,7 @@ mod tests {
 
     #[test]
     fn serde_defaults_preserve_backward_compatibility_for_v0_0_3_fields() {
-        #[derive(serde::Serialize)]
+        #[derive(serde::Serialize, serde::Deserialize)]
         struct LegacyPaneSummary {
             id: PaneId,
             workspace_id: WorkspaceId,
@@ -1229,8 +1230,15 @@ mod tests {
             has_failure_trace: false,
         };
         let pane_bytes = rmp_serde::to_vec_named(&legacy_pane).unwrap();
-        let decoded_pane: PaneSummary = rmp_serde::from_slice(&pane_bytes).unwrap();
+        let mut decoded_pane: PaneSummary = rmp_serde::from_slice(&pane_bytes).unwrap();
         assert_eq!(decoded_pane.agent_state, None);
+        assert_eq!(decoded_pane.default_shell_fallback, None);
+        decoded_pane.default_shell_fallback = Some("command unavailable".into());
+        let pane_bytes = rmp_serde::to_vec_named(&decoded_pane).unwrap();
+        let legacy_reader: LegacyPaneSummary = rmp_serde::from_slice(&pane_bytes).unwrap();
+        assert_eq!(legacy_reader.id, decoded_pane.id);
+        let current_reader: PaneSummary = rmp_serde::from_slice(&pane_bytes).unwrap();
+        assert_eq!(current_reader, decoded_pane);
 
         let legacy_ws = LegacyWorkspaceInfoV02 {
             id: ws_id,

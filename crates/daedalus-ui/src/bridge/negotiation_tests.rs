@@ -44,6 +44,7 @@ fn pong(supported: bool) -> ResponsePayload {
         guarded_runner_assignment_supported: false,
         resolved_import_preview_supported: false,
         agent_launch_metadata_supported: false,
+        default_pane_fallback_supported: supported,
         persistence_health: supported.then_some(daedalus_proto::PersistenceHealth::Durable),
         home_dir: supported.then(|| PathBuf::from("/home/test")),
     }
@@ -67,6 +68,7 @@ async fn launch_hint_only_fills_missing_agent_metadata_for_older_daemons() {
         has_failure_trace: false,
         agent_state: None,
         launch_preset: None,
+        default_shell_fallback: None,
     };
     for (supported, reported, expected) in [
         (false, None, Some("claude")),
@@ -272,6 +274,7 @@ async fn resolving_import_conflicts_requires_the_negotiated_daemon_capability() 
 #[tokio::test]
 async fn old_daemon_gets_no_new_requests() {
     let (conn, _ui, emitted, task, mut seen, _events) = handshake(false).await;
+    assert!(!conn.default_pane_fallback_supported);
 
     assert!(emitted.iter().any(|event| matches!(
         event,
@@ -348,6 +351,7 @@ async fn old_daemon_gets_no_new_requests() {
 #[tokio::test]
 async fn handshake_publishes_capabilities_before_terminal_readiness() {
     let (conn, _ui, emitted, task, mut seen, _events) = handshake(true).await;
+    assert!(conn.default_pane_fallback_supported);
     let order: Vec<&str> = emitted
         .iter()
         .filter_map(|event| match event {

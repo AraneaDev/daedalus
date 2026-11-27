@@ -184,6 +184,14 @@ impl SettingsDialog {
                         };
                         WorkbenchOperation::WidgetPreview(token)
                     }
+                    ClientMessage::GetWidgetResults {
+                        refresh: Some(_), ..
+                    } => {
+                        let Some(state) = self.custom.state.as_ref() else {
+                            return SettingsAction::None;
+                        };
+                        WorkbenchOperation::WidgetRefresh(state.revision)
+                    }
                     ClientMessage::InvokeWidgetAction { widget, .. } => {
                         let Some(detail_session) = self.custom.detail_session() else {
                             return SettingsAction::None;

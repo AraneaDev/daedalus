@@ -79,6 +79,7 @@ async fn negotiate(
         guarded_runner_assignment_supported,
         resolved_import_preview_supported,
         agent_launch_metadata_supported,
+        default_pane_fallback_supported,
         home_dir,
         ..
     } = conn.call(ClientMessage::Ping).await?
@@ -97,6 +98,7 @@ async fn negotiate(
     conn.guarded_runner_assignment_supported = guarded_runner_assignment_supported;
     conn.resolved_import_preview_supported = resolved_import_preview_supported;
     conn.agent_launch_metadata_supported = agent_launch_metadata_supported;
+    conn.default_pane_fallback_supported = default_pane_fallback_supported;
     let _ = conn
         .call(ClientMessage::Subscribe {
             pane_ids: None,

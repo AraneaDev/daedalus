@@ -4,6 +4,9 @@ mod launch;
 #[cfg(test)]
 mod negotiation_tests;
 mod recent_projects;
+mod repo_status_lane;
+#[cfg(test)]
+mod repo_status_lane_tests;
 mod rpc;
 mod session_init;
 mod setup;
@@ -82,6 +85,7 @@ pub enum WorkbenchOperation {
     PaneWidgets(u64),
     WidgetEdit,
     WidgetPreview(uuid::Uuid),
+    WidgetRefresh(u64),
     WidgetAction {
         widget: String,
         detail_session: uuid::Uuid,
@@ -559,6 +563,7 @@ async fn session_loop(
     auth_token: Option<&str>,
 ) {
     let membership = conn.membership_notifications();
+    let mut repo_status = repo_status_lane::RepoStatusLane::new(endpoint, auth_token, sink);
     let mut widgets = widget_lane::WidgetLane::new(endpoint, auth_token, sink);
     let mut recents = JoinSet::new();
     let mut images = JoinSet::new();
@@ -580,6 +585,7 @@ async fn session_loop(
                 return;
             }
             _ = widgets.join_next(), if widgets.has_jobs() => {}
+            _ = repo_status.join_next(), if repo_status.has_job() => {}
             Some(result) = images.join_next(), if !images.is_empty() => {
                 match result {
                     Ok(event) => sink.emit(event),
@@ -624,7 +630,7 @@ async fn session_loop(
                     }
                     continue;
                 }
-                if conn.workbench_supported && widgets.dispatch(&cmd) {
+                if conn.workbench_supported && (repo_status.dispatch(&cmd) || widgets.dispatch(&cmd)) {
                     continue;
                 }
                 let close_id = match &cmd {

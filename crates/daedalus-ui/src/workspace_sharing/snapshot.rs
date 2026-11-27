@@ -55,7 +55,12 @@ impl DaedalusApp {
         self.flush_workbench_layout(id);
     }
 
-    fn workbench_snapshot_is_stale(&self, id: WorkspaceId, revision: u64, settings: bool) -> bool {
+    pub(super) fn workbench_snapshot_is_stale(
+        &self,
+        id: WorkspaceId,
+        revision: u64,
+        settings: bool,
+    ) -> bool {
         let current = if settings {
             self.state.settings.custom.state.as_ref()
         } else {

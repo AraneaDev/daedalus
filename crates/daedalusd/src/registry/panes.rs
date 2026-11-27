@@ -150,7 +150,8 @@ impl Registry {
             } else {
                 command
             };
-            return self
+            let can_fall_back = command.as_ref().is_some_and(|argv| !argv.is_empty());
+            let spawned = self
                 .install_pane(
                     workspace_id,
                     role,
@@ -163,8 +164,34 @@ impl Registry {
                     true,
                     assignment_id,
                 )
-                .await
-                .map(ResponsePayload::PaneSpawned);
+                .await;
+            return match spawned {
+                Err(ProtoError::SpawnFailed(command_error)) if can_fall_back => {
+                    let mut shell = self
+                        .install_pane(
+                            workspace_id,
+                            role,
+                            None,
+                            None,
+                            cols,
+                            rows,
+                            HashMap::new(),
+                            None,
+                            true,
+                            None,
+                        )
+                        .await
+                        .map_err(|error| match error {
+                            ProtoError::SpawnFailed(shell_error) => ProtoError::SpawnFailed(
+                                format!("{command_error}; shell fallback failed: {shell_error}"),
+                            ),
+                            other => other,
+                        })?;
+                    shell.default_shell_fallback = Some(command_error);
+                    Ok(ResponsePayload::PaneSpawned(shell))
+                }
+                other => other.map(ResponsePayload::PaneSpawned),
+            };
         }
 
         let existing = {
