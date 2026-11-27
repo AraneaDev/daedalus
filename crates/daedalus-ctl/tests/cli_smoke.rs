@@ -1838,6 +1838,7 @@ mod workspace_import_peer {
         tokio::time::timeout(Duration::from_secs(10), async {
             let output = Command::new(env!("CARGO_BIN_EXE_daedalus-ctl"))
                 .kill_on_drop(true)
+                .env_remove("DAEDALUS_AUTH_TOKEN")
                 .arg("--socket")
                 .arg(endpoint)
                 .args(["workspace", "import"])
