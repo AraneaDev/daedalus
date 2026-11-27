@@ -17,16 +17,64 @@ pub enum DocumentError {
 }
 
 pub fn parse_workspace(input: &str) -> Result<WorkspaceDocument, DocumentError> {
-    let document = toml::from_str(input)?;
+    let value: toml::Value = toml::from_str(input)?;
+    for (key, label) in [("widgets", "widget"), ("templates", "template")] {
+        if let Some(items) = value.get(key).and_then(toml::Value::as_array) {
+            for item in items {
+                validate_refresh_keys(item, label)?;
+            }
+        }
+    }
+    let document = value.try_into()?;
     validate_workspace(&document)?;
     Ok(document)
 }
 
 pub fn parse_template(input: &str) -> Result<TemplateDocument, DocumentError> {
-    let document: TemplateDocument = toml::from_str(input)?;
+    let value: toml::Value = toml::from_str(input)?;
+    if let Some(template) = value.get("template") {
+        validate_refresh_keys(template, "template")?;
+    }
+    let document: TemplateDocument = value.try_into()?;
     validate_version(document.version)?;
     validate_template(&document.template)?;
     Ok(document)
+}
+
+// Portable TOML should diagnose spelling errors before decoding drops the field.
+fn validate_refresh_keys(owner: &toml::Value, owner_kind: &str) -> Result<(), DocumentError> {
+    let Some(sources) = owner
+        .get("definition")
+        .and_then(|definition| definition.get("sources"))
+        .and_then(toml::Value::as_array)
+    else {
+        return Ok(());
+    };
+    for source in sources {
+        if source.get("kind").and_then(toml::Value::as_str) != Some("command") {
+            continue;
+        }
+        let Some(refresh) = source.get("refresh").and_then(toml::Value::as_table) else {
+            continue;
+        };
+        if let Some(key) = refresh
+            .keys()
+            .find(|key| !matches!(key.as_str(), "interval_seconds" | "on_runner_completion"))
+        {
+            let owner_id = owner
+                .get("id")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("<missing>");
+            let source_id = source
+                .get("id")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("<missing>");
+            return invalid(format!(
+                "{owner_kind} '{owner_id}' source '{source_id}' has unknown refresh key '{key}'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn serialize_workspace(document: &WorkspaceDocument) -> Result<String, DocumentError> {
