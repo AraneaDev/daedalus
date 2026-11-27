@@ -141,3 +141,94 @@ fn empty_setup_can_launch_a_shell_without_writing_settings() {
     ));
     assert!(!w.root.path().join("settings").exists());
 }
+
+fn manifest_sessions(setup: Option<Vec<Assignment>>) -> Workbench {
+    let mut w = Workbench::new();
+    let mut ws = workspace("Manifest sessions");
+    ws.panes.clear();
+    ws.manifest = Some(daedalus_proto::WorkspaceManifest {
+        agent_preset: Some("shell".into()),
+        service_command: Some(vec!["server".into()]),
+        ..Default::default()
+    });
+    ws.setup = setup;
+    w.app.project_setups.set_daemon_backed(true);
+    w.app.project_setups.absorb(std::slice::from_ref(&ws));
+    w.app.state.set_workspaces(vec![ws]);
+    w.app.handle_ui_action(UiAction::OpenSessions);
+    w
+}
+
+#[test]
+fn manifest_shell_and_service_are_both_launchable() {
+    use daedalus_ui::state::SessionAction;
+    let mut w = manifest_sessions(None);
+    let actions = w
+        .app
+        .state
+        .action_palette
+        .session_actions
+        .as_deref()
+        .unwrap();
+    let [
+        SessionAction::Launch {
+            assignment: shell, ..
+        },
+        SessionAction::Launch {
+            assignment: service,
+            ..
+        },
+    ] = actions
+    else {
+        panic!("expected Shell and Service launch choices, got {actions:?}");
+    };
+    assert!(shell.uses_default_shell());
+    assert_eq!(service.role, PaneRole::Service);
+    assert_eq!(service.argv, ["server"]);
+    w.app.handle_ui_action(UiAction::ActionPaletteConfirm);
+    assert!(
+        matches!(w.command(), UiCommand::LaunchAssignment { assignment, .. } if assignment.uses_default_shell())
+    );
+}
+
+#[test]
+fn explicit_empty_setup_keeps_launch_shell_fallback() {
+    let mut w = manifest_sessions(Some(Vec::new()));
+    assert_eq!(w.app.state.palette_len(), 1);
+    w.app.handle_ui_action(UiAction::ActionPaletteConfirm);
+    assert!(
+        matches!(w.command(), UiCommand::LaunchAssignment { assignment, .. } if assignment.argv.is_empty())
+    );
+}
+
+#[test]
+fn saved_command_overrides_manifest_targets() {
+    let saved = Assignment {
+        id: "custom-service".into(),
+        name: "Custom service".into(),
+        role: PaneRole::Service,
+        argv: vec!["other-server".into()],
+    };
+    let mut w = manifest_sessions(Some(vec![saved.clone()]));
+    assert_eq!(w.app.state.palette_len(), 1);
+    w.app.handle_ui_action(UiAction::ActionPaletteConfirm);
+    assert!(
+        matches!(w.command(), UiCommand::LaunchAssignment { assignment, .. } if assignment == saved)
+    );
+}
+
+#[test]
+fn saved_manifest_shell_round_trips_through_launch() {
+    let shell = Assignment {
+        id: "manifest-agent".into(),
+        name: "Agent".into(),
+        role: PaneRole::Agent,
+        argv: vec!["shell".into()],
+    };
+    let mut w = manifest_sessions(Some(vec![shell.clone()]));
+    assert_eq!(w.app.state.palette_len(), 1);
+    w.app.handle_ui_action(UiAction::ActionPaletteConfirm);
+    assert!(
+        matches!(w.command(), UiCommand::LaunchAssignment { assignment, .. } if assignment == shell && assignment.uses_default_shell())
+    );
+}
