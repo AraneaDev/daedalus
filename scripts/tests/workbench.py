@@ -98,7 +98,11 @@ class Workbench:
         # Sample the straight top edge, clear of the rounded corner.
         x, y = position
         border = bytes.fromhex("42332b")
-        until("dialog transition", lambda: (self.pixel(x + 20, y) == border) == visible)
+        transition = "open" if visible else "close"
+        until(
+            f"dialog at {position} to {transition}",
+            lambda: (self.pixel(x + 20, y) == border) == visible,
+        )
 
     def review_ready(self):
         # During installation the terminal can temporarily occupy these coordinates.
@@ -150,6 +154,11 @@ esac
 """
     )
     npm.chmod(0o755)
+    cargo = scratch / "bin/cargo"
+    cargo.write_text(
+        '#!/bin/sh\n[ "$*" = "test --workspace" ] || exit 3\ntouch cargo-test-ran\n'
+    )
+    cargo.chmod(0o755)
     (project / "package.json").write_text('{"scripts":{"dev":"demo","test":"fixture"}}')
     (project / "package-lock.json").write_text("{}")
     (project / ".daedalus.toml").write_text('[agent]\ncommand = ["codex"]\n')
@@ -204,6 +213,7 @@ def exercise(binaries, scratch, screen):
         project_dialog = (460, 332)
         review_dialog = (370, 200)
         recent_dialog = (460, 292)
+        assignments_dialog = (395, 234)
         with running(
             binaries / "daedalus-ui", ["--no-auto-spawn"], project, env
         ) as client:
@@ -248,8 +258,8 @@ def exercise(binaries, scratch, screen):
             # Capture the rendered Run tests control after the action succeeded.
             tests_button = ui.pixels(1310, 0, 64, 30)
             ui.shortcut("s")
-            ui.wait_dialog((395, 214))
-            ui.click(850, 284)  # Widgets page
+            ui.wait_dialog(assignments_dialog)
+            ui.click(850, 304)  # Widgets page
             ui.wait_dialog((395, 274))
             ui.click(720, 385)  # Add service widget
             ui.wait_dialog((395, 254))
@@ -258,8 +268,8 @@ def exercise(binaries, scratch, screen):
             ui.key("a")
             ui.key("p")
             ui.key("i")
-            ui.click(720, 445)  # Cargo Test
-            ui.click(720, 445)  # Cargo Check
+            ui.click(720, 444)  # Runner status preset: Cargo Test
+            ui.click(720, 444)  # Runner status preset: Cargo Check
             ui.click(530, 525)  # Show duration
             ui.click(530, 525)  # Hide duration
             ui.click(890, 525)  # Show warnings
@@ -316,14 +326,18 @@ def exercise(binaries, scratch, screen):
             ui.key("Escape")
             ui.wait_dialog((395, 274), visible=False)
             ui.shortcut("s")
-            ui.wait_dialog((395, 214))
-            ui.click(975, 284)  # Custom widgets
+            ui.wait_dialog(assignments_dialog)
+            ui.click(975, 304)  # Custom widgets
             ui.wait_dialog((395, 334))
             ui.click(558, 440)  # New widget
-            ui.wait_dialog((395, 174))
-            ui.click(550, 282)  # Git Worktree template
+            ui.wait_dialog((395, 154))
+            ui.click(550, 264)  # Git Worktree template
             capture(ui, "widget-editor.png")
-            ui.click(942, 690)  # Add widget
+            ui.click(500, 584)  # Appearance
+            ui.wait_dialog((395, 274))
+            ui.click(910, 384)  # Spacious density
+            ui.click(545, 426)  # Flat surface
+            ui.click(942, 592)  # Add widget
             until(
                 "custom widget stored on the daemon",
                 lambda: (
@@ -348,6 +362,49 @@ def exercise(binaries, scratch, screen):
                 ui.wait_dialog((395, 254), visible=False)
                 capture(ui, "workspace-import.png")
             ui.key("Escape")
+            created = cli("widget", "list", "--dir", project, "--json")
+            assert created.returncode == 0, created.stderr
+            git_widget = next(
+                widget
+                for widget in json.loads(created.stdout)
+                if widget["name"] == "Git Worktree"
+            )
+            assert git_widget["definition"]["display"]["appearance"] == {
+                "density": "spacious",
+                "surface": "flat",
+                "status": "light_and_text",
+            }
+            cargo_patch = scratch / "cargo-button.json"
+            cargo_patch.write_text(
+                json.dumps(
+                    {
+                        "template": "cargo-test",
+                        "order": 1,
+                        "definition": {
+                            "display": {"appearance": {"accent": "#D34DF2"}}
+                        },
+                    }
+                )
+            )
+            created = cli(
+                "widget",
+                "configure",
+                "cargo-test",
+                "--create",
+                "--dir",
+                project,
+                "--patch",
+                cargo_patch,
+            )
+            assert created.returncode == 0, created.stderr
+            until(
+                "Cargo button rendered",
+                lambda: ui.pixel(40, 871) == bytes.fromhex("f24dd3"),
+            )
+            ui.click(65, 883)
+            until(
+                "Cargo button ran tests", lambda: (project / "cargo-test-ran").exists()
+            )
             ui.close(client)
 
         # Reconnect to the daemon and run the saved assignment again.

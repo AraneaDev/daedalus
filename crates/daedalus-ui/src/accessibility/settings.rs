@@ -33,9 +33,16 @@ pub(super) fn fields(
     }
     for (index, (control, rect)) in settings.controls(modal).enumerate() {
         let enabled = settings.enabled(control);
-        let review_text = settings.is_import_review_text(control);
+        let read_only = settings.is_read_only_text(control);
         let mut node = match control {
-            _ if review_text => named(Role::Label, settings.label(control)),
+            _ if settings.is_import_review_text(control) => {
+                named(Role::Label, settings.label(control))
+            }
+            _ if read_only => {
+                let mut text = Node::new(Role::Label);
+                text.set_value(settings.label(control));
+                text
+            }
             field if field.field_label().is_some() => {
                 let label = field.field_label().unwrap();
                 let mut field = if enabled {
@@ -66,8 +73,6 @@ pub(super) fn fields(
                     Control::Agy => "Add Agy".into(),
                     Control::Claude => "Add Claude".into(),
                     Control::Codex => "Add Codex".into(),
-                    Control::CargoTest => "Add Cargo Test runner".into(),
-                    Control::CargoCheck => "Add Cargo Check runner".into(),
                     _ => settings.label(control),
                 };
                 let mut button = named(Role::Button, label);
@@ -79,7 +84,7 @@ pub(super) fn fields(
         };
         if enabled {
             node.add_action(Action::Focus);
-        } else if !review_text {
+        } else if !read_only {
             node.set_disabled();
         }
         node.set_bounds(bounds(rect));
@@ -177,6 +182,60 @@ mod tests {
             }
         }
         assert!(click(&mut state, Control::Launch).is_none());
+    }
+
+    #[test]
+    fn composed_widget_details_expose_values_as_static_text() {
+        use daedalus_proto::StatusLevel;
+        use daedalus_proto::workbench::{
+            WidgetDefinition, WidgetDisplay, WidgetElement, WidgetInstance, WidgetResult,
+            WorkbenchState, WorkspaceDocument,
+        };
+
+        let mut state = AppState::new();
+        state.settings.begin(vec![]);
+        state.settings.custom_supported = true;
+        state.settings.open_custom_page();
+        let mut document = WorkspaceDocument::new("Build".into());
+        document.widgets.push(WidgetInstance {
+            id: "build".into(),
+            name: "Build".into(),
+            pinned: true,
+            template: None,
+            definition: Some(WidgetDefinition {
+                display: WidgetDisplay {
+                    elements: vec![WidgetElement::Status],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        });
+        state.settings.custom.accept_snapshot(WorkbenchState {
+            revision: 1,
+            document,
+            repo_baseline: None,
+        });
+        assert!(state.settings.custom.open_details(0));
+        state.settings.custom.preview = Some(WidgetResult {
+            label: "Ready".into(),
+            level: StatusLevel::Ok,
+            details: vec![("Log".into(), "Done".into())],
+            element_values: Default::default(),
+        });
+
+        let tree = crate::accessibility::tree(&state, 580., 640., 1.);
+        let detail = |index| {
+            let target = control_id(&state.settings, Control::CustomDetail(index));
+            &tree.nodes.iter().find(|(id, _)| *id == target).unwrap().1
+        };
+        let status = detail(0);
+        assert_eq!(status.role(), Role::Label);
+        assert_eq!(status.value(), Some("Status · Ready (OK)"));
+        assert!(!status.is_disabled());
+        assert!(!status.supports_action(Action::Focus));
+        assert!(!status.supports_action(Action::Click));
+        assert_eq!(detail(1).label(), Some("Log · Done"));
+        assert!(detail(1).is_disabled());
     }
 
     #[test]

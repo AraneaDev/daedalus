@@ -90,6 +90,7 @@ pub enum WorkbenchOperation {
         widget: String,
         detail_session: uuid::Uuid,
     },
+    WidgetButton(String),
     ImportPreview(uuid::Uuid),
     Import,
     Export(PathBuf),

@@ -1,4 +1,4 @@
-use super::WidgetTarget;
+use super::{DisplayOverrides, WidgetTarget};
 use crate::client::{ClientError, DaemonClient};
 use crate::commands::workspace_config::{print_state, update_widgets, workbench};
 use daedalus_proto::WorkspaceId;
@@ -11,12 +11,14 @@ pub(super) enum Change {
         id: String,
         name: String,
         template: Option<WidgetTemplate>,
-        definition: Option<WidgetDefinition>,
+        definition: Option<Box<WidgetDefinition>>,
+        display: DisplayOverrides,
     },
     Edit {
         id: String,
         draft: Option<WidgetTemplate>,
         name: Option<String>,
+        display: DisplayOverrides,
     },
     Duplicate(String, String),
     Remove(String),
@@ -30,6 +32,7 @@ impl Change {
         name: Option<String>,
         template: Option<WidgetTemplate>,
         inline: Option<WidgetTemplate>,
+        display: DisplayOverrides,
     ) -> Self {
         let name = name
             .or_else(|| {
@@ -43,7 +46,8 @@ impl Change {
             id,
             name,
             template,
-            definition: inline.map(|file| file.definition),
+            definition: inline.map(|file| Box::new(file.definition)),
+            display,
         }
     }
 
@@ -76,30 +80,31 @@ impl Change {
                 name,
                 template,
                 definition,
+                display,
             } => {
                 let mut instance = WidgetInstance {
                     id,
                     name,
                     pinned: true,
                     template: None,
-                    definition,
+                    definition: definition.map(|definition| *definition),
                 };
                 if let Some(template) = template {
                     attach_template(document, &mut instance, template);
                 } else if instance.definition.is_none() {
                     instance.definition = Some(WidgetDefinition::default());
                 }
+                update_display(document, &mut instance, display);
                 document.widgets.push(instance);
             }
-            Self::Edit { id, draft, name } => {
-                if draft.is_none() && name.is_none() {
-                    return Err(
-                        "Provide --file with an edited widget definition or --name to rename it."
-                            .into(),
-                    );
-                }
+            Self::Edit {
+                id,
+                draft,
+                name,
+                display,
+            } => {
                 let index = widget_index(document, &id)?;
-                let widget = &mut document.widgets[index];
+                let mut widget = document.widgets[index].clone();
                 if let Some(draft) = draft {
                     widget.name = draft.name;
                     widget.definition = Some(draft.definition);
@@ -107,6 +112,8 @@ impl Change {
                 if let Some(name) = name {
                     widget.name = name;
                 }
+                update_display(document, &mut widget, display);
+                document.widgets[index] = widget;
             }
             Self::Duplicate(id, new_id) => {
                 let index = widget_index(document, &id)?;
@@ -136,6 +143,22 @@ impl Change {
     }
 }
 
+fn update_display(
+    document: &WorkspaceDocument,
+    widget: &mut WidgetInstance,
+    display: DisplayOverrides,
+) {
+    if widget.definition.is_none()
+        && let Some(base) = document.widget_definition(widget)
+        && !display.matches(&base.display)
+    {
+        widget.definition = Some(base.clone());
+    }
+    if let Some(definition) = &mut widget.definition {
+        display.apply(&mut definition.display);
+    }
+}
+
 pub(super) fn find_widget<'a>(
     document: &'a WorkspaceDocument,
     id: &str,
@@ -143,7 +166,7 @@ pub(super) fn find_widget<'a>(
     Ok(&document.widgets[widget_index(document, id)?])
 }
 
-fn widget_index(document: &WorkspaceDocument, id: &str) -> Result<usize, ClientError> {
+pub(super) fn widget_index(document: &WorkspaceDocument, id: &str) -> Result<usize, ClientError> {
     document
         .widgets
         .iter()

@@ -19,9 +19,9 @@ use accesskit::{
 };
 use daedalus_proto::{AgentState, PaneRole, PaneStatus};
 use daedalus_ui::input::{UiAction, filter_modal_text};
-use daedalus_ui::layout::Rect;
 #[cfg(test)]
 use daedalus_ui::layout::overlays::{worktree_input_rect, worktree_modal_rect};
+use daedalus_ui::layout::{Rect, WorkspaceLayout};
 use daedalus_ui::state::{ActiveOverlay, AppState, ConnectionState};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -317,16 +317,17 @@ pub(super) fn workbench_tree(
     scale: f32,
     controls: &mut TerminalControls,
 ) -> TreeUpdate {
-    workbench_tree_with_search_bar(state, width, height, scale, controls, None)
+    workbench_tree_with_layout(state, width, height, scale, controls, None, None)
 }
 
-pub(super) fn workbench_tree_with_search_bar(
+pub(super) fn workbench_tree_with_layout(
     state: &AppState,
     width: f32,
     height: f32,
     scale: f32,
     controls: &mut TerminalControls,
     search_bar: Option<Rect>,
+    layout: Option<&WorkspaceLayout>,
 ) -> TreeUpdate {
     let mut root = named(Role::Window, "Daedalus Workbench");
     root.set_bounds(bounds(Rect::new(0.0, 0.0, width, height)));
@@ -365,8 +366,10 @@ pub(super) fn workbench_tree_with_search_bar(
     if state.workspace_list_loaded && current_overlay.is_none() {
         controls.append_sidebar(state, &mut root, &mut nodes);
         controls.append_run_tests(state, &mut root, &mut nodes);
-        controls.append_widgets(state, &mut root, &mut nodes);
+        controls.append_widgets(state, &mut root, &mut nodes, layout);
         controls.append_failed_runs(state, &mut root, &mut nodes);
+    } else {
+        controls.retire_widget_cells();
     }
     let focus = if let Some((id, node)) = current_overlay {
         root.push_child(id);
@@ -764,7 +767,7 @@ mod tests {
         let bar = Rect::new(330., 39., 340., 58.);
         let mut controls = TerminalControls::default();
         let render = |state: &AppState, controls: &mut TerminalControls| {
-            workbench_tree_with_search_bar(state, 1000., 600., 1., controls, Some(bar))
+            workbench_tree_with_layout(state, 1000., 600., 1., controls, Some(bar), None)
         };
         let click = |target_node| ActionRequest {
             action: Action::Click,

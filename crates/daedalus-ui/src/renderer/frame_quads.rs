@@ -1,3 +1,4 @@
+use super::footer_widget::FooterWidget;
 use super::{
     agent_tab_mark, banner_appearance, overlay_quads::collect_overlay_quads, pane,
     push_chrome_badge, push_control, push_rect_border, push_status_chip, quads::QuadInstance,
@@ -87,8 +88,12 @@ pub(super) fn collect_prepared_quads(
         for (_, button) in layout.cargo_buttons(s) {
             quads.push(QuadInstance::new(button, theme.bg_sidebar).rounded(5. * s, 0., 0.));
         }
-        for (_, button) in &layout.widget_buttons {
-            quads.push(QuadInstance::new(*button, theme.bg_sidebar).rounded(5. * s, 0., 0.));
+        for &(index, button) in &layout.widget_buttons {
+            if let Some(widget) = FooterWidget::get(state, index) {
+                widget.paint(&mut quads, button, layout.widget_row(index), theme, s);
+            } else {
+                quads.push(QuadInstance::new(button, theme.bg_sidebar).rounded(5. * s, 0., 0.));
+            }
         }
     }
 

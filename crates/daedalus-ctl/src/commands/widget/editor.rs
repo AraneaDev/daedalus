@@ -30,6 +30,7 @@ pub(super) async fn edit(
         id,
         draft: Some(draft),
         name: None,
+        display: Default::default(),
     }
     .save_at(client, workspace, state, selection.json)
     .await

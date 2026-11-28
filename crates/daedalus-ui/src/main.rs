@@ -132,7 +132,6 @@ struct DaedalusApp {
     ui_config: UiConfig,
     project_setups: daedalus_ui::project_setups::ProjectSetups,
     widget_directory: PathBuf,
-    workbench_capable: bool,
     watched_workbench: Option<WorkspaceId>,
     layout_saves: std::collections::HashMap<WorkspaceId, workspace_sharing::LayoutSave>,
     layout_workspace: Option<WorkspaceId>,
@@ -202,7 +201,6 @@ impl DaedalusApp {
         Self {
             project_setups: Default::default(),
             widget_directory,
-            workbench_capable: false,
             watched_workbench: None,
             layout_saves: Default::default(),
             layout_workspace: None,
@@ -741,7 +739,10 @@ impl DaedalusApp {
 
     fn activate_session(&mut self, target: HitTarget) {
         match target {
-            HitTarget::CustomWidget(index) => self.open_widget_details(index),
+            HitTarget::CustomWidget(index) => self.activate_widget(index),
+            HitTarget::WidgetElementAction { widget, element } => {
+                self.activate_widget_element(widget, element)
+            }
             HitTarget::Widget(role) => {
                 if let Some(id) = self.state.pane_id_for_role(role) {
                     if role == PaneRole::Runner && self.state.widget_diagnostic().is_some() {

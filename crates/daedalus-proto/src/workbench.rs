@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 pub const WORKSPACE_FORMAT_VERSION: u32 = 1;
 pub const SHARED_WORKSPACE_FILE: &str = ".daedalus-workspace.toml";
+pub const MIN_WIDGET_WIDTH: u16 = 110;
+pub const MAX_WIDGET_WIDTH: u16 = 1024;
 
 /// Fields changed by a scoped update. A missing scope replaces the whole document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +166,18 @@ pub struct WidgetDefinition {
     pub actions: Vec<NamedAction>,
 }
 
+impl WidgetDefinition {
+    pub fn primary_action(&self) -> Option<&NamedAction> {
+        let id = self.display.primary_action.as_deref()?;
+        self.actions.iter().find(|action| action.id == id)
+    }
+
+    pub fn element_action(&self, index: usize) -> Option<&NamedAction> {
+        let id = self.display.elements.get(index)?.action_id()?;
+        self.actions.iter().find(|candidate| candidate.id == id)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamedSource {
     pub id: String,
@@ -234,8 +248,124 @@ pub enum CommandOutput {
 #[serde(default)]
 pub struct WidgetDisplay {
     pub icon: Option<String>,
+    #[serde(skip_serializing_if = "WidgetStyle::is_default")]
+    pub style: WidgetStyle,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_action: Option<String>,
     pub summary: Vec<WidgetField>,
     pub details: Vec<WidgetField>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub elements: Vec<WidgetElement>,
+    #[serde(skip_serializing_if = "WidgetAppearance::is_default")]
+    pub appearance: WidgetAppearance,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WidgetAppearance {
+    /// Custom outline and control accent as #RRGGBB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
+    /// Preferred footer width in logical pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u16>,
+    pub density: WidgetDensity,
+    pub surface: WidgetSurface,
+    pub status: WidgetStatusPresentation,
+}
+
+impl WidgetAppearance {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn accent_rgb(&self) -> Option<[u8; 3]> {
+        let hex = self.accent.as_deref()?.strip_prefix('#')?;
+        if hex.len() != 6 || !hex.bytes().all(|digit| digit.is_ascii_hexdigit()) {
+            return None;
+        }
+        let [_, red, green, blue] = u32::from_str_radix(hex, 16).ok()?.to_be_bytes();
+        Some([red, green, blue])
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WidgetDensity {
+    Compact,
+    #[default]
+    Standard,
+    Spacious,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WidgetSurface {
+    #[default]
+    Automatic,
+    Flat,
+    Outline,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WidgetStatusPresentation {
+    #[default]
+    LightAndText,
+    Light,
+    Text,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WidgetElement {
+    Label {
+        text: String,
+    },
+    Status,
+    Counter {
+        #[serde(flatten)]
+        field: WidgetField,
+    },
+    Progress {
+        #[serde(flatten)]
+        field: WidgetField,
+        max: u64,
+    },
+    Button {
+        action: String,
+    },
+}
+
+impl WidgetElement {
+    pub fn value_field(&self) -> Option<&WidgetField> {
+        match self {
+            Self::Counter { field } | Self::Progress { field, .. } => Some(field),
+            _ => None,
+        }
+    }
+
+    pub fn action_id(&self) -> Option<&str> {
+        match self {
+            Self::Button { action } => Some(action),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WidgetStyle {
+    #[default]
+    Badge,
+    Button,
+    Led,
+}
+
+impl WidgetStyle {
+    fn is_default(&self) -> bool {
+        *self == Self::Badge
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,10 +404,20 @@ pub struct NamedAction {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WidgetAction {
     Diff,
-    Terminal { role: PaneRole },
-    Logs { role: PaneRole },
-    OpenUrl { url: String },
-    Command { command: WorkspaceCommand },
+    Terminal {
+        role: PaneRole,
+    },
+    Logs {
+        role: PaneRole,
+    },
+    OpenUrl {
+        url: String,
+    },
+    Command {
+        command: WorkspaceCommand,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        run_in_runner: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +426,27 @@ pub struct WidgetResult {
     pub level: StatusLevel,
     #[serde(default)]
     pub details: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub element_values: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl WidgetResult {
+    pub fn status_text(&self) -> String {
+        let severity = match self.level {
+            StatusLevel::Info => "Status",
+            StatusLevel::Ok => "OK",
+            StatusLevel::Warn => "Warning",
+            StatusLevel::Error => "Error",
+        };
+        format!("{severity} · {}", self.label)
+    }
+
+    pub fn element_value(&self, field: &WidgetField) -> Option<&str> {
+        self.element_values
+            .get(&field.source)?
+            .get(&field.field)
+            .map(String::as_str)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,4 +460,5 @@ pub enum WidgetActionResult {
     Pane(crate::PaneId),
     OpenUrl(String),
     Output(WidgetResult),
+    RunnerStarted(crate::PaneSummary),
 }

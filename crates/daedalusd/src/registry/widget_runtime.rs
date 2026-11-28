@@ -5,7 +5,7 @@ use crate::workbench::runtime::{SourceFields, WidgetInputs, evaluate_widget};
 use crate::workbench::scheduler::{Trigger, WidgetCommands};
 use crate::workbench::{command, sources};
 use daedalus_proto::workbench::{
-    CommandOutput, WidgetAction, WidgetActionResult, WidgetDefinition, WidgetResult,
+    CommandOutput, NamedAction, WidgetAction, WidgetActionResult, WidgetDefinition, WidgetResult,
     WidgetSnapshot, WidgetSource, WorkspaceCommand,
 };
 use daedalus_proto::{PaneRole, ProtoError, WorkspaceId, WorkspaceInfo};
@@ -24,16 +24,9 @@ impl Registry {
         widget_id: &str,
         action_id: &str,
     ) -> Result<WidgetActionResult, ProtoError> {
+        let lifecycle = self.lock_workspace_lifecycle(id).await?;
         let state = self.workbench(id).await?;
-        let definition = state
-            .document
-            .widgets
-            .iter()
-            .find(|widget| widget.id == widget_id)
-            .and_then(|widget| state.document.widget_definition(widget))
-            .ok_or_else(|| {
-                ProtoError::InvalidRequest(format!("No widget with ID '{widget_id}'"))
-            })?;
+        let definition = widget_definition(&state.document, widget_id)?;
         let action = definition
             .actions
             .iter()
@@ -41,10 +34,57 @@ impl Registry {
             .ok_or_else(|| {
                 ProtoError::InvalidRequest(format!("No action with ID '{action_id}'"))
             })?;
-        let workspace = self.widget_workspace(id).await?;
+        self.execute_widget_action(id, action, lifecycle, None)
+            .await
+    }
+
+    pub(crate) async fn activate_widget(
+        &self,
+        id: WorkspaceId,
+        widget_id: &str,
+        revision: u64,
+        action_id: Option<&str>,
+        size: (u16, u16),
+    ) -> Result<WidgetActionResult, ProtoError> {
+        let lifecycle = self.lock_workspace_lifecycle(id).await?;
+        let state = self.workbench(id).await?;
+        if state.revision != revision {
+            return Err(ProtoError::InvalidRequest(
+                "The widgets changed. Review the current button and try again.".into(),
+            ));
+        }
+        let definition = widget_definition(&state.document, widget_id)?;
+        let action = match action_id {
+            Some(id) => definition
+                .display
+                .elements
+                .iter()
+                .position(|element| element.action_id() == Some(id))
+                .and_then(|index| definition.element_action(index))
+                .ok_or_else(|| {
+                    ProtoError::InvalidRequest(format!("No button action with ID '{id}'"))
+                })?,
+            None => definition.primary_action().ok_or_else(|| {
+                ProtoError::InvalidRequest("This widget has no primary action.".into())
+            })?,
+        };
+        self.execute_widget_action(id, action, lifecycle, Some(size))
+            .await
+    }
+
+    async fn execute_widget_action(
+        &self,
+        id: WorkspaceId,
+        action: &NamedAction,
+        lifecycle: tokio::sync::OwnedMutexGuard<()>,
+        button_size: Option<(u16, u16)>,
+    ) -> Result<WidgetActionResult, ProtoError> {
         let spec = match &action.action {
             WidgetAction::Terminal { role } | WidgetAction::Logs { role } => {
-                return workspace
+                drop(lifecycle);
+                return self
+                    .widget_workspace(id)
+                    .await?
                     .info
                     .panes
                     .iter()
@@ -59,8 +99,42 @@ impl Registry {
                 env: Vec::new(),
                 timeout_seconds: None,
             },
-            WidgetAction::Command { command } => command.clone(),
+            WidgetAction::Command {
+                command,
+                run_in_runner: false,
+            } => command.clone(),
+            WidgetAction::Command {
+                command,
+                run_in_runner: true,
+            } => {
+                let (cols, rows) = button_size.unwrap_or((120, 36));
+                let pane = self
+                    .install_pane(
+                        id,
+                        PaneRole::Runner,
+                        Some(command.argv.clone()),
+                        None,
+                        cols,
+                        rows,
+                        Default::default(),
+                        None,
+                        false,
+                        None,
+                    )
+                    .await?;
+                if button_size.is_some() {
+                    return Ok(WidgetActionResult::RunnerStarted(pane));
+                }
+                return Ok(WidgetActionResult::Output(WidgetResult {
+                    label: "Runner started".into(),
+                    level: daedalus_proto::StatusLevel::Info,
+                    details: Vec::new(),
+                    element_values: Default::default(),
+                }));
+            }
         };
+        drop(lifecycle);
+        let workspace = self.widget_workspace(id).await?;
         let fields = command::run(
             &workspace.info,
             &spec,
@@ -267,6 +341,18 @@ impl Registry {
         }
         evaluate_widget(definition, &inputs, name)
     }
+}
+
+fn widget_definition<'a>(
+    document: &'a daedalus_proto::workbench::WorkspaceDocument,
+    widget_id: &str,
+) -> Result<&'a WidgetDefinition, ProtoError> {
+    document
+        .widgets
+        .iter()
+        .find(|widget| widget.id == widget_id)
+        .and_then(|widget| document.widget_definition(widget))
+        .ok_or_else(|| ProtoError::InvalidRequest(format!("No widget with ID '{widget_id}'")))
 }
 impl WidgetWorkspace {
     async fn pane_fields(&self, role: PaneRole, assignment: Option<&str>) -> SourceFields {
@@ -586,7 +672,101 @@ mod tests {
                 env: Vec::new(),
                 timeout_seconds: Some(3),
             },
+            run_in_runner: false,
         }
+    }
+
+    #[tokio::test]
+    async fn widget_button_launches_only_a_declared_action_at_the_current_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = test_registry(dir.path());
+        let workspace = install_actions(
+            &registry,
+            dir.path(),
+            vec![action(
+                "run",
+                WidgetAction::Command {
+                    command: WorkspaceCommand {
+                        argv: vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
+                        env: Vec::new(),
+                        timeout_seconds: None,
+                    },
+                    run_in_runner: true,
+                },
+            )],
+        )
+        .await;
+        let state = registry.workbench(workspace).await.unwrap();
+        let mut document = state.document;
+        let definition = document.widgets[0].definition.as_mut().unwrap();
+        definition
+            .actions
+            .push(action("secondary", command_action(&["/bin/true"])));
+        definition
+            .display
+            .elements
+            .push(daedalus_proto::workbench::WidgetElement::Button {
+                action: "run".into(),
+            });
+        registry
+            .update_workbench(workspace, Some(state.revision), document)
+            .await
+            .unwrap();
+
+        assert!(
+            registry
+                .activate_widget(workspace, "report", state.revision, Some("run"), (100, 30))
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .activate_widget(
+                    workspace,
+                    "report",
+                    state.revision + 1,
+                    Some("secondary"),
+                    (100, 30)
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .widget_workspace(workspace)
+                .await
+                .unwrap()
+                .info
+                .panes
+                .is_empty()
+        );
+        let WidgetActionResult::RunnerStarted(pane) = registry
+            .activate_widget(
+                workspace,
+                "report",
+                state.revision + 1,
+                Some("run"),
+                (100, 30),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected a runner to start");
+        };
+        assert_eq!((pane.cols, pane.rows), (100, 30));
+        let workspace = registry.widget_workspace(workspace).await.unwrap();
+        let [handle] = workspace.handles.as_slice() else {
+            panic!("expected one pane")
+        };
+        assert_eq!(handle.id(), pane.id);
+        assert_eq!(handle.role(), PaneRole::Runner);
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            while handle.summary().await.unwrap().status != (PaneStatus::Exited { code: Some(7) }) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

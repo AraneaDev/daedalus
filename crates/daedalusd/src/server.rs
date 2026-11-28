@@ -640,7 +640,8 @@ async fn dispatch_request(
         | ClientMessage::EncodeWidgetTemplate { .. }
         | ClientMessage::PreviewWidget { .. }
         | ClientMessage::GetWidgetResults { .. }
-        | ClientMessage::InvokeWidgetAction { .. }) => {
+        | ClientMessage::InvokeWidgetAction { .. }
+        | ClientMessage::ActivateWidget { .. }) => {
             workbench::dispatch(registry, filter, request).await
         }
     }

@@ -5,9 +5,11 @@ use daedalus_proto::workbench::{
 use daedalus_proto::{ClientMessage, WorkspaceId};
 
 mod draft;
+mod elements;
 mod fields;
 mod import_review;
 
+pub(crate) use draft::AppearanceInputError;
 pub use draft::WidgetDraft;
 use import_review::ImportReview;
 
@@ -33,6 +35,7 @@ pub struct WidgetEditor {
     pub showing_details: bool,
     pub action_output: bool,
     pub detail_page: usize,
+    pub(crate) detail_action_page: usize,
     pub advanced: bool,
     pub definition_json: String,
     pub path: String,
@@ -58,6 +61,7 @@ impl WidgetEditor {
         self.showing_details = true;
         self.action_output = false;
         self.detail_page = 0;
+        self.detail_action_page = 0;
         self.detail_session = Some(uuid::Uuid::new_v4());
         true
     }
@@ -253,6 +257,24 @@ impl WidgetEditor {
             {
                 draft.revision = snapshot.revision;
             }
+        }
+        if self.showing_details
+            && self.selected().is_some_and(|selected| {
+                let previous = self
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.document.widget_definition(selected));
+                let next = snapshot
+                    .document
+                    .widgets
+                    .iter()
+                    .find(|widget| widget.id == selected.id)
+                    .and_then(|widget| snapshot.document.widget_definition(widget));
+                previous != next
+            })
+        {
+            self.detail_page = 0;
+            self.detail_action_page = 0;
         }
         let widgets = &snapshot.document.widgets;
         match &self.selection {

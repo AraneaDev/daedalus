@@ -270,6 +270,15 @@ pub enum ClientMessage {
         widget: String,
         action: String,
     },
+    ActivateWidget {
+        workspace_id: WorkspaceId,
+        widget: String,
+        revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<String>,
+        cols: u16,
+        rows: u16,
+    },
     /// Recompute the proposal with the user's choices without applying it.
     ResolveWorkspaceImport {
         workspace_id: WorkspaceId,

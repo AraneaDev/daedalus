@@ -57,7 +57,7 @@ impl DaedalusApp {
         }
         self.sync_history_visit();
         match event {
-            UiEvent::WorkbenchCapability(supported) => self.workbench_capable = supported,
+            UiEvent::WorkbenchCapability(supported) => self.state.workbench_capable = supported,
             UiEvent::Workbench {
                 workspace_id,
                 operation,
@@ -104,7 +104,7 @@ impl DaedalusApp {
                 root_dir,
                 assignments,
             } => {
-                if self.workbench_capable {
+                if self.state.workbench_capable {
                     self.send_command(UiCommand::ReconcileWorkspaceMembership);
                 } else {
                     self.project_setup_changed(&root_dir, assignments);

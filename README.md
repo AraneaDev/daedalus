@@ -91,11 +91,9 @@ and Claude sessions have distinct tab marks alongside their session names.
 
 ![Focused agent terminal with compact service and runner summaries](docs/images/focused-workbench.png)
 
-In Cargo workspaces, choose **Cargo Test** or **Cargo Check** in the bottom bar to run the preset
-on the workspace host while keeping your agent in view. In workspace **Settings**, use
-**+ Cargo Test** or **+ Cargo Check** to save an editable runner command.
-To hide either automatic shortcut for this workspace, open **Settings → Widgets**,
-choose **Hide Cargo Test** or **Hide Cargo Check**, then select **Save widgets**.
+Add the **Cargo Test** or **Cargo Check** templates in **Settings → Custom widgets** to run
+Cargo from the bottom bar. Use **Unpin** to hide a widget from the bar. To save an editable
+runner command in the pane launcher, open **Settings → Assignments** and choose **+ Command**.
 
 ![Full Windows workbench with Codex and Claude tabs, terminal output, and the Cargo bottom bar](docs/images/windows-agent-tabs.png)
 
@@ -136,9 +134,40 @@ Open **Settings → Custom widgets → New widget** to start from a blank widget
 editable template. The built-in templates include Git Worktree, Cargo Test, Cargo
 Check, Clippy, Dev Server, Docker Compose, and Custom Status. Use **Test preview**
 to check the result, then pin the widget to the bottom bar or leave it in Settings.
+Use **On click** in the widget editor to choose between opening details and running
+an action directly from the bottom bar. Open **View widget details** in Custom widgets
+to inspect status and other actions for a button widget. The Cargo Test and Cargo Check
+templates start a runner terminal when clicked.
+
+Use **Style** to switch between a **Badge**, an outlined **Button**, and an **LED** with
+a status light and label. The LED uses the widget's current status and theme colors.
+Choose the click action separately. **Save as template** saves the style, sources, and
+actions together for reuse.
+
+Open **Appearance** in the widget editor to set an icon, a `#RRGGBB` accent, density,
+preferred width, surface style, or status presentation. A preferred width is measured in
+logical pixels and can shrink with the bottom bar. The accent styles borders and controls.
+Status presentation applies to standalone LEDs and Status elements. They use the theme's
+status colors and keep their text available to assistive technology in light-only mode.
+
+Use **Elements** in the widget editor to build an ordered row from these parts.
+
+| Element | What it shows |
+| --- | --- |
+| Label | Text you supply |
+| Status | A light and the widget's current status |
+| Counter | A value from a widget source, with an optional label |
+| Progress | A source value against a positive maximum |
+| Button | A named action you can run directly |
+
+When the row needs more space than the bottom bar has, open the widget to see its elements
+and run its actions in **Custom widgets**. Templates store the row in `display.elements`.
+Each button in the row runs its named action. Clicking the rest of the widget opens its details.
+
 The **Advanced** editor accepts the full widget definition, including multiple
-sources, highlight rules, icons, and actions. Select a widget in the bottom bar
-to see its details and actions.
+sources, highlight rules, icons, and actions. Set `display.style` to `badge`, `button`,
+or `led` and `display.primary_action` to a named action ID. Set `run_in_runner` on a
+command action to run its arguments in a terminal.
 
 ![Daedalus workbench with the Git Worktree template open in the widget editor](docs/images/widget-editor.png)
 
@@ -170,7 +199,8 @@ workspace for the current directory unless supplied a workspace ID or directory.
 ```sh
 daedalus-ctl widget template list
 daedalus-ctl widget create branch --template git-worktree
-daedalus-ctl widget edit branch
+daedalus-ctl widget edit branch --style led
+daedalus-ctl widget show branch
 daedalus-ctl widget template export git-worktree --file worktree-widget.toml
 daedalus-ctl workspace export --file .daedalus-workspace.toml
 daedalus-ctl workspace import --repo --dry-run --json
@@ -180,6 +210,78 @@ daedalus-ctl workspace update --dry-run --json
 
 Use `widget preview --file worktree-widget.toml` to test a definition, and
 `workspace configure --edit` to edit the complete setup in your terminal editor.
+Both `widget create` and `widget edit` accept `--style badge|button|led`.
+Use `--elements` with a JSON array to set the ordered row from the CLI. Use `[]` to
+clear it. Counter and progress elements use the widget's source and field IDs, and
+button elements use its action IDs. Set `max` to the value at full completion for a progress bar.
+
+```sh
+daedalus-ctl widget edit demo-runner --elements \
+  '[{"kind":"status"},{"kind":"counter","source":"runner","field":"passed","label":"Passed"},{"kind":"button","action":"run-tests"}]'
+```
+
+#### Configure widgets from an agent
+
+`widget show --effective` returns the instance's name, pin state, position, template,
+workspace revision, and full definition, including settings inherited from a template.
+`widget configure --patch` accepts a JSON object from a file or from stdin with `--patch -`.
+Omitted keys keep their current values. Objects merge by key and arrays are replaced as a whole.
+The patch can set `name`, `pinned`, one-based `order`, `template`, and any part of `definition`,
+including sources, refresh policies, rules, actions, elements, and appearance.
+
+```sh
+daedalus-ctl widget show demo-runner --effective
+daedalus-ctl widget configure demo-runner --patch - --dry-run --json <<'JSON'
+{
+  "definition": {
+    "display": {
+      "appearance": {
+        "accent": "#818CF8",
+        "width": 720,
+        "density": "compact",
+        "surface": "outline",
+        "status": "light_and_text"
+      }
+    }
+  }
+}
+JSON
+```
+
+Drop `--dry-run` to apply the same patch. Add `--create` to allow creating a missing widget,
+or `--expect-revision REVISION` to reject changes made against an older workspace revision.
+The daemon validates the preview without saving or running widget sources. A `null`
+definition restores inheritance for a widget with a template. A `null` template detaches it.
+Use `workspace import --file PATH --dry-run --json` to preview a full workspace configuration
+that also includes layout and pane assignments.
+
+### Workbench examples in this repository
+
+The project's [Daedalus manifest](.daedalus.toml) defines a **Runner** for the workspace's
+Cargo tests and a **Service** for a Python 3 demo server. The server listens on
+`127.0.0.1:18765` and serves the [public example directory](examples/workbench/public/).
+Open this checkout in Daedalus to use the pane commands.
+
+Add the [Runner button](examples/workbench/runner-button.toml) and
+[Service LED](examples/workbench/service-led.toml) with these commands from the checkout.
+
+```sh
+daedalus-ctl widget create demo-runner --dir . --file examples/workbench/runner-button.toml
+daedalus-ctl widget create demo-service --dir . --file examples/workbench/service-led.toml
+```
+
+The Runner widget puts **Run tests** next to its status and test counts. The Service LED reports
+when the daemon observes the demo port. To reuse either template in the desktop editor, open
+**Settings → Custom widgets → Import / export** and choose **Import widget template**.
+From the CLI, use `widget template import --file PATH` to add it to the library.
+
+To start the demo server from the CLI in an existing workspace, get its UUID from
+`daedalus-ctl workspace list` and pass it to `pane spawn`.
+
+```sh
+daedalus-ctl pane spawn WORKSPACE_UUID --role service -- \
+  python3 -m http.server 18765 --bind 127.0.0.1 --directory examples/workbench/public
+```
 
 ## Terminal links, activity and image previews
 

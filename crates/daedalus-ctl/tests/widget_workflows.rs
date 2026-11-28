@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::oneshot;
 
@@ -58,6 +59,24 @@ impl Workbench {
 
     async fn run(&self, args: &[&str]) -> String {
         output(self.command(args).output().await.unwrap())
+    }
+
+    async fn run_with_input(&self, args: &[&str], input: &str) -> String {
+        let mut command = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        command
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .await
+            .unwrap();
+        output(command.wait_with_output().await.unwrap())
     }
 
     async fn reject(&self, args: &[&str], expected: &str) -> String {
@@ -115,10 +134,475 @@ kind = "open_url"
 url = "https://example.invalid/review"
 "#;
 
+const TEMPLATE_ELEMENTS: &str =
+    "\n[[template.definition.display.elements]]\nkind = 'button'\naction = 'open'\n";
+
+#[tokio::test]
+async fn widget_agent_show_resolves_inherited_configuration() {
+    let app = Workbench::start().await;
+    let workspace = app.workspace(app.directory.path()).await;
+    let target = ["--workspace", workspace.as_str()];
+    let create = ["widget", "create", "branch", "--template", "git-worktree"];
+    app.run(&[&create[..], &target].concat()).await;
+    let show = ["widget", "show", "branch"];
+    let raw: Value = serde_json::from_str(&app.run(&[&show[..], &target].concat()).await).unwrap();
+    assert!(raw.get("definition").is_none());
+    assert!(raw.get("revision").is_none());
+
+    let effective: Value = serde_json::from_str(
+        &app.run(&[&show[..], &target, &["--effective"]].concat())
+            .await,
+    )
+    .unwrap();
+    assert_eq!(effective["id"], "branch");
+    assert_eq!(effective["revision"], 1);
+    assert_eq!(effective["name"], "Git Worktree");
+    assert_eq!(effective["pinned"], true);
+    assert_eq!(effective["order"], 1);
+    assert_eq!(effective["template"], "git-worktree");
+    assert_eq!(effective["definition"]["sources"][0]["kind"], "git");
+    assert_eq!(effective["definition"]["actions"][0]["kind"], "diff");
+    let display = &effective["definition"]["display"];
+    assert_eq!(display["style"], "badge");
+    assert_eq!(display["elements"], serde_json::json!([]));
+    assert_eq!(display["appearance"]["density"], "standard");
+    assert_eq!(display["appearance"].get("width"), Some(&Value::Null));
+    assert_eq!(display.get("primary_action"), Some(&Value::Null));
+    app.finish().await;
+}
+
+#[tokio::test]
+async fn widget_agent_configure_merges_instance_and_definition_from_stdin() {
+    let app = Workbench::start().await;
+    let workspace = app.workspace(app.directory.path()).await;
+    let target = ["--workspace", workspace.as_str()];
+    let template = app.file("review.toml");
+    let contents = TEMPLATE.replace(
+        "[[template.definition.display.details]]",
+        "[template.definition.display]\nicon = 'review'\nprimary_action = 'open'\n[[template.definition.display.details]]",
+    );
+    std::fs::write(&template, format!("{contents}{TEMPLATE_ELEMENTS}")).unwrap();
+    app.run(&[
+        "widget",
+        "template",
+        "create",
+        "--file",
+        template.to_str().unwrap(),
+    ])
+    .await;
+    for id in ["first", "branch"] {
+        let create = ["widget", "create", id, "--template", "review"];
+        app.run(&[&create[..], &target].concat()).await;
+    }
+    let configure = ["widget", "configure", "branch", "--patch", "-", "--json"];
+    let patch = r##"{
+        "name": "Review",
+        "pinned": false,
+        "order": 1,
+        "definition": {
+            "display": {
+                "icon": null,
+                "style": "led",
+                "elements": [{"kind": "label", "text": "Branch"}],
+                "primary_action": null,
+                "appearance": {"width": 520, "accent": "#818CF8"}
+            },
+            "rules": [{
+                "field": {"source": "review", "field": "detail"},
+                "condition": {"kind": "missing"},
+                "level": "warn"
+            }]
+        }
+    }"##;
+    let args = [&configure[..], &target].concat();
+    let result: Value = serde_json::from_str(
+        &app.run_with_input(
+            &[args.as_slice(), &["--expect-revision", "2"]].concat(),
+            patch,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(result["name"], "Review");
+    assert_eq!(result["pinned"], false);
+    assert_eq!(result["order"], 1);
+    assert_eq!(result["template"], "review");
+    assert_eq!(result["revision"], 3);
+    assert_eq!(result["changed"], true);
+    assert_eq!(result["dry_run"], false);
+    assert_eq!(result["definition"]["display"]["style"], "led");
+    assert!(result["definition"]["display"]["icon"].is_null());
+    assert_eq!(
+        result["definition"]["display"]["elements"][0]["text"],
+        "Branch"
+    );
+    assert!(result["definition"]["display"]["primary_action"].is_null());
+    assert_eq!(result["definition"]["display"]["appearance"]["width"], 520);
+    assert_eq!(
+        result["definition"]["display"]["appearance"]["accent"],
+        "#818CF8"
+    );
+    assert_eq!(result["definition"]["actions"][0]["kind"], "open_url");
+    assert_eq!(result["definition"]["rules"][0]["level"], "warn");
+
+    let repeated: Value = serde_json::from_str(&app.run_with_input(&args, patch).await).unwrap();
+    assert_eq!(repeated["changed"], false);
+    assert_eq!(repeated["revision"], 3);
+    let show = ["widget", "show", "branch", "--effective"];
+    let branch: Value =
+        serde_json::from_str(&app.run(&[&show[..], &target].concat()).await).unwrap();
+    assert_eq!(branch["definition"], result["definition"]);
+    let show = ["widget", "show", "first", "--effective"];
+    let first: Value =
+        serde_json::from_str(&app.run(&[&show[..], &target].concat()).await).unwrap();
+    assert_eq!(first["order"], 2);
+    assert_eq!(first["definition"]["rules"], serde_json::json!([]));
+    assert_eq!(first["definition"]["display"]["primary_action"], "open");
+    app.finish().await;
+}
+
+#[tokio::test]
+async fn widget_agent_configure_dry_run_validates_without_saving_or_running_sources() {
+    let app = Workbench::start().await;
+    let workspace = app.workspace(app.directory.path()).await;
+    let target = ["--workspace", workspace.as_str()];
+    let patch_file = app.file("patch.json");
+    let file = patch_file.to_str().unwrap();
+    let marker = app.file("ran");
+    #[cfg(unix)]
+    let argv = [
+        "/bin/sh",
+        "-c",
+        "touch \"$1\"",
+        "widget",
+        marker.to_str().unwrap(),
+    ];
+    #[cfg(windows)]
+    let argv = ["cmd", "/C", "type nul >", marker.to_str().unwrap()];
+    let patch = serde_json::json!({
+        "name": "Dry run",
+        "definition": {
+            "sources": [{
+                "id": "probe",
+                "kind": "command",
+                "command": {"argv": argv}
+            }],
+            "display": {"elements": [{"kind": "status"}]}
+        }
+    });
+    std::fs::write(file, patch.to_string()).unwrap();
+
+    let configure = [
+        "widget",
+        "configure",
+        "probe",
+        "--patch",
+        file,
+        "--json",
+        "--create",
+    ];
+    let args = [&configure[..], &target].concat();
+    let dry_run = [args.as_slice(), &["--dry-run"]].concat();
+    let preview: Value = serde_json::from_str(&app.run(&dry_run).await).unwrap();
+    assert_eq!(preview["name"], "Dry run");
+    assert_eq!(preview["revision"], 0);
+    assert_eq!(preview["changed"], true);
+    assert_eq!(preview["dry_run"], true);
+    assert!(!marker.exists());
+    let show = ["widget", "show", "probe"];
+    app.reject(&[&show[..], &target].concat(), "No widget with ID")
+        .await;
+
+    let mut invalid = patch.clone();
+    invalid["definition"]["display"]["primary_action"] = serde_json::json!("missing");
+    std::fs::write(file, invalid.to_string()).unwrap();
+    app.reject(&dry_run, "unknown primary action").await;
+    app.reject(&args, "unknown primary action").await;
+    app.reject(&[&show[..], &target].concat(), "No widget with ID")
+        .await;
+
+    let mut invalid = patch.clone();
+    invalid["definition"]["display"]["appearance"] = serde_json::json!({"accent": "violet"});
+    std::fs::write(file, invalid.to_string()).unwrap();
+    app.reject(&dry_run, "accent color in #RRGGBB format").await;
+
+    std::fs::write(file, patch.to_string()).unwrap();
+    app.reject(
+        &[args.as_slice(), &["--expect-revision", "1"]].concat(),
+        "revision 0",
+    )
+    .await;
+    assert!(!marker.exists());
+    app.finish().await;
+}
+
+#[tokio::test]
+async fn widget_agent_rejects_unknown_nested_patch_fields_without_saving() {
+    let app = Workbench::start().await;
+    let workspace = app.workspace(app.directory.path()).await;
+    let target = ["--workspace", workspace.as_str()];
+    let create = ["widget", "create", "branch", "--template", "git-worktree"];
+    app.run(&[&create[..], &target].concat()).await;
+    let patch_file = app.file("typo.json");
+    let configure = [
+        "widget",
+        "configure",
+        "branch",
+        "--patch",
+        patch_file.to_str().unwrap(),
+    ];
+    let args = [&configure[..], &target].concat();
+    let dry_run = [args.as_slice(), &["--dry-run"]].concat();
+    std::fs::write(
+        &patch_file,
+        r#"{"name":"Changed", "definition":{"display":{"appearance":{"witdh":null}}}}"#,
+    )
+    .unwrap();
+    for command in [&args, &dry_run] {
+        app.reject(command, "definition.display.appearance.witdh")
+            .await;
+    }
+    let show = ["widget", "show", "branch", "--effective"];
+    let saved: Value =
+        serde_json::from_str(&app.run(&[&show[..], &target].concat()).await).unwrap();
+    assert_eq!(saved["revision"], 1);
+    assert_eq!(saved["name"], "Git Worktree");
+    app.finish().await;
+}
+
+#[tokio::test]
+async fn widget_agent_dry_run_validates_the_workspace_document() {
+    let app = Workbench::start().await;
+    let workspace = app
+        .run(&[
+            "workspace",
+            "create",
+            " ",
+            "--dir",
+            app.directory.path().to_str().unwrap(),
+        ])
+        .await;
+    let target = ["--workspace", workspace.trim()];
+    let patch_file = app.file("default.json");
+    std::fs::write(&patch_file, "{}").unwrap();
+    let configure = [
+        "widget",
+        "configure",
+        "probe",
+        "--create",
+        "--patch",
+        patch_file.to_str().unwrap(),
+    ];
+    let args = [&configure[..], &target].concat();
+    let dry_run = [args.as_slice(), &["--dry-run"]].concat();
+    for command in [&args, &dry_run] {
+        app.reject(command, "workspace requires a valid name").await;
+    }
+    app.finish().await;
+}
+
+#[tokio::test]
+async fn widget_agent_configure_can_create_detach_and_restore_template_inheritance() {
+    let app = Workbench::start().await;
+    let workspace = app.workspace(app.directory.path()).await;
+    let target = ["--workspace", workspace.as_str()];
+    let configure = ["widget", "configure", "branch", "--patch", "-", "--json"];
+    let args = [&configure[..], &target].concat();
+    let created: Value = serde_json::from_str(
+        &app.run_with_input(
+            &[args.as_slice(), &["--create"]].concat(),
+            r#"{"template":"git-worktree"}"#,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(created["name"], "Git Worktree");
+    let git = &created["definition"];
+
+    let detached: Value =
+        serde_json::from_str(&app.run_with_input(&args, r#"{"template":null}"#).await).unwrap();
+    assert!(detached["template"].is_null());
+    assert_eq!(&detached["definition"], git);
+
+    let retargeted: Value = serde_json::from_str(
+        &app.run_with_input(&args, r#"{"template":"custom-status","definition":null}"#)
+            .await,
+    )
+    .unwrap();
+    assert_eq!(retargeted["template"], "custom-status");
+    assert_eq!(retargeted["definition"]["sources"][0]["kind"], "published");
+    let show = ["widget", "show", "branch"];
+    let raw: Value = serde_json::from_str(&app.run(&[&show[..], &target].concat()).await).unwrap();
+    assert!(raw.get("definition").is_none());
+    app.finish().await;
+}
+
+#[tokio::test]
+async fn widget_style_flags_preserve_template_actions_and_allow_reset() {
+    let app = Workbench::start().await;
+    let workspace = app.workspace(app.directory.path()).await;
+    let id = workspace.as_str();
+    app.run(&[
+        "widget",
+        "create",
+        "branch",
+        "--template",
+        "git-worktree",
+        "--style",
+        "led",
+        "--workspace",
+        id,
+    ])
+    .await;
+    let show = ["widget", "show", "branch", "--workspace", id];
+    let led: Value = serde_json::from_str(&app.run(&show).await).unwrap();
+    assert_eq!(led["style"], "led");
+    assert_eq!(led["template"], "git-worktree");
+    assert_eq!(led["definition"]["actions"][0]["kind"], "diff");
+
+    for style in ["button", "badge"] {
+        app.run(&[
+            "widget",
+            "edit",
+            "branch",
+            "--style",
+            style,
+            "--workspace",
+            id,
+        ])
+        .await;
+        let current: Value = serde_json::from_str(&app.run(&show).await).unwrap();
+        assert_eq!(current["style"], style);
+        assert_eq!(
+            current["definition"]["actions"],
+            led["definition"]["actions"]
+        );
+        assert_eq!(
+            current["definition"]["sources"],
+            led["definition"]["sources"]
+        );
+    }
+    app.finish().await;
+}
+
+#[tokio::test]
+async fn widget_elements_override_a_file_in_order_and_keep_its_definition() {
+    let app = Workbench::start().await;
+    let workspace = app.workspace(app.directory.path()).await;
+    let template = app.file("review.toml");
+    std::fs::write(&template, format!("{TEMPLATE}{TEMPLATE_ELEMENTS}")).unwrap();
+    let composition = r#"[
+        {"kind":"label","text":"Review"},
+        {"kind":"status"},
+        {"kind":"counter","source":"review","field":"open","label":"Open"},
+        {"kind":"progress","source":"review","field":"percent","max":100},
+        {"kind":"button","action":"open"}
+    ]"#;
+    app.run(&[
+        "widget",
+        "create",
+        "review",
+        "--file",
+        template.to_str().unwrap(),
+        "--elements",
+        composition,
+        "--style",
+        "led",
+        "--workspace",
+        &workspace,
+    ])
+    .await;
+    let show = ["widget", "show", "review", "--workspace", &workspace];
+    let widget: Value = serde_json::from_str(&app.run(&show).await).unwrap();
+    let elements: Value = serde_json::from_str(composition).unwrap();
+    assert_eq!(widget["elements"], elements);
+    assert_eq!(widget["definition"]["display"]["elements"], elements);
+    assert_eq!(widget["style"], "led");
+    assert_eq!(widget["definition"]["actions"][0]["id"], "open");
+    assert_eq!(widget["definition"]["sources"][0]["id"], "review");
+    app.reject(
+        &[
+            "widget",
+            "edit",
+            "review",
+            "--elements",
+            r#"{"kind":"status"}"#,
+            "--workspace",
+            &workspace,
+        ],
+        "JSON array",
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&app.run(&show).await).unwrap(),
+        widget
+    );
+    app.finish().await;
+}
+
+#[tokio::test]
+async fn widget_edit_can_clear_elements_inherited_from_a_template() {
+    let app = Workbench::start().await;
+    let workspace = app.workspace(app.directory.path()).await;
+    let template = app.file("review.toml");
+    std::fs::write(&template, format!("{TEMPLATE}{TEMPLATE_ELEMENTS}")).unwrap();
+    app.run(&[
+        "widget",
+        "template",
+        "create",
+        "--file",
+        template.to_str().unwrap(),
+    ])
+    .await;
+    let elements = r#"[{"kind":"button","action":"open"}]"#;
+    for (widget, flags) in [
+        ("first", &[][..]),
+        ("second", &["--elements", elements][..]),
+    ] {
+        let mut create = vec![
+            "widget",
+            "create",
+            widget,
+            "--template",
+            "review",
+            "--workspace",
+            &workspace,
+        ];
+        create.extend_from_slice(flags);
+        app.run(&create).await;
+    }
+    let first = ["widget", "show", "first", "--workspace", &workspace];
+    let inherited: Value = serde_json::from_str(&app.run(&first).await).unwrap();
+    let elements: Value = serde_json::from_str(elements).unwrap();
+    assert_eq!(inherited["elements"], elements);
+    assert!(inherited.get("definition").is_none());
+
+    app.run(&[
+        "widget",
+        "edit",
+        "first",
+        "--elements",
+        "[]",
+        "--workspace",
+        &workspace,
+    ])
+    .await;
+    let cleared: Value = serde_json::from_str(&app.run(&first).await).unwrap();
+    assert_eq!(cleared["elements"], serde_json::json!([]));
+    assert_eq!(cleared["template"], "review");
+    assert_eq!(cleared["definition"]["actions"][0]["id"], "open");
+    let unaffected: Value = serde_json::from_str(
+        &app.run(&["widget", "show", "second", "--workspace", &workspace])
+            .await,
+    )
+    .unwrap();
+    assert_eq!(unaffected["elements"], elements);
+    assert!(unaffected.get("definition").is_none());
+    app.finish().await;
+}
+
 #[tokio::test]
 async fn template_library_updates_leave_existing_workspaces_usable() {
-    use tokio::io::AsyncWriteExt;
-
     let app = Workbench::start().await;
     let template = app.file("review.toml");
     std::fs::write(&template, TEMPLATE).unwrap();

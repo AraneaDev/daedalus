@@ -4,12 +4,13 @@ mod selection;
 mod terminal_mouse;
 
 use super::{DaedalusApp, ViewportMetrics};
-use daedalus_proto::{PaneId, PaneRole};
+use daedalus_proto::{PaneId, PaneRole, WorkspaceId};
 use daedalus_ui::input::UiAction;
+use daedalus_ui::layout::footer::WidgetFooterCellKind;
 use daedalus_ui::layout::overlays::search_bar_rect;
-use daedalus_ui::layout::{Divider, HitTarget, PaneSplits, WorkspaceLayout, hit_test};
+use daedalus_ui::layout::{Divider, HitTarget, PaneSplits, Rect, WorkspaceLayout, hit_test};
 use daedalus_ui::selection::CellPos;
-use daedalus_ui::state::AppState;
+use daedalus_ui::state::{ActiveOverlay, AppState};
 use std::time::Instant;
 
 use dividers::{DividerDrag, divider_at};
@@ -50,6 +51,13 @@ pub(super) struct PointerState {
     last_click: Option<(Instant, PaneId, u16, u16)>,
     terminal_press: Option<TerminalPress>,
     terminal_hover: Option<(PaneId, u16, u16)>,
+    painted_widget_footer: Option<PaintedWidgetFooter>,
+}
+
+struct PaintedWidgetFooter {
+    workspace: WorkspaceId,
+    revision: u64,
+    buttons: Vec<(HitTarget, Rect)>,
 }
 
 impl PointerState {
@@ -71,6 +79,44 @@ impl PointerState {
 }
 
 impl DaedalusApp {
+    pub(super) fn record_painted_widget_footer(&mut self, layout: &WorkspaceLayout) {
+        self.pointer.painted_widget_footer =
+            self.state
+                .workbench
+                .as_ref()
+                .and_then(|(workspace, state)| {
+                    if self.state.active_workspace_id != Some(*workspace)
+                    || matches!(self.state.active_overlay(), Some(overlay) if overlay != ActiveOverlay::Search)
+                    {
+                        return None;
+                    }
+                    let buttons = layout
+                        .widget_rows
+                        .iter()
+                        .flat_map(|row| {
+                            row.cells
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, cell)| cell.kind == WidgetFooterCellKind::Button)
+                                .map(|(element, cell)| {
+                                    (
+                                        HitTarget::WidgetElementAction {
+                                            widget: row.widget,
+                                            element,
+                                        },
+                                        cell.bounds,
+                                    )
+                                })
+                        })
+                        .collect();
+                    Some(PaintedWidgetFooter {
+                        workspace: *workspace,
+                        revision: state.revision,
+                        buttons,
+                    })
+                });
+    }
+
     pub(super) fn handle_left_mouse_down(&mut self) {
         if let Some(metrics) = self.viewport_metrics() {
             self.click_at(metrics);
@@ -104,7 +150,40 @@ impl DaedalusApp {
             y,
         );
 
+        if !self.confirm_painted_widget_target(target, (x, y)) {
+            self.request_redraw();
+            return;
+        }
+
         self.activate_hit_target(&layout, target);
+    }
+
+    fn confirm_painted_widget_target(&self, target: HitTarget, (x, y): (f32, f32)) -> bool {
+        let painted = self
+            .pointer
+            .painted_widget_footer
+            .as_ref()
+            .and_then(|footer| {
+                let (hit, _) = footer
+                    .buttons
+                    .iter()
+                    .find(|(_, bounds)| bounds.contains(x, y))?;
+                Some((footer.workspace, footer.revision, *hit))
+            });
+        match (painted, target) {
+            (Some((id, revision, hit)), HitTarget::WidgetElementAction { .. }) => {
+                hit == target
+                    && self
+                        .state
+                        .workbench
+                        .as_ref()
+                        .is_some_and(|(current_id, current)| {
+                            id == *current_id && revision == current.revision
+                        })
+            }
+            (None, HitTarget::WidgetElementAction { .. }) | (Some(_), _) => false,
+            _ => true,
+        }
     }
 
     fn handle_viewport_controls(&mut self, layout: &WorkspaceLayout, scale: f32) -> bool {
@@ -196,7 +275,10 @@ impl DaedalusApp {
             HitTarget::RunCargo(preset) => self.handle_ui_action(UiAction::RunCargo(preset)),
             HitTarget::RunTests => self.handle_ui_action(UiAction::RunTests),
             HitTarget::OpenSessions => self.handle_ui_action(UiAction::OpenSessions),
-            HitTarget::CustomWidget(index) => self.open_widget_details(index),
+            HitTarget::CustomWidget(index) => self.activate_widget(index),
+            HitTarget::WidgetElementAction { widget, element } => {
+                self.activate_widget_element(widget, element)
+            }
             HitTarget::WorkspaceSettings => self.open_workspace_settings(),
             HitTarget::SidebarNewWorkspace => self.create_new_workspace(),
             HitTarget::SidebarNewWorktree => self.open_worktree_modal(),

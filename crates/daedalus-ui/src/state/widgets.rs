@@ -36,13 +36,15 @@ impl AppState {
         [overrides, defaults].into_iter().flatten()
     }
 
-    pub fn has_cargo_presets(&self) -> bool {
-        self.active_workspace()
-            .is_some_and(|ws| ws.project.tools.iter().any(|tool| tool == "Cargo"))
+    pub fn legacy_cargo_shortcuts_available(&self) -> bool {
+        !self.workbench_capable
+            && self
+                .active_workspace()
+                .is_some_and(|ws| ws.project.tools.iter().any(|tool| tool == "Cargo"))
     }
 
     pub fn cargo_preset_visible(&self, preset: CargoPreset) -> bool {
-        self.has_cargo_presets()
+        self.legacy_cargo_shortcuts_available()
             && !self
                 .active_workspace_id
                 .and_then(|id| self.workspace_widgets.get(&id))

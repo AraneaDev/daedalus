@@ -171,6 +171,7 @@ fn late_widget_test_cannot_populate_the_next_draft() {
     };
     let result = |label: &str| {
         Ok(ResponsePayload::WidgetResult(WidgetResult {
+            element_values: Default::default(),
             label: label.into(),
             level: StatusLevel::Ok,
             details: Vec::new(),
@@ -608,7 +609,7 @@ fn same_folder_workspaces_keep_separate_confirmed_runners() {
     b.root_dir.clone_from(&a.root_dir);
     let (a_id, b_id) = (a.id, b.id);
     w.app.state.set_workspaces(vec![a, b]);
-    w.app.workbench_capable = true;
+    w.app.state.workbench_capable = true;
     for (id, name, executable, revision) in [
         (a_id, "First runner", "first", 1),
         (b_id, "Second runner", "second", 1),
@@ -643,7 +644,7 @@ fn unrelated_workbench_save_preserves_the_widget_draft() {
     let ws = workspace("Draft");
     let id = ws.id;
     w.app.state.set_workspaces(vec![ws]);
-    w.app.workbench_capable = true;
+    w.app.state.workbench_capable = true;
     w.app.open_workspace_settings();
     w.app.workbench_response(
         id,
@@ -1015,6 +1016,7 @@ fn widget_detail_pages_hold_action_output_until_explicit_refresh() {
         Ok(ResponsePayload::Workbench(state)),
     );
     let result = WidgetResult {
+        element_values: Default::default(),
         label: "Ready".into(),
         level: StatusLevel::Ok,
         details: vec![(
@@ -1070,6 +1072,7 @@ fn widget_detail_pages_hold_action_output_until_explicit_refresh() {
         if widget == "runner" && action == "terminal")
     );
     let action_output = WidgetResult {
+        element_values: Default::default(),
         label: "Detailed output".into(),
         level: StatusLevel::Info,
         details: vec![],
@@ -1162,6 +1165,7 @@ fn manual_widget_refresh_ignores_results_for_an_older_workbench_snapshot() {
     let snapshot = |label: &str| WidgetSnapshot {
         id: "manual".into(),
         result: WidgetResult {
+            element_values: Default::default(),
             label: label.into(),
             level: StatusLevel::Ok,
             details: vec![],
@@ -1458,6 +1462,7 @@ fn duplicate_widget_test_keeps_the_in_flight_preview() {
         id,
         operation,
         Ok(ResponsePayload::WidgetResult(WidgetResult {
+            element_values: Default::default(),
             label: "Ready".into(),
             level: StatusLevel::Ok,
             details: Vec::new(),
@@ -1532,6 +1537,7 @@ fn busy_widget_preview_rejection_settles_only_its_request() {
         id,
         original,
         Ok(ResponsePayload::WidgetResult(WidgetResult {
+            element_values: Default::default(),
             label: "Original".into(),
             level: StatusLevel::Ok,
             details: Vec::new(),
@@ -1548,6 +1554,7 @@ fn busy_widget_preview_rejection_settles_only_its_request() {
         id,
         operation,
         Ok(ResponsePayload::WidgetResult(WidgetResult {
+            element_values: Default::default(),
             label: "Edited".into(),
             level: StatusLevel::Ok,
             details: Vec::new(),
@@ -1964,6 +1971,43 @@ fn reconnect_reloads_a_layout_base_and_workspace_removal_discards_the_pending_sa
         Ok(ResponsePayload::Workbench(ack)),
     );
     assert!(w.idle());
+}
+
+#[test]
+fn cargo_workspaces_with_workbench_support_use_custom_widgets() {
+    use daedalus_ui::assignments::CargoPreset;
+
+    let mut w = Workbench::new();
+    let mut project = workspace("Cargo project with widgets");
+    project.project.tools.push("Cargo".into());
+    w.app.state.set_workspaces(vec![project]);
+    w.app
+        .handle_daemon_event(UiEvent::WorkbenchCapability(true));
+
+    w.app.open_workspace_settings();
+    apply_control(&mut w, Control::WidgetsPage);
+    let settings = &w.app.state.settings;
+    assert!(
+        settings
+            .control_order()
+            .any(|c| c == Control::CustomWidgetsPage)
+    );
+    assert!(
+        settings
+            .control_order()
+            .all(|c| !matches!(c, Control::CargoTestShortcut | Control::CargoCheckShortcut))
+    );
+    assert!(
+        CargoPreset::ALL
+            .into_iter()
+            .all(|preset| !w.app.state.cargo_preset_visible(preset))
+    );
+    let viewport = ViewportMetrics {
+        size: (650, 550).into(),
+        scale_factor: 1.,
+        cell: (8., 16.),
+    };
+    assert!(w.app.layout_for(viewport).cargo_bar.is_none());
 }
 
 #[test]

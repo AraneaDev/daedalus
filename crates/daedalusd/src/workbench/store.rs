@@ -243,12 +243,14 @@ impl WorkbenchStore {
         if let Some(library) = &memory.library {
             return Ok(library.clone());
         }
-        Ok(
-            load_json(self.library_path().as_deref())?.unwrap_or_else(|| WidgetLibrary {
-                revision: 0,
-                templates: super::templates::builtins(),
-            }),
-        )
+        if let Some(mut library) = load_json::<WidgetLibrary>(self.library_path().as_deref())? {
+            super::templates::refresh_cargo_templates(&mut library.templates);
+            return Ok(library);
+        }
+        Ok(WidgetLibrary {
+            revision: 0,
+            templates: super::templates::builtins(),
+        })
     }
 
     fn workspace_path(&self, id: WorkspaceId) -> Option<PathBuf> {

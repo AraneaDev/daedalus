@@ -84,10 +84,25 @@ pub fn evaluate_widget(
             details.push((key["detail.".len()..].to_owned(), value.clone()));
         }
     }
+    let mut element_values = WidgetInputs::new();
+    for field in definition
+        .display
+        .elements
+        .iter()
+        .filter_map(|element| element.value_field())
+    {
+        if let Some(value) = read(field) {
+            element_values
+                .entry(field.source.clone())
+                .or_default()
+                .insert(field.field.clone(), value.clone());
+        }
+    }
     WidgetResult {
         label,
         level,
         details,
+        element_values,
     }
 }
 

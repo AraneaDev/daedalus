@@ -41,17 +41,26 @@ pub(super) fn project(
             }
         }
         for action in &definition.actions {
-            if let WidgetAction::Command { command } = &action.action {
+            if let WidgetAction::Command {
+                command,
+                run_in_runner,
+            } = &action.action
+            {
                 append_command(
                     &mut details,
                     format!("{} · {}", widget.name, action.label),
                     command,
-                    "Manual action",
+                    if *run_in_runner {
+                        "Manual runner launch"
+                    } else {
+                        "Manual action"
+                    },
                 );
             }
         }
     }
     WidgetResult {
+        element_values: Default::default(),
         label,
         level: StatusLevel::Info,
         details,
@@ -122,7 +131,10 @@ mod tests {
             actions: vec![NamedAction {
                 id: "run".into(),
                 label: "Run".into(),
-                action: WidgetAction::Command { command },
+                action: WidgetAction::Command {
+                    command,
+                    run_in_runner: false,
+                },
             }],
             ..Default::default()
         };

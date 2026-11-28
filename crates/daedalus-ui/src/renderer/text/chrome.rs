@@ -5,12 +5,17 @@ use super::{
     CHROME_SUB_FONT_SIZE_LOGICAL, CHROME_SUB_LINE_HEIGHT_LOGICAL, ChromeLineSpec, Rect, Theme,
     WorkspaceLayout, truncate_right_with_ellipsis,
 };
+use crate::layout::footer::{
+    WidgetFooterCellKind, WidgetFooterRow, widget_status_text_inset, widget_text_inset,
+};
 use crate::layout::{PaneRect, sidebar_workspace_close_rect};
+use crate::renderer::footer_widget::{FooterWidget, status_color};
 use crate::renderer::sidebar::{Badge, BadgeKind, Card};
 use crate::renderer::{
     SidebarCards, active_external_detail_preview, banner_appearance, format_ports_summary,
 };
 use crate::state::WorkspaceView;
+use daedalus_proto::workbench::{WidgetDensity, WidgetStatusPresentation, WidgetStyle};
 use daedalus_proto::{PaneRole, PaneStatus};
 
 fn workspace_disclosure_labels(
@@ -172,47 +177,58 @@ impl TextRenderer {
                 bold: true,
             });
         }
-        for (index, bounds) in &layout.widget_buttons {
-            let widget =
-                index.and_then(|index| state.workbench.as_ref()?.1.document.widgets.get(index));
-            let result = widget.and_then(|widget| {
-                state
-                    .widget_results
-                    .iter()
-                    .find(|snapshot| snapshot.id == widget.id)
-            });
-            let definition = widget.and_then(|widget| {
-                state
-                    .workbench
-                    .as_ref()?
-                    .1
-                    .document
-                    .widget_definition(widget)
-            });
-            let label = result
-                .map(|snapshot| snapshot.result.label.as_str())
-                .or_else(|| widget.map(|widget| widget.name.as_str()))
-                .unwrap_or("More widgets");
-            let title = definition
-                .and_then(|definition| definition.display.icon.as_deref())
-                .map_or_else(|| label.to_owned(), |icon| format!("{icon} {label}"));
-            let color = match result.map(|snapshot| snapshot.result.level) {
-                Some(daedalus_proto::StatusLevel::Ok) => theme.status_ok,
-                Some(daedalus_proto::StatusLevel::Warn) => theme.status_busy,
-                Some(daedalus_proto::StatusLevel::Error) => theme.status_err,
+        for &(index, bounds) in &layout.widget_buttons {
+            if let Some(row) = layout.widget_row(index) {
+                self.build_widget_row_text(row, theme);
+                continue;
+            }
+            let widget = FooterWidget::get(state, index);
+            let style = widget
+                .as_ref()
+                .map_or(WidgetStyle::default(), FooterWidget::style);
+            let title = widget
+                .as_ref()
+                .map_or_else(|| "More widgets".into(), FooterWidget::title);
+            let text_inset = widget.as_ref().map_or_else(
+                || widget_text_inset(WidgetDensity::Standard),
+                FooterWidget::text_inset,
+            );
+            let inset = if widget
+                .as_ref()
+                .is_some_and(FooterWidget::shows_status_light)
+            {
+                widget_status_text_inset(text_inset)
+            } else {
+                text_inset
+            } * s;
+            let color = match (style, widget.as_ref()) {
+                (WidgetStyle::Badge, Some(widget)) => {
+                    widget.status_color(theme, theme.text_primary)
+                }
+                (WidgetStyle::Led, Some(widget))
+                    if widget.status_presentation() == WidgetStatusPresentation::Text =>
+                {
+                    widget.status_color(theme, theme.text_primary)
+                }
                 _ => theme.text_primary,
             };
-            self.push_chrome_button(ChromeLineSpec {
+            let spec = ChromeLineSpec {
                 text: &title,
-                bounds: *bounds,
-                left: bounds.x + 6. * s,
+                bounds,
+                left: bounds.x + inset,
                 top: bounds.y + (bounds.height - CHROME_LINE_HEIGHT_LOGICAL * s) * 0.5,
-                max_w: (bounds.width - 12. * s).max(1.),
+                max_w: (bounds.width - inset - text_inset * s).max(1.),
                 font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
                 line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
                 color,
-                bold: false,
-            });
+                bold: style == WidgetStyle::Button
+                    || widget.is_some_and(|widget| widget.action.is_some()),
+            };
+            if style == WidgetStyle::Led {
+                self.push_chrome_line(spec);
+            } else {
+                self.push_chrome_button(spec);
+            }
         }
         for &(role, rect) in &layout.insight_rows {
             if let Some(text) = state.focused_widget_label(role) {
@@ -239,6 +255,45 @@ impl TextRenderer {
                 self.build_pane_header_text(pane_rect, state, theme, layout);
             }
             self.build_empty_pane_text(state, pane_rect, theme);
+        }
+    }
+
+    fn build_widget_row_text(&mut self, row: &WidgetFooterRow, theme: &Theme) {
+        let scale = self.scale_factor;
+        let trailing = row.text_inset * scale;
+        for cell in &row.cells {
+            if matches!(cell.kind, WidgetFooterCellKind::Status(_))
+                && row.status == WidgetStatusPresentation::Light
+            {
+                continue;
+            }
+            let bounds = cell.bounds;
+            let leading = cell.kind.leading_text_inset(row.text_inset, row.status) * scale;
+            let button = matches!(cell.kind, WidgetFooterCellKind::Button);
+            let progress = matches!(cell.kind, WidgetFooterCellKind::Progress { .. });
+            let color = match cell.kind {
+                WidgetFooterCellKind::Status(level) => {
+                    status_color(level, theme, theme.text_primary)
+                }
+                _ => theme.text_primary,
+            };
+            let spec = ChromeLineSpec {
+                text: &cell.text,
+                bounds,
+                left: bounds.x + leading,
+                top: bounds.y + (bounds.height - CHROME_LINE_HEIGHT_LOGICAL * scale) * 0.5
+                    - if progress { 2. * scale } else { 0. },
+                max_w: bounds.width - leading - trailing,
+                font_size_logical: CHROME_SUB_FONT_SIZE_LOGICAL,
+                line_height_logical: CHROME_LINE_HEIGHT_LOGICAL,
+                color,
+                bold: button,
+            };
+            if button {
+                self.push_chrome_button(spec);
+            } else {
+                self.push_chrome_line(spec);
+            }
         }
     }
 

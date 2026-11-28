@@ -79,7 +79,7 @@ impl TemplateAction {
                 selection,
             } => {
                 let template = load_template(client, &template).await?;
-                Change::create(id, None, Some(template), None)
+                Change::create(id, None, Some(template), None, Default::default())
                     .save(client, selection)
                     .await?;
             }

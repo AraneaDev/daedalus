@@ -1,7 +1,7 @@
 use super::{DaedalusApp, import_review};
 use daedalus_proto::workbench::WidgetActionResult;
 use daedalus_proto::{ClientMessage, ResponsePayload, WorkspaceId};
-use daedalus_ui::bridge::WorkbenchOperation;
+use daedalus_ui::bridge::{UiCommand, WorkbenchOperation};
 
 impl DaedalusApp {
     pub(super) fn workbench_auxiliary_response(
@@ -63,7 +63,9 @@ impl DaedalusApp {
                     && let Some(widget) = self.state.settings.custom.selected()
                     && let Some(snapshot) = results.iter().find(|snapshot| snapshot.id == widget.id)
                 {
-                    self.state.settings.custom.preview = Some(snapshot.result.clone());
+                    self.state
+                        .settings
+                        .update_widget_detail_result(snapshot.result.clone());
                 }
                 self.state.widget_results = results;
             }
@@ -164,7 +166,23 @@ impl DaedalusApp {
         operation: WorkbenchOperation,
         action: WidgetActionResult,
     ) {
+        if matches!(operation, WorkbenchOperation::WidgetButton(_))
+            && self.state.active_workspace_id != Some(id)
+        {
+            return;
+        }
         match action {
+            WidgetActionResult::RunnerStarted(pane) => {
+                let pane_id = pane.id;
+                let role = pane.role;
+                if !self.state.panes.contains_key(&pane_id) {
+                    self.state.register_pane(pane, false);
+                    self.send_command(UiCommand::RequestSnapshot { pane_id });
+                }
+                self.state.select_role_pane(id, role, pane_id);
+                self.schedule_resize_flush();
+                self.show_toast("Runner started", false);
+            }
             WidgetActionResult::Pane(pane) => {
                 if let Some(role) = self.state.panes.get(&pane).map(|state| state.summary.role) {
                     self.state.select_session(id, role, pane);
@@ -179,6 +197,32 @@ impl DaedalusApp {
                 }
             }
             WidgetActionResult::Output(result) => {
+                if let WorkbenchOperation::WidgetButton(widget) = &operation {
+                    let index = self.state.workbench.as_ref().and_then(|(_, state)| {
+                        state
+                            .document
+                            .widgets
+                            .iter()
+                            .position(|item| item.id == *widget)
+                    });
+                    if !result.details.is_empty()
+                        && !self.state.settings.open
+                        && let Some(index) = index
+                    {
+                        self.open_widget_details(Some(index));
+                        if self.state.settings.custom.showing_details {
+                            let editor = &mut self.state.settings.custom;
+                            editor.action_output = true;
+                            editor.preview = Some(result);
+                            return;
+                        }
+                    }
+                    self.show_toast(
+                        result.label,
+                        result.level == daedalus_proto::StatusLevel::Error,
+                    );
+                    return;
+                }
                 if settings
                     && self.state.settings.is_custom_page()
                     && let WorkbenchOperation::WidgetAction {

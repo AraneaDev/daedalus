@@ -1,14 +1,23 @@
 use std::collections::HashMap;
 
 use super::choice_dialogs::ChoiceControls;
-use super::{named, overlay, workspace_controls::WorkspaceControls};
+use super::{bounds, named, overlay, workspace_controls::WorkspaceControls};
 use accesskit::{Action, ActionRequest, Node, NodeId, Role, TreeId};
 use daedalus_proto::{PaneId, WorkspaceId};
 use daedalus_ui::assignments::CargoPreset;
-use daedalus_ui::layout::HitTarget;
+use daedalus_ui::layout::footer::WidgetFooterCellKind;
+use daedalus_ui::layout::{HitTarget, Rect, WorkspaceLayout};
 use daedalus_ui::state::{AppState, ConnectionState, WorkspaceView};
 
 const TAB_LIST: NodeId = NodeId(18);
+
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct WidgetCellId {
+    workspace: WorkspaceId,
+    revision: u64,
+    widget: String,
+    index: usize,
+}
 
 /// Platform requests can arrive after a pane closes. Allocate IDs once and never recycle them.
 #[derive(Default)]
@@ -21,6 +30,7 @@ pub(crate) struct TerminalControls {
     sidebar: WorkspaceControls,
     panes: HashMap<PaneId, u64>,
     widgets: HashMap<(WorkspaceId, String), NodeId>,
+    widget_cells: HashMap<WidgetCellId, NodeId>,
     choices: ChoiceControls,
 }
 
@@ -143,7 +153,9 @@ impl TerminalControls {
         state: &AppState,
         root: &mut Node,
         nodes: &mut Vec<(NodeId, Node)>,
+        layout: Option<&WorkspaceLayout>,
     ) {
+        let mut old_cells = std::mem::take(&mut self.widget_cells);
         let Some((workspace, stored)) = &state.workbench else {
             return;
         };
@@ -158,16 +170,113 @@ impl TerminalControls {
                     .iter()
                     .any(|candidate| &candidate.id == widget)
         });
-        for widget in &stored.document.widgets {
+        for (index, widget) in stored.document.widgets.iter().enumerate() {
             let node = *self
                 .widgets
                 .entry((*workspace, widget.id.clone()))
                 .or_insert_with(|| next_control_group(&mut self.serial));
-            let mut control = named(Role::Button, format!("Open {} widget", widget.name));
+            let definition = stored.document.widget_definition(widget);
+            let action = definition
+                .filter(|definition| widget.pinned && definition.display.elements.is_empty())
+                .and_then(|definition| definition.primary_action());
+            let label = action.map_or_else(
+                || format!("Open {} widget", widget.name),
+                |action| action.label.clone(),
+            );
+            let mut control = named(Role::Button, label);
+            let status_in_fallback = definition.is_some_and(|definition| {
+                if definition.display.elements.is_empty() {
+                    definition.display.style == daedalus_proto::workbench::WidgetStyle::Led
+                } else {
+                    layout
+                        .and_then(|layout| layout.widget_row(Some(index)))
+                        .is_none()
+                        && definition.display.elements.iter().any(|element| {
+                            matches!(element, daedalus_proto::workbench::WidgetElement::Status)
+                        })
+                }
+            });
+            if status_in_fallback {
+                let description = state
+                    .widget_results
+                    .iter()
+                    .find(|snapshot| snapshot.id == widget.id)
+                    .map_or_else(
+                        || "No status".into(),
+                        |snapshot| snapshot.result.status_text(),
+                    );
+                control.set_description(description);
+            }
             control.add_action(Action::Click);
+            if let Some((rect, row)) = layout.and_then(|layout| {
+                let rect = layout
+                    .widget_buttons
+                    .iter()
+                    .find(|(slot, _)| *slot == Some(index))?
+                    .1;
+                Some((rect, layout.widget_row(Some(index))))
+            }) {
+                control.set_bounds(bounds(rect));
+                if let Some(row) = row {
+                    let mut group = named(Role::Group, &widget.name);
+                    group.set_bounds(bounds(rect));
+                    group.push_child(node);
+                    nodes.push((node, control));
+                    for (index, cell) in row.cells.iter().enumerate() {
+                        let key = WidgetCellId {
+                            workspace: *workspace,
+                            revision: stored.revision,
+                            widget: widget.id.clone(),
+                            index,
+                        };
+                        let cell_id = old_cells
+                            .remove(&key)
+                            .unwrap_or_else(|| next_control_group(&mut self.serial));
+                        self.widget_cells.insert(key, cell_id);
+                        group.push_child(cell_id);
+                        nodes.push((
+                            cell_id,
+                            widget_cell_node(cell.bounds, &cell.text, cell.kind),
+                        ));
+                    }
+                    let group_id = NodeId(node.0 + 1);
+                    root.push_child(group_id);
+                    nodes.push((group_id, group));
+                    continue;
+                }
+            }
             root.push_child(node);
             nodes.push((node, control));
         }
+    }
+
+    pub(crate) fn retire_widget_cells(&mut self) {
+        self.widget_cells.clear();
+    }
+
+    fn widget_element_action(&self, state: &AppState, target: NodeId) -> Option<HitTarget> {
+        let (workspace, stored) = state.workbench.as_ref()?;
+        let (key, _) = self.widget_cells.iter().find(|(_, id)| **id == target)?;
+        if Some(*workspace) != state.active_workspace_id
+            || key.workspace != *workspace
+            || key.revision != stored.revision
+        {
+            return None;
+        }
+        let (widget, instance) = stored
+            .document
+            .widgets
+            .iter()
+            .enumerate()
+            .find(|(_, widget)| widget.pinned && widget.id == key.widget)?;
+        stored
+            .document
+            .widget_definition(instance)?
+            .element_action(key.index)?;
+        Some(HitTarget::WidgetElementAction {
+            widget,
+            element: key.index,
+        })
     }
     fn pane_base(&mut self, pane: PaneId) -> u64 {
         *self
@@ -310,9 +419,34 @@ impl TerminalControls {
         terminal
     }
 
+    pub(crate) fn action_with_layout(
+        &self,
+        state: &AppState,
+        request: &ActionRequest,
+        live_layout: impl FnOnce() -> Option<WorkspaceLayout>,
+    ) -> Option<HitTarget> {
+        let target = self.action(state, request)?;
+        if let HitTarget::WidgetElementAction { widget, element } = target
+            && !live_layout().is_some_and(|layout| {
+                layout
+                    .widget_row(Some(widget))
+                    .and_then(|row| row.cells.get(element))
+                    .is_some_and(|cell| cell.kind == WidgetFooterCellKind::Button)
+            })
+        {
+            return None;
+        }
+        Some(target)
+    }
+
     pub(crate) fn action(&self, state: &AppState, request: &ActionRequest) -> Option<HitTarget> {
         if request.target_tree != TreeId::ROOT || overlay(state).is_some() {
             return None;
+        }
+        if request.action == Action::Click
+            && let Some(target) = self.widget_element_action(state, request.target_node)
+        {
+            return Some(target);
         }
         if request.action == Action::Click
             && let Some((workspace, stored)) = &state.workbench
@@ -352,4 +486,31 @@ impl TerminalControls {
             }
         })
     }
+}
+
+fn widget_cell_node(rect: Rect, text: &str, kind: WidgetFooterCellKind) -> Node {
+    let mut node = match kind {
+        WidgetFooterCellKind::Text => {
+            let mut label = Node::new(Role::Label);
+            label.set_value(text);
+            label
+        }
+        WidgetFooterCellKind::Status(_) => named(Role::Status, text),
+        WidgetFooterCellKind::Progress { value, max } => {
+            let mut progress = named(Role::ProgressIndicator, text);
+            if let Some(value) = value {
+                progress.set_numeric_value(value.min(max) as f64);
+                progress.set_min_numeric_value(0.);
+                progress.set_max_numeric_value(max as f64);
+            }
+            progress
+        }
+        WidgetFooterCellKind::Button => {
+            let mut button = named(Role::Button, text);
+            button.add_action(Action::Click);
+            button
+        }
+    };
+    node.set_bounds(bounds(rect));
+    node
 }

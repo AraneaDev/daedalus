@@ -1,7 +1,8 @@
 use daedalus_proto::validate_assignments;
 use daedalus_proto::workbench::{
-    TemplateDocument, WORKSPACE_FORMAT_VERSION, WidgetAction, WidgetDefinition, WidgetSource,
-    WidgetTemplate, WorkspaceCommand, WorkspaceDocument,
+    MAX_WIDGET_WIDTH, MIN_WIDGET_WIDTH, TemplateDocument, WORKSPACE_FORMAT_VERSION, WidgetAction,
+    WidgetDefinition, WidgetElement, WidgetSource, WidgetTemplate, WorkspaceCommand,
+    WorkspaceDocument,
 };
 use std::collections::HashSet;
 use thiserror::Error;
@@ -135,6 +136,17 @@ pub fn validate_template(template: &WidgetTemplate) -> Result<(), DocumentError>
 }
 
 pub fn validate_definition(definition: &WidgetDefinition, path: &str) -> Result<(), DocumentError> {
+    let appearance = &definition.display.appearance;
+    if appearance.accent.is_some() && appearance.accent_rgb().is_none() {
+        return invalid(format!("{path} requires an accent color in #RRGGBB format"));
+    }
+    if let Some(width) = appearance.width
+        && !(MIN_WIDGET_WIDTH..=MAX_WIDGET_WIDTH).contains(&width)
+    {
+        return invalid(format!(
+            "{path} requires a preferred width between {MIN_WIDGET_WIDTH} and {MAX_WIDGET_WIDTH}"
+        ));
+    }
     let mut sources = HashSet::new();
     for named in &definition.sources {
         insert_id(&mut sources, &named.id, &format!("source in {path}"))?;
@@ -155,6 +167,13 @@ pub fn validate_definition(definition: &WidgetDefinition, path: &str) -> Result<
         .iter()
         .chain(&definition.display.details)
         .chain(definition.rules.iter().map(|rule| &rule.field))
+        .chain(
+            definition
+                .display
+                .elements
+                .iter()
+                .filter_map(WidgetElement::value_field),
+        )
     {
         if !sources.contains(field.source.as_str()) {
             return invalid(format!(
@@ -173,8 +192,41 @@ pub fn validate_definition(definition: &WidgetDefinition, path: &str) -> Result<
     for action in &definition.actions {
         insert_id(&mut actions, &action.id, &format!("action in {path}"))?;
         validate_name(&action.label, &format!("{path} action '{}'", action.id))?;
-        if let WidgetAction::Command { command } = &action.action {
-            validate_command(command, &format!("{path} action '{}'", action.id))?;
+        let action_path = format!("{path} action '{}'", action.id);
+        if let WidgetAction::Command {
+            command,
+            run_in_runner,
+        } = &action.action
+        {
+            validate_command(command, &action_path)?;
+            if *run_in_runner && (!command.env.is_empty() || command.timeout_seconds.is_some()) {
+                return invalid(format!(
+                    "{action_path} uses the runner environment and does not accept a widget timeout"
+                ));
+            }
+        }
+    }
+    if let Some(id) = &definition.display.primary_action
+        && !actions.contains(id.as_str())
+    {
+        return invalid(format!("{path} references unknown primary action '{id}'"));
+    }
+    for (index, element) in definition.display.elements.iter().enumerate() {
+        let element_path = format!("{path} element {}", index + 1);
+        match element {
+            WidgetElement::Label { text } => validate_name(text, &element_path)?,
+            WidgetElement::Progress { max, .. } if !(1..=i64::MAX as u64).contains(max) => {
+                return invalid(format!(
+                    "{element_path} requires a positive maximum no greater than {}",
+                    i64::MAX
+                ));
+            }
+            WidgetElement::Button { action } if !actions.contains(action.as_str()) => {
+                return invalid(format!(
+                    "{element_path} references unknown action '{action}'"
+                ));
+            }
+            _ => {}
         }
     }
     Ok(())

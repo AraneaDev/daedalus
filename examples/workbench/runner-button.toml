@@ -1,0 +1,49 @@
+version = 1
+
+[template]
+id = "example-runner-button"
+name = "Workspace tests"
+
+[[template.definition.sources]]
+id = "runner"
+kind = "runner"
+
+[template.definition.display]
+style = "button"
+
+[template.definition.display.appearance]
+accent = "#818CF8"
+width = 680
+density = "compact"
+surface = "outline"
+
+[[template.definition.display.elements]]
+kind = "status"
+
+[[template.definition.display.elements]]
+kind = "counter"
+source = "runner"
+field = "passed"
+label = "Passed"
+
+[[template.definition.display.elements]]
+kind = "counter"
+source = "runner"
+field = "failed"
+label = "Failed"
+
+[[template.definition.display.elements]]
+kind = "button"
+action = "run-tests"
+
+[[template.definition.display.details]]
+source = "runner"
+field = "phase"
+label = "Status"
+
+[[template.definition.actions]]
+id = "run-tests"
+label = "Run tests"
+kind = "command"
+run_in_runner = true
+command = { argv = ["cargo", "test", "--workspace"] }

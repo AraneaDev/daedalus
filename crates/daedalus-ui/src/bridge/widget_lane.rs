@@ -49,7 +49,9 @@ impl<'a> WidgetLane<'a> {
             ClientMessage::GetWidgetResults {
                 refresh: Some(_), ..
             } => Some("Refreshing widget…"),
-            ClientMessage::InvokeWidgetAction { .. } => Some("Running widget action…"),
+            ClientMessage::InvokeWidgetAction { .. } | ClientMessage::ActivateWidget { .. } => {
+                Some("Running widget action…")
+            }
             ClientMessage::GetWidgetResults { refresh: None, .. } => None,
             _ => return false,
         };

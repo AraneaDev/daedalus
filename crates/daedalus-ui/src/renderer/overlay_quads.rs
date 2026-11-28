@@ -226,7 +226,7 @@ impl OverlayQuads<'_> {
         );
         let modal = state.settings.modal_rect(screen_w, screen_h, s);
         for (control, rect) in state.settings.controls(modal) {
-            if state.settings.is_import_review_text(control) {
+            if state.settings.is_read_only_text(control) {
                 let inset = 11.0 * s;
                 quads.push(QuadInstance::from_xywh(
                     rect.x + inset,

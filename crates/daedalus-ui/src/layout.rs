@@ -1,3 +1,4 @@
+pub mod footer;
 pub mod overlays;
 
 use crate::sidebar_content::{SidebarContent, SidebarRow};
@@ -5,7 +6,7 @@ use daedalus_proto::{PaneId, PaneRole, WorkspaceId};
 
 pub const SIDEBAR_LOGICAL_WIDTH: f32 = 240.0;
 pub const CARGO_BAR_LOGICAL_HEIGHT: f32 = 34.;
-pub const WIDGET_BUTTON_MIN_LOGICAL_WIDTH: f32 = 110.;
+pub const WIDGET_BUTTON_MIN_LOGICAL_WIDTH: f32 = daedalus_proto::workbench::MIN_WIDGET_WIDTH as f32;
 pub const WIDGET_BUTTON_GAP_LOGICAL: f32 = 5.;
 pub const HEADER_LOGICAL_HEIGHT: f32 = 26.0;
 const FOCUSED_HEADER_LOGICAL_HEIGHT: f32 = 34.0;
@@ -215,6 +216,7 @@ pub struct WorkspaceLayout {
     pub cargo_presets: [bool; 2],
     pub widget_bar: Option<Rect>,
     pub widget_buttons: Vec<(Option<usize>, Rect)>,
+    pub widget_rows: Vec<footer::WidgetFooterRow>,
     pub failed_run_buttons: Vec<(WorkspaceId, Rect)>,
     pub sidebar_first: usize,
     pub sidebar_content: Option<std::sync::Arc<crate::sidebar_content::SidebarContent>>,
@@ -520,6 +522,7 @@ pub enum HitTarget {
     OpenSessions,
     Widget(PaneRole),
     CustomWidget(Option<usize>),
+    WidgetElementAction { widget: usize, element: usize },
     SessionTab(PaneRole),
     SelectSession(PaneId),
     CloseSession(PaneId),
@@ -874,6 +877,7 @@ pub fn compute_split_layout(input: &LayoutInput, splits: &PaneSplits) -> Workspa
         insight_rows: Vec::new(),
         widget_bar: None,
         widget_buttons: Vec::new(),
+        widget_rows: Vec::new(),
         compact_recap: canvas.compact_recap,
         close_tab: None,
         named_tabs: Vec::new(),
@@ -1094,6 +1098,16 @@ fn footer_target(
     scale_factor: f32,
     (x, y): (f32, f32),
 ) -> Option<HitTarget> {
+    for row in &layout.widget_rows {
+        if let Some(element) = row.cells.iter().position(|cell| {
+            matches!(cell.kind, footer::WidgetFooterCellKind::Button) && cell.bounds.contains(x, y)
+        }) {
+            return Some(HitTarget::WidgetElementAction {
+                widget: row.widget,
+                element,
+            });
+        }
+    }
     if let Some((index, _)) = layout
         .widget_buttons
         .iter()
