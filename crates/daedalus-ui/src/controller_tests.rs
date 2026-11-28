@@ -33,7 +33,7 @@ fn widget_editor_builds_previews_and_saves_a_daemon_definition() {
     let id = workspace.id;
     let agent = workspace.panes[0].id;
     workbench.app.state.set_workspaces(vec![workspace]);
-    workbench.app.workbench_capable = true;
+    workbench.app.state.workbench_capable = true;
     workbench.app.open_workspace_settings();
     let state = WorkbenchState {
         revision: 2,

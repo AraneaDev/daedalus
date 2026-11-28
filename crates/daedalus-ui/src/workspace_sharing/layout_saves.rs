@@ -82,7 +82,8 @@ fn normalize_layout(layout: &WorkbenchLayout) -> WorkbenchLayout {
 
 impl DaedalusApp {
     pub(crate) fn prepare_active_workbench_layout(&mut self) {
-        if !self.workbench_capable || self.layout_workspace == self.state.active_workspace_id {
+        if !self.state.workbench_capable || self.layout_workspace == self.state.active_workspace_id
+        {
             return;
         }
         self.layout_workspace = self.state.active_workspace_id;
@@ -108,7 +109,7 @@ impl DaedalusApp {
     }
 
     pub(crate) fn save_workbench_layout(&mut self) {
-        if !self.workbench_capable {
+        if !self.state.workbench_capable {
             return;
         }
         let Some(id) = self.state.active_workspace_id else {
@@ -141,7 +142,7 @@ impl DaedalusApp {
     }
 
     pub(super) fn flush_workbench_layout(&mut self, id: WorkspaceId) {
-        if !self.workbench_capable || self.state.connection != ConnectionState::Connected {
+        if !self.state.workbench_capable || self.state.connection != ConnectionState::Connected {
             return;
         }
         let initial = self
@@ -275,7 +276,7 @@ impl DaedalusApp {
     }
 
     pub(crate) fn refresh_inactive_layout_saves(&mut self) {
-        if !self.workbench_capable || self.state.connection != ConnectionState::Connected {
+        if !self.state.workbench_capable || self.state.connection != ConnectionState::Connected {
             return;
         }
         let reload: Vec<_> = self

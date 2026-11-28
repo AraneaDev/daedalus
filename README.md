@@ -91,11 +91,9 @@ and Claude sessions have distinct tab marks alongside their session names.
 
 ![Focused agent terminal with compact service and runner summaries](docs/images/focused-workbench.png)
 
-In Cargo workspaces, choose **Cargo Test** or **Cargo Check** in the bottom bar to run the preset
-on the workspace host while keeping your agent in view. To save an editable runner command,
-open **Settings → Assignments** and choose **+ Command**.
-To hide either automatic shortcut for this workspace, open **Settings → Widgets**,
-choose **Hide Cargo Test** or **Hide Cargo Check**, then select **Save widgets**.
+Add the **Cargo Test** or **Cargo Check** templates in **Settings → Custom widgets** to run
+Cargo from the bottom bar. Use **Unpin** to hide a widget from the bar. To save an editable
+runner command in the pane launcher, open **Settings → Assignments** and choose **+ Command**.
 
 ![Full Windows workbench with Codex and Claude tabs, terminal output, and the Cargo bottom bar](docs/images/windows-agent-tabs.png)
 

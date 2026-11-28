@@ -41,8 +41,8 @@ impl DaedalusApp {
     }
 
     pub(super) fn prepare_workbench_settings(&mut self, id: WorkspaceId) {
-        self.state.settings.custom_supported = self.workbench_capable;
-        if !self.workbench_capable {
+        self.state.settings.custom_supported = self.state.workbench_capable;
+        if !self.state.workbench_capable {
             return;
         }
         if let Some((_, state)) = self
@@ -58,7 +58,7 @@ impl DaedalusApp {
     }
 
     pub(super) fn poll_workbench(&mut self) {
-        if !self.workbench_capable || self.state.connection != ConnectionState::Connected {
+        if !self.state.workbench_capable || self.state.connection != ConnectionState::Connected {
             self.widget_refresh_at = None;
             return;
         }

@@ -609,7 +609,7 @@ fn same_folder_workspaces_keep_separate_confirmed_runners() {
     b.root_dir.clone_from(&a.root_dir);
     let (a_id, b_id) = (a.id, b.id);
     w.app.state.set_workspaces(vec![a, b]);
-    w.app.workbench_capable = true;
+    w.app.state.workbench_capable = true;
     for (id, name, executable, revision) in [
         (a_id, "First runner", "first", 1),
         (b_id, "Second runner", "second", 1),
@@ -644,7 +644,7 @@ fn unrelated_workbench_save_preserves_the_widget_draft() {
     let ws = workspace("Draft");
     let id = ws.id;
     w.app.state.set_workspaces(vec![ws]);
-    w.app.workbench_capable = true;
+    w.app.state.workbench_capable = true;
     w.app.open_workspace_settings();
     w.app.workbench_response(
         id,
@@ -1971,6 +1971,43 @@ fn reconnect_reloads_a_layout_base_and_workspace_removal_discards_the_pending_sa
         Ok(ResponsePayload::Workbench(ack)),
     );
     assert!(w.idle());
+}
+
+#[test]
+fn cargo_workspaces_with_workbench_support_use_custom_widgets() {
+    use daedalus_ui::assignments::CargoPreset;
+
+    let mut w = Workbench::new();
+    let mut project = workspace("Cargo project with widgets");
+    project.project.tools.push("Cargo".into());
+    w.app.state.set_workspaces(vec![project]);
+    w.app
+        .handle_daemon_event(UiEvent::WorkbenchCapability(true));
+
+    w.app.open_workspace_settings();
+    apply_control(&mut w, Control::WidgetsPage);
+    let settings = &w.app.state.settings;
+    assert!(
+        settings
+            .control_order()
+            .any(|c| c == Control::CustomWidgetsPage)
+    );
+    assert!(
+        settings
+            .control_order()
+            .all(|c| !matches!(c, Control::CargoTestShortcut | Control::CargoCheckShortcut))
+    );
+    assert!(
+        CargoPreset::ALL
+            .into_iter()
+            .all(|preset| !w.app.state.cargo_preset_visible(preset))
+    );
+    let viewport = ViewportMetrics {
+        size: (650, 550).into(),
+        scale_factor: 1.,
+        cell: (8., 16.),
+    };
+    assert!(w.app.layout_for(viewport).cargo_bar.is_none());
 }
 
 #[test]

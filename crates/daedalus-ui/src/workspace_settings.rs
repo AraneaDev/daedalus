@@ -90,28 +90,30 @@ impl DaedalusApp {
                 self.state.picker.close();
                 self.state.settings.begin(entries);
                 self.state.settings.widget_workspace = Some(id);
-                self.state.settings.cargo_shortcuts_available = self.state.has_cargo_presets();
+                self.state.settings.cargo_shortcuts_available =
+                    self.state.legacy_cargo_shortcuts_available();
                 self.state.settings.setup_baseline = baseline;
                 self.prepare_workbench_settings(id);
                 self.state.settings.set_automatic_widgets(
                     self.state.has_widget_source(PaneRole::Service),
                     self.state.has_widget_source(PaneRole::Runner),
                 );
-                let widgets = if self.workbench_capable || self.state.settings.custom_supported {
-                    self.state
-                        .workspace_widgets
-                        .get(&id)
-                        .cloned()
-                        .unwrap_or_default()
-                } else {
-                    match daedalus_ui::workspace_widgets::load(&self.widget_directory, id) {
-                        Ok(widgets) => widgets.unwrap_or_default(),
-                        Err(error) => {
-                            self.state.settings.error = Some(error);
-                            Default::default()
+                let widgets =
+                    if self.state.workbench_capable || self.state.settings.custom_supported {
+                        self.state
+                            .workspace_widgets
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_default()
+                    } else {
+                        match daedalus_ui::workspace_widgets::load(&self.widget_directory, id) {
+                            Ok(widgets) => widgets.unwrap_or_default(),
+                            Err(error) => {
+                                self.state.settings.error = Some(error);
+                                Default::default()
+                            }
                         }
-                    }
-                };
+                    };
                 self.state.settings.reset_pane_widget_draft(widgets);
             }
             Err(err) => self.show_toast(err, true),
@@ -217,7 +219,7 @@ impl DaedalusApp {
             return;
         };
 
-        if self.workbench_capable || self.state.settings.custom_supported {
+        if self.state.workbench_capable || self.state.settings.custom_supported {
             if self.state.connection != daedalus_ui::state::ConnectionState::Connected {
                 self.state.settings.error = Some("Reconnect to save the widget settings.".into());
                 return;
