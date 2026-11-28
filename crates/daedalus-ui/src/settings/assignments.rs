@@ -1,5 +1,5 @@
 use super::{Control, PAGE_SIZE, SettingsAction, SettingsDialog};
-use crate::assignments::{Assignment, CargoPreset};
+use crate::assignments::Assignment;
 use Control::*;
 use daedalus_proto::PaneRole;
 
@@ -81,7 +81,6 @@ impl SettingsDialog {
             pages,
             vec![Prev, Next, Remove],
             vec![Add, Agy, Claude, Codex],
-            vec![CargoTest, CargoCheck],
             vec![Name],
             vec![Role],
             vec![Executable],
@@ -128,8 +127,6 @@ impl SettingsDialog {
             Agy => "+ Agy".into(),
             Claude => "+ Claude".into(),
             Codex => "+ Codex".into(),
-            CargoTest => "+ Cargo Test".into(),
-            CargoCheck => "+ Cargo Check".into(),
             Launch => "Save & launch".into(),
             _ => return None,
         })
@@ -187,33 +184,21 @@ impl SettingsDialog {
                 self.assignments.selected =
                     (self.assignments.selected + 1) % self.assignments.drafts.len()
             }
-            Add | Agy | Claude | Codex | CargoTest | CargoCheck => {
-                let id = uuid::Uuid::new_v4().to_string();
-                let mut template = match c {
-                    CargoTest => CargoPreset::Test.assignment(),
-                    CargoCheck => CargoPreset::Check.assignment(),
-                    _ => {
-                        let executable = match c {
-                            Agy => "agy",
-                            Claude => "claude",
-                            Codex => "codex",
-                            _ => "",
-                        };
-                        Assignment {
-                            id: String::new(),
-                            name: executable.into(),
-                            role: if c == Add {
-                                PaneRole::Runner
-                            } else {
-                                PaneRole::Agent
-                            },
-                            argv: vec![executable.into()],
-                        }
-                    }
+            Add | Agy | Claude | Codex => {
+                let (executable, role) = match c {
+                    Agy => ("agy", PaneRole::Agent),
+                    Claude => ("claude", PaneRole::Agent),
+                    Codex => ("codex", PaneRole::Agent),
+                    _ => ("", PaneRole::Runner),
                 };
-                template.id = id;
+                let assignment = Assignment {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: executable.into(),
+                    role,
+                    argv: vec![executable.into()],
+                };
                 self.assignments.selected = self.assignments.drafts.len();
-                self.assignments.drafts.push(Draft::from(template));
+                self.assignments.drafts.push(Draft::from(assignment));
                 self.focus = Name;
                 self.select_all = true;
             }

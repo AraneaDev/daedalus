@@ -284,6 +284,7 @@ fn import_review_styles_content_as_readable_summary() {
         label: "Orbit".into(),
         level: StatusLevel::Ok,
         details: vec![("Coding agent".into(), "codex".into())],
+        element_values: Default::default(),
     });
 
     let (width, height) = (1000., 800.);
@@ -547,6 +548,7 @@ fn custom_widget_chrome_renders_reports_icons_overflow_and_action_details() {
                     label: label.into(),
                     level,
                     details: vec![],
+                    element_values: Default::default(),
                 },
             });
         }
@@ -576,6 +578,7 @@ fn custom_widget_chrome_renders_reports_icons_overflow_and_action_details() {
         label: "Runner diagnostics".into(),
         level: StatusLevel::Error,
         details: vec![("Failure".into(), "compile error\ncheck the log".into())],
+        element_values: Default::default(),
     });
     frame.state.settings.focus = Control::CustomRefresh;
 
@@ -617,5 +620,532 @@ fn custom_widget_chrome_renders_reports_icons_overflow_and_action_details() {
     assert_eq!(
         footer_items[5],
         ("More widgets", theme.text_primary.to_glyphon_color())
+    );
+}
+
+#[test]
+fn styled_footer_renders_a_button_and_a_labeled_led() {
+    use daedalus_proto::StatusLevel;
+    use daedalus_proto::workbench::{
+        WidgetDefinition, WidgetDisplay, WidgetInstance, WidgetResult, WidgetSnapshot, WidgetStyle,
+        WorkbenchState, WorkspaceDocument,
+    };
+
+    let mut frame = Frame::new();
+    let theme = Theme::dark();
+    let mut document = WorkspaceDocument::new("Styles".into());
+    frame.layout.widget_bar = Some(Rect::new(0., 766., 1200., 34.));
+    let button = Rect::new(8., 771., 200., 24.);
+    let led = Rect::new(
+        216.,
+        771.,
+        crate::layout::WIDGET_BUTTON_MIN_LOGICAL_WIDTH,
+        24.,
+    );
+    for (style, name, rect) in [
+        (WidgetStyle::Button, "Tests", button),
+        (WidgetStyle::Led, "Endpoint", led),
+    ] {
+        frame
+            .layout
+            .widget_buttons
+            .push((Some(document.widgets.len()), rect));
+        document.widgets.push(WidgetInstance {
+            id: name.into(),
+            name: name.into(),
+            pinned: true,
+            template: None,
+            definition: Some(WidgetDefinition {
+                display: WidgetDisplay {
+                    style,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        });
+    }
+    frame.state.workbench = Some((
+        frame.state.active_workspace_id.unwrap(),
+        WorkbenchState {
+            revision: 1,
+            document,
+            repo_baseline: None,
+        },
+    ));
+    frame.state.widget_results.push(WidgetSnapshot {
+        id: "Endpoint".into(),
+        result: WidgetResult {
+            label: "Ready".into(),
+            level: StatusLevel::Ok,
+            details: Vec::new(),
+            element_values: Default::default(),
+        },
+    });
+
+    frame.labels(1200., 800.);
+    let led_text = frame
+        .renderer
+        .chrome_items
+        .iter()
+        .find(|item| item.buffer.lines[0].text() == "OK · Ready · Endpoint")
+        .unwrap();
+    assert_eq!(led_text.left, led.x + 20.);
+    let rendered = led_text.buffer.layout_runs().next().unwrap();
+    assert!(rendered.glyphs.iter().any(|glyph| glyph.start == 0));
+    let (quads, _) = crate::renderer::collect_quads(
+        &frame.state,
+        &frame.layout,
+        &theme,
+        1200.,
+        800.,
+        1.,
+        (8., 19.),
+    );
+    assert!(quads.iter().any(|quad| quad.rect == [8., 771., 200., 24.]
+        && quad.color == theme.border_focused.to_array()
+        && quad.style[1] == 1.));
+    assert!(quads.iter().any(|quad| quad.rect == [222., 779., 8., 8.]
+        && quad.color == theme.status_ok.to_array()
+        && quad.style[0] == 4.));
+
+    let (_, workspace) = frame.state.workbench.as_mut().unwrap();
+    workspace.document.widgets[1]
+        .definition
+        .as_mut()
+        .unwrap()
+        .display
+        .appearance
+        .status = daedalus_proto::workbench::WidgetStatusPresentation::Text;
+    frame.state.widget_results[0].result.level = StatusLevel::Warn;
+    frame.labels(1200., 800.);
+    assert!(
+        frame
+            .renderer
+            .chrome_items
+            .iter()
+            .any(|item| item.buffer.lines[0].text() == "Warning · Ready · Endpoint")
+    );
+}
+
+#[test]
+fn composed_footer_paints_ordered_text_and_a_progress_fill() {
+    use daedalus_proto::StatusLevel;
+    use daedalus_proto::workbench::{
+        NamedAction, WidgetAction, WidgetDefinition, WidgetDisplay, WidgetElement, WidgetField,
+        WidgetInstance, WidgetResult, WidgetSnapshot, WorkbenchState, WorkspaceDocument,
+    };
+
+    let mut frame = Frame::new();
+    let theme = Theme::dark();
+    let mut document = WorkspaceDocument::new("Build".into());
+    let field = |field: &str, label: &str| WidgetField {
+        source: "build".into(),
+        field: field.into(),
+        label: Some(label.into()),
+    };
+    document.widgets.push(WidgetInstance {
+        id: "build".into(),
+        name: "Build pipeline".into(),
+        pinned: true,
+        template: None,
+        definition: Some(WidgetDefinition {
+            display: WidgetDisplay {
+                elements: vec![
+                    WidgetElement::Label {
+                        text: "Build pipeline".into(),
+                    },
+                    WidgetElement::Status,
+                    WidgetElement::Counter {
+                        field: field("failed", "Failures"),
+                    },
+                    WidgetElement::Progress {
+                        field: field("passed", "Passed"),
+                        max: 20,
+                    },
+                    WidgetElement::Button {
+                        action: "logs".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            actions: vec![NamedAction {
+                id: "logs".into(),
+                label: "Open logs".into(),
+                action: WidgetAction::Logs {
+                    role: daedalus_proto::PaneRole::Runner,
+                },
+            }],
+            ..Default::default()
+        }),
+    });
+    frame.state.widget_results.push(WidgetSnapshot {
+        id: "build".into(),
+        result: WidgetResult {
+            label: "Checks pending".into(),
+            level: StatusLevel::Warn,
+            details: Vec::new(),
+            element_values: [(
+                "build".into(),
+                [("failed".into(), "3".into()), ("passed".into(), "5".into())].into(),
+            )]
+            .into(),
+        },
+    });
+    frame.layout.set_widget_footer(
+        Rect::new(0., 766., 1200., 34.),
+        &document,
+        &frame.state.widget_results,
+        1.,
+    );
+    frame.state.workbench = Some((
+        frame.state.active_workspace_id.unwrap(),
+        WorkbenchState {
+            revision: 1,
+            document,
+            repo_baseline: None,
+        },
+    ));
+
+    frame.labels(1200., 800.);
+    let footer: Vec<_> = frame
+        .renderer
+        .chrome_items
+        .iter()
+        .filter(|item| item.top >= 766.)
+        .map(|item| item.buffer.lines[0].text())
+        .collect();
+    assert_eq!(
+        footer,
+        [
+            "Build pipeline",
+            "Warning · Checks pending",
+            "Failures: 3",
+            "Passed: 5/20",
+            "Open logs"
+        ]
+    );
+    let (quads, _) = crate::renderer::collect_quads(
+        &frame.state,
+        &frame.layout,
+        &theme,
+        1200.,
+        800.,
+        1.,
+        (8., 19.),
+    );
+    let row = frame.layout.widget_row(Some(0)).unwrap();
+    let status = row.cells[1].bounds;
+    let dot = quads
+        .iter()
+        .find(|quad| {
+            let [x, y, width, height] = quad.rect;
+            status.contains(x, y)
+                && width == 8.
+                && height == 8.
+                && quad.color == theme.status_busy.to_array()
+        })
+        .expect("the warning has a colored status light");
+    let status_text = frame
+        .renderer
+        .chrome_items
+        .iter()
+        .find(|item| item.buffer.lines[0].text() == "Warning · Checks pending")
+        .unwrap();
+    assert!(status_text.left > dot.rect[0] + dot.rect[2]);
+    let action = row.cells[4].bounds;
+    assert!(quads.iter().any(|quad| quad.rect
+        == [action.x, action.y, action.width, action.height]
+        && quad.color == theme.border_focused.to_array()
+        && quad.style[1] > 0.));
+    let progress = row.cells[3].bounds;
+    assert!(quads.iter().any(|quad| {
+        let [x, y, width, _] = quad.rect;
+        progress.contains(x, y)
+            && quad.color == theme.border_focused.to_array()
+            && width > 0.
+            && (width * 4. - (progress.width - (x - progress.x) * 2.)).abs() < 0.1
+    }));
+}
+
+fn pinned_widget(
+    name: &str,
+    display: daedalus_proto::workbench::WidgetDisplay,
+) -> daedalus_proto::workbench::WidgetInstance {
+    use daedalus_proto::workbench::{WidgetDefinition, WidgetInstance};
+
+    WidgetInstance {
+        id: name.into(),
+        name: name.into(),
+        pinned: true,
+        template: None,
+        definition: Some(WidgetDefinition {
+            display,
+            ..Default::default()
+        }),
+    }
+}
+
+#[test]
+fn footer_width_preferences_leave_room_for_composed_content_and_overflow() {
+    use daedalus_proto::workbench::{
+        WidgetAppearance, WidgetDisplay, WidgetElement, WorkspaceDocument,
+    };
+
+    let (_, mut layout) = make_state_with_agent_row();
+    layout.cargo_bar = None;
+    let mut document = WorkspaceDocument::new("Widths".into());
+    document.widgets = vec![
+        pinned_widget(
+            "Wide stand-alone widget",
+            WidgetDisplay {
+                appearance: WidgetAppearance {
+                    width: Some(500),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
+        pinned_widget(
+            "Composition",
+            WidgetDisplay {
+                appearance: WidgetAppearance {
+                    width: Some(110),
+                    ..Default::default()
+                },
+                elements: vec![WidgetElement::Label {
+                    text: "Configure lint rules".into(),
+                }],
+                ..Default::default()
+            },
+        ),
+        pinned_widget("Neighbor", WidgetDisplay::default()),
+    ];
+
+    let mut layout_at = |width| {
+        layout.set_widget_footer(Rect::new(0., 766., width, 34.), &document, &[], 1.);
+        layout.clone()
+    };
+    let roomy = layout_at(1200.);
+    assert_eq!(roomy.widget_buttons[0].1.width, 500.);
+    assert!(roomy.widget_buttons[1].1.width > 110.);
+    assert!(roomy.widget_row(Some(1)).is_some());
+
+    let crowded = layout_at(460.);
+    assert_eq!(crowded.widget_buttons.len(), 3);
+    assert!(crowded.widget_buttons[0].1.width < 500.);
+    assert_eq!(
+        crowded.widget_buttons[1].1.width,
+        roomy.widget_buttons[1].1.width
+    );
+    assert_eq!(
+        crowded.widget_row(Some(1)).unwrap().cells[0].bounds.width,
+        roomy.widget_row(Some(1)).unwrap().cells[0].bounds.width
+    );
+    assert!(crowded.widget_buttons[2].1.width >= 110.);
+    assert!(crowded.widget_buttons[2].1.right() < 460.);
+
+    let compact = layout_at(360.);
+    assert_eq!(compact.widget_buttons[1].0, Some(1));
+    assert!(compact.widget_row(Some(1)).is_none());
+
+    let narrow = layout_at(340.);
+    assert_eq!(narrow.widget_buttons.len(), 2);
+    assert_eq!(narrow.widget_buttons[0].0, Some(0));
+    assert_eq!(narrow.widget_buttons[1].0, None);
+    assert!(narrow.widget_buttons[1].1.right() < 340.);
+}
+
+#[test]
+fn widget_appearance_styles_footer_controls_and_preserves_status_meaning() {
+    use crate::theme::Rgba;
+    use daedalus_proto::StatusLevel;
+    use daedalus_proto::workbench::{
+        NamedAction, WidgetAction, WidgetAppearance, WidgetDensity, WidgetDisplay, WidgetElement,
+        WidgetField, WidgetResult, WidgetSnapshot, WidgetStatusPresentation, WidgetStyle,
+        WidgetSurface, WorkbenchState, WorkspaceDocument,
+    };
+
+    let theme = Theme::dark();
+    let accent = Rgba::from_rgb_u8(0x74, 0x9f, 0xfa).to_array();
+    let mut frame = Frame::new();
+    frame.layout.cargo_bar = None;
+    let mut document = WorkspaceDocument::new("Appearance".into());
+    let mut build = pinned_widget(
+        "Checks",
+        WidgetDisplay {
+            appearance: WidgetAppearance {
+                accent: Some("#749FFA".into()),
+                density: WidgetDensity::Compact,
+                surface: WidgetSurface::Outline,
+                status: WidgetStatusPresentation::Light,
+                width: Some(460),
+            },
+            elements: vec![
+                WidgetElement::Status,
+                WidgetElement::Progress {
+                    field: WidgetField {
+                        source: "build".into(),
+                        field: "passed".into(),
+                        label: Some("Passed".into()),
+                    },
+                    max: 4,
+                },
+                WidgetElement::Button {
+                    action: "logs".into(),
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    build.definition.as_mut().unwrap().actions = vec![NamedAction {
+        id: "logs".into(),
+        label: "Open logs".into(),
+        action: WidgetAction::Logs {
+            role: daedalus_proto::PaneRole::Runner,
+        },
+    }];
+    document.widgets = vec![
+        build,
+        pinned_widget(
+            "Endpoint",
+            WidgetDisplay {
+                style: WidgetStyle::Led,
+                appearance: WidgetAppearance {
+                    density: WidgetDensity::Spacious,
+                    status: WidgetStatusPresentation::Text,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
+        pinned_widget(
+            "Flat label",
+            WidgetDisplay {
+                appearance: WidgetAppearance {
+                    surface: WidgetSurface::Flat,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
+    ];
+    frame.state.widget_results = vec![
+        WidgetSnapshot {
+            id: "Checks".into(),
+            result: WidgetResult {
+                label: "Checks pending".into(),
+                level: StatusLevel::Warn,
+                details: Vec::new(),
+                element_values: [("build".into(), [("passed".into(), "1".into())].into())].into(),
+            },
+        },
+        WidgetSnapshot {
+            id: "Endpoint".into(),
+            result: WidgetResult {
+                label: "Serving".into(),
+                level: StatusLevel::Ok,
+                details: Vec::new(),
+                element_values: Default::default(),
+            },
+        },
+    ];
+    frame.layout.set_widget_footer(
+        Rect::new(0., 766., 1200., 34.),
+        &document,
+        &frame.state.widget_results,
+        1.,
+    );
+    frame.state.workbench = Some((
+        frame.state.active_workspace_id.unwrap(),
+        WorkbenchState {
+            revision: 1,
+            document,
+            repo_baseline: None,
+        },
+    ));
+
+    frame.labels(1200., 800.);
+    let [(_, build), (_, endpoint), (_, flat)] = frame.layout.widget_buttons[..] else {
+        panic!("expected all three widget slots");
+    };
+    assert_eq!(build.width, 460.);
+    let row = frame.layout.widget_row(Some(0)).unwrap();
+    assert_eq!(row.cells[0].text, "Warning · Checks pending");
+    assert_eq!(row.cells[1].bounds.x - row.cells[0].bounds.right(), 2.);
+    assert!(
+        !frame
+            .renderer
+            .chrome_items
+            .iter()
+            .any(|item| item.buffer.lines[0].text().contains("Checks pending"))
+    );
+    let endpoint_text = frame
+        .renderer
+        .chrome_items
+        .iter()
+        .find(|item| item.buffer.lines[0].text() == "OK · Serving · Endpoint")
+        .unwrap();
+    assert!(endpoint_text.left > endpoint.x + 6. && endpoint_text.left < endpoint.x + 20.);
+    assert_eq!(
+        endpoint_text.default_color,
+        theme.status_ok.to_glyphon_color()
+    );
+
+    let (quads, _) = crate::renderer::collect_quads(
+        &frame.state,
+        &frame.layout,
+        &theme,
+        1200.,
+        800.,
+        1.,
+        (8., 19.),
+    );
+    for bounds in [build, row.cells[2].bounds] {
+        assert!(quads.iter().any(|quad| quad.rect
+            == [bounds.x, bounds.y, bounds.width, bounds.height]
+            && quad.color == accent
+            && quad.style[1] > 0.));
+    }
+    assert_eq!(
+        quads
+            .iter()
+            .filter(|quad| quad.rect == [build.x, build.y, build.width, build.height])
+            .count(),
+        1
+    );
+    let status = row.cells[0].bounds;
+    assert!(quads.iter().any(|quad| {
+        let [x, y, width, height] = quad.rect;
+        status.contains(x, y)
+            && width == 8.
+            && height == 8.
+            && quad.color == theme.status_busy.to_array()
+    }));
+    let progress = row.cells[1].bounds;
+    assert!(quads.iter().any(|quad| {
+        let [x, y, _, height] = quad.rect;
+        x == progress.x + 4. && progress.contains(x, y) && height == 2. && quad.color == accent
+    }));
+    for bounds in [endpoint, flat] {
+        assert!(
+            !quads
+                .iter()
+                .any(|quad| bounds.contains(quad.rect[0], quad.rect[1]))
+        );
+    }
+
+    let action = row.cells[2].bounds;
+    frame.state.widget_results[0].result.label = "A refreshed report with a longer label".into();
+    frame.state.widget_results[0].result.element_values.clear();
+    let document = &frame.state.workbench.as_ref().unwrap().1.document;
+    frame.layout.set_widget_footer(
+        Rect::new(0., 766., 1200., 34.),
+        document,
+        &frame.state.widget_results,
+        1.,
+    );
+    assert_eq!(
+        frame.layout.widget_row(Some(0)).unwrap().cells[2].bounds,
+        action
     );
 }

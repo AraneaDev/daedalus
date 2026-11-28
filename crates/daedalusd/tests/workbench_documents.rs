@@ -53,6 +53,136 @@ fn template_and_workspace_round_trip() {
 }
 
 #[test]
+fn widget_styles_round_trip_and_legacy_templates_keep_the_default_appearance() {
+    let legacy = parse_workspace(WORKSPACE).unwrap();
+    let legacy_text = serialize_workspace(&legacy).unwrap();
+    assert!(!legacy_text.contains("style ="));
+    assert!(!legacy_text.contains(".appearance]"));
+
+    for style in ["button", "led"] {
+        let text = WORKSPACE.replace(
+            "[[templates.definition.display.summary]]",
+            &format!("[templates.definition.display]\nstyle = '{style}'\n\n[[templates.definition.display.summary]]"),
+        );
+        let document = parse_workspace(&text).unwrap();
+        assert_ne!(document, legacy, "style {style} should affect the template");
+        let saved = serialize_workspace(&document).unwrap();
+        assert!(saved.contains(&format!("style = \"{style}\"")));
+        assert_eq!(parse_workspace(&saved).unwrap(), document);
+    }
+}
+
+#[test]
+fn widget_appearance_round_trips_and_rejects_invalid_values() {
+    let appearance = "\n[templates.definition.display.appearance]\naccent = '#7C3AED'\nwidth = 260\ndensity = 'compact'\nsurface = 'outline'\nstatus = 'light'\n";
+    let parsed = parse_workspace(&format!("{WORKSPACE}{appearance}")).unwrap();
+    assert_eq!(
+        parsed.templates[0]
+            .definition
+            .display
+            .appearance
+            .accent_rgb(),
+        Some([124, 58, 237])
+    );
+    let exported = serialize_workspace(&parsed).unwrap();
+    assert!(exported.contains("#7C3AED"), "{exported}");
+    assert!(exported.contains("width = 260"));
+    assert_eq!(parse_workspace(&exported).unwrap(), parsed);
+    for (invalid, message) in [
+        (appearance.replace("#7C3AED", "purple"), "#RRGGBB"),
+        (appearance.replace("#7C3AED", "#+12345"), "#RRGGBB"),
+        (appearance.replace("260", "109"), "110"),
+        (appearance.replace("260", "1025"), "1024"),
+    ] {
+        let error = parse_workspace(&format!("{WORKSPACE}{invalid}")).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+    }
+}
+
+#[test]
+fn workspace_merge_combines_independent_appearance_edits_from_defaults() {
+    use daedalusd::workbench::merge::merge_workspace;
+
+    let base = parse_workspace(WORKSPACE).unwrap();
+    let mut local = base.clone();
+    local.templates[0].definition.display.appearance.accent = Some("#818CF8".into());
+    let mut incoming = base.clone();
+    incoming.templates[0].definition.display.appearance.width = Some(480);
+
+    let (merged, conflicts) =
+        merge_workspace(&base, &local, &incoming, &Default::default()).unwrap();
+    assert!(conflicts.is_empty());
+    let appearance = &merged.templates[0].definition.display.appearance;
+    assert_eq!(appearance.accent.as_deref(), Some("#818CF8"));
+    assert_eq!(appearance.width, Some(480));
+
+    let base = local;
+    let local = parse_workspace(WORKSPACE).unwrap();
+    let mut incoming = base.clone();
+    incoming.templates[0].definition.display.appearance.density =
+        daedalus_proto::workbench::WidgetDensity::Compact;
+    let (merged, conflicts) =
+        merge_workspace(&base, &local, &incoming, &Default::default()).unwrap();
+    assert!(conflicts.is_empty());
+    let appearance = &merged.templates[0].definition.display.appearance;
+    assert_eq!(appearance.accent, None);
+    assert_eq!(
+        appearance.density,
+        daedalus_proto::workbench::WidgetDensity::Compact
+    );
+}
+
+#[test]
+fn repository_examples_parse_with_the_pane_commands_and_widget_styles() {
+    use daedalus_proto::workbench::{WidgetAction, WidgetStyle};
+    let project =
+        daedalusd::manifest::parse_project_manifest(include_str!("../../../.daedalus.toml"))
+            .unwrap()
+            .workspace_manifest;
+    let runner = parse_template(include_str!(
+        "../../../examples/workbench/runner-button.toml"
+    ))
+    .unwrap()
+    .template
+    .definition;
+    let service = parse_template(include_str!("../../../examples/workbench/service-led.toml"))
+        .unwrap()
+        .template
+        .definition;
+    assert_eq!(runner.display.style, WidgetStyle::Button);
+    assert_eq!(runner.display.appearance.width, Some(680));
+    assert!(matches!(&runner.element_action(3).unwrap().action,
+        WidgetAction::Command { command, run_in_runner: true } if Some(&command.argv) == project.runner_command.as_ref()));
+    let inputs = [(
+        "runner".into(),
+        [
+            ("passed".into(), "12".into()),
+            ("failed".into(), "1".into()),
+            ("unbound".into(), "hidden".into()),
+        ]
+        .into(),
+    )]
+    .into();
+    let result =
+        daedalusd::workbench::runtime::evaluate_widget(&runner, &inputs, "Workspace tests");
+    assert_eq!(
+        result.element_value(runner.display.elements[1].value_field().unwrap()),
+        Some("12")
+    );
+    assert_eq!(
+        result.element_value(runner.display.elements[2].value_field().unwrap()),
+        Some("1")
+    );
+    assert!(!result.element_values["runner"].contains_key("unbound"));
+    assert_eq!(service.display.style, WidgetStyle::Led);
+    assert_eq!(service.display.appearance.width, Some(240));
+    assert!(
+        matches!(service.sources[0].source, WidgetSource::Port { port: Some(port), .. }
+        if project.service_command.as_ref().unwrap().contains(&port.to_string()))
+    );
+}
+
+#[test]
 fn reject_duplicate_identity_and_unknown_version() {
     for (invalid, message) in [
         (WORKSPACE.replace("version = 1", "version = 2"), "version"),
@@ -72,6 +202,161 @@ fn reject_duplicate_identity_and_unknown_version() {
         let error = parse_workspace(&invalid).unwrap_err().to_string();
         assert!(error.contains(message), "expected {message}: {error}");
     }
+}
+
+#[test]
+fn widget_button_action_must_reference_a_defined_action() {
+    let text = WORKSPACE.replace(
+        "[[templates.definition.display.summary]]",
+        "[templates.definition.display]\nprimary_action = 'missing'\n\n[[templates.definition.display.summary]]",
+    );
+    let error = parse_workspace(&text).unwrap_err().to_string();
+    assert!(
+        error.contains("unknown primary action 'missing'"),
+        "{error}"
+    );
+}
+
+#[test]
+fn widget_elements_validate_data_bindings_and_button_references() {
+    for (element, message) in [
+        (
+            "kind = 'counter'\nsource = 'missing'\nfield = 'count'",
+            "unknown source 'missing'",
+        ),
+        (
+            "kind = 'progress'\nsource = 'git'\nfield = 'count'\nmax = 0",
+            "positive maximum",
+        ),
+        (
+            "kind = 'button'\naction = 'missing'",
+            "unknown action 'missing'",
+        ),
+        ("kind = 'label'\ntext = ''", "requires a valid name"),
+    ] {
+        let text = format!("{WORKSPACE}\n[[templates.definition.display.elements]]\n{element}");
+        let error = parse_workspace(&text).unwrap_err().to_string();
+        assert!(error.contains(message), "expected {message}: {error}");
+    }
+
+    let mut document = parse_workspace(WORKSPACE).unwrap();
+    let definition = &mut document.templates[0].definition;
+    definition
+        .display
+        .elements
+        .push(daedalus_proto::workbench::WidgetElement::Progress {
+            field: definition.display.summary[0].clone(),
+            max: (i64::MAX as u64) + 1,
+        });
+    let error = daedalusd::workbench::documents::validate_workspace(&document).unwrap_err();
+    assert!(error.to_string().contains("requires a positive maximum"));
+}
+
+#[test]
+fn workspace_merge_resolves_composed_element_references() {
+    use daedalus_proto::workbench::{ConflictChoice, NamedAction, WidgetAction, WidgetElement};
+    use daedalusd::workbench::{documents::validate_workspace, merge::merge_workspace};
+
+    let mut base = parse_workspace(WORKSPACE).unwrap();
+    base.templates[0].definition.actions.push(NamedAction {
+        id: "diff".into(),
+        label: "Diff".into(),
+        action: WidgetAction::Diff,
+    });
+    let mut local = base.clone();
+    let display = &mut local.templates[0].definition.display;
+    display.elements = vec![
+        WidgetElement::Counter {
+            field: display.summary[0].clone(),
+        },
+        WidgetElement::Label {
+            text: "Repository".into(),
+        },
+        WidgetElement::Button {
+            action: "diff".into(),
+        },
+    ];
+    let mut incoming = base.clone();
+    let definition = &mut incoming.templates[0].definition;
+    definition.display.summary.clear();
+    definition.sources.clear();
+    definition.actions.clear();
+
+    let (preview, conflicts) =
+        merge_workspace(&base, &local, &incoming, &Default::default()).unwrap();
+    validate_workspace(&preview).unwrap();
+    assert_eq!(conflicts.len(), 2);
+    assert_eq!(
+        preview.templates[0].definition.display.elements,
+        local.templates[0].definition.display.elements
+    );
+    let resolutions = conflicts
+        .into_iter()
+        .map(|conflict| (conflict.path, ConflictChoice::Incoming))
+        .collect();
+    let (merged, unresolved) = merge_workspace(&base, &local, &incoming, &resolutions).unwrap();
+    validate_workspace(&merged).unwrap();
+    assert!(unresolved.is_empty());
+    assert_eq!(
+        merged.templates[0].definition.display.elements,
+        [WidgetElement::Label {
+            text: "Repository".into()
+        }]
+    );
+}
+
+#[test]
+fn repairing_an_action_reference_preserves_the_selected_element_order() {
+    use daedalus_proto::workbench::{ConflictChoice, NamedAction, WidgetAction, WidgetElement};
+    use daedalusd::workbench::{documents::validate_workspace, merge::merge_workspace};
+
+    let mut base = parse_workspace(WORKSPACE).unwrap();
+    let definition = &mut base.templates[0].definition;
+    definition.actions.push(NamedAction {
+        id: "diff".into(),
+        label: "Diff".into(),
+        action: WidgetAction::Diff,
+    });
+    definition.display.elements = ["Before", "After"]
+        .map(|text| WidgetElement::Label { text: text.into() })
+        .into();
+    let mut local = base.clone();
+    let local_display = &mut local.templates[0].definition.display;
+    local_display.primary_action = Some("diff".into());
+    local_display.elements.insert(
+        1,
+        WidgetElement::Button {
+            action: "diff".into(),
+        },
+    );
+    let mut incoming = base.clone();
+    let remote_definition = &mut incoming.templates[0].definition;
+    remote_definition.actions.clear();
+    remote_definition
+        .display
+        .elements
+        .push(WidgetElement::Status);
+
+    let resolutions = [
+        (
+            "/templates/git/definition/display/elements".into(),
+            ConflictChoice::Incoming,
+        ),
+        (
+            "/templates/git/definition/$action_references".into(),
+            ConflictChoice::Local,
+        ),
+    ]
+    .into();
+    let (merged, conflicts) = merge_workspace(&base, &local, &incoming, &resolutions).unwrap();
+    validate_workspace(&merged).unwrap();
+    assert!(conflicts.is_empty());
+    let merged_definition = &merged.templates[0].definition;
+    assert!(merged_definition.primary_action().is_some());
+    assert_eq!(
+        merged_definition.display.elements,
+        incoming.templates[0].definition.display.elements
+    );
 }
 
 #[test]

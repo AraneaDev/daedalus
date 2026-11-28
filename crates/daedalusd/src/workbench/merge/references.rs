@@ -1,6 +1,7 @@
 use super::{Merge, child};
 use daedalus_proto::workbench::{
-    ConflictChoice, NamedSource, WidgetDefinition, WidgetField, WidgetRule, WorkspaceDocument,
+    ConflictChoice, NamedAction, NamedSource, WidgetDefinition, WidgetElement, WidgetField,
+    WidgetRule, WorkspaceDocument,
 };
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -56,7 +57,7 @@ impl Merge<'_> {
             let lookup = |document: &'_ WorkspaceDocument| {
                 document.templates.iter().position(|t| t.id == template.id)
             };
-            self.source_references(
+            self.definition_references(
                 child(&child("/templates", &template.id), "definition"),
                 &mut template.definition,
                 lookup(base).map(|i| &base.templates[i].definition),
@@ -71,7 +72,7 @@ impl Merge<'_> {
             let lookup = |document: &'_ WorkspaceDocument| {
                 document.widgets.iter().position(|w| w.id == widget.id)
             };
-            self.source_references(
+            self.definition_references(
                 child(&widget_path(&widget.id), "definition"),
                 definition,
                 lookup(base).and_then(|i| base.widgets[i].definition.as_ref()),
@@ -81,9 +82,21 @@ impl Merge<'_> {
         }
     }
 
-    fn source_references(
+    fn definition_references(
         &mut self,
         path: String,
+        definition: &mut WidgetDefinition,
+        base: Option<&WidgetDefinition>,
+        local: Option<&WidgetDefinition>,
+        incoming: Option<&WidgetDefinition>,
+    ) {
+        self.source_references(&path, definition, base, local, incoming);
+        self.action_references(&path, definition, base, local, incoming);
+    }
+
+    fn source_references(
+        &mut self,
+        path: &str,
         definition: &mut WidgetDefinition,
         base: Option<&WidgetDefinition>,
         local: Option<&WidgetDefinition>,
@@ -100,6 +113,13 @@ impl Merge<'_> {
             .iter()
             .chain(&definition.display.details)
             .chain(definition.rules.iter().map(|rule| &rule.field))
+            .chain(
+                definition
+                    .display
+                    .elements
+                    .iter()
+                    .filter_map(WidgetElement::value_field),
+            )
             .filter(|field| !known.contains(field.source.as_str()))
             .map(|field| field.source.clone())
             .collect();
@@ -112,7 +132,7 @@ impl Merge<'_> {
         let local = local.map(|definition| SourceReferences::affected(definition, affected));
         let incoming = incoming.map(|definition| SourceReferences::affected(definition, affected));
         let chosen = match self.side(
-            child(&path, "$source_references"),
+            child(path, "$source_references"),
             base.as_ref(),
             local.as_ref(),
             incoming.as_ref(),
@@ -133,6 +153,67 @@ impl Merge<'_> {
         replace_affected(&mut definition.rules, chosen.rules, |rule| {
             affected(&rule.field.source)
         });
+        definition.display.elements.retain(|element| {
+            element.value_field().is_none_or(|field| {
+                definition
+                    .sources
+                    .iter()
+                    .any(|source| source.id == field.source)
+            })
+        });
+    }
+
+    fn action_references(
+        &mut self,
+        path: &str,
+        definition: &mut WidgetDefinition,
+        base: Option<&WidgetDefinition>,
+        local: Option<&WidgetDefinition>,
+        incoming: Option<&WidgetDefinition>,
+    ) {
+        let dangling: BTreeSet<_> = definition
+            .display
+            .elements
+            .iter()
+            .filter_map(WidgetElement::action_id)
+            .chain(definition.display.primary_action.as_deref())
+            .filter(|id| !definition.actions.iter().any(|action| action.id == *id))
+            .map(str::to_owned)
+            .collect();
+        if dangling.is_empty() {
+            return;
+        }
+
+        let affected = |id: &str| dangling.contains(id);
+        let base = base.map(|definition| ActionReferences::affected(definition, affected));
+        let local = local.map(|definition| ActionReferences::affected(definition, affected));
+        let incoming = incoming.map(|definition| ActionReferences::affected(definition, affected));
+        let chosen = match self.side(
+            child(path, "$action_references"),
+            base.as_ref(),
+            local.as_ref(),
+            incoming.as_ref(),
+        ) {
+            ConflictChoice::Local => local,
+            ConflictChoice::Incoming => incoming,
+        }
+        .unwrap_or_default();
+        definition
+            .actions
+            .extend(chosen.actions.into_iter().cloned());
+        if definition
+            .display
+            .primary_action
+            .as_deref()
+            .is_some_and(affected)
+        {
+            definition.display.primary_action = chosen.primary.map(str::to_owned);
+        }
+        definition.display.elements.retain(|element| {
+            element
+                .action_id()
+                .is_none_or(|id| definition.actions.iter().any(|action| action.id == id))
+        });
     }
 }
 
@@ -142,6 +223,7 @@ struct SourceReferences<'a> {
     summary: Vec<&'a WidgetField>,
     details: Vec<&'a WidgetField>,
     rules: Vec<&'a WidgetRule>,
+    elements: Vec<&'a WidgetElement>,
 }
 
 impl<'a> SourceReferences<'a> {
@@ -168,6 +250,46 @@ impl<'a> SourceReferences<'a> {
                 .rules
                 .iter()
                 .filter(|rule| includes(&rule.field.source))
+                .collect(),
+            elements: definition
+                .display
+                .elements
+                .iter()
+                .filter(|element| {
+                    element
+                        .value_field()
+                        .is_some_and(|field| includes(&field.source))
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Default, Serialize)]
+struct ActionReferences<'a> {
+    actions: Vec<&'a NamedAction>,
+    primary: Option<&'a str>,
+    elements: Vec<&'a WidgetElement>,
+}
+
+impl<'a> ActionReferences<'a> {
+    fn affected(definition: &'a WidgetDefinition, includes: impl Fn(&str) -> bool) -> Self {
+        Self {
+            actions: definition
+                .actions
+                .iter()
+                .filter(|action| includes(&action.id))
+                .collect(),
+            primary: definition
+                .display
+                .primary_action
+                .as_deref()
+                .filter(|id| includes(id)),
+            elements: definition
+                .display
+                .elements
+                .iter()
+                .filter(|element| element.action_id().is_some_and(&includes))
                 .collect(),
         }
     }

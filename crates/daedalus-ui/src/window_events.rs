@@ -113,10 +113,12 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                         accesskit_winit::WindowEvent::InitialTreeRequested => {
                             self.accessibility_active = true;
                             self.last_accessibility_tree = None;
+                            self.terminal_controls.retire_widget_cells();
                         }
                         accesskit_winit::WindowEvent::AccessibilityDeactivated => {
                             self.accessibility_active = false;
                             self.last_accessibility_tree = None;
+                            self.terminal_controls.retire_widget_cells();
                         }
                         accesskit_winit::WindowEvent::ActionRequested(request) => {
                             if self.accessibility_active {
@@ -124,8 +126,11 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                                     accessibility::setup_action(&mut self.state, &request)
                                 {
                                     self.handle_setup_action(action);
-                                } else if let Some(target) =
-                                    self.terminal_controls.action(&self.state, &request)
+                                } else if let Some(target) = self
+                                    .terminal_controls
+                                    .action_with_layout(&self.state, &request, || {
+                                        self.compute_current_layout()
+                                    })
                                 {
                                     self.activate_session(target);
                                 } else if let Some(action) =
@@ -288,8 +293,13 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
                 };
 
                 match renderer.render(&mut self.state, &layout) {
-                    Ok(true) if renderer.recap_visible() => self.history.presented(),
-                    Ok(_) => {}
+                    Ok(true) => {
+                        if renderer.recap_visible() {
+                            self.history.presented();
+                        }
+                        self.record_painted_widget_footer(&layout);
+                    }
+                    Ok(false) => {}
                     Err(RenderError::Reconfigure) => {
                         if let Some(window) = self.window.as_ref() {
                             let size = window.inner_size();
@@ -332,18 +342,24 @@ impl ApplicationHandler<AppEvent> for DaedalusApp {
         } else {
             None
         };
+        let layout = if self.accessibility_active && self.state.active_overlay().is_none() {
+            self.compute_current_layout()
+        } else {
+            None
+        };
         if self.accessibility_active
             && let Some(adapter) = &mut self.accessibility
             && let Some(window) = &self.window
         {
             let size = window.inner_size();
-            let tree = accessibility::workbench_tree_with_search_bar(
+            let tree = accessibility::workbench_tree_with_layout(
                 &self.state,
                 size.width as f32,
                 size.height as f32,
                 window.scale_factor() as f32,
                 &mut self.terminal_controls,
                 search_bar,
+                layout.as_ref(),
             );
             if self.last_accessibility_tree.as_ref() != Some(&tree) {
                 adapter.update_if_active(|| {

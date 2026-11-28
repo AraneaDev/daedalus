@@ -1,0 +1,29 @@
+version = 1
+
+[template]
+id = "example-service-led"
+name = "Demo HTTP server"
+
+[[template.definition.sources]]
+id = "http"
+kind = "port"
+port = 18765
+
+[template.definition.display]
+style = "led"
+
+[template.definition.display.appearance]
+width = 240
+surface = "flat"
+status = "light_and_text"
+
+[[template.definition.display.details]]
+source = "http"
+field = "label"
+label = "Status"
+
+[[template.definition.actions]]
+id = "open-service"
+label = "Open service terminal"
+kind = "logs"
+role = "service"

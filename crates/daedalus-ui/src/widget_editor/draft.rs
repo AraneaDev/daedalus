@@ -1,8 +1,29 @@
+use super::elements::ElementDraft;
 use super::fields::{edit_fields, format_fields};
 use daedalus_proto::workbench::{
-    CommandOutput, NamedAction, NamedSource, RefreshPolicy, WidgetAction, WidgetDefinition,
-    WidgetInstance, WidgetSource, WidgetTemplate, WorkspaceCommand, WorkspaceDocument,
+    CommandOutput, MAX_WIDGET_WIDTH, MIN_WIDGET_WIDTH, NamedAction, NamedSource, RefreshPolicy,
+    WidgetAction, WidgetAppearance, WidgetDefinition, WidgetInstance, WidgetSource, WidgetTemplate,
+    WorkspaceCommand, WorkspaceDocument,
 };
+
+pub(crate) enum AppearanceInputError {
+    Accent,
+    Width,
+}
+
+impl std::fmt::Display for AppearanceInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Accent => {
+                f.write_str("Use #RRGGBB for Accent, or clear it to use the theme color.")
+            }
+            Self::Width => write!(
+                f,
+                "Enter a whole width from {MIN_WIDGET_WIDTH}–{MAX_WIDGET_WIDTH} px, or clear it for automatic sizing."
+            ),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct WidgetDraft {
@@ -20,6 +41,12 @@ pub struct WidgetDraft {
     pub details: String,
     pub url: String,
     pub change_source: bool,
+    pub(crate) accent: String,
+    pub(crate) width: String,
+    pub(crate) icon: String,
+    pub(crate) editing_appearance: bool,
+    pub(crate) elements: Vec<ElementDraft>,
+    pub(crate) editing_element: Option<usize>,
     new_url_action_id: String,
 }
 
@@ -45,6 +72,12 @@ impl WidgetDraft {
             details: String::new(),
             url: String::new(),
             change_source: false,
+            accent: String::new(),
+            width: String::new(),
+            icon: String::new(),
+            editing_appearance: false,
+            elements: Vec::new(),
+            editing_element: None,
             new_url_action_id: uuid::Uuid::new_v4().to_string(),
         };
         draft.load_fields();
@@ -95,6 +128,24 @@ impl WidgetDraft {
         }
         self.summary = format_fields(&self.definition.display.summary);
         self.details = format_fields(&self.definition.display.details);
+        let display = &self.definition.display;
+        self.accent = display.appearance.accent.clone().unwrap_or_default();
+        self.width = display
+            .appearance
+            .width
+            .map(|width| width.to_string())
+            .unwrap_or_default();
+        self.icon = display.icon.clone().unwrap_or_default();
+        self.editing_appearance = false;
+        self.elements = self
+            .definition
+            .display
+            .elements
+            .iter()
+            .cloned()
+            .map(ElementDraft::new)
+            .collect();
+        self.editing_element = None;
         self.url =
             first_url(&self.definition.actions).map_or_else(String::new, |(_, url)| url.into());
     }
@@ -105,12 +156,46 @@ impl WidgetDraft {
         if widget.name.is_empty() {
             return Err("Enter a name for the widget.".into());
         }
+        widget.definition = Some(self.build_definition()?);
+        Ok(widget)
+    }
+
+    pub(crate) fn build_definition(&self) -> Result<WidgetDefinition, String> {
         let mut definition = self.definition.clone();
         self.update_source(&mut definition)?;
         self.update_display(&mut definition)?;
-        self.update_url(&mut definition.actions);
-        widget.definition = Some(definition);
-        Ok(widget)
+        definition.actions = self.available_actions();
+        if let Some(id) = definition.display.primary_action.as_deref()
+            && (id == self.new_url_action_id || self.definition.primary_action().is_some())
+            && definition.primary_action().is_none()
+        {
+            definition.display.primary_action = None;
+        }
+        Ok(definition)
+    }
+
+    pub(crate) fn available_actions(&self) -> Vec<NamedAction> {
+        let mut actions = self.definition.actions.clone();
+        self.update_url(&mut actions);
+        actions
+    }
+
+    pub(crate) fn primary_action_label(&self) -> Option<String> {
+        let id = self.definition.display.primary_action.as_deref()?;
+        self.available_actions()
+            .into_iter()
+            .find(|action| action.id == id)
+            .map(|action| action.label)
+    }
+
+    pub(crate) fn cycle_primary_action(&mut self) {
+        let actions = self.available_actions();
+        let current = self.definition.display.primary_action.as_deref();
+        let next = actions
+            .iter()
+            .position(|action| Some(action.id.as_str()) == current)
+            .map_or(0, |index| index + 1);
+        self.definition.display.primary_action = actions.get(next).map(|action| action.id.clone());
     }
 
     pub(super) fn build_for_document(
@@ -207,9 +292,45 @@ impl WidgetDraft {
     }
 
     fn update_display(&self, definition: &mut WidgetDefinition) -> Result<(), String> {
+        definition.display.appearance = self
+            .validated_appearance()
+            .map_err(|error| error.to_string())?;
+        if self.icon != definition.display.icon.as_deref().unwrap_or_default() {
+            let icon = self.icon.trim();
+            definition.display.icon = (!icon.is_empty()).then(|| icon.into());
+        }
         definition.display.summary = edit_fields(&self.summary, &definition.display.summary)?;
         definition.display.details = edit_fields(&self.details, &definition.display.details)?;
+        definition.display.elements = self
+            .elements
+            .iter()
+            .map(ElementDraft::build)
+            .collect::<Result<_, _>>()?;
         Ok(())
+    }
+
+    pub(crate) fn validated_appearance(&self) -> Result<WidgetAppearance, AppearanceInputError> {
+        let accent = self.accent.trim();
+        let mut appearance = WidgetAppearance {
+            accent: (!accent.is_empty()).then(|| accent.into()),
+            ..self.definition.display.appearance.clone()
+        };
+        if appearance.accent.is_some() && appearance.accent_rgb().is_none() {
+            return Err(AppearanceInputError::Accent);
+        }
+        let width = self.width.trim();
+        appearance.width = if width.is_empty() {
+            None
+        } else {
+            Some(
+                width
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|width| (MIN_WIDGET_WIDTH..=MAX_WIDGET_WIDTH).contains(width))
+                    .ok_or(AppearanceInputError::Width)?,
+            )
+        };
+        Ok(appearance)
     }
 
     fn update_url(&self, actions: &mut Vec<NamedAction>) {

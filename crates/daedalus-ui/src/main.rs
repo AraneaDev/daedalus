@@ -741,7 +741,10 @@ impl DaedalusApp {
 
     fn activate_session(&mut self, target: HitTarget) {
         match target {
-            HitTarget::CustomWidget(index) => self.open_widget_details(index),
+            HitTarget::CustomWidget(index) => self.activate_widget(index),
+            HitTarget::WidgetElementAction { widget, element } => {
+                self.activate_widget_element(widget, element)
+            }
             HitTarget::Widget(role) => {
                 if let Some(id) = self.state.pane_id_for_role(role) {
                     if role == PaneRole::Runner && self.state.widget_diagnostic().is_some() {

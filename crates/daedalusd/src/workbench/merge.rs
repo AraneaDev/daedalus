@@ -1,6 +1,8 @@
 mod references;
 
-use daedalus_proto::workbench::{ConflictChoice, MergeConflict, WorkspaceDocument};
+use daedalus_proto::workbench::{
+    ConflictChoice, MergeConflict, WidgetAppearance, WorkspaceDocument,
+};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,6 +74,18 @@ impl Merge<'_> {
         ) = (base, local, incoming)
         {
             return Some(Value::Object(self.object(path, base, local, incoming)));
+        }
+        // Portable definitions omit the default appearance. Restore it for
+        // merging so individual edits can combine even across the default.
+        if path.ends_with("/display/appearance") {
+            let default = serde_json::json!(WidgetAppearance::default());
+            if let (Value::Object(base), Value::Object(local), Value::Object(incoming)) = (
+                base.unwrap_or(&default),
+                local.unwrap_or(&default),
+                incoming.unwrap_or(&default),
+            ) {
+                return Some(Value::Object(self.object(path, base, local, incoming)));
+            }
         }
         if let (Some(Value::Array(base)), Some(Value::Array(local)), Some(Value::Array(incoming))) =
             (base, local, incoming)

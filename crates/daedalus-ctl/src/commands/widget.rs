@@ -1,3 +1,4 @@
+mod configuration;
 mod editor;
 mod instances;
 mod templates;
@@ -5,20 +6,86 @@ mod templates;
 use super::workspace_config::{Target, workbench};
 use crate::client::{ClientError, DaemonClient};
 use crate::unexpected_response;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
+use daedalus_proto::workbench::{WidgetDisplay, WidgetElement, WidgetStyle};
 use daedalus_proto::{ClientMessage, ResponsePayload};
 use instances::{Change, find_widget};
 use std::path::PathBuf;
 use templates::{TemplateAction, decode, load_template};
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum Style {
+    Badge,
+    Button,
+    Led,
+}
+
+impl From<Style> for WidgetStyle {
+    fn from(style: Style) -> Self {
+        match style {
+            Style::Badge => Self::Badge,
+            Style::Button => Self::Button,
+            Style::Led => Self::Led,
+        }
+    }
+}
+
+#[derive(Debug, Default, Args)]
+pub(crate) struct DisplayOverrides {
+    /// Set the widget's appearance in the bottom bar.
+    #[arg(long, value_enum)]
+    style: Option<Style>,
+    /// Set ordered widget elements. Use [] to clear them.
+    #[arg(long, value_name = "JSON", value_parser = parse_elements)]
+    elements: Option<Elements>,
+}
+
+impl DisplayOverrides {
+    fn is_empty(&self) -> bool {
+        self.style.is_none() && self.elements.is_none()
+    }
+
+    fn matches(&self, display: &WidgetDisplay) -> bool {
+        self.style
+            .is_none_or(|style| WidgetStyle::from(style) == display.style)
+            && self
+                .elements
+                .as_ref()
+                .is_none_or(|elements| elements.0 == display.elements)
+    }
+
+    fn apply(self, display: &mut WidgetDisplay) {
+        if let Some(style) = self.style {
+            display.style = style.into();
+        }
+        if let Some(Elements(elements)) = self.elements {
+            display.elements = elements;
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Elements(Vec<WidgetElement>);
+
+fn parse_elements(value: &str) -> Result<Elements, String> {
+    serde_json::from_str(value)
+        .map(Elements)
+        .map_err(|error| format!("Provide a JSON array of widget elements. {error}"))
+}
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Action {
     List(WidgetTarget),
     Show {
         id: String,
+        /// Emit the resolved definition and saved revision as JSON.
+        #[arg(long)]
+        effective: bool,
         #[command(flatten)]
         selection: WidgetTarget,
     },
+    /// Apply a JSON merge patch to a widget.
+    Configure(configuration::Configure),
     Create {
         id: String,
         #[arg(long, conflicts_with = "template")]
@@ -28,6 +95,8 @@ pub(crate) enum Action {
         #[arg(long)]
         name: Option<String>,
         #[command(flatten)]
+        display: DisplayOverrides,
+        #[command(flatten)]
         selection: WidgetTarget,
     },
     Edit {
@@ -36,6 +105,8 @@ pub(crate) enum Action {
         file: Option<PathBuf>,
         #[arg(long)]
         name: Option<String>,
+        #[command(flatten)]
+        display: DisplayOverrides,
         #[command(flatten)]
         selection: WidgetTarget,
     },
@@ -120,16 +191,38 @@ impl Action {
                 }
                 return Ok(());
             }
-            Self::Show { id, selection } => {
+            Self::Show {
+                id,
+                effective,
+                selection,
+            } => {
                 let workspace = selection.target.resolve(client).await?;
                 let state = workbench(client, workspace).await?;
-                return print_json(serde_json::to_value(find_widget(&state.document, &id)?)?);
+                if effective {
+                    return print_json(configuration::effective(&state, &id)?);
+                }
+                let widget = find_widget(&state.document, &id)?;
+                let display = state
+                    .document
+                    .widget_definition(widget)
+                    .map(|definition| &definition.display);
+                let mut result = serde_json::to_value(widget)?;
+                result["style"] =
+                    serde_json::to_value(display.map(|display| display.style).unwrap_or_default())?;
+                result["elements"] = serde_json::to_value(
+                    display
+                        .map(|display| display.elements.as_slice())
+                        .unwrap_or_default(),
+                )?;
+                return print_json(result);
             }
+            Self::Configure(configure) => return configure.run(client).await,
             Self::Create {
                 id,
                 file,
                 template,
                 name,
+                display,
                 selection,
             } => {
                 let (template, inline) = match (template, file) {
@@ -137,22 +230,34 @@ impl Action {
                     (None, Some(path)) => (None, Some(decode(client, &path).await?)),
                     (None, None) => (None, None),
                 };
-                (selection, Change::create(id, name, template, inline))
+                (
+                    selection,
+                    Change::create(id, name, template, inline, display),
+                )
             }
             Self::Edit {
                 id,
                 file,
                 name,
+                display,
                 selection,
             } => {
-                if file.is_none() && name.is_none() {
+                if file.is_none() && name.is_none() && display.is_empty() {
                     return editor::edit(client, id, selection).await;
                 }
                 let draft = match file {
                     Some(path) => Some(decode(client, &path).await?),
                     None => None,
                 };
-                (selection, Change::Edit { id, draft, name })
+                (
+                    selection,
+                    Change::Edit {
+                        id,
+                        draft,
+                        name,
+                        display,
+                    },
+                )
             }
             Self::Duplicate {
                 id,

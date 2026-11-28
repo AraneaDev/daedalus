@@ -57,6 +57,13 @@ fn widget_editor_builds_previews_and_saves_a_daemon_definition() {
     settings.set_value(Control::CustomSummary, "main:text");
     let url = "https://example.invalid/health";
     settings.set_value(Control::CustomUrl, url);
+    settings.activate(Control::CustomPrimaryAction);
+    settings.activate(Control::CustomStyle);
+    assert_eq!(settings.label(Control::CustomStyle), "Style · Button ↻");
+    assert_eq!(
+        settings.label(Control::CustomPrimaryAction),
+        "On click · Open link ↻"
+    );
     let preview = settings.activate(Control::CustomPreview);
     workbench.app.handle_settings_action(preview);
     let UiCommand::Workbench {
@@ -76,6 +83,11 @@ fn widget_editor_builds_previews_and_saves_a_daemon_definition() {
         definition.actions[0].action,
         WidgetAction::OpenUrl { url: url.into() }
     );
+    assert_eq!(definition.primary_action(), definition.actions.first());
+    assert_eq!(
+        definition.display.style,
+        daedalus_proto::workbench::WidgetStyle::Button
+    );
     let duplicate = workbench
         .app
         .state
@@ -84,6 +96,7 @@ fn widget_editor_builds_previews_and_saves_a_daemon_definition() {
     workbench.app.handle_settings_action(duplicate);
     assert!(workbench.commands.try_recv().is_err());
     let result = WidgetResult {
+        element_values: Default::default(),
         label: "Ready".into(),
         level: StatusLevel::Ok,
         details: vec![],

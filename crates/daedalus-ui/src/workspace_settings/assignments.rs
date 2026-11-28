@@ -57,10 +57,7 @@ impl DaedalusApp {
         assignment: Assignment,
         launch: AssignmentLaunch,
     ) -> bool {
-        let (cols, rows) = self
-            .compute_current_layout()
-            .and_then(|layout| layout.panes.first().map(|pane| (pane.cols, pane.rows)))
-            .unwrap_or((FALLBACK_PANE_COLS, FALLBACK_PANE_ROWS));
+        let (cols, rows) = self.launch_pane_size();
         self.send_command(UiCommand::LaunchAssignment {
             workspace_id,
             launch: if assignment.role == PaneRole::Runner {
@@ -72,6 +69,12 @@ impl DaedalusApp {
             cols,
             rows,
         })
+    }
+
+    pub(crate) fn launch_pane_size(&self) -> (u16, u16) {
+        self.compute_current_layout()
+            .and_then(|layout| layout.panes.first().map(|pane| (pane.cols, pane.rows)))
+            .unwrap_or((FALLBACK_PANE_COLS, FALLBACK_PANE_ROWS))
     }
 
     pub(crate) fn restore_session_names(&mut self, workspaces: &[WorkspaceInfo]) {

@@ -5,6 +5,7 @@ use daedalus_proto::ClientMessage;
 
 mod definition;
 mod details;
+mod elements;
 mod sharing;
 
 impl SettingsDialog {
@@ -23,6 +24,7 @@ impl SettingsDialog {
             rows.extend([
                 vec![CustomPrev, CustomEdit, CustomNext],
                 vec![CustomDuplicate, CustomMove, CustomPin, CustomRemove],
+                vec![CustomInspect],
             ]);
         } else if self.custom_enabled(CustomNext) {
             rows.push(vec![CustomPrev, CustomNext]);
@@ -34,6 +36,7 @@ impl SettingsDialog {
     pub(super) fn custom_label(&self, control: Control) -> Option<String> {
         if let Some(label) = self
             .definition_label(control)
+            .or_else(|| self.element_label(control))
             .or_else(|| self.detail_label(control))
             .or_else(|| self.sharing_label(control))
         {
@@ -47,6 +50,7 @@ impl SettingsDialog {
                 || "Edit widget".into(),
                 |widget| format!("Edit {}", widget.name),
             ),
+            CustomInspect => "View widget details".into(),
             CustomPrev => "‹ Previous".into(),
             CustomNext => "Next ›".into(),
             CustomDuplicate => "Duplicate".into(),
@@ -65,32 +69,18 @@ impl SettingsDialog {
             }
             CustomSharing => "Import / export".into(),
             CustomBack => "Back".into(),
-            _ if matches!(
-                control,
-                CustomName
-                    | CustomExecutable
-                    | CustomArguments
-                    | CustomInterval
-                    | CustomPublish
-                    | CustomSummary
-                    | CustomDetails
-                    | CustomUrl
-                    | CustomPath
-                    | CustomRoot
-                    | CustomDefinition
-            ) =>
-            {
-                format!(
-                    "{}   {}",
-                    control.field_label()?,
-                    self.custom_value(control).unwrap_or_default()
-                )
-            }
-            _ => return None,
+            _ => format!(
+                "{}   {}",
+                control.field_label()?,
+                self.custom_value(control)?
+            ),
         })
     }
 
     pub(super) fn custom_enabled(&self, control: Control) -> bool {
+        if let Some(enabled) = self.element_enabled(control) {
+            return enabled;
+        }
         match control {
             CustomNew => self.custom.state.is_some(),
             CustomTemplate => !self.custom.library.templates.is_empty(),
@@ -98,9 +88,13 @@ impl SettingsDialog {
                 let count = state.document.widgets.len();
                 count > 1 || (count == 1 && self.custom.selected().is_none())
             }),
-            CustomEdit | CustomDuplicate | CustomRemove | CustomExportTemplate => {
+            CustomEdit | CustomInspect | CustomDuplicate | CustomRemove | CustomExportTemplate => {
                 self.custom.selected().is_some()
             }
+            CustomPrimaryAction => self.custom.draft.as_ref().is_some_and(|draft| {
+                draft.definition.display.primary_action.is_some()
+                    || !draft.available_actions().is_empty()
+            }),
             CustomPin => self.custom.draft.is_some() || self.custom.selected().is_some(),
             CustomMove => self.custom.selected_index().is_some_and(|index| index > 0),
             CustomApplyImport => self.can_apply_import(),
@@ -112,6 +106,8 @@ impl SettingsDialog {
             CustomDetailNext => {
                 (self.custom.detail_page + 1) * self.detail_page_size() < self.detail_line_count()
             }
+            CustomActionPrev => self.custom.detail_action_page > 0,
+            CustomActionNext => self.has_next_action_page(),
             _ => true,
         }
     }
@@ -136,7 +132,10 @@ impl SettingsDialog {
             CustomSummary => &draft.summary,
             CustomDetails => &draft.details,
             CustomUrl => &draft.url,
-            _ => return None,
+            CustomAccent => &draft.accent,
+            CustomWidth => &draft.width,
+            CustomIcon => &draft.icon,
+            _ => return self.element_value(control),
         })
     }
 
@@ -151,6 +150,9 @@ impl SettingsDialog {
         }
         if self.focus == CustomDefinition {
             return Some(&mut self.custom.definition_json);
+        }
+        if elements::is_text_field(self.focus) {
+            return self.element_field();
         }
         let draft = self.custom.draft.as_mut()?;
         if matches!(
@@ -168,11 +170,20 @@ impl SettingsDialog {
             CustomSummary => &mut draft.summary,
             CustomDetails => &mut draft.details,
             CustomUrl => &mut draft.url,
+            CustomAccent => &mut draft.accent,
+            CustomWidth => &mut draft.width,
+            CustomIcon => &mut draft.icon,
             _ => return None,
         })
     }
 
     pub(super) fn apply_custom_control(&mut self, control: Control) -> SettingsAction {
+        if control == CustomInspect {
+            return self
+                .custom
+                .selected_index()
+                .map_or(SettingsAction::None, SettingsAction::InspectWidget);
+        }
         match self.custom_command(control) {
             Ok(Some(request)) => {
                 let operation = match &request {
@@ -230,6 +241,9 @@ impl SettingsDialog {
 
     fn custom_command(&mut self, control: Control) -> Result<Option<ClientMessage>, String> {
         let id = self.widget_workspace.ok_or("No workspace is open")?;
+        if self.apply_element_control(control) {
+            return Ok(None);
+        }
         let editor = &mut self.custom;
         match control {
             CustomNew => {
@@ -257,8 +271,8 @@ impl SettingsDialog {
                 self.focus = CustomNew;
             }
             CustomName | CustomExecutable | CustomArguments | CustomInterval | CustomPublish
-            | CustomSummary | CustomDetails | CustomUrl | CustomPath | CustomRoot
-            | CustomDefinition => self.select_all = true,
+            | CustomSummary | CustomDetails | CustomUrl | CustomAccent | CustomWidth
+            | CustomIcon | CustomPath | CustomRoot | CustomDefinition => self.select_all = true,
             CustomPin => {
                 if let Some(draft) = &mut editor.draft {
                     draft.widget.pinned = !draft.widget.pinned;
@@ -290,12 +304,20 @@ impl SettingsDialog {
             | CustomAdvanced
             | CustomApplyDefinition
             | CustomOutput
+            | CustomPrimaryAction
+            | CustomStyle
+            | CustomAppearance
+            | CustomAppearanceBack
+            | CustomDensity
+            | CustomSurface
+            | CustomStatusPresentation
             | CustomPreview
             | CustomSave
             | CustomSaveTemplate => {
                 return self.definition_command(id, control);
             }
-            CustomDetailPrev | CustomDetailNext | CustomRefresh | CustomViewAction(_) => {
+            CustomDetailPrev | CustomDetailNext | CustomActionPrev | CustomActionNext
+            | CustomRefresh | CustomViewAction(_) => {
                 return self.detail_command(id, control);
             }
             CustomImport

@@ -16,6 +16,7 @@ pub enum SettingsAction {
     Save(Vec<Assignment>),
     Launch(Vec<Assignment>, String),
     SaveWidgets(WorkspaceWidgets),
+    InspectWidget(usize),
     Workbench {
         operation: crate::bridge::WorkbenchOperation,
         request: Box<daedalus_proto::ClientMessage>,
@@ -47,10 +48,41 @@ pub enum Control {
     CustomSummary,
     CustomDetails,
     CustomUrl,
+    CustomPrimaryAction,
+    CustomStyle,
+    CustomAppearance,
+    CustomAppearanceBack,
+    CustomAccent,
+    CustomWidth,
+    CustomIcon,
+    CustomDensity,
+    CustomSurface,
+    CustomStatusPresentation,
+    CustomElements,
+    CustomElementsBack,
+    CustomElementAddLabel,
+    CustomElementAddStatus,
+    CustomElementAddCounter,
+    CustomElementAddProgress,
+    CustomElementAddButton,
+    CustomElementPrev,
+    CustomElementNext,
+    CustomElementEarlier,
+    CustomElementLater,
+    CustomElementRemove,
+    CustomElementText,
+    CustomElementSource,
+    CustomElementField,
+    CustomElementCaption,
+    CustomElementMax,
+    CustomElementAction,
+    CustomInspect,
     CustomPreview,
     CustomDetail(usize),
     CustomDetailPrev,
     CustomDetailNext,
+    CustomActionPrev,
+    CustomActionNext,
     CustomViewAction(usize),
     CustomRefresh,
     CustomAdvanced,
@@ -84,8 +116,6 @@ pub enum Control {
     Agy,
     Claude,
     Codex,
-    CargoTest,
-    CargoCheck,
     Remove,
     #[default]
     Name,
@@ -126,6 +156,14 @@ impl Control {
             CustomSummary => "Bar fields".into(),
             CustomDetails => "Detail fields".into(),
             CustomUrl => "Open URL".into(),
+            CustomAccent => "Accent (#RRGGBB)".into(),
+            CustomWidth => "Width (px)".into(),
+            CustomIcon => "Icon (optional)".into(),
+            CustomElementText => "Label text".into(),
+            CustomElementSource => "Source ID".into(),
+            CustomElementField => "Field name".into(),
+            CustomElementCaption => "Caption (optional)".into(),
+            CustomElementMax => "Maximum".into(),
             CustomPath => "TOML file path".into(),
             CustomRoot => "New workspace folder (optional, on daemon host)".into(),
             CustomDefinition => "Widget definition (JSON)".into(),
@@ -286,6 +324,13 @@ impl SettingsDialog {
         self.is_custom_page() && self.custom.sharing && matches!(control, CustomDetail(_))
     }
 
+    pub fn is_read_only_text(&self, control: Control) -> bool {
+        self.is_import_review_text(control)
+            || (self.is_custom_page()
+                && self.custom.showing_details
+                && matches!(control, CustomDetail(index) if self.is_composed_detail(index)))
+    }
+
     pub fn open_custom_page(&mut self) {
         self.activate(CustomWidgetsPage);
     }
@@ -444,6 +489,12 @@ impl SettingsDialog {
             } else {
                 String::new()
             }
+        } else if self.is_custom_page()
+            && let Some(draft) = &self.custom.draft
+            && let Some(index) = draft.editing_element
+            && !draft.elements.is_empty()
+        {
+            format!("{} of {}", index + 1, draft.elements.len())
         } else if self.is_pane_widgets_page() || self.is_custom_page() {
             String::new()
         } else if self.assignments.is_empty() {
@@ -465,8 +516,17 @@ impl SettingsDialog {
                 self.custom
                     .selected()
                     .map_or_else(|| "Widget details".into(), |widget| widget.name.clone())
-            } else if self.custom.draft.is_some() {
-                "Widget editor".into()
+            } else if let Some(draft) = &self.custom.draft {
+                if draft.editing_element.is_some() {
+                    draft.selected_element().map_or_else(
+                        || "Widget elements".into(),
+                        |element| format!("Widget elements · {}", element.kind()),
+                    )
+                } else if draft.editing_appearance {
+                    "Widget appearance".into()
+                } else {
+                    "Widget editor".into()
+                }
             } else {
                 "Custom widgets".into()
             }
@@ -735,20 +795,25 @@ mod tests {
     use daedalus_proto::PaneRole;
 
     #[test]
-    fn cargo_templates_create_editable_runner_assignments() {
+    fn assignments_omit_cargo_presets_and_keep_saved_cargo_commands_editable() {
         let mut dialog = SettingsDialog::default();
-        dialog.begin(Vec::new());
-        dialog.activate(CargoTest);
-        dialog.activate(CargoCheck);
+        let saved = crate::assignments::CargoPreset::Check.assignment();
+        dialog.begin(vec![saved.clone()]);
+        let labels: Vec<_> = dialog.control_order().map(|c| dialog.label(c)).collect();
+        assert!(
+            !labels
+                .iter()
+                .any(|label| matches!(label.as_str(), "+ Cargo Test" | "+ Cargo Check"))
+        );
+        assert!(labels.iter().any(|label| label == "+ Command"));
         dialog.set_value(Argument(1), "--all-targets");
         let SettingsAction::Launch(entries, id) = dialog.activate(Launch) else {
             panic!("expected launch");
         };
         assert_eq!(entries[0].role, PaneRole::Runner);
-        assert_eq!(entries[0].argv, ["cargo", "test", "--workspace"]);
-        assert_eq!(entries[1].role, PaneRole::Runner);
-        assert_eq!(entries[1].argv, ["cargo", "check", "--all-targets"]);
-        assert_eq!(entries[1].id, id);
+        assert_eq!(entries[0].argv, ["cargo", "check", "--all-targets"]);
+        assert_eq!(entries[0].id, saved.id);
+        assert_eq!(id, saved.id);
     }
 
     #[test]

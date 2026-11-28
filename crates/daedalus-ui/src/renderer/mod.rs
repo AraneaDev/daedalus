@@ -1,3 +1,4 @@
+mod footer_widget;
 mod frame_quads;
 mod image_preview;
 mod overlay_quads;

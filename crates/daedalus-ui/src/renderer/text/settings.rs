@@ -122,7 +122,7 @@ impl TextRenderer {
                 continue;
             }
             let label = dialog.label(c);
-            let read_only = dialog.is_import_review_text(c);
+            let read_only = dialog.is_read_only_text(c);
             let enabled = dialog.enabled(c);
             let color = if read_only {
                 theme.text_primary

@@ -1,0 +1,14 @@
+[runner]
+command = ["cargo", "test", "--workspace"]
+
+[runner.widget]
+preset = "cargo-test"
+label = "Workspace tests"
+show_duration = true
+
+[service]
+command = ["python3", "-m", "http.server", "18765", "--bind", "127.0.0.1", "--directory", "examples/workbench/public"]
+
+[service.widget]
+preset = "service"
+label = "Demo HTTP server"

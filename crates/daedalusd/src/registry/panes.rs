@@ -259,7 +259,7 @@ impl Registry {
 
     /// The caller holds the workspace lifecycle lock until installation completes.
     #[allow(clippy::too_many_arguments)]
-    async fn install_pane(
+    pub(super) async fn install_pane(
         &self,
         workspace_id: WorkspaceId,
         role: PaneRole,

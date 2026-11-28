@@ -166,6 +166,24 @@ pub(super) async fn dispatch(
                 .invoke_widget_action(workspace_id, &widget, &action)
                 .await?,
         )),
+        ClientMessage::ActivateWidget {
+            workspace_id,
+            widget,
+            revision,
+            action,
+            cols,
+            rows,
+        } => Ok(ResponsePayload::WidgetAction(
+            registry
+                .activate_widget(
+                    workspace_id,
+                    &widget,
+                    revision,
+                    action.as_deref(),
+                    (cols, rows),
+                )
+                .await?,
+        )),
         _ => unreachable!("only workbench requests are routed here"),
     }
 }

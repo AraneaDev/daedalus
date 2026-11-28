@@ -210,6 +210,59 @@ impl DaedalusApp {
         }
     }
 
+    pub(super) fn activate_widget(&mut self, index: Option<usize>) {
+        self.activate_widget_at(index, None);
+    }
+
+    pub(super) fn activate_widget_element(&mut self, widget: usize, element: usize) {
+        self.activate_widget_at(Some(widget), Some(element));
+    }
+
+    fn activate_widget_at(&mut self, index: Option<usize>, element: Option<usize>) {
+        let button = index.and_then(|index| {
+            let (id, state) = self.state.workbench.as_ref()?;
+            if self.state.active_workspace_id != Some(*id) || state.revision == 0 {
+                return None;
+            }
+            let widget = state
+                .document
+                .widgets
+                .get(index)
+                .filter(|widget| widget.pinned)?;
+            let definition = state.document.widget_definition(widget)?;
+            let action = match element {
+                Some(index) => Some(definition.element_action(index)?.id.clone()),
+                None if definition.display.elements.is_empty() => {
+                    definition.primary_action()?;
+                    None
+                }
+                None => return None,
+            };
+            Some((*id, state.revision, widget.id.clone(), action))
+        });
+        let Some((id, revision, widget, action)) = button else {
+            self.open_widget_details(index);
+            return;
+        };
+        let (cols, rows) = self.launch_pane_size();
+        if self.state.connection != ConnectionState::Connected
+            || !self.request_workbench_as(
+                id,
+                WorkbenchOperation::WidgetButton(widget.clone()),
+                ClientMessage::ActivateWidget {
+                    workspace_id: id,
+                    widget,
+                    revision,
+                    action,
+                    cols,
+                    rows,
+                },
+            )
+        {
+            self.show_toast("Reconnect to run widget actions.", true);
+        }
+    }
+
     pub(super) fn open_widget_details(&mut self, index: Option<usize>) {
         self.open_workspace_settings();
         if !self.state.settings.open {
@@ -217,9 +270,14 @@ impl DaedalusApp {
         }
         self.state.settings.open_custom_page();
         self.state.settings.focus = daedalus_ui::settings::Control::CustomNew;
-        if let Some(index) = index
-            && self.state.settings.custom.open_details(index)
-        {
+        if let Some(index) = index {
+            self.show_widget_details(index);
+        }
+        self.request_redraw();
+    }
+
+    pub(super) fn show_widget_details(&mut self, index: usize) {
+        if self.state.settings.custom.open_details(index) {
             self.state.settings.focus = daedalus_ui::settings::Control::CustomRefresh;
             self.state.settings.custom.preview =
                 self.state.settings.custom.selected().and_then(|widget| {
@@ -230,6 +288,5 @@ impl DaedalusApp {
                         .map(|snapshot| snapshot.result.clone())
                 });
         }
-        self.request_redraw();
     }
 }

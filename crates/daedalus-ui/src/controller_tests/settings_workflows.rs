@@ -171,6 +171,7 @@ fn late_widget_test_cannot_populate_the_next_draft() {
     };
     let result = |label: &str| {
         Ok(ResponsePayload::WidgetResult(WidgetResult {
+            element_values: Default::default(),
             label: label.into(),
             level: StatusLevel::Ok,
             details: Vec::new(),
@@ -1015,6 +1016,7 @@ fn widget_detail_pages_hold_action_output_until_explicit_refresh() {
         Ok(ResponsePayload::Workbench(state)),
     );
     let result = WidgetResult {
+        element_values: Default::default(),
         label: "Ready".into(),
         level: StatusLevel::Ok,
         details: vec![(
@@ -1070,6 +1072,7 @@ fn widget_detail_pages_hold_action_output_until_explicit_refresh() {
         if widget == "runner" && action == "terminal")
     );
     let action_output = WidgetResult {
+        element_values: Default::default(),
         label: "Detailed output".into(),
         level: StatusLevel::Info,
         details: vec![],
@@ -1162,6 +1165,7 @@ fn manual_widget_refresh_ignores_results_for_an_older_workbench_snapshot() {
     let snapshot = |label: &str| WidgetSnapshot {
         id: "manual".into(),
         result: WidgetResult {
+            element_values: Default::default(),
             label: label.into(),
             level: StatusLevel::Ok,
             details: vec![],
@@ -1458,6 +1462,7 @@ fn duplicate_widget_test_keeps_the_in_flight_preview() {
         id,
         operation,
         Ok(ResponsePayload::WidgetResult(WidgetResult {
+            element_values: Default::default(),
             label: "Ready".into(),
             level: StatusLevel::Ok,
             details: Vec::new(),
@@ -1532,6 +1537,7 @@ fn busy_widget_preview_rejection_settles_only_its_request() {
         id,
         original,
         Ok(ResponsePayload::WidgetResult(WidgetResult {
+            element_values: Default::default(),
             label: "Original".into(),
             level: StatusLevel::Ok,
             details: Vec::new(),
@@ -1548,6 +1554,7 @@ fn busy_widget_preview_rejection_settles_only_its_request() {
         id,
         operation,
         Ok(ResponsePayload::WidgetResult(WidgetResult {
+            element_values: Default::default(),
             label: "Edited".into(),
             level: StatusLevel::Ok,
             details: Vec::new(),

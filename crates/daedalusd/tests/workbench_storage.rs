@@ -794,6 +794,54 @@ async fn widget_library_rejects_duplicates_and_preserves_a_concurrent_save_acros
 }
 
 #[tokio::test]
+async fn widget_library_refreshes_only_untouched_legacy_cargo_templates() {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut daemon = DaemonFixture::start(scratch.path()).await;
+    let ResponsePayload::WidgetLibrary(library) = daemon
+        .call(ClientMessage::ListWidgetTemplates)
+        .await
+        .unwrap()
+    else {
+        panic!("expected widget library");
+    };
+    let latest: Vec<_> = library
+        .templates
+        .into_iter()
+        .filter(|template| matches!(template.id.as_str(), "cargo-test" | "cargo-check"))
+        .collect();
+    let mut saved = latest.clone();
+    for template in &mut saved {
+        template.definition.display.primary_action = None;
+        template.definition.display.style = Default::default();
+        template
+            .definition
+            .actions
+            .retain(|action| action.id != "run");
+    }
+    saved[1].name = "Customized Cargo widget".into();
+    let customized = saved[1].clone();
+    daemon
+        .call(ClientMessage::UpdateWidgetTemplates {
+            revision: library.revision,
+            templates: saved,
+        })
+        .await
+        .unwrap();
+    daemon.finish().await;
+
+    let mut daemon = DaemonFixture::start(scratch.path()).await;
+    let ResponsePayload::WidgetLibrary(library) = daemon
+        .call(ClientMessage::ListWidgetTemplates)
+        .await
+        .unwrap()
+    else {
+        panic!("expected widget library");
+    };
+    assert_eq!(library.templates, [latest[0].clone(), customized]);
+    daemon.finish().await;
+}
+
+#[tokio::test]
 async fn importing_a_new_workspace_validates_the_preview_and_rolls_back_failed_storage() {
     let scratch = tempfile::tempdir().unwrap();
     let root = scratch.path();

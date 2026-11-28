@@ -1,8 +1,8 @@
 use super::*;
 use accesskit::{Action, ActionRequest, Role, TreeId};
 use daedalus_proto::workbench::{
-    NamedAction, WidgetAction, WidgetActionResult, WidgetDefinition, WidgetInstance, WidgetResult,
-    WidgetSnapshot, WorkbenchState, WorkspaceDocument,
+    NamedAction, WidgetAction, WidgetActionResult, WidgetDefinition, WidgetElement, WidgetInstance,
+    WidgetResult, WidgetSnapshot, WorkbenchState, WorkspaceDocument,
 };
 use daedalus_proto::{ClientMessage, ResponsePayload, StatusLevel};
 use daedalus_ui::layout::{CARGO_BAR_LOGICAL_HEIGHT, HitTarget, Rect, hit_test};
@@ -89,6 +89,196 @@ fn click(app: &mut DaedalusApp, metrics: ViewportMetrics, bounds: Rect) {
 }
 
 #[test]
+fn widget_button_activates_from_the_bottom_bar_and_accessibility_tree() {
+    let mut w = Workbench::new();
+    let ws = workspace("Widget button");
+    let id = ws.id;
+    let agent = ws.panes[0].id;
+    let mut runner = ws.panes[2].clone();
+    runner.id = daedalus_proto::PaneId::new();
+    w.app.state.set_workspaces(vec![ws]);
+    let mut state = widgets(&[true]);
+    state.document.widgets[0]
+        .definition
+        .as_mut()
+        .unwrap()
+        .display
+        .primary_action = Some("terminal".into());
+    w.app.state.workbench = Some((id, state));
+    let viewport = metrics(700, 460, 1);
+    let layout = w.app.layout_for(viewport);
+    click(&mut w.app, viewport, layout.widget_buttons[0].1);
+
+    let mut controls = accessibility::TerminalControls::default();
+    let tree = accessibility::workbench_tree(&w.app.state, 700., 460., 1., &mut controls);
+    let (target_node, _) = tree
+        .nodes
+        .iter()
+        .find(|(_, node)| node.label() == Some("Open runner terminal"))
+        .unwrap();
+    let target = controls
+        .action(
+            &w.app.state,
+            &ActionRequest {
+                target_node: *target_node,
+                target_tree: TreeId::ROOT,
+                action: Action::Click,
+                data: None,
+            },
+        )
+        .unwrap();
+    w.app.activate_session(target);
+
+    for _ in 0..2 {
+        let UiCommand::Workbench {
+            request, operation, ..
+        } = w.command()
+        else {
+            panic!("expected a widget command");
+        };
+        assert!(
+            matches!(*request, ClientMessage::ActivateWidget { workspace_id, widget, revision: 1, .. }
+            if workspace_id == id && widget == "widget-0")
+        );
+        if !w.app.state.panes.contains_key(&runner.id) {
+            w.app.workbench_response(
+                id,
+                operation,
+                Ok(ResponsePayload::WidgetAction(
+                    WidgetActionResult::RunnerStarted(runner.clone()),
+                )),
+            );
+        }
+    }
+    assert!(!w.app.state.settings.open);
+    assert_eq!(w.app.state.focused_pane_id(), Some(agent));
+    assert_eq!(
+        w.app.state.pane_id_for_role(PaneRole::Runner),
+        Some(runner.id)
+    );
+}
+
+#[test]
+fn button_details_show_cached_status_and_the_primary_action_beyond_the_first_four() {
+    let mut w = Workbench::new();
+    let ws = workspace("Widget details");
+    let id = ws.id;
+    w.app.state.set_workspaces(vec![ws]);
+    w.app
+        .handle_daemon_event(UiEvent::WorkbenchCapability(true));
+    let mut state = widgets(&[true]);
+    let definition = state.document.widgets[0].definition.as_mut().unwrap();
+    let action = definition.actions.remove(0);
+    definition.actions.extend((0..4).map(|index| NamedAction {
+        id: format!("other-{index}"),
+        ..action.clone()
+    }));
+    definition.display.primary_action = Some(action.id.clone());
+    definition.actions.push(action);
+    w.app.state.workbench = Some((id, state));
+    w.app.state.widget_results.push(WidgetSnapshot {
+        id: "widget-0".into(),
+        result: WidgetResult {
+            element_values: Default::default(),
+            label: "Last run".into(),
+            level: StatusLevel::Ok,
+            details: vec![("Passed".into(), "12".into())],
+        },
+    });
+    w.app.open_widget_details(None);
+    let action = w.app.state.settings.activate(Control::CustomInspect);
+    w.app.handle_settings_action(action);
+    let settings = &w.app.state.settings;
+    assert_eq!(settings.label(Control::CustomDetail(0)), "Passed · 12");
+    assert!(
+        settings
+            .control_order()
+            .any(|control| control == Control::CustomViewAction(4))
+    );
+}
+
+#[test]
+fn inline_widget_button_sends_its_named_action_and_group_click_opens_details() {
+    let mut w = Workbench::new();
+    let ws = workspace("Widget elements");
+    let id = ws.id;
+    w.app.state.set_workspaces(vec![ws]);
+    w.app
+        .handle_daemon_event(UiEvent::WorkbenchCapability(true));
+    let mut state = widgets(&[true]);
+    let definition = state.document.widgets[0].definition.as_mut().unwrap();
+    definition.display.primary_action = Some("terminal".into());
+    definition.actions.push(NamedAction {
+        id: "diff".into(),
+        label: "View diff".into(),
+        action: WidgetAction::Diff,
+    });
+    definition.display.elements = vec![
+        WidgetElement::Status,
+        WidgetElement::Button {
+            action: "diff".into(),
+        },
+    ];
+    w.app.state.workbench = Some((id, state));
+
+    w.app.activate_session(HitTarget::WidgetElementAction {
+        widget: 0,
+        element: 1,
+    });
+    assert!(matches!(w.command(), UiCommand::Workbench { request, .. }
+        if matches!(request.as_ref(), ClientMessage::ActivateWidget { widget, action: Some(action), revision: 1, .. }
+            if widget == "widget-0" && action == "diff")));
+    assert!(!w.app.state.settings.open);
+
+    w.app.activate_session(HitTarget::CustomWidget(Some(0)));
+    assert!(w.app.state.settings.custom.showing_details);
+    assert!(w.commands.try_iter().all(|command| !matches!(command,
+        UiCommand::Workbench { request, .. } if matches!(*request, ClientMessage::ActivateWidget { .. }))));
+}
+
+#[test]
+fn pointer_cannot_run_a_reordered_button_until_the_new_frame_is_painted() {
+    let mut w = Workbench::new();
+    let ws = workspace("Widget frame");
+    let id = ws.id;
+    w.app.state.set_workspaces(vec![ws]);
+    let mut state = widgets(&[true]);
+    let definition = state.document.widgets[0].definition.as_mut().unwrap();
+    let mut second = definition.actions[0].clone();
+    second.id = "second".into();
+    definition.actions.push(second);
+    definition.display.elements = ["terminal", "second"]
+        .map(|action| WidgetElement::Button {
+            action: action.into(),
+        })
+        .into();
+    w.app.state.workbench = Some((id, state));
+    let viewport = metrics(1000, 550, 1);
+    let painted = w.app.layout_for(viewport);
+    let first_button = painted.widget_rows[0].cells[0].bounds;
+    w.app.record_painted_widget_footer(&painted);
+
+    let (_, state) = w.app.state.workbench.as_mut().unwrap();
+    state.revision = 2;
+    state.document.widgets[0]
+        .definition
+        .as_mut()
+        .unwrap()
+        .display
+        .elements
+        .swap(0, 1);
+
+    click(&mut w.app, viewport, first_button);
+    assert!(w.idle());
+    let revised = w.app.layout_for(viewport);
+    w.app.record_painted_widget_footer(&revised);
+    click(&mut w.app, viewport, first_button);
+    assert!(matches!(w.command(), UiCommand::Workbench { request, .. }
+        if matches!(request.as_ref(), ClientMessage::ActivateWidget { action: Some(action), revision: 2, .. }
+            if action == "second")));
+}
+
+#[test]
 fn delayed_widget_output_keeps_the_current_details_view() {
     let mut w = Workbench::new();
     let ws = workspace("Delayed actions");
@@ -98,6 +288,7 @@ fn delayed_widget_output_keeps_the_current_details_view() {
         .handle_daemon_event(UiEvent::WorkbenchCapability(true));
     w.app.state.workbench = Some((id, widgets(&[true, true])));
     let refresh = WidgetResult {
+        element_values: Default::default(),
         label: "Current details".into(),
         level: StatusLevel::Ok,
         details: vec![],
@@ -109,6 +300,7 @@ fn delayed_widget_output_keeps_the_current_details_view() {
         })
         .to_vec();
     let output = WidgetResult {
+        element_values: Default::default(),
         label: "Earlier action output".into(),
         level: StatusLevel::Info,
         details: vec![],
@@ -239,6 +431,7 @@ fn footer_overflow_opens_the_custom_list_and_details_actions_restore_terminal_fo
     w.app.state.widget_results = vec![WidgetSnapshot {
         id: "widget-1".into(),
         result: WidgetResult {
+            element_values: Default::default(),
             label: "Tests ready".into(),
             level: StatusLevel::Ok,
             details: vec![("Passed".into(), "12".into())],

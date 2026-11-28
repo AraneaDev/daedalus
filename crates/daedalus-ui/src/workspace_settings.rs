@@ -156,6 +156,11 @@ impl DaedalusApp {
                 self.request_redraw();
                 return;
             }
+            SettingsAction::InspectWidget(index) => {
+                self.show_widget_details(index);
+                self.request_redraw();
+                return;
+            }
             SettingsAction::Workbench { operation, request } => {
                 if let Some(id) = self.state.settings.widget_workspace {
                     self.request_workbench_as(id, operation, *request);
