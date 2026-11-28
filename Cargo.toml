@@ -21,7 +21,7 @@ bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive", "env"] }
 glyphon = "0.12"
 nix = { version = "0.32", features = ["signal", "process", "user"] }
-noyalib = { version = "0.0.53", default-features = false, features = ["std", "compat-serde-yaml"] }
+noyalib = { version = "0.0.64", default-features = false, features = ["std", "compat-serde-yaml"] }
 portable-pty = "0.9"
 rmp-serde = "1.3"
 serde = { version = "1", features = ["derive"] }
