@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.23](https://github.com/AraneaDev/daedalus/compare/v0.0.22...v0.0.23) (2026-11-28)
+
+
+### Features
+
+* add configurable workspace widgets and pane examples ([#67](https://github.com/AraneaDev/daedalus/issues/67)) ([ab7aeb9](https://github.com/AraneaDev/daedalus/commit/ab7aeb99ac1accc8900e8fcc6c2aff69169609dd))
+
 ## [0.0.22](https://github.com/AraneaDev/daedalus/compare/v0.0.21...v0.0.22) (2026-11-27)
 
 
